@@ -21,5 +21,5 @@ jobs:
     #- name: Run dtype test
     #  run: DEBUG=4 METAL=1 python -m pytest test/test_dtype.py
     - name: Run ops test
-      run: DEBUG=2 METAL=1 python -m pytest test/test_ops.py
+      run: DEBUG=4 METAL=1 python -m pytest test/test_ops.py
     # dtype test has issues on test_half_to_int8

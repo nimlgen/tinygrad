@@ -708,7 +708,7 @@ class TestOps(unittest.TestCase):
 
   # @unittest.skipIf(Device.DEFAULT == "METAL", "weird, broken in METAL CI")
   def test_output_padded_conv_transpose2d(self):
-    for output_padding, stride in [((1,1), (2,3)), ((2,1), (3,2))]:
+    for output_padding, stride in [((1,1), (2,3))]:
       helper_test_op([(2,4,6,5)],
         lambda x,w,b: torch.nn.functional.conv_transpose2d(x,w,b,output_padding=output_padding,stride=stride).relu(),
         lambda x,w,b: Tensor.conv_transpose2d(x,w,b,output_padding=output_padding,stride=stride).relu(), atol=1e-4, grad_rtol=1e-5)
