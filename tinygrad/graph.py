@@ -40,7 +40,7 @@ def nm(x):
 
 def get_sop(op: List[Op]):
   if len(op) <= 2: return '.'.join([str(y).split(".")[1] for y in op][::-1])
-  if len(op) <= 4: return '.'.join([str(y).split(".")[1][0:3] for y in op][::-1])
+  if len(op) <= 6: return '.'.join([str(y).split(".")[1][0:3] for y in op][::-1])
   return str(len(op))
 
 def str_dtype(dtyp):
