@@ -5,7 +5,7 @@ from typing import List, Any
 from tinygrad.codegen.cstyle import CStyleCodegen, CStyleLanguage
 from tinygrad.helpers import prod, getenv, DEBUG, DType
 from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferMapped
+from tinygrad.runtime.lib import RawBufferMapped, LRUAllocator, DeviceInfo
 
 METAL_XCODE = getenv("METAL_XCODE")
 
@@ -14,6 +14,7 @@ class _METAL:
     self.mtl_buffers_in_flight: List[Any] = []
     self.device = Metal.MTLCreateSystemDefaultDevice()
     self.mtl_queue = self.device.newCommandQueue()
+    self.dev_info = DeviceInfo(memory_size=self.device.dedicatedMemorySize()-(4<<30)) # Since we run on m1s with shared memory, give 4gb for the system.
   # TODO: is there a better way to do this?
   def synchronize(self):
     for cbuf in self.mtl_buffers_in_flight: cbuf.waitUntilCompleted()
@@ -79,4 +80,5 @@ class MetalCodegen(CStyleCodegen):
     gid = [f"gid.{chr(120+i)}" for i in range(3)], lid = [f"lid.{chr(120+i)}" for i in range(3)],
     extra_args = ['uint3 gid [[threadgroup_position_in_grid]]', 'uint3 lid [[thread_position_in_threadgroup]]'])
 
-MetalBuffer = Compiled(RawMetalBuffer, MetalCodegen, MetalProgram, METAL.synchronize)
+MetalAlloc = LRUAllocator(RawMetalBuffer, METAL.dev_info)
+MetalBuffer = Compiled(MetalAlloc, MetalCodegen, MetalProgram, METAL.synchronize)

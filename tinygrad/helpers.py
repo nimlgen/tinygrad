@@ -3,7 +3,7 @@ import os, functools, platform, time, re
 from weakref import KeyedRef, ref
 from _weakref import _remove_dead_weakref # type: ignore
 import numpy as np
-from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Callable, Any
+from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Any
 from math import prod # noqa: F401 # pylint:disable=unused-import
 
 ShapeType = Tuple[int, ...]
@@ -117,10 +117,13 @@ class GlobalCounters:
   global_mem: ClassVar[int] = 0
   time_sum_s: ClassVar[float] = 0.0
   kernel_count: ClassVar[int] = 0
-  mem_used: ClassVar[int] = 0   # NOTE: this is not reset
-  cache: ClassVar[Optional[List[Tuple[Callable, Any]]]] = None
+
+  # NOTE: Allocator counters. No reset them.
+  mem_used: ClassVar[int] = 0
+  mem_cached: ClassVar[int] = 0
+
   @staticmethod
-  def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count, GlobalCounters.cache = 0,0,0.0,0,None
+  def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count = 0,0,0.0,0
 
 # Stripped down version of a WeakSet
 class LightWeakSet:
