@@ -4,8 +4,8 @@ from collections import defaultdict
 from enum import Enum, auto
 
 from tinygrad.helpers import dedup, colored, ImageDType, DEBUG, prod, dtypes, mnum, DType, all_same, partition
-from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, UnaryOps
-from tinygrad.lazy import LazyBuffer
+from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, UnaryOps, Compiled
+from tinygrad.lazy import LazyBuffer, Device
 from tinygrad.ops import MovementOps, ReduceOps, BinaryOps, TernaryOps
 from tinygrad.runtime.lib import RawConst, buf_is_kernel_arg
 from tinygrad.shape.shapetracker import ShapeTracker, strides_for_shape, View
@@ -150,6 +150,8 @@ class Linearizer:
     # bufs are needed because kernels like f(x) = x + x and f(x, y) = x + y have the same str(ast), but are different kernels.
     # mapping the buffers to integers is required because a-b != b-a (and how would you tell a and b apart?)
     self.key = (ast.map_buffers({x:(self.arg_bufs[x.realized] if x.realized in self.arg_bufs else x) for x in self.bufs}).key, tuple([x.key for x in self.bufs]))
+
+    self.target_dev = cast(Compiled, Device[output_buffer.device]) # only Compiled calls linearizer
 
   def codegen(self): raise NotImplementedError("must be implemented")
 

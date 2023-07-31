@@ -6,7 +6,7 @@ from tinygrad.lazy import Device
 from tinygrad.tensor import Tensor
 from tinygrad.ops import GlobalCounters, RawBuffer
 
-JIT_SUPPORTED_DEVICE = ["GPU", "CLANG", "METAL", "CUDA", "HIP", "WEBGPU"]
+JIT_SUPPORTED_DEVICE = []
 
 class TinyJit:
   def __init__(self, fxn:Callable):

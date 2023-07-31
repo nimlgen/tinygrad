@@ -4,7 +4,7 @@ import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
 from tinygrad.helpers import DEBUG, getenv, fromimport, colored
 from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer
+from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, DeviceInfo
 from tinygrad.codegen.cstyle import CStyleCodegen, CStyleLanguage
 
 def pretty_ptx(s):
@@ -50,6 +50,11 @@ else:
     def __init__(self, size, dtype): super().__init__(size, dtype, cuda.mem_alloc(size * dtype.itemsize)) # type: ignore
     def _copyin(self, x:np.ndarray, stream:Optional[cuda.Stream]=None): cuda.memcpy_htod_async(self._buf, x.ravel(), stream) # type: ignore
     def _copyout(self, x:np.ndarray): cuda.memcpy_dtoh(x, self._buf) # type: ignore
+  gpu_attrs = pycuda.driver.Context.get_device().get_attributes()
+  CUDA_DEVICE_INFO = DeviceInfo(
+    cores_count_executing_in_parallel=gpu_attrs.get(pycuda._driver.device_attribute.MULTIPROCESSOR_COUNT, None),
+    threads_executed_in_parallel=gpu_attrs.get(pycuda._driver.device_attribute.WARP_SIZE, None),
+    max_blocks_per_core=gpu_attrs.get(pycuda._driver.device_attribute.MAX_BLOCKS_PER_MULTIPROCESSOR, None))
 
 class CUDAProgram:
   def __init__(self, name:str, prg:str, binary=False):
@@ -94,4 +99,4 @@ class CUDACodegen(CStyleCodegen):
     """)
   supports_float4_alu = False
 
-CUDABuffer = Compiled(RawCUDABuffer, fromimport("tinygrad.codegen.assembly_ptx", "PTXCodegen") if getenv("PTX") else CUDACodegen, CUDAProgram, cuda.Context.synchronize)
+CUDABuffer = Compiled(RawCUDABuffer, fromimport("tinygrad.codegen.assembly_ptx", "PTXCodegen") if getenv("PTX") else CUDACodegen, CUDAProgram, cuda.Context.synchronize, CUDA_DEVICE_INFO)

@@ -1,6 +1,6 @@
 from typing import Callable
-import itertools, time
-from tinygrad.helpers import DEBUG, prod, getenv, ImageDType
+import itertools, time, math
+from tinygrad.helpers import DEBUG, prod, getenv, ImageDType, unwrap_optional, round_up
 from tinygrad.ops import ReduceOps, BinaryOps, LazyOp
 from tinygrad.codegen.linearizer import Linearizer
 from tinygrad.lazy import LazyBuffer
@@ -160,11 +160,16 @@ def hand_coded_optimizations(k:Linearizer):
       # early exit
       return
 
+  max_threads = unwrap_optional(k.target_dev.device_info.cores_count_executing_in_parallel, 32) * 512
+  warp_size = unwrap_optional(k.target_dev.device_info.threads_executed_in_parallel, 16)
+
   if hasattr(k, 'lang') and len(k.lang.smem_prefix):
     # are we grouping? (requires local shape support)
-    if not k.float4_axis(0) and k.first_reduce <= 2 and k.first_reduce + 1 <= k.shape_len and prod(k.sts[0].shape[:k.first_reduce]) <= 2048:
-      # TODO: use 1024 if it's allowed in a smarter way
-      for sz in (([256, 16]) if prod(k.sts[0].shape[:k.first_reduce]) <= 32 else [16]):
+    if not k.float4_axis(0) and k.first_reduce <= 2 and k.first_reduce + 1 <= k.shape_len and prod(k.sts[0].shape[:k.first_reduce]) <= max_threads / 16:
+      pp = max_threads // prod(k.sts[0].shape[:k.first_reduce])
+      pp = math.gcd(*[pp]+[st.shape[k.first_reduce] for st in k.sts if st.shape[k.first_reduce] > 1])
+      pref_sz = round_up(pp, warp_size) if pp > warp_size else 16
+      for sz in ([pref_sz]):
         if all(st.shape[k.first_reduce] % sz == 0 or st.shape[k.first_reduce] == 1 for st in k.sts):
           k.shift_to(k.first_reduce, sz, top=True, insert_before=k.first_reduce + len(k.group_for_reduce))
           k.group_for_reduce.append(sz)
@@ -199,7 +204,7 @@ def hand_coded_optimizations(k:Linearizer):
 
   # potentially do more upcasts of non reduce axes based on a heuristic
   upcasted_axis = set()
-  while prod(k.sts[0].shape[:k.first_reduce]) >= 1024:
+  while prod(k.sts[0].shape[:k.first_reduce]) >= max_threads:
     xb_choices = []
     for axis, upcast_amount in itertools.product(range(k.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
       # if we haven't upcasted it, it mods, and some buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
@@ -236,14 +241,29 @@ def hand_coded_optimizations(k:Linearizer):
       k.upcast()
 
   # **** local groups ****
+  min_preferred_global_dim = unwrap_optional(k.target_dev.device_info.cores_count_executing_in_parallel, 32) * 4
+  preferred_local_dim = round_up(prod(k.full_shape[:k.first_reduce]) // (unwrap_optional(k.target_dev.device_info.max_blocks_per_core, 16) * unwrap_optional(k.target_dev.device_info.cores_count_executing_in_parallel, 32)), warp_size)
+  preferred_local_dim = max(preferred_local_dim, warp_size)
 
   if hasattr(k, 'lang') and len(k.lang.lid):
     for axis in range(k.first_reduce - k.local_dims - 1, -1, -1):
+      global_size = prod(k.full_shape[:k.first_reduce-k.local_dims])
       local_size = prod(k.full_shape[k.first_reduce-k.local_dims:k.first_reduce])
+      if local_size >= preferred_local_dim: break
       if k.full_shape[axis] == 1: continue
-      last_try = k.local_dims == 0 and axis == 0
+      last_try = (k.local_dims == 0 or local_size < preferred_local_dim) and axis == 0
       if any(k.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(k.sts))) or last_try:
-        for sz in [x for x in (([32] if last_try else []) + [16,8,4,3]) if k.full_shape[axis] % x == 0 and local_size*x <= 128]:
+        # Trying a bit harder last time, to have better utilization.
+        last_try_sz = []
+        bst_utilization, bst_x = 0, 512
+        if last_try:
+          for x in range(1, 2*preferred_local_dim//local_size):
+            if k.full_shape[axis] % x == 0 and local_size*x <= preferred_local_dim*2 and (global_size//x >= min_preferred_global_dim or local_size < warp_size):
+              utilization = (local_size*x) / round_up(local_size*x, warp_size)
+              if utilization >= bst_utilization: bst_utilization, bst_x = utilization, x
+          last_try_sz = [bst_x] + last_try_sz
+
+        for sz in [x for x in ((last_try_sz if last_try else []) + [64,32,16,8,4,3]) if k.full_shape[axis] % x == 0 and local_size*x <= preferred_local_dim*2 and (global_size//x >= min_preferred_global_dim or local_size < warp_size)]:
           k.shift_to(axis, sz, insert_before=k.first_reduce-k.local_dims)
           k.local_dims += 1
           break

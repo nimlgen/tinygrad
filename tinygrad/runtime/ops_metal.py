@@ -4,7 +4,7 @@ import Metal, Cocoa, libdispatch # type: ignore
 from tinygrad.codegen.cstyle import CStyleCodegen, CStyleLanguage
 from tinygrad.helpers import prod, getenv, DEBUG, DType
 from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferMapped
+from tinygrad.runtime.lib import RawBufferMapped, DeviceInfo
 
 METAL_XCODE = getenv("METAL_XCODE")
 
@@ -13,6 +13,9 @@ class _METAL:
     self.device = Metal.MTLCreateSystemDefaultDevice()
     self.dispatch_group = libdispatch.dispatch_group_create() 
     self.mtl_queue = self.device.newCommandQueue()
+    self.device_info = DeviceInfo(cores_count_executing_in_parallel=self.device.gpuCoreCount() if hasattr(self.device, 'gpuCoreCount') else 16, 
+                                  threads_executed_in_parallel=32,
+                                  max_blocks_per_core=3) # No info to grep for m1s from api atm.
   def command_buffer(self):
     command_buffer = self.mtl_queue.commandBuffer()
     libdispatch.dispatch_group_enter(self.dispatch_group)
@@ -81,4 +84,4 @@ class MetalCodegen(CStyleCodegen):
     gid = [f"gid.{chr(120+i)}" for i in range(3)], lid = [f"lid.{chr(120+i)}" for i in range(3)],
     extra_args = ['uint3 gid [[threadgroup_position_in_grid]]', 'uint3 lid [[thread_position_in_threadgroup]]'])
 
-MetalBuffer = Compiled(RawMetalBuffer, MetalCodegen, MetalProgram, METAL.synchronize)
+MetalBuffer = Compiled(RawMetalBuffer, MetalCodegen, MetalProgram, METAL.synchronize, METAL.device_info)
