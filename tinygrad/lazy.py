@@ -25,6 +25,8 @@ REMOVE_MOVEMENT_NOPS, MERGE_ELEMENTWISE_INTO_REDUCE, SHUFFLE_MOVEMENT_OPS, MERGE
 MERGE_ONE_REDUCE_INTO_ELEMENTWISE, SHUFFLE_PAD_OPS, SIMPLIFY_SUM_RESHAPE_EXPAND_SUM = OPT>=2, OPT>=2, OPT>=2   # shuffle pad ops is fine now since we only push to merge binops
 PUSH_PERMUTES, PUSH_CONTIGUOUS = OPT>=3, OPT>=3
 
+MERGE_REDUCE_TO_REDUCE = True
+
 def _simplify_sum_reshape_expand_sum(self:LazyBuffer, src: Any, prev_src: Any) -> Optional[LazyOp]:
   if prev_src.op.op == MovementOps.EXPAND:
     if src.op.op == ReduceOps.SUM:
@@ -38,7 +40,7 @@ def _simplify_sum_reshape_expand_sum(self:LazyBuffer, src: Any, prev_src: Any) -
   return None
 
 # **** realize functions ****
-def _ast_reduceops(self:LazyBuffer) -> LazyOp:
+def _ast_reduceops(self:LazyBuffer, reduces_cnt=0) -> LazyOp:
   # TODO: this can also corealize a binary op after the reduce, not just before
   # NOTE: mypy doesn't know that if not src.realized, then src.op must be a LazyOp so we have to ignore a bunch of warnings
   src = self.op.src[0]
@@ -58,20 +60,20 @@ def _ast_reduceops(self:LazyBuffer) -> LazyOp:
       # If we did remove an expand above, we might stumble back into a case where the reduction is not necessary
       if src.shape == self.shape:
         return src.op # type: ignore
-      src = src.op # type: ignore
+      src = _ast_binaryops(src, reduces_cnt=reduces_cnt+1) # type: ignore
   return LazyOp(self.op.op, (src,), self.op.arg)
 
 # this supports late merging an upstream Reduce op and even an Elementwise op above that
-def _ast_binaryops(self:LazyBuffer) -> LazyOp:
+def _ast_binaryops(self:LazyBuffer, reduces_cnt=0) -> LazyOp:
   real_srcs: Dict[LazyBuffer, Union[None, LazyOp, LazyBuffer]] = {x:None for x in self.op.buffers}
   # NOTE: contiguous does not always mean the same size with SHRINK. this is still mergeable but requires more thought how
   # TODO: this can also support late fusion of BinaryOps, required for test_fold_conv_sgd
   psrcs: List[Tuple[LazyBuffer, LazyBuffer]] = [(k,x) for k,x in zip(real_srcs.keys(), map(get_movementroot_contiguous, real_srcs.keys())) if x.optype == ReduceOps and not x.realized and prod(k.shape) == prod(x.shape) and len(x.children) <= 1 and len(k.children) <= 1]
   intermediate_shape: Tuple[int, ...] = self.shape
-  if MERGE_ONE_REDUCE_INTO_ELEMENTWISE and len(psrcs) >= 1:
+  if MERGE_ONE_REDUCE_INTO_ELEMENTWISE and len(psrcs) >= 1 and reduces_cnt <= 1:
     psrc = psrcs[0] # NOTE: right now we can't handle multiple, as we'd have to check for loop
-    if psrc[1].optype == ReduceOps:
-      top = _ast_reduceops(psrc[1])
+    assert psrc[1].optype == ReduceOps
+    top = _ast_reduceops(psrc[1], reduces_cnt)
     real_srcs[psrc[0]] = top
     real_srcs.update({x:x for x in top.buffers})  # the reduce op buffers are not modified
 
