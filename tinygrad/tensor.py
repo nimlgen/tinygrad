@@ -9,6 +9,7 @@ from typing import List, Tuple, Callable, Optional, ClassVar, Type, Union, Seque
 from tinygrad.helpers import ImageDType, argfix, make_pair, getenv, IMAGE, DEBUG, flatten, DType, dtypes
 from tinygrad.lazy import LazyBuffer
 from tinygrad.ops import Device, LoadOps
+from extra.tinyboard import tinyboard_log_mlops
 
 # An instantiation of the Function is the Context
 class Function:
@@ -25,6 +26,7 @@ class Function:
   def apply(fxn:Type[Function], *x:Tensor, **kwargs) -> Tensor:
     ctx = fxn(x[0].device, *x)
     ret = Tensor(ctx.forward(*[t.lazydata for t in x], **kwargs), device=ctx.device, requires_grad=ctx.requires_grad)
+    tinyboard_log_mlops(fxn, ret, *x)
     if ctx.requires_grad and not Tensor.no_grad: ret._ctx = ctx    # used by autograd engine
     return ret
 
@@ -33,7 +35,7 @@ import tinygrad.mlops as mlops
 # **** start with two base classes, Tensor and Function ****
 
 class Tensor:
-  __slots__ = "lazydata", "requires_grad", "grad", "_ctx"
+  __slots__ = "lazydata", "requires_grad", "grad", "_ctx", "node_id"
   __deletable__ = ('_ctx',)
   training: ClassVar[bool] = False
   no_grad: ClassVar[bool] = False

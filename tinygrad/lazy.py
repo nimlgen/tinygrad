@@ -13,6 +13,8 @@ from tinygrad.runtime.lib import RawConst, RawBuffer, RawBufferMapped, RawBuffer
 from tinygrad.runtime.ops_cpu import RawNumpyBuffer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
 
+from extra.tinyboard import tinyboard_log_lazyop_rename
+
 # lazy can recurse a lot
 sys.setrecursionlimit(10000)
 
@@ -138,11 +140,13 @@ class LazyBuffer:
   def realize(self:LazyBuffer) -> LazyBuffer:
     if not self.realized:
       # get real ops first
+      oldop = self.op
       if self.optype is BinaryOps: self.op = _ast_binaryops(self)
       elif self.optype is ReduceOps:
         self.op = _ast_reduceops(self)
         if self.op.op in BinaryOps: self.op = _ast_binaryops(self)
       elif self.optype is LoadOps: LOAD_OPS_DISPATCHER[cast(LoadOps, self.op.op)](self)
+      tinyboard_log_lazyop_rename(oldop, self.op) # This is to support kernel coloring
       # run the ast if we still have to, and log the op
       if not self.realized:
         for x in self.op.buffers: x.realize()
