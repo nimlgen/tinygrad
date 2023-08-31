@@ -102,9 +102,8 @@ class Transformer:
     h = tok_emb + pos_emb
     return h.realize()
 
-  def postprocess(self, x, temperature:Optional[float]):
-    logits = self.lm_head(self.ln_f(x))
-    if temperature is not None: return (logits[:, -1, :] / (temperature+1e-10)).softmax().flatten().realize()
+  def postprocess(self, x):
+    logits = self.lm_head(self.ln_f(x))[:, -1, :].flatten()
     return logits.realize()
 
   def __call__(self, tokens:Tensor, start_pos:int, temperature:Optional[float]):
@@ -118,7 +117,7 @@ class Transformer:
       for i, (hi, (cache_k, cache_v)) in enumerate(zip(self.h_jitted, self.kv_caches)):
         h, cache_k, cache_v = hi(h, cache_k, cache_v, start_pos=start_pos, mask=None, jit_ctx={start_pos_var: start_pos})
         self.kv_caches[i] = (cache_k, cache_v)
-      return self.postprocess_jitted(h, temperature)
+      return self.postprocess_jitted(h)
     else:
       pos = self.allpos.shrink(((0, self.allpos.shape[0]), (start_pos, start_pos+seqlen)))
       mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-inf"), dtype=dtypes.float32).triu(start_pos+1).realize()
@@ -126,7 +125,16 @@ class Transformer:
       for i, (hi, (cache_k, cache_v)) in enumerate(zip(self.h, self.kv_caches)):
         h, cache_k, cache_v = hi(h, cache_k, cache_v, start_pos=start_pos, mask=mask)
         self.kv_caches[i] = (cache_k, cache_v)
-      return self.postprocess(h, temperature)
+      return self.postprocess(h)
+
+def sample(logits, temperature):
+  if temperature < 1e-6:
+    # so close to 0 we use argmax
+    return int(logits.numpy().argmax())
+  else:
+    probs = (logits / temperature).softmax()
+    probs = probs.numpy().flatten()
+    return int(np.random.choice(len(probs), p=probs))
 
 # **** files and arguments ****
 
@@ -178,9 +186,8 @@ class GPT2:
         with Timing(f"ran model in ", on_exit=(lambda et: f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU"+
                     f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                     f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s") if DEBUG else None, enabled=timing):
-          probs = self.model(Tensor([toks[start_pos:]]), start_pos, temperature)
-        probs_np = probs.numpy()
-        tok = int(np.random.choice(len(probs_np), p=probs_np))
+          logits = self.model(Tensor([toks[start_pos:]]), start_pos, temperature)
+        tok = sample(logits, temperature)
       start_pos = len(toks)
       toks.append(tok)
       output = self.tokenizer.decode(toks)
