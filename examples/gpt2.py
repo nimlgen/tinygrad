@@ -97,7 +97,7 @@ class Transformer:
     self.h_jitted = [TinyJit(h.__call__) for h in self.h]
 
   def embed(self, tokens, pos):
-    tok_emb = self.wte(tokens)
+    tok_emb = self.wte(tokens, upto=50304)
     pos_emb = self.wpe(pos)
     h = tok_emb + pos_emb
     return h.realize()
