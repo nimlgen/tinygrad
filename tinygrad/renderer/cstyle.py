@@ -1,8 +1,8 @@
-from typing import Dict, List, Optional, NamedTuple, Tuple, Union
+from typing import Dict, List, Optional, NamedTuple, Tuple, Union, Set
 import math
 from tinygrad.codegen.linearizer import UOps, UOp, MemOp, ConstOp
 from tinygrad.ops import UnaryOps, BinaryOps, TernaryOps
-from tinygrad.helpers import ImageDType, dtypes, getenv, prod, DType
+from tinygrad.helpers import ImageDType, dtypes, getenv, prod, DType, MemRequestType
 from tinygrad.shape.symbolic import DivNode, AndNode, render_python, NumNode, Variable, sym_render
 
 # div is different in cl than python
@@ -18,6 +18,9 @@ class CStyleLanguage(NamedTuple):
   buffer_suffix: str = ""
   smem_prefix: str = ""
   arg_int_prefix: str = ""
+  atomic_prefix: str = ""
+  atomic_add: str = ""
+  simd_sum: str = ""
   barrier: str = ""
   gid: List[str] = []
   lid: List[str] = []
@@ -77,10 +80,11 @@ class CStyleLanguage(NamedTuple):
   def render_conditional(self, cond: str, x:str, y:str) -> str:
     return f"({cond})?({x}):{y}"
 
-  def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,DType]], global_size:List[int], local_size:List[int], prekernel:List[str]) -> Tuple[str,List[int],List[int]]:
+  def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,DType]], atomics_on_bufs:Set[str], global_size:List[int], local_size:List[int], prekernel:List[str]) -> Tuple[str,List[int],List[int]]:
     tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n" if any(isinstance(dtype, ImageDType) for _,dtype in bufs) else ""
     buftypes = [(name,f"{'read_only' if i > 0 else 'write_only'} image2d_t" if dtype.name.startswith('image') else
                 self.arg_int_prefix if dtype == dtypes._arg_int32 else
+                ("const " if i > 0 else "")+self.atomic_prefix+dtype.name+"*" if name in atomics_on_bufs else
                 ("const " if i > 0 else "")+self.buffer_prefix+dtype.name+"*"+self.buffer_suffix) for i,(name,dtype) in enumerate(bufs)]
     prg = ''.join([f"{self.kernel_prefix} void {f'__launch_bounds__ ({prod(local_size)}, 1) ' if self.launch_bounds else ''}{function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
@@ -90,7 +94,7 @@ class CStyleLanguage(NamedTuple):
     return prg, global_size[::-1], local_size[::-1]
 
   # returns a str statement that does the store
-  def render_store(self, buf_name:str, buf_dtype:DType, var_name:str, var_dtype:DType, idx, local=False) -> str:
+  def render_store(self, buf_name:str, buf_dtype:DType, var_name:str, var_dtype:DType, idx, local=False, mreq_type=MemRequestType.REGULAR) -> str:
     if isinstance(buf_dtype, ImageDType):
       assert var_dtype == dtypes._float4, "images must be float4"
       return f"write_imagef({buf_name}, (int2)({idx[0].render(render_cl)}, {idx[1].render(render_cl)}), {var_name});"
@@ -98,6 +102,8 @@ class CStyleLanguage(NamedTuple):
       return f"vstore_half{'' if var_dtype.sz == 1 else str(var_dtype.sz)}({var_name}, 0, {buf_name}+{idx.render(render_cl, strip_parens=True)});"
     if var_dtype.sz > 1:
       return f"*(({self.smem_prefix if local else self.buffer_prefix}{buf_dtype.name}{var_dtype.sz}*)({buf_name}+{idx.render(render_cl, strip_parens=True)})) = ({buf_dtype.name}{var_dtype.sz}){var_name};"
+    if mreq_type != MemRequestType.REGULAR:
+      return {MemRequestType.ATOMIC_ADD: self.atomic_add}[mreq_type].format(f"&{buf_name}[{idx.render(render_cl)}]", var_name) + ";"
     return f"*({buf_name}+{idx.render(render_cl, strip_parens=True)}) = {var_name};" if self.uses_ptr_arithmetic else f"{buf_name}[{idx.render(render_cl)}] = {var_name};"
 
 def add_gl_dimension(prefix: str, args, i:int, var, local_size:List[int], xid:List[str]):
@@ -111,6 +117,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
   kernel,prekernel = [],[]
   pend_close = None
   bufs = []
+  atomics_on_bufs = set()
   depth = 0
   def kk(s): kernel.append("  "*depth+s)
 
@@ -158,6 +165,15 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
         kk("}")
       else:
         raise NotImplementedError(f"WMMA not implemented for {args}")
+    elif uop == UOps.LOCAL_REDUCE:
+      local_index = Variable.sum(args[0]).render(render_cl)
+      kk(f"{{ int lane = ({local_index}) % warp_size;")
+      kk(f"int wid = ({local_index}) / warp_size;")
+      kk(f"{lang.simd_sum.format(args[1].render())}")
+      kk(f"if (lane == 0) {args[2].name}[wid]={args[1].render()};")
+      kk(f"{lang.barrier}")
+      kk(f"{args[1].render()} = (({local_index}) < ({args[3]} / warp_size)) ? {args[2].name}[lane] : 0;")
+      kk(f"if (wid == 0) {lang.simd_sum.format(args[1].render())} }}")
     elif uop == UOps.ALU:
       assert newvar is not None
       kk(f"{lang.generic_var_prefix if newvar not in vin else ''}{newvar.render(newvar not in vin and lang.generic_var_prefix == '')} = {lang.code_for_op[args](*[x.render() for x in vin])};")
@@ -173,7 +189,9 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
     elif uop == UOps.STORE:
       assert args.valid.min == 1 and isinstance(args, MemOp), "store must be valid and to memory"
       # TODO: instead of dtypes.float, a base type
-      kk(lang.render_store(args.name, args.memory_dtype, vin[0].render(), vin[0].dtype if vin[0].offset is None else dtypes.float, args.idx, args.local))
+      if args.mreq_type != MemRequestType.REGULAR: atomics_on_bufs.add(args.name)
+      kk(lang.render_store(args.name, args.memory_dtype, vin[0].render(), vin[0].dtype if vin[0].offset is None else dtypes.float, args.idx, args.local, args.mreq_type))
+      # kk(lang.render_store(args.name, args.memory_dtype, vin[0].render(), vin[0].dtype if vin[0].offset is None else dtypes.float, args.idx, args.local))
     elif uop == UOps.CAST and newvar is not None and newvar.dtype.sz > 1:
       kk(f"{newvar.render(True)} = {lang.render_cast([x.render() for x in vin], newvar.dtype)};")
     elif uop == UOps.DEFINE_LOCAL:
@@ -186,4 +204,4 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
     else:
       raise RuntimeError(f"failed to render {uop}")
 
-  return lang.render_kernel(function_name, kernel, bufs, global_size, local_size, prekernel)
+  return lang.render_kernel(function_name, kernel, bufs, atomics_on_bufs, global_size, local_size, prekernel)

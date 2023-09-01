@@ -127,6 +127,20 @@ class OptimizedKernel(Kernel):
 
   # ******************** high level optimizers ********************
 
+  def _can_use_atomics(self, x) -> Tuple[bool, bool]: # return pair of bools (if can use atomics & if children have reduce op)
+    if x.__class__ is not LazyOp: return (True, True)
+    if x.op in ReduceOps: return (True, True)
+    results = [self._can_use_atomics(v) for v in x.src]
+    if not all([x for x,_ in results]): return (False, False)
+    if not any([y for _,y in results]): return (True, False)
+    if x.op in [BinaryOps.ADD, BinaryOps.SUB, BinaryOps.MUL, BinaryOps.DIV]: return (True, True)
+    return (False, True)
+
+  def can_use_atomics(self) -> bool:
+    if not self.opts.supports_atomics: return False
+    if not self.reduceop or self.reduceop.op != ReduceOps.SUM: return False
+    return self._can_use_atomics(self.ast)[0]
+
   def apply_auto_opt(self, x):
     for axis, amt, typ in x:
       if axis is None or amt == 1: continue
@@ -277,13 +291,23 @@ class OptimizedKernel(Kernel):
         # early exit
         return
 
+    def round_to_power2(x): return 1<<(x-1).bit_length() if x > 0 else 0
+
+    # NOTE: Default is 256 to match previous hand-written value=1024. So should not get worse perf on devices with no device_info.
+    sm_count = 80
+    min_preferred_global_dim = sm_count * 4
+    max_threads_count = sm_count * 1024
+    min_preferred_local_dim = 32
+
     if self.opts.has_local and all(isinstance(s, int) for s in self.sts[0].shape[:self.first_reduce]):
       # are we grouping? (requires local shape support)
-      if not self.float4_axis(0) and self.first_reduce <= 2 and self.first_reduce + 1 <= self.shape_len and prod(self.sts[0].shape[:self.first_reduce]) <= 2048:
+      if not self.float4_axis(0) and self.reduceop is not None and (prod(self.sts[0].shape[:self.first_reduce]) <= 2048 or True):
         # TODO: use 1024 if it's allowed in a smarter way
-        for sz in (([256, 16]) if prod(self.sts[0].shape[:self.first_reduce]) <= 32 else [16]):
+        # Choose local shape to be as big as possible but not making global dim too small at the same time.
+        preferred_sz = min(512, round_to_power2(max(prod(self.full_shape[self.first_reduce:]) // (min_preferred_global_dim * 8), min_preferred_local_dim)))
+        for sz in [preferred_sz, 16]:
           if all(st.shape[self.first_reduce] % sz == 0 or st.shape[self.first_reduce] == 1 for st in self.sts):
-            self.shift_to(self.first_reduce, sz, top=True, insert_before=self.first_reduce + len(self.group_for_reduce))
+            self.shift_to(self.first_reduce, sz, top=False, insert_before=self.first_reduce + len(self.group_for_reduce))
             self.group_for_reduce.append(sz)
             break
 
@@ -294,6 +318,21 @@ class OptimizedKernel(Kernel):
         if self.sts[0].shape[axes[0]]%4 == 0:
           self.shift_to(axes[0], 4, insert_before=self.first_reduce + len(self.group_for_reduce))   # insert at the end of the grouped axis
           self.group_for_reduce.append(4)
+      
+      # When has local reduce and kernel is heavy on ops count, use atomics to fill up enough SMs.
+      if self.group_for_reduce and self.can_use_atomics():
+        initial_global_dims = self.first_reduce - self.local_dims
+        reduce_shapes = [st.shape[self.first_reduce + len(self.group_for_reduce)] for st in self.sts if st.shape[self.first_reduce + len(self.group_for_reduce)] != 1]
+        sz = round_to_power2(min(prod(self.full_shape[self.first_reduce+len(self.group_for_reduce):]) // 8, min(reduce_shapes) if reduce_shapes else 1)) # willing to have only up to 8 ops in the kernel.
+        if sz > 1 and all(st.shape[self.first_reduce + len(self.group_for_reduce)] % sz == 0 or st.shape[self.first_reduce + len(self.group_for_reduce)] == 1 for st in self.sts):
+          self.shift_to(self.first_reduce + len(self.group_for_reduce), sz, top=True, insert_before=0)
+          self.forced_global_dims_with_reduce = initial_global_dims + 1
+
+        for splits in [2]:
+          if self.full_unupcasted_shape[-1]%splits == 0:
+            self.shift_to(len(self.full_unupcasted_shape)-1, splits, insert_before=len(self.full_unupcasted_shape))
+            self.upcast()
+            break
 
     # now do everything required
     self.required_optimizations()
@@ -320,7 +359,7 @@ class OptimizedKernel(Kernel):
 
     # potentially do more upcasts of non reduce axes based on a heuristic
     upcasted_axis = set()
-    while prod(self.sts[0].shape[:self.first_reduce]) >= 1024:
+    while prod(self.sts[0].shape[:self.first_reduce]) >= max_threads_count:
       xb_choices = []
       for axis, upcast_amount in itertools.product(range(self.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
         # if we haven't upcasted it, it's not symbolic, it mods, and some buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
@@ -360,11 +399,12 @@ class OptimizedKernel(Kernel):
 
     if self.opts.has_local:
       for axis in range(self.first_reduce - self.local_dims - 1, -1, -1):
+        global_size = prod(self.full_shape[:self.first_reduce-self.local_dims])
         local_size = prod(self.full_shape[self.first_reduce-self.local_dims:self.first_reduce])
         if self.full_shape[axis] == 1: continue
         last_try = self.local_dims == 0 and axis == 0
         if any(st.views[-1].strides[axis] == 0 for st in self.sts) or last_try:
-          for sz in [x for x in (([32] if last_try else []) + [16,8,4,3]) if self.full_shape[axis] % x == 0 and local_size*x <= 128]:
+          for sz in [x for x in (([512, 256, 128, 64, 32] if last_try else []) + [16,8,4,3]) if self.full_shape[axis] % x == 0 and local_size*x <= 512 and global_size//x >= min_preferred_global_dim]:
             self.shift_to(axis, sz, insert_before=self.first_reduce-self.local_dims)
             self.local_dims += 1
             break

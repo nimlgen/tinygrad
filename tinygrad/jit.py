@@ -1,6 +1,7 @@
 from typing import Callable, List, Tuple, Any, Dict, cast, Union, Optional
 from weakref import ref
 import functools, itertools
+from collections import defaultdict
 from tinygrad.helpers import DEBUG, DType, merge_dicts
 from tinygrad.ops import Device
 from tinygrad.tensor import Tensor
@@ -17,6 +18,7 @@ class TinyJit:
     self.jit_cache: List[Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]] = []
     self.ret: Any = None
     self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
+    self.batching = []
 
   # add support for instance methods
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
@@ -41,6 +43,18 @@ class TinyJit:
           try: variables[k] = var_vals[k]
           except KeyError: pass
         prg(pargs, variables, jit=True)
+      # print(self.batching)
+      # self.jit_cache[0][0].clprg.ss()
+      # for bt in self.batching:
+      #   stream = 0
+      #   for jj,i in enumerate(bt):
+      #     prg, pargs, variables = self.jit_cache[i]
+      #     for v in (var_vals.keys() & variables.keys()): variables[v] = var_vals[v]
+      #     prg(pargs, variables, jit=True, stream=stream % 2)
+      #     if stream % 2 == 1: prg.clprg.batch_sync()
+      #     stream += 1
+      #   # print("sync")
+      #   self.jit_cache[0][0].clprg.batch_sync()
       for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
     elif self.cnt == 1:
       CacheCollector.start()
@@ -57,6 +71,34 @@ class TinyJit:
         #if prg.local_size is None: prg.local_size = prg.optimize_local_size(args, preserve_output=True)  # the JIT can optimize local
       assert set([x[0] for x in self.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
       for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+
+      # inps = {}
+      # outputs = {}
+      # deps = defaultdict(set)
+      # for i,(prg, pargs, variables) in enumerate(self.jit_cache):
+      #   deps[i] = set()
+      #   for a in pargs[1:]:
+      #     inps[a] = i
+      #     if a in outputs:
+      #       deps[i].add(outputs[a])
+      #   outputs[pargs[0]] = i
+      #   if (pargs[0] in inps and inps[pargs[0]] != i): deps[i].add(inps[pargs[0]])
+      # for jj in range(len(self.jit_cache)):
+      #   rem = []
+      #   for k,v in deps.items():
+      #     if len(v) == 0: rem.append(k)
+      #   for r in rem:
+      #     deps.pop(r)
+      #   for k,v in deps.items():
+      #     for r in rem: 
+      #       if r in v:
+      #         v.remove(r)
+      #   if len(rem) > 0: self.batching.append(rem)
+      #   else: break
+      # # print(len(deps.keys()), self.batching)
+      # assert len(deps.keys()) == 0
+      # # print(self.batching)
+
     elif self.cnt == 0:
       self.ret = self.fxn(*args, **kwargs)
     self.cnt += 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, functools, platform, time, re, contextlib
 import numpy as np
+from enum import Enum, auto
 from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Iterable, Any
 from math import prod # noqa: F401 # pylint:disable=unused-import
 
@@ -131,3 +132,5 @@ class GlobalCounters:
   mem_cached: ClassVar[int] = 0 # NOTE: this is not reset
   @staticmethod
   def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count = 0,0,0.0,0
+
+class MemRequestType(Enum): REGULAR = auto(); ATOMIC_ADD = auto()

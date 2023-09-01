@@ -54,11 +54,14 @@ else:
   CUDAAlloc = CUDAAllocator(pycuda.driver.Context.get_device().total_memory())
   class RawCUDABuffer(RawBufferCopyInOut): # type: ignore
     def __init__(self, size, dtype): super().__init__(size, dtype, allocator=CUDAAlloc)
-    def _copyin(self, x:np.ndarray, stream:Optional[cuda.Stream]=None): cuda.memcpy_htod_async(self._buf, x.ravel(), stream) # type: ignore
+    def _copyin(self, x:np.ndarray, stream:Optional[cuda.Stream]=None): cuda.memcpy_htod_async(self._buf, x.ravel(), stream if stream else CUDA_STREAMS[0]) # type: ignore
     def _copyout(self, x:np.ndarray): cuda.memcpy_dtoh(x, self._buf) # type: ignore
+  CUDA_STREAMS = [cuda.Stream(), cuda.Stream()]
+  EVNTS = []
 
 class CUDAProgram:
   def __init__(self, name:str, prg:str, binary=False):
+    self.has_atomics_on_output = prg.find("atomic") != -1
     if not binary:
       try: prg = cuda_compile(prg, target="ptx", no_extern_c=True, options=['-Wno-deprecated-gpu-targets']).decode('utf-8')
       except cuda.CompileError as e:
@@ -75,20 +78,41 @@ class CUDAProgram:
     # TODO: name is wrong, so we get it from the ptx using hacks
     self.prg = cuda.module_from_buffer(prg.encode('utf-8')).get_function(prg.split(".visible .entry ")[1].split("(")[0])
 
-  def __call__(self, global_size, local_size, *args, wait=False):
+  def __call__(self, global_size, local_size, *args, wait=False, **kwargs):
     if wait:
       start, end = cuda.Event(), cuda.Event()
       start.record()
-    self.prg(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size))
+    stream_id = kwargs.get('stream', 0)
+    if self.has_atomics_on_output: cuda.memset_d8(args[0]._buf, 0, args[0].size * args[0].dtype.itemsize)
+    self.prg(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), stream=CUDA_STREAMS[stream_id])
+    sss = cuda.Event()
+    sss.record(CUDA_STREAMS[stream_id])
+    EVNTS.append(sss)
     if wait:
       end.record()
       end.synchronize()
       return start.time_till(end)*1e-3
 
+  def ss(self): cuda.Context.synchronize
+
+  def batch_sync(self):
+    global EVNTS
+    for i in range(len(CUDA_STREAMS)):
+      for jj in range(len(EVNTS)):
+        if i != jj:
+          CUDA_STREAMS[i].wait_for_event(EVNTS[jj])
+    EVNTS = []
+    # for i in range(len(EVNTS)):
+    #   EVNTS[i].synchronize()
+    # EVNTS=[]
+    
+
 renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
-  kernel_prefix = "__global__", smem_prefix = "__shared__ ", arg_int_prefix = "const int", barrier = "__syncthreads();", float4 = "make_float4",
+  kernel_prefix = "#define warp_size (32)\n__global__", smem_prefix = "__shared__ ", arg_int_prefix = "const int", barrier = "__syncthreads();", float4 = "make_float4",
   gid = [f'blockIdx.{chr(120+i)}' for i in range(3)],
   lid = [f'threadIdx.{chr(120+i)}' for i in range(3)],
+  atomic_add = "atomicAdd({0}, {1})",
+  simd_sum = "for (int __offset = warp_size/2; __offset > 0; __offset /= 2) {0} += __shfl_down_sync(0xFFFFFFFF, {0}, __offset);",
   half_prekernel = """
     #include <cuda_fp16.h>
     struct __align__(8) half4 {
@@ -97,4 +121,4 @@ renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
       __device__ __forceinline__ explicit operator float4() const {return make_float4(__half2float(x.x), __half2float(x.y), __half2float(y.x), __half2float(y.y)); }
     };
   """)) if not getenv("PTX") else fromimport("tinygrad.renderer.assembly_ptx", "uops_to_ptx_asm")
-CUDABuffer = Compiled(RawCUDABuffer, LinearizerOptions(supports_float4=False if getenv("PTX") else True, supports_float4_alu=False, global_max = [65535, 65535, 2147483647], local_max = [64, 1024, 1024]), renderer, CUDAProgram, cuda.Context.synchronize)
+CUDABuffer = Compiled(RawCUDABuffer, LinearizerOptions(supports_float4=False if getenv("PTX") else True, supports_float4_alu=False, supports_atomics=True, supports_fast_local_reduce=True, global_max = [65535, 65535, 2147483647], local_max = [64, 1024, 1024]), renderer, CUDAProgram, cuda.Context.synchronize)

@@ -3,7 +3,7 @@ import itertools, math
 from collections import defaultdict
 from enum import Enum, auto
 
-from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, mnum, DType, all_same, partition, prod
+from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, mnum, DType, all_same, partition, MemRequestType, prod
 from tinygrad.ops import LazyOp, UnaryOps, Op
 from tinygrad.lazy import LazyBuffer
 from tinygrad.ops import ReduceOps, BinaryOps, TernaryOps
@@ -20,6 +20,7 @@ class UOps(Enum):
   DEFINE_GLOBAL = auto(); DEFINE_LOCAL = auto() # this defines buffers # noqa: E702
   LOAD = auto(); STORE = auto(); BARRIER = auto() # noqa: E702
   ALU = auto(); WMMA = auto(); CAST = auto() # noqa: E702
+  LOCAL_REDUCE = auto() # not requred # noqa: E702
   # TODO: add CONST. use ALU WHERE for gated load
   # *** assembly only UOps ***
   SPECIAL = auto(); LABEL = auto(); COND_BRANCH = auto() # TODO: replace these with LOOP and ENDLOOP # noqa: E702
@@ -112,6 +113,7 @@ class MemOp(NamedTuple):
   # shared
   valid: Node
   invalid_value: Union[float, int] = 0.0
+  mreq_type: MemRequestType = MemRequestType.REGULAR
 
 class ConstOp(NamedTuple):
   value: Union[float, int]
@@ -176,7 +178,7 @@ class Linearizer(OptimizedKernel):
       ret.append(Token(self.load_cache[key].name, self.load_cache[key].dtype, expanded_nodes[dim].index(_idx[dim])) if localtype != dtypes.float else self.load_cache[key])
     return ret
 
-  def global_store(self, i, idxs:List[VariableOrNum], store:List[Token], ssa) -> None:
+  def global_store(self, i, idxs:List[VariableOrNum], store:List[Token], ssa, mreq_type = MemRequestType.REGULAR) -> None:
     expanded_nodes = [idx.expand() for idx in idxs]
     _idxs = [x[::-1] for x in itertools.product(*expanded_nodes[::-1])]
     upcast_dim = self.get_upcast_dim(i)
@@ -204,7 +206,7 @@ class Linearizer(OptimizedKernel):
     for idx, var in store_offset.items():
       idx, valid = self.sts[i].expr_idxs(idx)
       if isinstance(self.bufs[i].dtype, ImageDType): idx = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
-      self.uop(UOps.STORE, None, [var], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid))
+      self.uop(UOps.STORE, None, [var], MemOp(self.get_buffer_name(i), idx, self.bufs[i].__class__ is LocalBuffer, self.bufs[i].dtype, valid, 0.0, mreq_type))
 
   kernel_cnt: Final[DefaultDict[str, int]] = defaultdict(int)
   def linearize(self):
@@ -226,9 +228,12 @@ class Linearizer(OptimizedKernel):
     for lb in self.local_alias.values():
       self.uop(UOps.DEFINE_LOCAL, None, [], (lb.name, self.sts[self.bufs.index(lb)].size()))
     # add a local buffer for multistage reduce. # TODO: use local alias
+    can_use_fast_late_reduce = self.opts.supports_fast_local_reduce and len(self.group_for_reduce) == 1 and self.reduceop.op == ReduceOps.SUM and not self.upcast_in_mid_reduce_axes # type: ignore
     if self.group_for_reduce:
       # TODO: the strides of this can be controlled
-      self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + self.group_for_reduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
+      # self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + self.group_for_reduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
+      greduce = [math.ceil(i / 32) for i in self.group_for_reduce] if can_use_fast_late_reduce else self.group_for_reduce
+      self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + greduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
       self.bufs.append(LocalBuffer("temp", self.sts[-1].size()))
       self.uop(UOps.DEFINE_LOCAL, None, [], ("temp", self.sts[-1].size()))
 
@@ -350,7 +355,11 @@ class Linearizer(OptimizedKernel):
       self.load_cache.clear()
 
       # end the local loop, do the local reduce
-      if self.group_for_reduce:
+      if self.group_for_reduce and can_use_fast_late_reduce:
+        self.uop(UOps.BARRIER, None, [], ())
+        self.uop(UOps.LOCAL_REDUCE, None, [], (local_idxs, acc[0], self.bufs[-1], prod(self.group_for_reduce)))
+        self.uop(UOps.ENDLOOP, None, [], (local_idxs, "local"))
+      elif self.group_for_reduce:
         fake_global_idxs = [x*0 for x in global_idxs]
         self.global_store(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, acc, ssa)  # store accumulators
         self.uop(UOps.BARRIER, None, [], ())
@@ -394,7 +403,10 @@ class Linearizer(OptimizedKernel):
     val = self.ast_parse(self.ast, acc, loaded_buffers, ssa)
 
     # store
-    self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val, ssa)
+    mreq_type = {ReduceOps.SUM: MemRequestType.ATOMIC_ADD}[cast(ReduceOps, self.reduceop.op)] if self.forced_global_dims_with_reduce else MemRequestType.REGULAR
+    # print("mreq_type", mreq_type)
+    self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val, ssa, mreq_type)
+    # self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val, ssa)
 
     # end the global (and maybe local) loop
     self.uop(UOps.ENDLOOP, None, [], (loop_global_idxs+loop_local_idxs, "global+local") if not self.group_for_reduce else (loop_global_idxs, "global"))

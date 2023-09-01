@@ -18,6 +18,8 @@ class LinearizerOptions(NamedTuple):
   supports_float4: bool = True
   supports_float4_alu: bool = True
   has_local: bool = True
+  supports_atomics: bool = False
+  supports_fast_local_reduce: bool = False
   # NOTE: these two should be in z,y,x(reversed) order for cstyle backends, they are flipped when kernel is rendered
   global_max: Optional[List[int]] = None
   local_max: Optional[List[int]] = None
@@ -67,6 +69,7 @@ class Kernel:
     self.local_alias: Dict[int, LocalBuffer] = {}
     self.use_tensor_cores: bool = False
     self.exclude_local_upcast: int = 0
+    self.forced_global_dims_with_reduce: int = 0
     self.reverse_upcast_dir: bool = False
 
   def has_variable_shape(self) -> bool:
@@ -94,7 +97,9 @@ class Kernel:
     return [x for x in self.sts[i].unit_stride_axes() if should_upcast and x >= self.shape_len-self.upcasted and self.sts[i].shape[x] > 1]
 
   @property
-  def first_reduce(self) -> int: return [x!=y for x,y in zip(self.sts[0].shape[:self.shape_len-self.upcasted]+(0,), self.full_shape[:self.shape_len-self.upcasted]+(1,))].index(True)
+  def first_reduce(self) -> int:
+    # NOTE: Global dims are ignored, since there is no real reduce. Reduce in global dims is just atomics.
+    return self.forced_global_dims_with_reduce + [x!=y for x,y in zip(self.sts[0].shape[:self.shape_len-self.upcasted]+(0,), self.full_shape[:self.shape_len-self.upcasted]+(1,))].index(True)
 
   @property
   def output_shape(self) -> Tuple[int, ...]: return self.sts[0].shape
