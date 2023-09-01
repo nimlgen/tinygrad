@@ -228,7 +228,7 @@ class Linearizer(OptimizedKernel):
     for lb in self.local_alias.values():
       self.uop(UOps.DEFINE_LOCAL, None, [], (lb.name, self.sts[self.bufs.index(lb)].size()))
     # add a local buffer for multistage reduce. # TODO: use local alias
-    can_use_fast_late_reduce = self.opts.supports_fast_local_reduce and len(self.group_for_reduce) == 1 and self.reduceop.op == ReduceOps.SUM and not self.upcast_in_mid_reduce_axes # type: ignore
+    can_use_fast_late_reduce = self.opts.supports_fast_local_reduce and len(self.group_for_reduce) == 1 and self.group_for_reduce[0] % 32 == 0 and self.reduceop.op == ReduceOps.SUM and not self.upcast_in_mid_reduce_axes # type: ignore
     if self.group_for_reduce:
       # TODO: the strides of this can be controlled
       # self.sts.append(ShapeTracker(tuple([1] * self.first_reduce + self.group_for_reduce + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))
