@@ -172,7 +172,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
       kk(f"{lang.simd_sum.format(args[1].render())}")
       kk(f"if (lane == 0) {args[2].name}[wid]={args[1].render()};")
       kk(f"{lang.barrier}")
-      kk(f"{args[1].render()} = (({local_index}) < ({args[3]} / warp_size)) ? {args[2].name}[lane] : 0;")
+      kk(f"{args[1].render()} = (({local_index}) < (({args[3]} + warp_size - 1) / warp_size)) ? {args[2].name}[lane] : 0;")
       kk(f"if (wid == 0) {lang.simd_sum.format(args[1].render())} }}")
     elif uop == UOps.ALU:
       assert newvar is not None

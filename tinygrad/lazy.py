@@ -243,7 +243,16 @@ class LazyBuffer:
     device_support_atomics = getattr(Device[self.device].linearizer_opts, 'supports_atomics') if hasattr(Device[self.device].linearizer_opts, 'supports_atomics') else False
     min_dimension = 512 if op == ReduceOps.SUM and device_support_atomics else 256
     heuristic, divisor, dim_to_split = max(((divisor := math.gcd(min_dimension, old))/(stride or math.inf), divisor, i) for i, (old, new, stride) in enumerate(zip(self.shape, new_shape, self.st.real_strides())) if old != new) # type: ignore
-    if divisor < 16 or heuristic < 0.125: return self._reduce_op(op, new_shape) # Choose largest divisor (>=16) to split on, penalize large strides.
+    
+    if divisor < 16:
+      for dd in range(17, 32):
+        for i, (old, new, stride) in enumerate(zip(self.shape, new_shape, self.st.real_strides())):
+          if old != new and old % dd == 0:
+            divisor = dd
+            heuristic = 1
+            dim_to_split = i
+    
+    if divisor < 16 or heuristic < 0.1: return self._reduce_op(op, new_shape) # Choose largest divisor (>=16) to split on, penalize large strides.
     def splitted_shape(dim_aft_div): return self.shape[:dim_to_split] + (self.shape[dim_to_split]//divisor,) + dim_aft_div + self.shape[dim_to_split+1:]
     return self.reshape(splitted_shape((divisor,)))._reduce_op(op, splitted_shape((1,))).reshape(splitted_shape(()))._reduce_op(op, new_shape)
 
