@@ -306,6 +306,7 @@ class OptimizedKernel(Kernel):
         # Choose local shape to be as big as possible but not making global dim too small at the same time.
         # preferred_sz = min(512, round_to_power2(max(prod(self.full_shape[self.first_reduce:]) // (min_preferred_global_dim * 8), min_preferred_local_dim)))
         for sz in [512, 256, 131, 128, 64, 48, 32, 29, 16]:
+          if self.can_use_atomics() and prod(self.full_shape[self.first_reduce:]) // sz < 32 and sz != 16: continue
           if prod(self.full_shape[self.first_reduce:]) // sz < 8: continue
           if all(st.shape[self.first_reduce] % sz == 0 or st.shape[self.first_reduce] == 1 for st in self.sts):
             self.shift_to(self.first_reduce, sz, top=False, insert_before=self.first_reduce + len(self.group_for_reduce))
@@ -321,7 +322,7 @@ class OptimizedKernel(Kernel):
           self.group_for_reduce.append(4)
       
       # When has local reduce and kernel is heavy on ops count, use atomics to fill up enough SMs.
-      if self.group_for_reduce and self.can_use_atomics() and False:
+      if self.group_for_reduce and self.can_use_atomics():
         initial_global_dims = self.first_reduce - self.local_dims
         reduce_shapes = [st.shape[self.first_reduce + len(self.group_for_reduce)] for st in self.sts if st.shape[self.first_reduce + len(self.group_for_reduce)] != 1]
         sz = round_to_power2(min(prod(self.full_shape[self.first_reduce+len(self.group_for_reduce):]) // 8, min(reduce_shapes) if reduce_shapes else 1)) # willing to have only up to 8 ops in the kernel.
