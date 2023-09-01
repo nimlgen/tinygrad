@@ -322,7 +322,7 @@ class OptimizedKernel(Kernel):
           self.group_for_reduce.append(4)
       
       # When has local reduce and kernel is heavy on ops count, use atomics to fill up enough SMs.
-      if self.group_for_reduce and self.can_use_atomics():
+      if self.group_for_reduce and self.can_use_atomics() and False:
         initial_global_dims = self.first_reduce - self.local_dims
         reduce_shapes = [st.shape[self.first_reduce + len(self.group_for_reduce)] for st in self.sts if st.shape[self.first_reduce + len(self.group_for_reduce)] != 1]
         sz = round_to_power2(min(prod(self.full_shape[self.first_reduce+len(self.group_for_reduce):]) // 8, min(reduce_shapes) if reduce_shapes else 1)) # willing to have only up to 8 ops in the kernel.
