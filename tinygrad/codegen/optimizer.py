@@ -291,7 +291,7 @@ class OptimizedKernel(Kernel):
 
       buf0 = self.bufs.index(self.reduceop.src[0].src[0])
       buf0_strides = self.sts[buf0].real_strides()
-      BLOCKSIZE = 32
+      BLOCKSIZE = 4
       THREADS_PER_ROW = 8
       for global_idx in range(0, self.global_dims):
         if self.full_shape[global_idx]%BLOCKSIZE == 0 and \
@@ -304,7 +304,7 @@ class OptimizedKernel(Kernel):
           self.shift_to(global_idx, BLOCKSIZE, insert_before=self.first_reduce)
           self.local_dims += 1
 
-          if self.full_shape[global_idx] > BLOCKSIZE*4:
+          if self.full_shape[global_idx]%(BLOCKSIZE*4) == 0:
             self.shift_to(global_idx, 4)
             self.upcast()
           return
