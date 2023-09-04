@@ -294,8 +294,9 @@ class OptimizedKernel(Kernel):
       BLOCKSIZE = 32
       THREADS_PER_ROW = 8
       if self.full_shape[0] >= BLOCKSIZE*THREADS_PER_ROW and self.full_shape[0]%BLOCKSIZE == 0 and \
-          self.full_shape[1] >= BLOCKSIZE*THREADS_PER_ROW and self.full_shape[1]%THREADS_PER_ROW == 0 and \
-          buf0_strides[1] == 1:
+          self.full_shape[self.first_reduce] >= BLOCKSIZE*THREADS_PER_ROW and self.full_shape[self.first_reduce]%THREADS_PER_ROW == 0 and \
+          buf0_strides[self.first_reduce] == 1:
+        if DEBUG >= 4: print(f"matvec optimize: full_shape={self.full_shape} first_reduce={self.first_reduce} buf0_strides={buf0_strides}")
         self.shift_to(self.first_reduce, THREADS_PER_ROW, top=False, insert_before=self.first_reduce + len(self.group_for_reduce))
         self.group_for_reduce.append(THREADS_PER_ROW)
 
