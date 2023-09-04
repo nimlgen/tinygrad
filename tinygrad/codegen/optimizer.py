@@ -293,20 +293,21 @@ class OptimizedKernel(Kernel):
       buf0_strides = self.sts[buf0].real_strides()
       BLOCKSIZE = 32
       THREADS_PER_ROW = 8
-      if self.full_shape[0] >= BLOCKSIZE*THREADS_PER_ROW and self.full_shape[0]%BLOCKSIZE == 0 and \
-          self.full_shape[self.first_reduce] >= BLOCKSIZE*THREADS_PER_ROW and self.full_shape[self.first_reduce]%THREADS_PER_ROW == 0 and \
-          buf0_strides[self.first_reduce] == 1:
-        if DEBUG >= 4: print(f"matvec optimize: full_shape={self.full_shape} first_reduce={self.first_reduce} buf0_strides={buf0_strides}")
-        self.shift_to(self.first_reduce, THREADS_PER_ROW, top=False, insert_before=self.first_reduce + len(self.group_for_reduce))
-        self.group_for_reduce.append(THREADS_PER_ROW)
+      for global_idx in range(0, self.global_dims):
+        if self.full_shape[global_idx]%BLOCKSIZE == 0 and \
+            self.full_shape[self.first_reduce]%THREADS_PER_ROW == 0 and \
+            buf0_strides[self.first_reduce] == 1 and self.full_shape[global_idx]*self.full_shape[self.first_reduce] > 1024*1024:
+          print(f"MATVEC: full_shape={self.full_shape} first_reduce={self.first_reduce} buf0_strides={buf0_strides}")
+          self.shift_to(self.first_reduce, THREADS_PER_ROW, top=False, insert_before=self.first_reduce + len(self.group_for_reduce))
+          self.group_for_reduce.append(THREADS_PER_ROW)
 
-        self.shift_to(0, BLOCKSIZE, insert_before=self.first_reduce)
-        self.local_dims += 1
+          self.shift_to(global_idx, BLOCKSIZE, insert_before=self.first_reduce)
+          self.local_dims += 1
 
-        if self.full_shape[0] > BLOCKSIZE*4:
-          self.shift_to(0, 4)
-          self.upcast()
-        return
+          if self.full_shape[global_idx] > BLOCKSIZE*4:
+            self.shift_to(global_idx, 4)
+            self.upcast()
+          return
 
     if self.opts.has_local and all(isinstance(s, int) for s in self.sts[0].shape[:self.first_reduce]):
       # are we grouping? (requires local shape support)
