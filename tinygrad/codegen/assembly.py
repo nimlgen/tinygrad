@@ -127,7 +127,7 @@ def uops_to_asmstyle(lang, function_name:str, uops:List[UOp]):
             lang.ins.append(AssemblyInstruction(UOps.ALU, lang.tor[var], [lang.tor[var], 1], BinaryOps.ADD))
             pred = lang.render_alu(BinaryOps.CMPLT, lang.tor[var], var.max+1, dtypes.bool)
             lang.ins.append(AssemblyInstruction(UOps.COND_BRANCH, None, [pred], ("$loop_"+var.expr, True)))
-      elif args[1] == "global+local":
+      elif args[1] == "global" or args[1] == "global+local":
         for i, var in enumerate(reversed(args[0])):
           lang.ins.append(AssemblyInstruction(UOps.ENDLOOP, None, [lang.tor[var]], (var.max+1, f"gid{i}")))
       elif args[1] == 'local':

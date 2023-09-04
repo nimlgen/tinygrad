@@ -145,7 +145,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp])  -> T
         kk(f"if ({Variable.sum(args[0]).render(render_cl)} == 0) {{")
         pend_close = "}"*(len(args[0])+1) + f" /* {args[1]} */"
       else:
-        if args[1] == "global" and pend_close:
+        if (args[1] == "global" or args[1] == "global+local") and pend_close:
           depth -= 1
           kk(pend_close)
           pend_close = None

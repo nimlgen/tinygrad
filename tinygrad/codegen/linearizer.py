@@ -312,9 +312,17 @@ class Linearizer(OptimizedKernel):
       # end the local loop, do the local reduce
       if self.group_for_reduce:
         fake_global_idxs = [x*0 for x in global_idxs]
+        just_local_idxs = [x for i,x in enumerate(local_idxs) if i < self.local_dims]
+
+        loop_group_reduce_local_idxs = [loop_local_idxs[i] for i in range(0,self.local_dims+len(self.group_for_reduce)) if i >= self.local_dims]
+        loop_local_idxs = [loop_local_idxs[i] for i in range(0,self.local_dims+len(self.group_for_reduce)) if i < self.local_dims]
+
         self.global_store(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, acc)  # store accumulators
         self.uop(UOps.BARRIER, None, [], ())
-        self.uop(UOps.ENDLOOP, None, [], ([loop_local_idxs[i]*0 if i < len(self.group_for_reduce) else loop_local_idxs[i] for i in range(0,self.local_dims+len(self.group_for_reduce))], "local"))
+        self.uop(UOps.ENDLOOP, None, [], (loop_group_reduce_local_idxs, "local"))
+
+        # group_reduce in local indexs are over, 0 them out
+        local_idxs = [x*0 if i >= self.local_dims else x for i,x in enumerate(local_idxs)]
 
         # if any group_for_reduce items aren't reduces, upcast them here
         for j in self.upcast_in_mid_reduce_axes:
@@ -331,17 +339,17 @@ class Linearizer(OptimizedKernel):
         acc = self.global_load(-1, fake_global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, {ReduceOps.SUM: 0.0, ReduceOps.MAX: -math.inf}[cast(ReduceOps, self.reduceop.op)])
 
         # late reduce loop
-        end_local_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce else 0) for i in range(self.local_dims, self.first_reduce+len(self.group_for_reduce))]
-        self.uop(UOps.LOOP, None, [], (end_local_idxs, "late_reduce"))
+        end_group_reduce_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce else 0) for i in range(self.first_reduce, self.first_reduce+len(self.group_for_reduce))]
+        self.uop(UOps.LOOP, None, [], (end_group_reduce_idxs, "late_reduce"))
 
         # load localbufs
-        loaded_buffers["LOCAL_BUFFER"] = self.global_load(-1, fake_global_idxs+local_idxs[0:-len(self.group_for_reduce)]+end_local_idxs[-len(self.group_for_reduce):]+fake_reduce_idxs+upcast_idxs)
+        loaded_buffers["LOCAL_BUFFER"] = self.global_load(-1, fake_global_idxs+just_local_idxs+end_group_reduce_idxs+fake_reduce_idxs+upcast_idxs)
 
         # there's no AST here (and there's no shape for the reduce LazyOp)
         self.ast_parse(LazyOp(self.reduceop.op, ("LOCAL_BUFFER",)), [acc[off] for off in self.acc_offsets(-1)], loaded_buffers, do_reduce=True) # type: ignore
 
         # end the late reduce loop
-        self.uop(UOps.ENDLOOP, None, [], (end_local_idxs, "late_reduce"))
+        self.uop(UOps.ENDLOOP, None, [], (end_group_reduce_idxs, "late_reduce"))
         self.load_cache.clear()
 
     # load latebufs
@@ -354,7 +362,7 @@ class Linearizer(OptimizedKernel):
     self.global_store(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, val)
 
     # end the global (and maybe local) loop
-    self.uop(UOps.ENDLOOP, None, [], (loop_global_idxs+loop_local_idxs, "global+local") if not self.group_for_reduce else (loop_global_idxs, "global"))
+    self.uop(UOps.ENDLOOP, None, [], (loop_global_idxs+loop_local_idxs, "global+local") if loop_local_idxs else (loop_global_idxs, "global"))
 
     # (recursively) remove childless uops
     UOPS_WO_SIDE_EFFECTS = {UOps.CONST, UOps.ALU, UOps.LOAD, UOps.CAST, UOps.GEP}
