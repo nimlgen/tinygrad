@@ -26,15 +26,15 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
         traceback.print_exc()
       return 10000_000   # 10000 seconds is infinity
   opts = []
-  if k.first_reduce < k.shape_len: # TODO: Grouped reduces do not work with other locals. More chances to mutate to 1, so locals can be used.
-    opts.append(ng.p.TransitionChoice([(0,s,"G") for s in get_divisors(k.full_shape[k.first_reduce], min_div=16) if all(st.shape[k.first_reduce] % s == 0 or st.shape[k.first_reduce] == 1 for st in k.sts)], transitions=(0.8, 0.2)))
+  # if k.first_reduce < k.shape_len: # TODO: Grouped reduces do not work with other locals. More chances to mutate to 1, so locals can be used.
   for i in range(k.first_reduce):
     # TODO: the upcast always happen first, you might want to reverse this?
     # TODO: the order of the locals might improve things too
-    opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=32)]))
-    opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i])]))
+    opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=8)]))
+    opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i], min_div=4)]))
   for i in range(k.shape_len-k.first_reduce):
-    opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=32)]))
+    opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
+    opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=8)]))
   if not opts: return "BASELINE"
   search_space = prod([len(x.choices) for x in opts])
   st = time.perf_counter()
