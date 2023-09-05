@@ -1,7 +1,9 @@
 from typing import Callable
 import time
 from tinygrad.codegen.linearizer import Linearizer
-from tinygrad.helpers import DEBUG, prod, getenv
+from tinygrad.helpers import DEBUG, prod, getenv, merge_dicts
+from tinygrad.tensor import Tensor
+from tinygrad.lazy import LazyBuffer
 
 def get_divisors(n, min_div = 1, max_div = 512):
   if min_div > 1: yield 1
@@ -10,15 +12,22 @@ def get_divisors(n, min_div = 1, max_div = 512):
 
 def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, baseline):
   import nevergrad as ng
+  # if k.has_variable_shape():
+  #   print(k.full_shape)
+  #   return "BASELINE"
+
   def opt(x):
     try:
       k = create_k()
       k.process()
       k.apply_auto_opt(x)
       prg = to_prg(k)
-      first_tm = prg.exec(k.bufs, force_wait=True, optimizing=True)
+      # print(k.bufs)
+      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
+      first_tm = prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True)
       if baseline*5 < first_tm*1000: return first_tm*1000  # very slow
-      tm = min([first_tm]+[prg.exec(k.bufs, force_wait=True, optimizing=True) for _ in range(2)])*1000
+      tm = min([first_tm]+[prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True) for _ in range(2)])*1000
       return tm
     except Exception:
       if DEBUG >= 3:
@@ -28,11 +37,13 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
   opts = []
   # if k.first_reduce < k.shape_len: # TODO: Grouped reduces do not work with other locals. More chances to mutate to 1, so locals can be used.
   for i in range(k.first_reduce):
+    if (k.full_shape[i].__class__ is not int): continue
     # TODO: the upcast always happen first, you might want to reverse this?
     # TODO: the order of the locals might improve things too
     opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=8)]))
     opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i], min_div=4)]))
   for i in range(k.shape_len-k.first_reduce):
+    if (k.full_shape[k.first_reduce+i].__class__ is not int): continue
     opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
     opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=8)]))
   if not opts: return "BASELINE"
@@ -58,16 +69,22 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg):
 
   if global_db is not None and skey in global_db:
     choice = global_db[skey]
-  elif k.has_variable_shape():
-    # don't optimize variable shapes
-    choice = "BASELINE"
+  # elif not k.has_variable_shape():
+  #   # don't optimize variable shapes
+  #   choice = "BASELINE"
   else:
     # get baseline
+    # print(k.has_variable_shape(), k.bufs)
     def get_baseline():
       k = create_k()
       k.hand_coded_optimizations()
       prg = to_prg(k)
-      return min([prg.exec(k.bufs, force_wait=True, optimizing=True) for _ in range(5)])*1000
+      # print(k.bufs)
+      # return 1030123
+      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
+      # prnt(var_vals)
+      return min([prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True) for _ in range(5)])*1000
     choice = kernel_optimize_search(k, create_k, to_prg, get_baseline())
     if global_db is not None:
       global_db[skey] = choice
