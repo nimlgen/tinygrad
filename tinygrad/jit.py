@@ -10,6 +10,9 @@ from tinygrad.shape.symbolic import Variable
 
 JIT_SUPPORTED_DEVICE = ["GPU", "CLANG", "METAL", "CUDA", "HIP", "WEBGPU", "LLVM"]
 
+import torch
+from torch.cuda import CUDAGraph
+
 class TinyJit:
   def __init__(self, fxn:Callable):
     self.fxn: Callable = fxn
@@ -17,6 +20,7 @@ class TinyJit:
     self.jit_cache: List[Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]] = []
     self.ret: Any = None
     self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
+    self.cuda_graph = None
 
   # add support for instance methods
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
@@ -36,15 +40,51 @@ class TinyJit:
         # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
         if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
         self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
-      for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
-        for k in variables.keys():
-          try: variables[k] = var_vals[k]
-          except KeyError: pass
-        prg(pargs, variables, jit=True)
+      
+      if self.cnt == 3:
+        # s = torch.cuda.Stream()
+        # print(s)
+        # with torch.cuda.stream(s):
+          # self.cuda_graph.capture_begin()
+        self.jit_cache[0][0].clprg.start_graph()
+        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+          prg(pargs, variables, jit=True)
+        gg, self.cuda_graph = self.jit_cache[0][0].clprg.get_graph()
+        gg.debug_dot_print("/tmp/cugraph.dot")
+          # self.cuda_graph.capture_end()
+        # torch.cuda.current_stream().wait_stream(s)
+        
+        # self.cuda_graph = torch.cuda.CUDAGraph()
+        # print(g)
+        # print()
+      elif self.cuda_graph:
+        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+        self.jit_cache[0][0].clprg.replay_graph(self.cuda_graph)
+      else:
+        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+          prg(pargs, variables, jit=True)
+
       for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
     elif self.cnt == 1:
       CacheCollector.start()
+      
+      # s = torch.cuda.Stream()
+      # with torch.cuda.stream(s):
+        # self.cuda_graph.capture_begin()
       self.ret = self.fxn(*args, **kwargs)
+        # self.cuda_graph.capture_end()
+      # torch.cuda.current_stream().wait_stream(s)
+      # g = torch.cuda.CUDAGraph()
+      # print(g)
       self.jit_cache = CacheCollector.finish()
       assert len(self.jit_cache) != 0, "didn't JIT anything!"
       if DEBUG >= 1: print(f"JIT captured {len(self.jit_cache)} kernels with {len(input_rawbuffers)} inputs")
