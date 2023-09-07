@@ -6,7 +6,7 @@ from tinygrad.ops import Device
 from tinygrad.tensor import Tensor
 from tinygrad.ops import RawBuffer
 from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.symbolic import Variable
+from tinygrad.shape.symbolic import Variable, sym_infer
 
 JIT_SUPPORTED_DEVICE = ["GPU", "CLANG", "METAL", "CUDA", "HIP", "WEBGPU", "LLVM"]
 
@@ -70,7 +70,9 @@ class TinyJit:
             try: variables[k] = var_vals[k]
             except KeyError: pass
           # print(pargs)
-          prg.clprg.update_node(self.cuda_graph, *self.cbs[j], *pargs, *variables.values())
+          global_size = [sym_infer(sz, var_vals) for sz in prg.global_size] if prg.global_size is not None else prg.global_size
+          local_size = [sym_infer(sz, var_vals) for sz in prg.local_size] if prg.local_size is not None else prg.local_size
+          prg.clprg.update_node(self.cuda_graph, global_size, local_size, *self.cbs[j][2:], *pargs, *variables.values())
         self.jit_cache[0][0].clprg.replay_graph(self.cuda_graph)
       else:
         for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
