@@ -51,6 +51,7 @@ else:
   import pycuda.driver as cuda # type: ignore
   CUDA_GRAPH_STREAM = cuda.Stream()
   GH_STREAM = None
+  LAUNCH_INFO = []
   class CUDAAllocator(LRUAllocator):
     def _do_alloc(self, size, dtype, device, **kwargs): return cuda.mem_alloc(size * dtype.itemsize) # type: ignore
     def _cached_bufkey(self, size, dtype, device): return (device, size*dtype.itemsize) # Buffers of the same length could be reused, no matter what dtype.
@@ -79,30 +80,45 @@ class CUDAProgram:
     self.prg = cuda.module_from_buffer(prg.encode('utf-8')).get_function(prg.split(".visible .entry ")[1].split("(")[0])
 
   def start_graph(self):
-    global GH_STREAM
+    global GH_STREAM, LAUNCH_INFO
     GH_STREAM = cuda.Stream()
     GH_STREAM.begin_capture()
+    LAUNCH_INFO = []
     # event_init = cuda.Event()
     return GH_STREAM
 
   def get_graph(self):
-    global GH_STREAM
+    global GH_STREAM, LAUNCH_INFO
     graph = GH_STREAM.end_capture()
     # graph.debug_dot_print("test.dot")  # print dotfile of graph
     instance = graph.instance()
+    rr = LAUNCH_INFO
     GH_STREAM = None
-    return graph, instance
+    LAUNCH_INFO = []
+    return graph, instance, rr
+
+  def capture_node(self, global_size, local_size, *args):
+    global GH_STREAM, LAUNCH_INFO
+    stream_id = GH_STREAM
+    assert getattr(self, 'graph_node', None) is None
+    graph_node = cuda.add_kernel_node(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), stream=stream_id, func=self.prg)
+    LAUNCH_INFO.append((global_size, local_size, self.prg, graph_node))
+
+  def update_node(self, instance, global_size, local_size, f, graph_node, *args):
+    # print(self.graph_node, self.prg, instance, len(args), self.global_size, self.was, self.local_size)
+    cuda.kernel_node_set_params(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=f, graph_exec=instance, node=graph_node)
 
   def replay_graph(self, instance):
     instance.launch()
 
   def __call__(self, global_size, local_size, *args, wait=False):
     global GH_STREAM
+    if GH_STREAM is not None: return self.capture_node(global_size, local_size, *args)
     if wait:
       start, end = cuda.Event(), cuda.Event()
       start.record()
-    stream_id = GH_STREAM if GH_STREAM is not None else None
-    self.prg(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), stream=stream_id)
+    # stream_id = GH_STREAM if GH_STREAM is not None else None
+    self.prg(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size))
     if wait:
       end.record()
       end.synchronize()

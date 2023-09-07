@@ -35,11 +35,13 @@ class TinyJit:
       try: var_vals: Dict[Variable, int] = kwargs["jit_ctx"]
       except KeyError: var_vals = merge_dicts([arg.lazydata.st.var_vals for arg in args if arg.__class__ is Tensor])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
+      sh = set()
       for (j,i),(input_name, expected_st, expected_type) in self.input_replace.items():
         assert input_rawbuffers[input_name][0].dtype == expected_type, f"type mismatch in JIT, {input_rawbuffers[input_name][0].dtype} != {expected_type}"
         # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
         if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
         self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
+        sh.add(j)
       
       if self.cnt == 3:
         # s = torch.cuda.Stream()
@@ -52,19 +54,23 @@ class TinyJit:
             try: variables[k] = var_vals[k]
             except KeyError: pass
           prg(pargs, variables, jit=True)
-        gg, self.cuda_graph = self.jit_cache[0][0].clprg.get_graph()
+        gg, self.cuda_graph, self.cbs = self.jit_cache[0][0].clprg.get_graph()
+        assert len(self.cbs) == len(self.jit_cache)
         gg.debug_dot_print("/tmp/cugraph.dot")
-          # self.cuda_graph.capture_end()
+        # self.cuda_graph.capture_end()
         # torch.cuda.current_stream().wait_stream(s)
         
         # self.cuda_graph = torch.cuda.CUDAGraph()
         # print(g)
         # print()
-      elif self.cuda_graph:
-        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+      if self.cuda_graph:
+        for j,(prg, pargs, variables) in enumerate(self.jit_cache): # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          if len(variables) == 0 and j not in sh: continue 
           for k in variables.keys():
             try: variables[k] = var_vals[k]
             except KeyError: pass
+          # print(pargs)
+          prg.clprg.update_node(self.cuda_graph, *self.cbs[j], *pargs, *variables.values())
         self.jit_cache[0][0].clprg.replay_graph(self.cuda_graph)
       else:
         for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
