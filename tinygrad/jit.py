@@ -1,7 +1,7 @@
 from typing import Callable, List, Tuple, Any, Dict, cast, Union, Optional
 from weakref import ref
 import functools, itertools
-from tinygrad.helpers import DEBUG, DType, merge_dicts
+from tinygrad.helpers import DEBUG, DType, merge_dicts, getenv
 from tinygrad.ops import Device
 from tinygrad.tensor import Tensor
 from tinygrad.ops import RawBuffer
@@ -43,7 +43,7 @@ class TinyJit:
         self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
         sh.add(j)
       
-      if self.cnt == 3:
+      if self.cnt == 3 and getenv("CG", 1):
         # s = torch.cuda.Stream()
         # print(s)
         # with torch.cuda.stream(s):
