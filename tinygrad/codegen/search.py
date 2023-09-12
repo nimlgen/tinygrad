@@ -33,7 +33,7 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
       k.process()
       k.apply_auto_opt(x)
       prg = to_prg(k)
-      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      var_vals = merge_dicts([arg.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
       first_tm = prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True)
       if baseline*5 < first_tm*1000: return first_tm*1000  # very slow
@@ -75,7 +75,7 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg):
       k = create_k()
       k.hand_coded_optimizations()
       prg = to_prg(k)
-      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      var_vals = merge_dicts([arg.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
       return min([prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True) for _ in range(5)])*1000
     choice = kernel_optimize_search(k, create_k, to_prg, get_baseline())
