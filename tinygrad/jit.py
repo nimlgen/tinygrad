@@ -2,12 +2,12 @@ from typing import Callable, List, Tuple, Any, Dict, cast, Union, Optional, Set
 from weakref import ref
 from collections import defaultdict
 import functools, itertools
-from tinygrad.helpers import DEBUG, DType, merge_dicts
+from tinygrad.helpers import DEBUG, DType, merge_dicts, getenv
 from tinygrad.ops import Device
 from tinygrad.tensor import Tensor
 from tinygrad.ops import RawBuffer
 from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.symbolic import Variable
+from tinygrad.shape.symbolic import Variable, sym_infer
 
 JIT_SUPPORTED_DEVICE = ["GPU", "CLANG", "METAL", "CUDA", "HIP", "WEBGPU", "LLVM"]
 
@@ -18,6 +18,7 @@ class TinyJit:
     self.jit_cache: List[Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]] = []
     self.ret: Any = None
     self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
+    self.cuda_graph = None
 
   # add support for instance methods
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
@@ -29,6 +30,7 @@ class TinyJit:
     assert len(input_rawbuffers) != 0, "no inputs to JIT"
     assert len(set(input_rawbuffers.values())) == len(input_rawbuffers), "duplicate inputs to JIT"
     if self.cnt >= 2:
+      sh = set()
       try: var_vals: Dict[Variable, int] = kwargs["jit_ctx"]
       except KeyError: var_vals = merge_dicts([arg.lazydata.var_vals for arg in args if arg.__class__ is Tensor])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
@@ -37,11 +39,45 @@ class TinyJit:
         # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
         if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
         self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
-      for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
-        for k in variables.keys():
-          try: variables[k] = var_vals[k]
-          except KeyError: pass
-        prg(pargs, variables, jit=True)
+        sh.add(j)
+
+      if self.cnt == 3 and getenv("CG", 1):
+        # s = torch.cuda.Stream()
+        # print(s)
+        # with torch.cuda.stream(s):
+          # self.cuda_graph.capture_begin()
+        self.jit_cache[0][0].clprg.start_graph()
+        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+          prg(pargs, variables, jit=True)
+        gg, self.cuda_graph, self.cbs = self.jit_cache[0][0].clprg.get_graph()
+        assert len(self.cbs) == len(self.jit_cache)
+        gg.debug_dot_print("/tmp/cugraph.dot")
+        # self.cuda_graph.capture_end()
+        # torch.cuda.current_stream().wait_stream(s)
+
+        # self.cuda_graph = torch.cuda.CUDAGraph()
+        # print(g)
+        # print()
+      if self.cuda_graph:
+        for j,(prg, pargs, variables) in enumerate(self.jit_cache): # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          if len(variables) == 0 and j not in sh: continue 
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+          # print(pargs)
+          global_size = [sym_infer(sz, var_vals) for sz in prg.global_size] if prg.global_size is not None else prg.global_size
+          local_size = [sym_infer(sz, var_vals) for sz in prg.local_size] if prg.local_size is not None else prg.local_size
+          prg.clprg.update_node(self.cuda_graph, global_size, local_size, *self.cbs[j][2:], *pargs, *variables.values())
+        self.jit_cache[0][0].clprg.replay_graph(self.cuda_graph)
+      else:
+        for prg, pargs, variables in self.jit_cache: # type: Callable, List[Optional[RawBuffer]], Dict[Variable, int]
+          for k in variables.keys():
+            try: variables[k] = var_vals[k]
+            except KeyError: pass
+          prg(pargs, variables, jit=True)
       for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
     elif self.cnt == 1:
       CacheCollector.start()

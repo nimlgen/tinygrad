@@ -8,6 +8,7 @@ from tinygrad.ops import Compiled
 from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, LRUAllocator
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
+from tinygrad.jit import CacheCollector
 
 def pretty_ptx(s):
   # all expressions match `<valid_before><expr><valid_after>` and replace it with `<valid_before>color(<expr>)<valid_after>`
@@ -48,6 +49,9 @@ if getenv("CUDACPU", 0) == 1:
 else:
   import pycuda.autoprimaryctx # type: ignore # pylint: disable=unused-import # noqa: F401
   import pycuda.driver as cuda # type: ignore
+  CUDA_GRAPH_STREAM = cuda.Stream()
+  GH_STREAM = None
+  LAUNCH_INFO = []
   class CUDAAllocator(LRUAllocator):
     def _do_alloc(self, size, dtype, device, **kwargs): return cuda.mem_alloc(size * dtype.itemsize) # type: ignore
     def _cached_bufkey(self, size, dtype, device): return (device, size*dtype.itemsize) # Buffers of the same length could be reused, no matter what dtype.
@@ -75,7 +79,42 @@ class CUDAProgram:
     # TODO: name is wrong, so we get it from the ptx using hacks
     self.prg = cuda.module_from_buffer(prg.encode('utf-8')).get_function(prg.split(".visible .entry ")[1].split("(")[0])
 
+  def start_graph(self):
+    global GH_STREAM, LAUNCH_INFO
+    GH_STREAM = cuda.Stream()
+    GH_STREAM.begin_capture()
+    LAUNCH_INFO = []
+    # event_init = cuda.Event()
+    return GH_STREAM
+
+  def get_graph(self):
+    global GH_STREAM, LAUNCH_INFO
+    graph = GH_STREAM.end_capture()
+    # graph.debug_dot_print("test.dot")  # print dotfile of graph
+    instance = graph.instantiate()
+    rr = LAUNCH_INFO
+    GH_STREAM = None
+    LAUNCH_INFO = []
+    return graph, instance, rr
+
+  def capture_node(self, global_size, local_size, *args):
+    global GH_STREAM, LAUNCH_INFO
+    stream_id = GH_STREAM
+    assert getattr(self, 'graph_node', None) is None
+    _, _, graph, deps = stream_id.get_capture_info_v2()
+    graph_node = graph.add_kernel_node(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=self.prg, dependencies=deps)
+    stream_id.update_capture_dependencies([graph_node], 1)
+    LAUNCH_INFO.append((global_size, local_size, self.prg, graph_node))
+
+  def update_node(self, instance, global_size, local_size, f, graph_node, *args):
+    instance.kernel_node_set_params(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=f, kernel_node=graph_node)
+
+  def replay_graph(self, instance):
+    instance.launch()
+
   def __call__(self, global_size, local_size, *args, wait=False):
+    global GH_STREAM
+    if GH_STREAM is not None: return self.capture_node(global_size, local_size, *args)
     if wait:
       start, end = cuda.Event(), cuda.Event()
       start.record()
