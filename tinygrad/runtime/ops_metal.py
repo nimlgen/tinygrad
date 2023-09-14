@@ -1,6 +1,6 @@
 # pip3 install pyobjc-framework-Metal pyobjc-framework-Cocoa pyobjc-framework-libdispatch
 import os, subprocess, pathlib, functools, ctypes, struct
-import Metal, Cocoa, libdispatch # type: ignore
+import Foundation, Metal, Cocoa, libdispatch # type: ignore
 from typing import List, Any, Tuple
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
@@ -40,8 +40,14 @@ def unwrap(x):
   assert err is None, str(err)
   return ret
 
+from collections import defaultdict
 THE_IBUF = None
 THE_CNT = 0
+THE_FNC_MAP = {}
+LAUNCH_INFO = []
+RUNNERS = {}
+BUFS_USED = defaultdict(set)
+INST_INFO = {}
 
 class MetalProgram:
   def __init__(self, name:str, prg:str, binary:bool=False):
@@ -55,6 +61,7 @@ class MetalProgram:
       options = Metal.MTLCompileOptions.alloc().init()
       self.library = unwrap(METAL.device.newLibraryWithSource_options_error_(prg, options, None))
     self.fxn = self.library.newFunctionWithName_(name)
+    self.graph_fxn = self.library.newFunctionWithName_("graph_"+name)
     self.argument_buf = None
     self.packed_data = None
     # hacks to disassemble shader
@@ -67,6 +74,7 @@ class MetalProgram:
       # clone https://github.com/dougallj/applegpu.git in tinygrad/disassemblers
       os.system(f"cd {pathlib.Path(__file__).parents[2]}/disassemblers/applegpu && python3 compiler_explorer.py /tmp/shader.bin")
     self.pipeline_state = unwrap(METAL.device.newComputePipelineStateWithFunction_error_(self.fxn, None))
+    self.graph_pipeline_state = unwrap(METAL.device.newComputePipelineStateWithFunction_error_(self.graph_fxn, None))
 
   def start_graph(self):
     global THE_IBUF, THE_CNT
@@ -75,7 +83,7 @@ class MetalProgram:
     desc.setCommandTypes_(Metal.MTLIndirectCommandTypeConcurrentDispatchThreads)
     desc.setInheritBuffers_(False)
     desc.setMaxKernelBufferBindCount_(32) # TODO: Set to 1 with argument buffers
-    THE_IBUF = METAL.device.newIndirectCommandBufferWithDescriptor_maxCommandCount_options_(desc, 1024, 0)
+    THE_IBUF = METAL.device.newIndirectCommandBufferWithDescriptor_maxCommandCount_options_(desc, 32, 0)
     print(THE_IBUF)
     THE_CNT = 0
     pass
@@ -87,8 +95,13 @@ class MetalProgram:
     # return GH_STREAM
 
   def get_graph(self):
-    global THE_IBUF
-    return None, THE_IBUF, None
+    global THE_IBUF, THE_CNT, INST_INFO
+    instance = THE_IBUF
+    THE_IBUF = None
+    
+    INST_INFO[instance] = THE_CNT
+    THE_CNT = 0
+    return True, instance, LAUNCH_INFO
     pass
     # global GH_STREAM, LAUNCH_INFO
     # graph = GH_STREAM.end_capture()
@@ -100,17 +113,33 @@ class MetalProgram:
     # return graph, instance, rr
 
   def capture_node(self, global_size, local_size, *bufs):
-    # global THE_IBUF, THE_CNT
+    global THE_IBUF, THE_CNT, LAUNCH_INFO, BUFS_USED
     # print(dir(THE_IBUF))
-    # encoder = THE_IBUF.indirectComputeCommandAtIndex_(THE_CNT)
+    encoder = THE_IBUF.indirectComputeCommandAtIndex_(THE_CNT)
     # print(dir(encoder))
     # print(encoder)
-    # encoder.setComputePipelineState_(self.pipeline_state)
+    encoder.setComputePipelineState_(self.pipeline_state)
+
+    # packed_data = self.process_args(*bufs)
+    # if self.argument_buf is None:
+    #   self.argument_buf = METAL.device.newBufferWithLength_options_(len(packed_data), Metal.MTLResourceStorageModeShared)
+    # self.argument_buf.contents().as_buffer(len(packed_data))[:len(packed_data)] = packed_data
     # for i,a in enumerate(bufs):
     #   if isinstance(a, RawMetalBuffer): encoder.setKernelBuffer_offset_atIndex_(a._buf, 0, i)
-    #   elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+    #   elif isinstance(a, int):
+    #     METAL.device.newBufferWithLength_options_(len(packed_data), Metal.MTLResourceStorageModeShared)
+        
+    #     encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
     #   else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
-    # encoder.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    for i,a in enumerate(bufs):
+      if isinstance(a, RawMetalBuffer):
+        BUFS_USED[THE_IBUF].add(a._buf)
+        print(a._buf)
+        encoder.setKernelBuffer_offset_atIndex_(a._buf, 0, i)
+      # elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+      else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+    encoder.concurrentDispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    # encoder.setBarrier()
     THE_CNT += 1
     # encoder.endEncoding()
     # pass
@@ -120,17 +149,48 @@ class MetalProgram:
     # _, _, graph, deps = stream_id.get_capture_info_v2()
     # graph_node = graph.add_kernel_node(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=self.prg, dependencies=deps)
     # stream_id.update_capture_dependencies([graph_node], 1)
-    # LAUNCH_INFO.append((global_size, local_size, self.prg, graph_node))
+    LAUNCH_INFO.append((global_size, local_size, THE_CNT-1))
 
-  def update_node(self, instance, global_size, local_size, f, graph_node, *args):
-    pass
-    # instance.kernel_node_set_params(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=f, kernel_node=graph_node)
+  def update_node(self, instance, global_size, local_size, nodeid, *bufs):
+    print("enter update_node")
+    return
+    
+    global RUNNERS, BUFS_USED
+    if instance in RUNNERS: 
+      RUNNERS[instance].waitUntilCompleted()
+      RUNNERS.pop(instance)
+    encoder = instance.indirectComputeCommandAtIndex_(nodeid)
+    encoder.reset()
+    BUFS_USED[THE_IBUF].clear()
+    encoder.setComputePipelineState_(self.pipeline_state)
+    for i,a in enumerate(bufs):
+      BUFS_USED[THE_IBUF].add(a._buf)
+      if isinstance(a, RawMetalBuffer): encoder.setKernelBuffer_offset_atIndex_(a._buf, 0, i)
+      # elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+      else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+    encoder.concurrentDispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    encoder.setBarrier()
+    # encoder.endEncoding()
 
   def replay_graph(self, instance):
-    # command_buffer = METAL.mtl_queue.commandBuffer()
-    # encoder = command_buffer.computeCommandEncoder()
-    # print(dir(encoder))
-    pass
+    print("enter replay")
+    global RUNNERS, BUFS_USED, INST_INFO
+    METAL.synchronize()
+    print("sync passed")
+    RUNNERS.clear()
+
+    command_buffer = METAL.mtl_queue.commandBuffer()
+    encoder = command_buffer.computeCommandEncoder()
+    encoder.setComputePipelineState_(self.pipeline_state)
+    for v in BUFS_USED[instance]:
+      encoder.useResource_usage_(v, Metal.MTLResourceUsageWrite | Metal.MTLResourceUsageRead)
+    encoder.executeCommandsInBuffer_withRange_(instance, Foundation.NSMakeRange(0, 1))
+    encoder.endEncoding()
+    command_buffer.commit()
+    
+    METAL.mtl_buffers_in_flight.append(command_buffer)
+    RUNNERS[instance] = command_buffer
+    print("here")
     # instance.launch()
 
   def process_args(self, *bufs):
@@ -147,27 +207,37 @@ class MetalProgram:
     return struct.pack(format, *data)
 
   def __call__(self, global_size, local_size, *bufs, wait=False):
-    global THE_IBUF
+    global THE_IBUF, THE_FNC_MAP, RUNNERS
+    for k in RUNNERS.keys(): k.waitUntilCompleted()
+    RUNNERS.clear()
+
     if THE_IBUF is not None: return self.capture_node(global_size, local_size, *bufs)
     assert prod(local_size) <= self.pipeline_state.maxTotalThreadsPerThreadgroup(), f"local size {local_size} bigger than {self.pipeline_state.maxTotalThreadsPerThreadgroup()} with exec width {self.pipeline_state.threadExecutionWidth()} memory length {self.pipeline_state.staticThreadgroupMemoryLength()}"
-    
-    packed_data = self.process_args(*bufs)
-    if self.argument_buf is None:
-      self.argument_buf = METAL.device.newBufferWithLength_options_(len(packed_data), Metal.MTLResourceStorageModeShared)
-    self.argument_buf.contents().as_buffer(len(packed_data))[:len(packed_data)] = packed_data
+
+    # packed_data = self.process_args(*bufs)
+    # if self.argument_buf is None:
+    #   self.argument_buf = METAL.device.newBufferWithLength_options_(len(packed_data), Metal.MTLResourceStorageModeShared)
+    # self.argument_buf.contents().as_buffer(len(packed_data))[:len(packed_data)] = packed_data
     
     command_buffer = METAL.mtl_queue.commandBuffer()
     encoder = command_buffer.computeCommandEncoder()
+    # print(Foundation.NSRange(1, 10))
     encoder.setComputePipelineState_(self.pipeline_state)
-    encoder.setBuffer_offset_atIndex_(self.argument_buf, 0, 0)
-    for i,a in enumerate(bufs):
-      if isinstance(a, RawMetalBuffer): encoder.useResource_usage_(a._buf, Metal.MTLResourceUsageWrite | Metal.MTLResourceUsageRead)
-    # print(dir(encoder))
+    # encoder.setBuffer_offset_atIndex_(self.argument_buf, 0, 0)
     # for i,a in enumerate(bufs):
-    #   if isinstance(a, RawMetalBuffer): encoder.setBuffer_offset_atIndex_(a._buf, 0, i)
-    #   elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
-    #   else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+    #   if not isinstance(a, RawMetalBuffer): continue
+    #   if a._buf in THE_FNC_MAP: 
+    #     # print("waitForFence_")
+    #     encoder.waitForFence_(THE_FNC_MAP[a._buf])
+    #   encoder.useResource_usage_(a._buf, Metal.MTLResourceUsageWrite | Metal.MTLResourceUsageRead)
+    # print(dir(encoder))
+    for i,a in enumerate(bufs):
+      if isinstance(a, RawMetalBuffer): encoder.setBuffer_offset_atIndex_(a._buf, 0, i)
+      elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+      else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
     encoder.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    # if not bufs[0]._buf in THE_FNC_MAP: THE_FNC_MAP[bufs[0]._buf] = METAL.device.newFence()
+    # encoder.updateFence_(THE_FNC_MAP[bufs[0]._buf])
     encoder.endEncoding()
     command_buffer.commit()
     if wait:
@@ -179,17 +249,20 @@ class MTLLanguage(CStyleLanguage):
   def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,DType]], local_size:List[int], prekernel:List[str]) -> Tuple[str, List[int], List[int]]:
     prg = super().render_kernel(function_name, kernel, bufs, local_size, prekernel)
     res = ""
+    ok = False
     for line in prg.splitlines():
       if line.startswith("kernel "):
+        ok = True
         res += f"""
 struct Args {{
   {";".join([(f"device {buf[1].name}* {buf[0]}" if buf[1] != dtypes._arg_int32 else f"int {buf[0]}") for buf in bufs])};
 }};
-kernel void {function_name}(device Args& args, {','.join(self.extra_args)}) {{
+kernel void graph_{function_name}(constant Args& args, {','.join(self.extra_args)}) {{
   {";".join([(f"device {buf[1].name}* {buf[0]} = args.{buf[0]}" if buf[1] != dtypes._arg_int32 else f"int {buf[0]} = args.{buf[0]}") for buf in bufs])};
 \n"""
-      else: res += line+"\n"
-    return res
+      elif ok: 
+        res += line+"\n"
+    return prg + res
 
 renderer = functools.partial(uops_to_cstyle, MTLLanguage(
   kernel_prefix = "#include <metal_stdlib>\nusing namespace metal;\nkernel ", buffer_prefix = "device ", smem_prefix = "threadgroup ", arg_int_prefix = "constant int&",

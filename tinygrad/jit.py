@@ -54,7 +54,7 @@ class TinyJit:
           prg(pargs, variables, jit=True)
         gg, self.cuda_graph, self.cbs = self.jit_cache[0][0].clprg.get_graph()
         assert len(self.cbs) == len(self.jit_cache)
-        gg.debug_dot_print("/tmp/cugraph.dot")
+        # gg.debug_dot_print("/tmp/cugraph.dot")
         # self.cuda_graph.capture_end()
         # torch.cuda.current_stream().wait_stream(s)
 
