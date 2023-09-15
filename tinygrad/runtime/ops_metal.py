@@ -86,6 +86,7 @@ class MetalProgram:
     THE_IBUF = METAL.device.newIndirectCommandBufferWithDescriptor_maxCommandCount_options_(desc, 32, 0)
     print(THE_IBUF)
     THE_CNT = 0
+    LAUNCH_INFO = []
     pass
     # global GH_STREAM, LAUNCH_INFO
     # GH_STREAM = cuda.Stream()
@@ -95,7 +96,10 @@ class MetalProgram:
     # return GH_STREAM
 
   def get_graph(self):
-    global THE_IBUF, THE_CNT, INST_INFO
+    global THE_IBUF, THE_CNT, INST_INFO, LAUNCH_INFO
+    x = LAUNCH_INFO
+    LAUNCH_INFO = []
+    return True, x, x
     instance = THE_IBUF
     THE_IBUF = None
     
@@ -115,10 +119,10 @@ class MetalProgram:
   def capture_node(self, global_size, local_size, *bufs):
     global THE_IBUF, THE_CNT, LAUNCH_INFO, BUFS_USED
     # print(dir(THE_IBUF))
-    encoder = THE_IBUF.indirectComputeCommandAtIndex_(THE_CNT)
+    # encoder = THE_IBUF.indirectComputeCommandAtIndex_(THE_CNT)
     # print(dir(encoder))
     # print(encoder)
-    encoder.setComputePipelineState_(self.pipeline_state)
+    # encoder.setComputePipelineState_(self.pipeline_state)
 
     # packed_data = self.process_args(*bufs)
     # if self.argument_buf is None:
@@ -131,14 +135,18 @@ class MetalProgram:
         
     #     encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
     #   else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
-    for i,a in enumerate(bufs):
-      if isinstance(a, RawMetalBuffer):
-        BUFS_USED[THE_IBUF].add(a._buf)
-        print(a._buf)
-        encoder.setKernelBuffer_offset_atIndex_(a._buf, 0, i)
-      # elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
-      else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
-    encoder.concurrentDispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    
+    
+    # for i,a in enumerate(bufs):
+    #   if isinstance(a, RawMetalBuffer):
+    #     BUFS_USED[THE_IBUF].add(a._buf)
+    #     print(a._buf)
+    #     encoder.setKernelBuffer_offset_atIndex_(a._buf, 0, i)
+    #   # elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+    #   else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+    # encoder.concurrentDispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
+    
+    
     # encoder.setBarrier()
     THE_CNT += 1
     # encoder.endEncoding()
@@ -149,10 +157,11 @@ class MetalProgram:
     # _, _, graph, deps = stream_id.get_capture_info_v2()
     # graph_node = graph.add_kernel_node(*[x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) if (isinstance(x, int) and not getenv("CUDACPU")) else x for x in args], block=tuple(local_size), grid=tuple(global_size), func=self.prg, dependencies=deps)
     # stream_id.update_capture_dependencies([graph_node], 1)
-    LAUNCH_INFO.append((global_size, local_size, THE_CNT-1))
+    LAUNCH_INFO.append((global_size, local_size, THE_CNT-1, bufs, self.pipeline_state))
 
-  def update_node(self, instance, global_size, local_size, nodeid, *bufs):
-    print("enter update_node")
+  def update_node(self, instance, global_size, local_size, nodeid, b, a, *bufs):
+    # print("enter update_node")
+    instance[nodeid] = (global_size, local_size, nodeid, bufs, self.pipeline_state)
     return
     
     global RUNNERS, BUFS_USED
@@ -173,24 +182,27 @@ class MetalProgram:
     # encoder.endEncoding()
 
   def replay_graph(self, instance):
-    print("enter replay")
-    global RUNNERS, BUFS_USED, INST_INFO
-    METAL.synchronize()
-    print("sync passed")
-    RUNNERS.clear()
+    # print("enter replay")
+    # global RUNNERS, BUFS_USED, INST_INFO
+    # METAL.synchronize()
+    # print("sync passed")
+    # RUNNERS.clear()
 
     command_buffer = METAL.mtl_queue.commandBuffer()
     encoder = command_buffer.computeCommandEncoder()
-    encoder.setComputePipelineState_(self.pipeline_state)
-    for v in BUFS_USED[instance]:
-      encoder.useResource_usage_(v, Metal.MTLResourceUsageWrite | Metal.MTLResourceUsageRead)
-    encoder.executeCommandsInBuffer_withRange_(instance, Foundation.NSMakeRange(0, 1))
+    for global_size,local_size,_,bufs,pipeline_state in instance:
+      encoder.setComputePipelineState_(pipeline_state)
+      for i,a in enumerate(bufs):
+        if isinstance(a, RawMetalBuffer): encoder.setBuffer_offset_atIndex_(a._buf, 0, i)
+        elif isinstance(a, int): encoder.setBytes_length_atIndex_((arg:=ctypes.c_int32(a)), ctypes.sizeof(arg), i)
+        else: raise RuntimeError(f"arg at index {i} has unsupported type {type(a)}")
+      encoder.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
     encoder.endEncoding()
     command_buffer.commit()
-    
+
     METAL.mtl_buffers_in_flight.append(command_buffer)
-    RUNNERS[instance] = command_buffer
-    print("here")
+    # RUNNERS[instance] = command_buffer
+    # print("here")
     # instance.launch()
 
   def process_args(self, *bufs):
@@ -208,8 +220,8 @@ class MetalProgram:
 
   def __call__(self, global_size, local_size, *bufs, wait=False):
     global THE_IBUF, THE_FNC_MAP, RUNNERS
-    for k in RUNNERS.keys(): k.waitUntilCompleted()
-    RUNNERS.clear()
+    # for k in RUNNERS.keys(): k.waitUntilCompleted()
+    # RUNNERS.clear()
 
     if THE_IBUF is not None: return self.capture_node(global_size, local_size, *bufs)
     assert prod(local_size) <= self.pipeline_state.maxTotalThreadsPerThreadgroup(), f"local size {local_size} bigger than {self.pipeline_state.maxTotalThreadsPerThreadgroup()} with exec width {self.pipeline_state.threadExecutionWidth()} memory length {self.pipeline_state.staticThreadgroupMemoryLength()}"
