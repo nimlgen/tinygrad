@@ -20,7 +20,7 @@ def kernel_optimize_opts(k:Linearizer):
     opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=8)]))
     opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i], min_div=4)]))
   for i in range(k.shape_len-k.first_reduce):
-    if (k.full_shape[i].__class__ is not int): continue
+    if (k.full_shape[k.first_reduce+i].__class__ is not int): continue
     opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=8)]))
     opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
   return opts
@@ -33,7 +33,7 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
       k.process()
       k.apply_auto_opt(x)
       prg = to_prg(k)
-      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      var_vals = merge_dicts([arg.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
       first_tm = prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True)
       if baseline*5 < first_tm*1000: return first_tm*1000  # very slow
@@ -65,7 +65,7 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg):
 
   if getenv("KOPT") == 2 and global_db is None:
     import shelve
-    global_db = shelve.open("/tmp/kopt_cache")
+    global_db = shelve.open("/home/nimlgen/amd_kopt_cache")
 
   if global_db is not None and skey in global_db:
     choice = global_db[skey]
@@ -75,7 +75,7 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg):
       k = create_k()
       k.hand_coded_optimizations()
       prg = to_prg(k)
-      var_vals = merge_dicts([arg.st.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
+      var_vals = merge_dicts([arg.var_vals for arg in k.bufs if arg.__class__ is LazyBuffer])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
       return min([prg.exec(k.bufs, var_vals, force_wait=True, optimizing=True) for _ in range(5)])*1000
     choice = kernel_optimize_search(k, create_k, to_prg, get_baseline())

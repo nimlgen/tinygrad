@@ -12,7 +12,7 @@ from tinygrad.shape.view import strides_for_shape
 OSX = platform.system() == "Darwin"
 WINDOWS = platform.system() == "Windows"
 
-def temp(x:str) -> str: return (Path(tempfile.gettempdir()) / x).as_posix()
+def temp(x:str) -> str: return (Path("/home/nimlgen/tmp/zzzz") / x).as_posix()
 
 def fetch(url):
   if url.startswith("/") or url.startswith("."):

@@ -80,9 +80,9 @@ class LRUAllocator:
     self.buffer_info: Dict[Any, Tuple[int, DType, str]] = dict()
     self.cached_buffers: Dict[Tuple[int, ...], Deque[Tuple[Any, int]]] = defaultdict(deque) # Cached buffer storage, splitted by type and size, newest first.
     self.aging_order: Dict[Any, Deque[Tuple[Tuple[int, ...], int]]] = defaultdict(deque) # Keys of cached_buffers, ordered from oldest to newest updates.
-  def __del__(self):
-    for v in self.cached_buffers.values():
-      for buf, _ in v: self._free_buffer(buf)
+  # def __del__(self):
+  #   for v in self.cached_buffers.values():
+  #     for buf, _ in v: self._free_buffer(buf, from_del=True)
   def _cache_reuse_buffer(self, rawbufs: Deque[Tuple[Any, int]]): # The newest cached buffer is reused.
     GlobalCounters.mem_cached -= self._underlying_buf_memsz(rawbufs[0][0])
     return rawbufs.popleft()[0]
@@ -95,8 +95,9 @@ class LRUAllocator:
     self.buffer_info[newbuf] = (size, dtype, device)
     return newbuf
   def _free_buffer(self, buf_to_free):
-    from tinygrad.jit import CacheCollector
-    CacheCollector._on_buf_free(buf_to_free)
+    if not from_del: # Import is not allowed when Python is shutting down. We also do not care about CacheCollector in this case.
+      from tinygrad.jit import CacheCollector
+      CacheCollector._on_buf_free(buf_to_free)
     self.free_space[self.buffer_info[buf_to_free][2]] += self._underlying_buf_memsz(buf_to_free)
     GlobalCounters.mem_cached -= self._underlying_buf_memsz(buf_to_free)
     self.buffer_info.pop(buf_to_free)
