@@ -20,6 +20,7 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
           path: pr
         # the base default to tinygrad master and cannot be other fork branch for security purpose
       - name: Checkout code from tinygrad master
@@ -35,9 +36,22 @@ jobs:
           pip install tabulate
           BASE="$GITHUB_WORKSPACE/base"
           PR="$GITHUB_WORKSPACE/pr"
-          cp "$BASE/sz.py" .
+          OLDPR="$GITHUB_WORKSPACE/oldpr"
+          HOMEDIR=$PWD
+
+          cp "$BASE/sz.py" $HOMEDIR
+          NUM_COMMITS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" | jq '.commits')
+
+          echo $NUM_COMMITS
+          mkdir -p $OLDPR
+          cp -r $PR $OLDPR
+          cd $OLDPR/pr
+          git log --oneline -n 10
+          git checkout HEAD~$NUM_COMMITS
+          cd $HOMEDIR
+
           echo "loc_content<<EOF" >> "$GITHUB_ENV"
-          python sz.py "$BASE" "$PR" >> "$GITHUB_ENV"
+          python sz.py "$OLDPR/pr" "$PR" >> "$GITHUB_ENV"
           echo "EOF" >> "$GITHUB_ENV"
       - name: Comment Code Line Diff
         continue-on-error: false
