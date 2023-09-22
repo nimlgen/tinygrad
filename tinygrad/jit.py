@@ -1,7 +1,7 @@
 from typing import Callable, List, Tuple, Any, Dict, cast, Union, Optional, Set
 from weakref import ref
 from collections import defaultdict
-import functools, itertools
+import functools, itertools, math
 from tinygrad.helpers import DEBUG, DType, merge_dicts
 from tinygrad.ops import RawBuffer, Device, Compiled
 from tinygrad.tensor import Tensor
@@ -11,14 +11,18 @@ from tinygrad.shape.symbolic import Variable
 JIT_SUPPORTED_DEVICE = ["GPU", "CLANG", "METAL", "CUDA", "HIP", "WEBGPU", "LLVM"]
 
 class TinyJit:
+  class _ExecBatch:
+    def __init__(self, batch_executor, jit_cache, input_replace, updatable_entries):
+      self.batch_executor: Any = batch_executor
+      self.jit_cache: List[Tuple[Any, List[Optional[RawBuffer]], Dict[Variable, int]]] = jit_cache
+      self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]] = input_replace  # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
+      self.updatable_entries: Dict[int, List[int]] = updatable_entries # (kernel_number) -> list(argument id). These are buffers from input + variables.
+
   def __init__(self, fxn:Callable):
     self.fxn: Callable = fxn
     self.cnt: int = 0
-    self.jit_cache: List[Tuple[Any, List[Optional[RawBuffer]], Dict[Variable, int]]] = []
+    self.batches: List[TinyJit._ExecBatch] = []
     self.ret: Any = None
-    self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
-    self.batch_executor: Any = None
-    self.updatable_entries: Dict[int, List[int]] = defaultdict(list) # (kernel_number) -> list(argument id). These are buffers from input + variables.
 
   # add support for instance methods
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
@@ -30,41 +34,48 @@ class TinyJit:
     assert len(input_rawbuffers) != 0, "no inputs to JIT"
     assert len(set(input_rawbuffers.values())) == len(input_rawbuffers), "duplicate inputs to JIT"
     if self.cnt >= 2:
+      infer_cache: Dict[int, int] = dict()
       try: var_vals: Dict[Variable, int] = kwargs["jit_ctx"]
       except KeyError: var_vals = merge_dicts([arg.lazydata.var_vals for arg in args if arg.__class__ is Tensor])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
-      for (j,i),(input_name, expected_st, expected_type) in self.input_replace.items():
-        assert input_rawbuffers[input_name][0].dtype == expected_type, f"type mismatch in JIT, {input_rawbuffers[input_name][0].dtype} != {expected_type}"
-        # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
-        if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
-        self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
-      for j in self.updatable_entries.keys():
-        for k in self.jit_cache[j][2].keys():
-          try: self.jit_cache[j][2][k] = var_vals[k]
-          except KeyError: pass
-      self.batch_executor.exec(self.jit_cache, self.updatable_entries, infer_cache=dict())
-      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+
+      for batch in self.batches:
+        for (j,i),(input_name, expected_st, expected_type) in batch.input_replace.items():
+          assert input_rawbuffers[input_name][0].dtype == expected_type, f"type mismatch in JIT, {input_rawbuffers[input_name][0].dtype} != {expected_type}"
+          # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
+          if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
+          batch.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
+        for j in batch.updatable_entries.keys():
+          for k in batch.jit_cache[j][2].keys():
+            try: batch.jit_cache[j][2][k] = var_vals[k]
+            except KeyError: pass
+        batch.batch_executor.exec(batch.jit_cache,batch.updatable_entries,infer_cache=infer_cache)
+        for (j,i) in batch.input_replace.keys(): batch.jit_cache[j][1][i] = None
     elif self.cnt == 1:
       CacheCollector.start()
       self.ret = self.fxn(*args, **kwargs)
-      self.jit_cache = CacheCollector.finish()
-      assert len(self.jit_cache) != 0, "didn't JIT anything!"
-      if DEBUG >= 1: print(f"JIT captured {len(self.jit_cache)} kernels with {len(input_rawbuffers)} inputs")
+      jit_cache = CacheCollector.finish()
+      assert len(jit_cache) != 0, "didn't JIT anything!"
+      if DEBUG >= 1: print(f"JIT captured {len(jit_cache)} kernels with {len(input_rawbuffers)} inputs")
 
-      # get the inputs for replacement
-      for j_,cache in enumerate(self.jit_cache): # type: Tuple[int, Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]]
+      # Splitting the JIT cache into batches to enable parallel execution (cpu+accel). Batch sizes follow a logarithmic pattern: 4, 8, 16, 32, and so on.
+      # This helps push tasks to the accelerator while the CPU prepares the next batch.
+      jits, input_replace, updatable_entries = defaultdict(list), defaultdict(dict), defaultdict(lambda:defaultdict(list)) # type: ignore
+      for j_,cache in enumerate(jit_cache): # type: Tuple[int, Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]]
+        batchid, j = int(math.log(j_+4,2)-2), len(jits[int(math.log(j_+4,2)-2)])
         for i,a in enumerate(cache[1]):
           if a in [v[0] for v in input_rawbuffers.values()]:
-            self.input_replace[(j_,i)] = [(k, v[1], v[0].dtype) for k,v in input_rawbuffers.items() if v[0] == a][0]
-            self.updatable_entries[j_].append(i)
-        for i in range(len(cache[2])): self.updatable_entries[j_].append(len(cache[1])+i)
-        #if prg.local_size is None: prg.local_size = prg.optimize_local_size(args, preserve_output=True)  # the JIT can optimize local
-      assert set([x[0] for x in self.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
-
-      # init batch_executor
-      try: self.batch_executor = cast(Compiled, Device[Device.DEFAULT]).batch_exec(self.jit_cache)
-      except (ValueError, TypeError): self.batch_executor = BasicBatchExecutor()
-      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+            input_replace[batchid][(j,i)] = [(k, v[1], v[0].dtype) for k,v in input_rawbuffers.items() if v[0] == a][0]
+            updatable_entries[batchid][j].append(i)
+        for i in range(len(cache[2])): updatable_entries[batchid][j].append(len(cache[1])+i)
+        jits[batchid].append(jit_cache[j_])
+      for batchid in range(len(jits.keys())):
+        try: batch_executor = cast(Compiled, Device[Device.DEFAULT]).batch_exec(jits[batchid])
+        except (ValueError, TypeError): batch_executor = BasicBatchExecutor()
+        for (j,i) in input_replace[batchid].keys(): jits[batchid][j][1][i] = None
+        self.batches.append(TinyJit._ExecBatch(batch_executor, jits[batchid], input_replace[batchid], updatable_entries[batchid]))
+      assert sum(len(batch.jit_cache) for batch in self.batches) == len(jit_cache), "some jit kernels are not batched"
+      assert set([x[0] for batch in self.batches for x in batch.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
     elif self.cnt == 0:
       self.ret = self.fxn(*args, **kwargs)
     self.cnt += 1
