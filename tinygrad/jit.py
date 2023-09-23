@@ -1,7 +1,7 @@
 from typing import Callable, List, Tuple, Any, Dict, cast, Union, Optional, Set
 from weakref import ref
 from collections import defaultdict
-import functools, itertools
+import functools, itertools, math
 from tinygrad.helpers import DEBUG, DType, merge_dicts
 from tinygrad.ops import RawBuffer, Device, BasicBatchExecutor
 from tinygrad.tensor import Tensor
@@ -14,11 +14,11 @@ class TinyJit:
   def __init__(self, fxn:Callable):
     self.fxn: Callable = fxn
     self.cnt: int = 0
-    self.jit_cache: List[Tuple[Any, List[Optional[RawBuffer]], Dict[Variable, int]]] = []
+    self.jit_cache: Dict[int,List[Tuple[Any, List[Optional[RawBuffer]], Dict[Variable, int]]]] = defaultdict(list)
     self.ret: Any = None
-    self.input_replace: Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]= {}   # (kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)
-    self.batch_executor: Any = None
-    self.updatable_entries: Dict[int, List[int]] = defaultdict(list) # (kernel_number) -> list(argument id). These are buffers from input + variables.
+    self.input_replace: Dict[int,Dict[Tuple[int, int], Tuple[Union[int, str], ShapeTracker, DType]]] = defaultdict(dict) # (batchid) -> {(kernel_number, buffer_number) -> (input_name, expected_shapetracker, expected_type)}
+    self.batch_executors: List[Any] = []
+    self.updatable_entries: Dict[int,Dict[int, List[int]]] = defaultdict(lambda:defaultdict(list)) # (batchid) -> {(kernel_number) -> list(argument id)}. These are buffers from input + variables.
 
   # add support for instance methods
   def __get__(self, obj, objtype): return functools.partial(self.__call__, obj)
@@ -33,36 +33,39 @@ class TinyJit:
       try: var_vals: Dict[Variable, int] = kwargs["jit_ctx"]
       except KeyError: var_vals = merge_dicts([arg.lazydata.var_vals for arg in args if arg.__class__ is Tensor])
       if len(var_vals) > 1: var_vals = dict(sorted(var_vals.items(), key=lambda kv: kv[0].key))
-      for (j,i),(input_name, expected_st, expected_type) in self.input_replace.items():
-        assert input_rawbuffers[input_name][0].dtype == expected_type, f"type mismatch in JIT, {input_rawbuffers[input_name][0].dtype} != {expected_type}"
-        # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
-        if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
-        self.jit_cache[j][1][i] = input_rawbuffers[input_name][0]
-      for j in self.updatable_entries.keys():
-        for k in self.jit_cache[j][2].keys():
-          try: self.jit_cache[j][2][k] = var_vals[k]
-          except KeyError: pass
-      self.batch_executor.exec(self.jit_cache, self.updatable_entries)
-      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+      for batchid,batchexec in enumerate(self.batch_executors):
+        for (j,i),(input_name, expected_st, expected_type) in self.input_replace[batchid].items():
+          assert input_rawbuffers[input_name][0].dtype == expected_type, f"type mismatch in JIT, {input_rawbuffers[input_name][0].dtype} != {expected_type}"
+          # NOTE: if we pass jit_ctx instead of using reshape to update the var_vals, we cannot compare the shapetracker directly
+          if "jit_ctx" not in kwargs: assert input_rawbuffers[input_name][1].views == expected_st.views, f"ShapeTracker.views mismatch in JIT, {input_rawbuffers[input_name][1].views} != {expected_st.views}"
+          self.jit_cache[batchid][j][1][i] = input_rawbuffers[input_name][0]
+        for j in self.updatable_entries[batchid].keys():
+          for k in self.jit_cache[batchid][j][2].keys():
+            try: self.jit_cache[batchid][j][2][k] = var_vals[k]
+            except KeyError: pass
+        batchexec.exec(self.jit_cache[batchid], self.updatable_entries[batchid])
+        for (j,i) in self.input_replace[batchid].keys(): self.jit_cache[batchid][j][1][i] = None
     elif self.cnt == 1:
       CacheCollector.start()
       self.ret = self.fxn(*args, **kwargs)
-      self.jit_cache = CacheCollector.finish()
-      assert len(self.jit_cache) != 0, "didn't JIT anything!"
-      if DEBUG >= 1: print(f"JIT captured {len(self.jit_cache)} kernels with {len(input_rawbuffers)} inputs")
-
-      # get the inputs for replacement
-      for j_,cache in enumerate(self.jit_cache): # type: Tuple[int, Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]]
+      jits = CacheCollector.finish()
+      assert len(jits) != 0, "didn't JIT anything!"
+      if DEBUG >= 1: print(f"JIT captured {len(jits)} kernels with {len(input_rawbuffers)} inputs")
+      # Splitting the JIT cache into batches to enable parallel execution (cpu+accel). Batch sizes follow a logarithmic pattern: 4, 8, 16, 32, and so on.
+      # This helps push tasks to the accelerator while the CPU prepares the next batch.
+      for j_,cache in enumerate(jits): # type: Tuple[int, Tuple[Callable, List[Optional[RawBuffer]], Dict[Variable, int]]]
+        batchid, j = int(math.log(j_+4,2)-2), len(self.jit_cache[int(math.log(j_+4,2)-2)])
         for i,a in enumerate(cache[1]):
           if a in [v[0] for v in input_rawbuffers.values()]:
-            self.input_replace[(j_,i)] = [(k, v[1], v[0].dtype) for k,v in input_rawbuffers.items() if v[0] == a][0]
-            self.updatable_entries[j_].append(i)
-        for i in range(len(cache[2])): self.updatable_entries[j_].append(len(cache[1])+i)
-        #if prg.local_size is None: prg.local_size = prg.optimize_local_size(args, preserve_output=True)  # the JIT can optimize local
-      assert set([x[0] for x in self.input_replace.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
-
-      self.batch_executor = self.jit_cache[0][0].batch_exec(self.jit_cache) if hasattr(self.jit_cache[0][0], 'batch_exec') else BasicBatchExecutor(self.jit_cache)
-      for (j,i) in self.input_replace.keys(): self.jit_cache[j][1][i] = None
+            self.input_replace[batchid][(j,i)] = [(k, v[1], v[0].dtype) for k,v in input_rawbuffers.items() if v[0] == a][0]
+            self.updatable_entries[batchid][j].append(i)
+        for i in range(len(cache[2])): self.updatable_entries[batchid][j].append(len(cache[1])+i)
+        self.jit_cache[batchid].append(cache)
+      for batchid in range(len(self.jit_cache.keys())):
+        self.batch_executors.append(self.jit_cache[batchid][0][0].batch_exec(self.jit_cache[batchid]) if hasattr(self.jit_cache[batchid][0][0], 'batch_exec') else BasicBatchExecutor(self.jit_cache[batchid]))
+        for (j,i) in self.input_replace[batchid].keys(): self.jit_cache[batchid][j][1][i] = None
+      assert sum(len(x) for x in self.jit_cache.values()) == len(jits), "some jit kernels are not batched"
+      assert set([x[0] for inp in self.input_replace.values() for x in inp.values()]) == set(input_rawbuffers.keys()), "some input tensors not found"
     elif self.cnt == 0:
       self.ret = self.fxn(*args, **kwargs)
     self.cnt += 1
