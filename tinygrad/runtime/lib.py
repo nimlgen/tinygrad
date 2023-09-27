@@ -1,7 +1,7 @@
 import ctypes
 import numpy as np
 from collections import defaultdict, deque
-from typing import TypeVar, Type, Any, Dict, Deque, Tuple
+from typing import TypeVar, Type, Any, Dict, Deque, Tuple, Union
 from tinygrad.helpers import DType, dtypes, prod, GlobalCounters, ImageDType
 
 _T = TypeVar("_T")
@@ -24,6 +24,8 @@ class RawBuffer:  # pylint: disable=abstract-method
   # NOTE: this interface allows for 0 copy
   @classmethod
   def fromCPU(cls:Type[_T], x:np.ndarray) -> _T: raise NotImplementedError("must be implemented")
+  @classmethod
+  def initFrom(cls:Type[_T], x:Union[Type[_T],np.ndarray]) -> _T: raise NotImplementedError("must be implemented")
   def toCPU(self) -> np.ndarray: raise NotImplementedError("must be implemented")
 
 class RawConst(RawBuffer): # pylint: disable=abstract-method
@@ -44,12 +46,29 @@ class RawBufferCopyIn(RawBuffer):
     ret = cls(prod(x.shape), dtypes.from_np(x.dtype), **kwargs)
     if x.size > 0: ret._copyin(x)
     return ret
+  
+  @classmethod
+  def initFrom(cls, x:Union[Type[_T],np.ndarray], **kwargs):
+    if isinstance(x, RawBuffer): x = x.toCPU() # Fallthrough to np.ndarray case.
+    if isinstance(x, np.ndarray):
+      ret = cls(prod(x.shape), dtypes.from_np(x.dtype), **kwargs)
+      if x.size > 0: ret._copyin(x)
+    else: raise NotImplementedError(f"init From {type(x)} is not implemented")
+    return ret
 
 class RawBufferMapped(RawBufferCopyIn):
   def _buffer(self) -> memoryview: raise NotImplementedError("must be implemented")
   # NOTE: this metadata prevents the backing buffer from being freed. hack can be removed with PEP688
   def toCPU(self) -> np.ndarray: return np.frombuffer(self._buffer(), dtype=np.dtype(self.dtype.np, metadata={"backing": self}), count=self.size)  # type: ignore
   def _copyin(self, x:np.ndarray) -> None: np.copyto(self.toCPU(), x.reshape(-1))
+
+  @classmethod
+  def initFrom(cls, x:Union[Type[_T],np.ndarray], **kwargs):
+    if isinstance(x, RawBufferMapped):
+      ret = cls(x.size, x.dtype, **kwargs)
+      ret._buffer()[:len(x._buffer())] = x._buffer()
+    else: ret = super().initFrom(x)
+    return ret
 
 # this one is simple enough that i moved it out of the runtimes
 class RawMallocBuffer(RawBufferMapped):
@@ -71,6 +90,14 @@ class RawBufferTransfer(RawBuffer):
   def transfer(cls, x, shape, dtype, **kwargs):
     ret = cls(prod(shape), dtype, **kwargs)
     ret._transfer(x)
+    return ret
+  
+  @classmethod
+  def initFrom(cls, x:Union[Type[_T],np.ndarray], **kwargs):
+    if isinstance(x, RawBufferTransfer):
+      ret = cls(x.size, x.dtype, **kwargs)
+      ret._transfer(x)
+    else: ret = super().initFrom(x)
     return ret
 
 class LRUAllocator:

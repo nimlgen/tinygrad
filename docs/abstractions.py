@@ -204,6 +204,8 @@ class RawNumpyBuffer(RawBuffer):
     super().__init__(buf.size, dtypes.from_np(buf.dtype), buf)
   @classmethod
   def fromCPU(cls, x): return cls(x)
+  @classmethod
+  def initFrom(cls, x): return cls(x)
   def toCPU(self): return self._buf
 
 # %%
