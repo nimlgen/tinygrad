@@ -23,8 +23,6 @@ class RawBuffer:  # pylint: disable=abstract-method
 
   # NOTE: this interface allows for 0 copy
   @classmethod
-  def fromCPU(cls:Type[_T], x:np.ndarray) -> _T: raise NotImplementedError("must be implemented")
-  @classmethod
   def initFrom(cls:Type[_T], x:Union[Type[_T],np.ndarray]) -> _T: raise NotImplementedError("must be implemented")
   def toCPU(self) -> np.ndarray: raise NotImplementedError("must be implemented")
 
@@ -67,7 +65,7 @@ class RawBufferMapped(RawBufferCopyIn):
     if isinstance(x, RawBufferMapped):
       ret = cls(x.size, x.dtype, **kwargs)
       ret._buffer()[:len(x._buffer())] = x._buffer()
-    else: ret = super().initFrom(x)
+    else: ret = super(RawBufferMapped, cls).initFrom(x)
     return ret
 
 # this one is simple enough that i moved it out of the runtimes
@@ -83,7 +81,7 @@ class RawBufferCopyInOut(RawBufferCopyIn):
     if x.size > 0: self._copyout(x)
     return x
 
-class RawBufferTransfer(RawBuffer):
+class RawBufferCopyInOutBetween(RawBufferCopyInOut):
   def _transfer(self, x) -> None: raise NotImplementedError("must be implemented")
 
   @classmethod
@@ -94,10 +92,10 @@ class RawBufferTransfer(RawBuffer):
   
   @classmethod
   def initFrom(cls, x:Union[Type[_T],np.ndarray], **kwargs):
-    if isinstance(x, RawBufferTransfer):
+    if isinstance(x, RawBufferCopyInOutBetween):
       ret = cls(x.size, x.dtype, **kwargs)
       ret._transfer(x)
-    else: ret = super().initFrom(x)
+    else: ret = super(RawBufferCopyInOutBetween, cls).initFrom(x)
     return ret
 
 class LRUAllocator:

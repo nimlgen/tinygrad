@@ -5,7 +5,7 @@ import pyopencl as cl  # type: ignore
 from typing import Optional, List
 from tinygrad.helpers import DEBUG, getenv, prod, ImageDType, OSX, fromimport
 from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferCopyInOut, LRUAllocator, RawBufferTransfer
+from tinygrad.runtime.lib import RawBufferCopyInOutBetween, LRUAllocator
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
 
@@ -45,7 +45,7 @@ class _CL:
 CL = _CL()
 if not getenv("DELAYED_RUNTIME_INIT", False): CL.post_init()
 
-class CLBuffer(RawBufferCopyInOut, RawBufferTransfer):
+class CLBuffer(RawBufferCopyInOutBetween):
   def __init__(self, size, dtype, device='0'): super().__init__(size, dtype, allocator=CL.cl_allocator, **{'device': device})
   def _copyin(self, x:np.ndarray):
     assert not self.dtype.name.startswith("image"), f"can't copyin images {self.dtype}"

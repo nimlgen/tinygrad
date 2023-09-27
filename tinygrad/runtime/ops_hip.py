@@ -4,7 +4,7 @@ import extra.hip_wrapper as hip
 from typing import Tuple, Any, List
 from tinygrad.helpers import DEBUG, getenv, GlobalCounters
 from tinygrad.ops import Compiled, ASTRunner, BasicBatchExecutor
-from tinygrad.runtime.lib import RawBufferCopyInOut, LRUAllocator, RawBufferTransfer
+from tinygrad.runtime.lib import RawBufferCopyInOutBetween, LRUAllocator
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cstyle import uops_to_cstyle, CStyleLanguage
 from tinygrad.shape.symbolic import sym_infer
@@ -84,7 +84,7 @@ class HIPGraph(BasicBatchExecutor):
   @functools.lru_cache(maxsize=32)
   def __get_batch(self, j): return int(math.log(j+4,2)-2) # Batch sizes are logarithmic 4,8,16,32,...
 
-class RawHIPBuffer(RawBufferCopyInOut, RawBufferTransfer):
+class RawHIPBuffer(RawBufferCopyInOutBetween):
   def __init__(self, size, dtype, device=str(HIP.default_device)): super().__init__(size, dtype, allocator=HIP.allocator, **{'device': int(device)})
   def _copyin(self, x:np.ndarray):
     x = np.require(x, requirements='C')

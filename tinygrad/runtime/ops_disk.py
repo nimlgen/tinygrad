@@ -34,6 +34,7 @@ class RawDiskBuffer(RawBufferMapped):
 
   def _buffer(self): return memoryview(self._buf[1])[self.offset:self.offset+self.size*self.dtype.itemsize]
   def readinto(self, buf):
+    print(self.offset)
     self._buf[0].seek(self.offset)
     self._buf[0].readinto(buf)
 
