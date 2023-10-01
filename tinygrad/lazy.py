@@ -2,15 +2,17 @@ from __future__ import annotations
 import sys, operator, math
 from typing import Callable, Optional, Tuple, Union, List, Dict, Any, cast, Mapping
 from weakref import ref, WeakSet, WeakValueDictionary
+from collections import defaultdict
+import gc
 
 import numpy as np
-from tinygrad.graph import log_schedule_item
-from tinygrad.helpers import DEBUG, prod, getenv, DType, dtypes, flatten, ImageDType, partition, all_int, dedup, merge_dicts
+# from tinygrad.graph import log_op
+from tinygrad.helpers import GRAPH, DEBUG, prod, getenv, DType, dtypes, flatten, ImageDType, partition, all_int, dedup, merge_dicts
 from tinygrad.ops import Device, Compiled, UnaryOps, BinaryOps, TernaryOps, ReduceOps, MovementOps, LoadOps, OpType, LazyOp, MemBuffer, ConstBuffer, BufferOps
 from tinygrad.shape.shapetracker import ShapeTracker, get_contraction
 from tinygrad.shape.symbolic import Variable, sint
 
-from tinygrad.runtime.lib import RawBuffer, RawBufferMapped, RawBufferTransfer
+from tinygrad.runtime.lib import RawConst, RawBuffer, RawBufferMapped, RawBufferTransfer
 from tinygrad.runtime.ops_cpu import RawNumpyBuffer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
 
@@ -27,8 +29,7 @@ REMOVE_MOVEMENT_NOPS, MERGE_ELEMENTWISE_INTO_REDUCE, SHUFFLE_MOVEMENT_OPS, MERGE
 MERGE_ONE_REDUCE_INTO_ELEMENTWISE, SHUFFLE_PAD_OPS = OPT>=2, OPT>=2
 PUSH_PERMUTES, PUSH_CONTIGUOUS = OPT>=3, OPT>=3
 
-# **** ast fixing functions ****
-
+# **** realize functions ****
 def _ast_reduceops(op:LazyOp) -> LazyOp:
   # TODO: this can also corealize a binary op after the reduce, not just before
   src = op.src[0]
@@ -64,14 +65,19 @@ def _ast_binaryops(op:LazyOp, shape: Tuple[sint, ...]) -> LazyOp:
   ast = op.map_buffers(cast(Dict[LazyBuffer, Union[LazyOp, LazyBuffer]], real_srcs))
   return LazyOp(MovementOps.RESHAPE, (ast, ), shape) if intermediate_shape != shape else ast
 
+fix_up_ref_x2 = defaultdict(int)
 def _replace_bufferops(op:LazyOp) -> Tuple[LazyOp, List[LazyBuffer]]:
   replacements:Dict[LazyBuffer, LazyOp] = {}
-  base_bufs = dedup([x.base for x in op.buffers if not x.is_unrealized_const()])
+  base_bufs = dedup([x.base for x in op.buffers if (x.realized and not isinstance(x.realized, RawConst)) or not isinstance(Device[x.device], Compiled) or x.device == "LLVM" or (not x.realized and x.base.op.op != LoadOps.CONST)])
   for x in op.buffers:
     st = x.st.simplify()
     if x.base in base_bufs:
+      # fix_up_ref_x2[ref(x)] += 1
       replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st))
+    elif x.realized and isinstance(x.realized, RawConst):
+      replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(x.realized._buf, x.realized.dtype, st))
     elif not x.realized and x.base.op.op == LoadOps.CONST:
+      # fix_up_ref_x2[ref(x)] += 1
       replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(float(x.base.op.arg), x.dtype, st))
     else:
       raise NotImplementedError(f"not handled {x}")
@@ -99,10 +105,14 @@ def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dty
 
 UNSAFE_PAD_OPS = {BinaryOps.DIV, BinaryOps.CMPLT, UnaryOps.LOG2, UnaryOps.EXP2, UnaryOps.RECIP}
 
+import itertools
+xxx = itertools.count()
+
 class LazyBuffer:
   __deletable__ = ('op',)
-  def __init__(self, device:str, st:ShapeTracker, optype:OpType, op:Optional[LazyOp], dtype:DType, var_vals:Dict[Variable,int], src:Optional[RawBuffer]=None, base:Optional[LazyBuffer]=None):
-    self.st: ShapeTracker = st
+  def __init__(self, device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dtype:DType, var_vals:Dict[Variable,int], src:Optional[RawBuffer]=None, base:Optional[LazyBuffer]=None):
+    self.id = next(xxx)
+    self.st: ShapeTracker = st  # NOTE: this is not a copy! this should be a "read-only" ShapeTracker
     self._var_vals: Dict[Variable, int] = var_vals
     self.device, self.shape, self.optype, self._dtype = device, self.st.shape, optype, dtype
     self._realized: Optional[RawBuffer] = src
@@ -110,15 +120,17 @@ class LazyBuffer:
     # TODO: does children have to be a ref count instead of a set? can a Buffer be a double child?
     self.children: WeakSet = WeakSet()
     self.views: WeakSet = WeakSet()
-    # NOTE: op should be read only after construction of LazyBuffer. it is now with schedule
-    if op is not None:
-      self.op: LazyOp = op
-      for x in op.buffers: x.children.add(self)
+    # NOTE: op should be read only after construction of LazyBuffer
+    self.op: LazyOp = op
     assert optype != MovementOps or (base is not None and base.optype != MovementOps), "MovementOps must be based"
     self._base = base
     if base: base.views.add(self)
-    else: assert st.contiguous, "unbased LazyBuffers must be contiguous"
+    for x in op.buffers: x.children.add(self)
     if not LAZY: self.realize()
+
+    # log phantom ops to the graph
+    # if GRAPH >= 3:
+    #   log_op(self, self.op, phantom=True)
 
   @property
   def var_vals_key(self): return tuple(sorted(self.var_vals.keys()))
@@ -199,15 +211,137 @@ class LazyBuffer:
     op, base_bufs = _replace_bufferops(op)
     return ret + [(op, self, tuple(base_bufs))]
 
+  def schedule_out_buffers(self, schedule):
+    cnt = defaultdict(int)
+    for op,out,buffers in schedule:
+      for buf in buffers: cnt[ref(buf)] += 1
+    for op,out,buffers in schedule:
+      if op.op in LoadOps: continue
+    #   xx = cnt[ref(out)]
+    #   res = sys.getrefcount(out) - cnt[ref(out)]
+    
+      if out.id == 1806:
+        print(f"refs of {out.id}: ")
+        for x in gc.get_referrers(out):
+          print(x)
+          print()
+      print(f"{out.id}({sys.getrefcount(out)-cnt[ref(out)]-fix_up_ref_x2[ref(out)]})", [f"{xbufx.id}({sys.getrefcount(xbufx)})" for xbufx in buffers])
+    print("---" * 8)
+      
+      # print(xx, res)
+      # if sys.getrefcount(op) == 1 and op.output_buffer is None:
+      #   # Buffer used only internally
+      # else:
+      #   # Buffer used outside, create a new buffer to avoid hazards.
+
   def realize(self:LazyBuffer) -> LazyBuffer:
-    if not self.realized: run_schedule(self.schedule())
+    if not self.realized:
+      # NOTE: if you for loop the schedule it's slow because nothing frees
+      schedule = self.schedule()
+      # self.schedule_out_buffers(schedule)
+      built_progs = []
+      #if DEBUG >= 2: print(f"scheduled {len(schedule)}")
+      while len(schedule):
+        op,out,buffers = schedule.pop(0)
+        # print("SCHED", self.id, out.id)
+        if DEBUG >= 3:
+          from extra.utils import print_tree   # type: ignore
+          print_tree(op)
+        if op.op in LoadOps:
+          # TODO: Move to exec?
+          # LOAD_OPS_DISPATCHER[cast(LoadOps, op.op)](out)
+          # TODO: why can't we delete these ops?
+          built_progs.append((out, op, None))
+        else:
+          if hasattr(Device[out.device], 'build_ast'):
+            prg = Device[out.device].build_ast(op, output=out, inputs=[x.realized for x in buffers], args_info=[(x.shape, x.dtype) for x in ([out]+list(buffers))], var_vals=out.var_vals, **self._device_extra_args())
+            # print("buult for", out.id, "self is ", self.id)
+            built_progs.append((out, prg, [x for x in buffers]))
+          else:
+            # print("HHEre")
+            out.realized = Device[out.device].exec_ast(op, output=out, inputs=[x.realized for x in buffers], var_vals=out.var_vals, **self._device_extra_args())
+            built_progs.append((out, op, [x for x in buffers]))
+          del out.op
+          for v in out.views: del v.op
+        # assert out.realized and isinstance(out.realized, (RawConst, Device[out.device].buffer)), f"device mismatch on realized got {type(out.realized)} expected {out.device}"
+        # assert out.realized.dtype == out.dtype, "realized dtype is incorrect"
+      # Programs built, start executing
+      
+      # Schedule buffers
+      cnt = defaultdict(int)
+      last_use = {}
+      query_list = []
+      for j,(out,prog,buffers) in enumerate(built_progs):
+        if buffers is None: continue
+        for buf in buffers:
+          last_use[ref(buf)] = j
+          cnt[ref(buf)] += 1
+      for j,(out,prog,buffers) in enumerate(built_progs):
+        if isinstance(prog, LazyOp): continue
+        if out.realized is not None: continue
+        if sys.getrefcount(out)-cnt[ref(out)] == 3:
+          need_bytes = prod((s if isinstance(s, int) else s.max for s in out.shape)) * out.dtype.itemsize
+          query_list.append((need_bytes, j, last_use[ref(out)], ref(out)))
+        else: out.realized = Device[out.device].buffer(prod((s if isinstance(s, int) else s.max for s in out.shape)), out.dtype, **self._device_extra_args())
+
+      def _no_intersect(start:int, end:int, usages:List[Tuple[int, int]]): return all(en < start or end < st for st, en in usages)
+      
+      # TODO: Support devices
+      def _can_use_rawbuf(out:LazyBuffer, with_buf:RawBuffer):
+        out_size = prod((s if isinstance(s, int) else s.max for s in out.shape))
+        need_bytes = out_size * out.dtype.itemsize
+        return (need_bytes<=with_buf.size*with_buf.dtype.itemsize if not isinstance(out.dtype, ImageDType) and not isinstance(with_buf.dtype, ImageDType) else out_size==with_buf.size and buf.dtype==with_buf.dtype and buf.dtype.shape==with_buf.dtype.shape)
+
+      # The query list contains a query for every placeholder that should be replaced with the actual rawbuffer. Queries are served from the largest to the smallest.
+      # For each query, find any rawbuffer that is free within the query timeframe or allocate a new one.
+      rawbuf_pool: List[Tuple[RawBuffer, List[Tuple[int, int]]]] = []
+      query_list = sorted(query_list, key=lambda x: x[0], reverse=True)
+      for _, start, end, buf in query_list:
+        pool_idx = next((i for i,(with_buf, usages) in enumerate(rawbuf_pool) if _can_use_rawbuf(buf(), with_buf) and _no_intersect(start,end,usages)), -1)
+        if pool_idx == -1:
+          new_buf = Device[out.device].buffer(prod((s if isinstance(s, int) else s.max for s in buf().shape)), buf().dtype, **self._device_extra_args())
+          rawbuf_pool.append((new_buf, []))
+          pool_idx = len(rawbuf_pool) - 1
+        # else: print("Q REPL")
+        buf().realized = rawbuf_pool[pool_idx][0]
+        rawbuf_pool[pool_idx][1].append((start, end))
+
+        # print(f"{out.id}({sys.getrefcount(out)-cnt[ref(out)]})", [f"{buf.id}({sys.getrefcount(buf)-cnt[ref(buf)]})" for buf in buffers])
+        # if out.id == 3663 or out.id == 3660:
+        #   print(f"refs of {out.id}: ")
+        #   for x in gc.get_referrers(out):
+        #     print(x)
+        #     print()
+        # print(out.id, sys.getrefcount(out), sys.getrefcount(out) - cnt[ref(out)], cnt[ref(out)])
+
+      # print(f"query_list {len(query_list)}")
+
+      # Execute
+      for out,prog,buffers in built_progs:
+        if isinstance(prog, LazyOp):
+          # print("here", prog.op)
+          if prog.op in LoadOps: LOAD_OPS_DISPATCHER[cast(LoadOps, prog.op)](out)
+          else: out.realized = Device[out.device].exec_ast(prog, output=out, inputs=[x.realized for x in buffers], var_vals=out.var_vals, **self._device_extra_args())
+        else:
+          assert out.realized and isinstance(out.realized, (RawConst, Device[out.device].buffer)), f"device mismatch on realized got {type(out.realized)} expected {out.device}"
+          assert out.realized.dtype == out.dtype, "realized dtype is incorrect"
+          Device[out.device].exec_prog(prog, output=out, inputs=[x.realized for x in buffers], var_vals=out.var_vals)
+
+      # Execute all progs
+      # for out,prog,bufs in built_progs:
+      #   print(prog)
+      #   if out.realized is None:
+      #     print("alloc")
+      #     print(self.id, out.id)
+      #     out.realized = Device[out.device].buffer(prod((s if isinstance(s, int) else s.max for s in out.shape)), out.dtype, **self._device_extra_args())
+        # prog.exec_prog()
+
+    # print("exit?", self.realized)
     return self
 
-  # *** creation/special ops ***
-
   @staticmethod
-  def loadop(op, shape, dtype, device, arg=None, src=None, val_vals=None) -> LazyBuffer:
-    return create_lazybuffer(device, ShapeTracker.from_shape(tuple(shape)), LoadOps, LazyOp(op, tuple() if src is None else (src,), arg), dtype, val_vals if val_vals else {})
+  def loadop(op, shape, dtype, device, arg=None, src=None) -> LazyBuffer:
+    return create_lazybuffer(device, ShapeTracker.from_shape(tuple(shape)), LoadOps, LazyOp(op, tuple() if src is None else (src,), arg), dtype, {})
 
   # create a constant with the shape and dtype of self
   def const(self, val:Union[float, int]) -> LazyBuffer:
@@ -216,20 +350,21 @@ class LazyBuffer:
 
   def contiguous(self:LazyBuffer) -> LazyBuffer:
     if not self.realized and self.op.op == LoadOps.CONTIGUOUS: return self  # two CONTIGUOUS in a row is one
-    return self.loadop(LoadOps.CONTIGUOUS, self.shape, self.dtype, self.device, src=self, val_vals=self.var_vals)
+    return create_lazybuffer(self.device, ShapeTracker.from_shape(self.shape), LoadOps, LazyOp(LoadOps.CONTIGUOUS, (self,), None), self.dtype, self.var_vals)
 
   @staticmethod
   def fromCPU(x: np.ndarray) -> LazyBuffer:
-    return LazyBuffer("CPU", ShapeTracker.from_shape(x.shape), LoadOps, None, dtypes.from_np(x.dtype), {}, RawNumpyBuffer.fromCPU(x))
-
-  def prepare_transfer(self):
-    self_casted = self.e(UnaryOps.CAST, arg=(dtypes.from_np(self.dtype.np), False)) if dtypes.from_np(self.dtype.np) != self.dtype else self
-    return self_casted.contiguous().realize().realized
+    return LazyBuffer("CPU", ShapeTracker.from_shape(x.shape), LoadOps, LazyOp(LoadOps.EMPTY, (), None), dtypes.from_np(x.dtype), {}, RawNumpyBuffer.fromCPU(x))
 
   def toCPU(self) -> np.ndarray:
     assert self.dtype.np, f"{self.dtype} is not supported in toCPU"
+    if self.id == 220: print("REALIZE ", self.id)
+    self_casted = self.e(UnaryOps.CAST, arg=(dtypes.from_np(self.dtype.np), False)) if dtypes.from_np(self.dtype.np) != self.dtype else self
+    realized = self_casted.contiguous().realize().realized
     assert all_int(self.shape), f"no toCPU if shape is symbolic, {self.shape=}"
-    return cast(RawBuffer, self.prepare_transfer()).toCPU().reshape(self.shape)
+    if realized is None:
+      print("none in toCPU", self.id)
+    return cast(RawBuffer, realized).toCPU().reshape(self.shape)
 
   # *** elementwise ops ***
 
@@ -276,7 +411,7 @@ class LazyBuffer:
 
   # *** movement ops ***
 
-  def _movement_op(self, st: ShapeTracker, op: MovementOps, arg: Union[Tuple[sint, ...], Tuple[Tuple[sint, sint], ...]]) -> LazyBuffer:
+  def shuffle_and_prune_movement_ops(self, st: ShapeTracker, op: MovementOps, arg: Union[Tuple[sint, ...], Tuple[Tuple[sint, sint], ...]]) -> LazyBuffer:
     if SHUFFLE_MOVEMENT_OPS and self.optype == BinaryOps and not self.realized and (op in {MovementOps.SHRINK, MovementOps.STRIDE, MovementOps.PERMUTE} or (op == MovementOps.RESHAPE and self.op.op in UnaryOps)) and not self.children:
       return self.op.replace_with_movement_ops([(op, arg)])
     if REMOVE_MOVEMENT_NOPS and not self.realized and st.contiguous:
@@ -302,17 +437,18 @@ class LazyBuffer:
       assert isinstance(self.op.src[0], LazyBuffer)
       self.op.src[0].children.discard(self) # NOTE: this is only required in reshape and when pushing permutes, why??
       return self.op.src[0].reshape(arg)
-    return self._movement_op(self.st.reshape(arg), MovementOps.RESHAPE, arg)
+    return self.shuffle_and_prune_movement_ops(self.st.reshape(arg), MovementOps.RESHAPE, arg)
 
   def pad(self:LazyBuffer, arg:Tuple[Tuple[int, int], ...]) -> LazyBuffer:
     if all(b == 0 and e == 0 for b,e in arg): return self
     if not self.realized and self.op.op == MovementOps.PAD: return self.op.src[0].pad(tuple([(b1+b2, e1+e2) for (b1,e1),(b2,e2) in zip(self.op.arg, arg)]))
-    return self._movement_op(self.st.pad(arg), MovementOps.PAD, arg)
+    return self.shuffle_and_prune_movement_ops(self.st.pad(arg), MovementOps.PAD, arg)
 
   def expand(self: LazyBuffer, arg:Tuple[sint, ...]) -> LazyBuffer:
     if self.shape == arg: return self
-    if not self.realized and self.op.op == MovementOps.EXPAND: return self.op.src[0].expand(arg)
-    return self._movement_op(self.st.expand(arg), MovementOps.EXPAND, arg)
+    if not self.realized and self.op.op == MovementOps.EXPAND:
+      return self.op.src[0].expand(arg)
+    return self.shuffle_and_prune_movement_ops(self.st.expand(arg), MovementOps.EXPAND, arg)
 
   def permute(self: LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     if arg == tuple(range(len(self.shape))): return self
@@ -335,17 +471,17 @@ class LazyBuffer:
         if shape_idx_groups := get_contraction(self.op.src[0].shape, self.shape):
           self.op.src[0].children.discard(self) # NOTE: this is only required in reshape and when pushing permutes, why??
           return self.op.src[0].permute(tuple(flatten(shape_idx_groups[i] for i in arg))).reshape(self.st.permute(arg).shape)
-    return self._movement_op(self.st.permute(arg), MovementOps.PERMUTE, arg)
+    return self.shuffle_and_prune_movement_ops(self.st.permute(arg), MovementOps.PERMUTE, arg)
 
   def shrink(self:LazyBuffer, arg:Tuple[Tuple[sint, sint], ...]) -> LazyBuffer:
     if all(b - a == s for s, (a, b) in zip(self.shape, arg)): return self
     if not self.realized and self.op.op == MovementOps.SHRINK: return self.op.src[0].shrink(tuple([(b1+b2, b1+e2) for (b1,_),(b2,e2) in zip(self.op.arg, arg)]))
-    return self._movement_op(self.st.shrink(arg), MovementOps.SHRINK, arg)
+    return self.shuffle_and_prune_movement_ops(self.st.shrink(arg), MovementOps.SHRINK, arg)
 
   def stride(self:LazyBuffer, arg:Tuple[int, ...]) -> LazyBuffer:
     if all(a == 1 for a in arg): return self
     if not self.realized and self.op.op == MovementOps.STRIDE: return self.op.src[0].stride(tuple(map(operator.mul, arg, self.op.arg)))
-    return self._movement_op(self.st.stride(arg), MovementOps.STRIDE, arg)
+    return self.shuffle_and_prune_movement_ops(self.st.stride(arg), MovementOps.STRIDE, arg)
 
   def replace_with_movement_ops(self: LazyBuffer, ops:List[Tuple[MovementOps, Any]]) -> LazyBuffer:
     y = self
@@ -379,28 +515,9 @@ MOVEMENT_OPS_DISPATCHER: Dict[MovementOps, Callable] = {
   MovementOps.STRIDE: LazyBuffer.stride,
 }
 
-# *** realization (unrelated to lazy) ***
-
-def run_schedule(schedule:List[Tuple[LazyOp, LazyBuffer, Tuple[LazyBuffer, ...]]]):
-  # NOTE: if you for loop the schedule it's slow because nothing frees
-  while len(schedule):
-    op,out,buffers = schedule.pop(0)
-    log_schedule_item(op, out, buffers)
-    if DEBUG >= 3:
-      from extra.utils import print_tree   # type: ignore
-      print_tree(op)
-    if op.op in LoadOps:
-      LOAD_OPS_DISPATCHER[cast(LoadOps, op.op)](out)
-      # TODO: why can't we delete these ops?
-    else:
-      out.realized = Device[out.device].exec_ast(op, output=out, inputs=[x.realized for x in buffers], var_vals=out.var_vals, **out._device_extra_args())
-      del out.op
-      for v in out.views: del v.op
-    assert out.realized and isinstance(out.realized, Device[out.device].buffer), f"device mismatch on realized got {type(out.realized)} expected {out.device}"
-    assert out.realized.dtype == out.dtype, "realized dtype is incorrect"
+# *** loadop realization (unrelated to lazy) ***
 
 def _realize_contiguous(buffer: LazyBuffer) -> None:
-  # this is just a copy now, if it's not a copy schedule will handle it
   src = cast(LazyBuffer, buffer.op.src[0])
   buffer.realized = src.realized
   assert buffer.dtype == src.dtype, f"contiguous dtype mismatch, expecting {buffer.dtype}, got {src.dtype}"
@@ -411,13 +528,14 @@ def _realize_custom(buffer: LazyBuffer) -> None:
 
 def _realize_from(buffer: LazyBuffer) -> None:
   rawbuf = buffer.op.src[0].realize()
+  # print("rawbuf from", buffer.op.src[0].id)
   assert rawbuf.realized, "realize failed?"
   if DEBUG >= 3: print(f"*** copy {buffer.device} <- {rawbuf.device} size {rawbuf.realized.size} dtype {rawbuf.realized.dtype}")
   # TODO: make this generic
   if isinstance(rawbuf.realized, RawDiskBuffer) and issubclass(Device[buffer.device].buffer, RawBufferMapped):
     assert all_int(buffer.shape), "does not support symbolic shape"
     buffer.realized = Device[buffer.device].buffer(prod(buffer.shape), buffer.dtype, **buffer._device_extra_args())
-    rawbuf.prepare_transfer().readinto(cast(RawBufferMapped, buffer.realized)._buffer())
+    rawbuf.realized.readinto(cast(RawBufferMapped, buffer.realized)._buffer())
   elif isinstance(rawbuf.realized, RawBufferTransfer) and issubclass(Device[buffer.device].buffer, RawBufferTransfer) and P2P >= 1:
     buffer.realized = cast(RawBufferTransfer, Device[buffer.device].buffer).transfer(rawbuf.realized, buffer.shape, buffer.dtype, **buffer._device_extra_args())
   else:

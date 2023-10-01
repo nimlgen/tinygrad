@@ -11,8 +11,8 @@ from dataclasses import dataclass
 # NOTE: rdna3 only has RECIP and not DIV. DIV and POW are on the chopping block
 class UnaryOps(Enum): NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto(); SQRT = auto(); RECIP = auto(); NEG = auto() # noqa: E702
 class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
-class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
 class ReduceOps(Enum): SUM = auto(); MAX = auto() # noqa: E702
+class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
 class BufferOps(Enum): MEM = auto(); CONST = auto() # noqa: E702
 # Ops below this line are not allowed in ASTs
 class MovementOps(Enum): RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); SHRINK = auto(); STRIDE = auto(); AS_STRIDED = auto() # noqa: E702
@@ -112,6 +112,8 @@ class Interpreted:
     self.synchronize = lambda: None
     self.codegen = None
 
+  def build_ast(self, ast:LazyOp, output, inputs, var_vals, args_info, **kwargs): return ast
+  
   def exec_ast(self, ast:LazyOp, output=None, inputs=None, var_vals=None, context=None, **kwargs):
     if ast.op == BufferOps.MEM and BufferOps.MEM not in self.fxn_for_op:
       assert inputs[ast.arg.idx-1].dtype == ast.arg.dtype, "dtype mismatch"
@@ -157,7 +159,7 @@ def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.ex
 
 # **************** for Compiled Buffers ****************
 
-from tinygrad.runtime.lib import RawBuffer
+from tinygrad.runtime.lib import RawBuffer, RawConst
 from tinygrad.shape.symbolic import Variable, sym_infer
 
 class BasicBatchExecutor:
@@ -190,7 +192,7 @@ class ASTRunner:
     if et := self.clprg(global_size, local_size, *rawbufs, *var_vals.values(), wait=force_wait or DEBUG>=1): GlobalCounters.time_sum_s += et
     op_estimate = sym_infer(self.op_estimate, var_vals)
     if DEBUG >= 2:
-      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(37-ansilen(self.display_name))) if self.display_name is not None else self.name:33s} arg {len(rawbufs):3d} sz {str(global_size):18s} {str(local_size):12s} OPs {int(op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
+      print(f"{colored(f'*** {GlobalCounters.kernel_count:4d}', 'magenta' if jit else None)} {(self.display_name+' '*(33-ansilen(self.display_name))) if self.display_name is not None else self.name:33s} arg {len(rawbufs):3d} sz {str(global_size):18s} {str(local_size):12s} OPs {int(op_estimate/1e6):6d}M/{GlobalCounters.global_ops/1e9:7.2f}G  mem {GlobalCounters.mem_used/1e9:5.2f} GB " +
             (str() if et is None else f"tm {et*1e6:9.2f}us/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({op_estimate/((et or 1e-20)*1e9):8.2f} GFLOPS, {self.mem_estimate/((et or 1e-20)*1e9):7.2f} GB/s)"))
     GlobalCounters.kernel_count += 1
     GlobalCounters.global_ops += op_estimate
@@ -211,6 +213,45 @@ class Compiled:
                      op_estimate=k.info.flops, mem_estimate=k.mem_estimate,
                      display_name=k.display_name, runtime_args={"binary": False}).build(self.runtime, self.batch_exec)
 
+  def build_ast(self, ast:LazyOp, output, inputs, var_vals, args_info, **kwargs):
+    from tinygrad.codegen.linearizer import Linearizer
+    k = Linearizer(ast, self.linearizer_opts, var_vals)
+
+    # check if we can reuse the output buffer
+    # if it's aliased, don't use it
+    # NOTE: this is pretty wrong actually, who knows where else this buffer is used?
+    output.realized = output.output_buffer
+    if output.realized:
+      if output.realized.__class__ is RawConst: output.realized = None  # can't assign to RawConst
+      for i,a in enumerate(inputs):
+        # TODO: if this is contiguous it's fine
+        if a == output.realized:
+          if any(not x.arg.st.contiguous for x in ast.get_lazyops() if x.op == BufferOps.MEM and x.arg.idx == i+1):
+            output.realized = None
+            break
+
+    # compilation time
+    def get_program():
+      from tinygrad.codegen.search import kernel_optimize
+      if getenv("KOPT"):
+        inps = [self.buffer(prod((s if isinstance(s, int) else s.max for s in x[0])), x[1], **kwargs) for x in args_info]
+        kernel_optimize(k, lambda: Linearizer(ast, self.linearizer_opts, var_vals), self.to_program, inps)
+      elif not getenv("NOOPT"): k.hand_coded_optimizations()
+      return self.to_program(k)
+
+    if hasattr(k, 'key') and getenv("ENABLE_METHOD_CACHE", 1):
+      if k.key not in self.method_cache: self.method_cache[k.key] = get_program()
+      prg = self.method_cache[k.key]
+    else:
+      prg = get_program()
+
+    if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
+    return prg
+  
+  def exec_prog(self, prg, output, inputs, var_vals):
+    prg.exec([output.realized]+inputs, var_vals=var_vals)
+    return output.realized
+  
   def exec_ast(self, ast:LazyOp, output, inputs, var_vals, **kwargs):
     #if DEBUG >= 4:
     #  from extra.utils import print_tree
@@ -221,6 +262,7 @@ class Compiled:
     # NOTE: this is pretty wrong actually, who knows where else this buffer is used?
     output.realized = output.output_buffer
     if output.realized:
+      if output.realized.__class__ is RawConst: output.realized = None  # can't assign to RawConst
       for i,a in enumerate(inputs):
         # TODO: if this is contiguous it's fine
         if a == output.realized:
