@@ -28,6 +28,7 @@ class RawShmBuffer(RawBufferMapped):
     super().__init__(size, dtype, shm)
   def __del__(self):
     if self.cache_id is None: self._buf.close()
+    super().__del__()
   def _buffer(self): return memoryview(self._buf)
 
 # TODO: is this wrong?
