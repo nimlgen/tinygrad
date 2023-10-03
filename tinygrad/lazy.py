@@ -428,6 +428,8 @@ def _realize_empty(buffer: LazyBuffer) -> None:
 def _realize_rand(buffer: LazyBuffer) -> None:
   rng = np.random.default_rng(buffer.op.arg)
   buffer.realized = Device[buffer.device].buffer.fromCPU(rng.random(size=buffer.shape, dtype=np.float32).astype(dtype=buffer.dtype.np, copy=False), **buffer._device_extra_args()) # type: ignore
+  from tinygrad.jit import CacheCollector
+  CacheCollector.add(lambda args, vars, jit: args[0]._copyin(args[1].random(size=args[2], dtype=np.float32).astype(dtype=args[3], copy=False)), [buffer.realized, rng, buffer.shape, buffer.dtype.np], {})
 
 def _realize_const(buffer: LazyBuffer) -> None:
   buffer.realized = Device[buffer.device].buffer.fromCPU(np.array(buffer.op.arg, dtype=buffer.dtype.np), **buffer._device_extra_args())
