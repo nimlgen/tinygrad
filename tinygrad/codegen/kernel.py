@@ -54,6 +54,11 @@ class Kernel:
     self.ast = ast
     self.var_vals = var_vals
     self.key = (ast, tuple(var_vals.keys())) if var_vals else ast
+    self.process()
+
+  def reset(self) -> None:
+    if hasattr(self, "sts"): delattr(self, "sts")
+    self.process()
 
   def process(self) -> None:
     if hasattr(self, "sts"): return   # already processed

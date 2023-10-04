@@ -1,7 +1,8 @@
 from typing import Callable
 import time
-from tinygrad.codegen.linearizer import Linearizer
+from tinygrad.codegen.linearizer import Linearizer, MemBuffer
 from tinygrad.helpers import DEBUG, prod, getenv
+from tinygrad.ops import Device
 
 def get_divisors(n, min_div = 1, max_div = 512):
   if min_div > 1: yield 1
@@ -21,19 +22,18 @@ def kernel_optimize_opts(k:Linearizer):
     opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
   return opts
 
-def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, baseline, bufs):
+def kernel_optimize_search(k:Linearizer, to_prg, baseline, bufs, budget):
   import nevergrad as ng
   def opt(x):
     try:
-      k = create_k()
-      k.process()
+      k.reset()
       k.apply_auto_opt(x)
       prg = to_prg(k)
       first_tm = prg.exec(bufs, force_wait=True, optimizing=True)
       if baseline*5 < first_tm*1000: return first_tm*1000  # very slow
       tm = min([first_tm]+[prg.exec(bufs, force_wait=True, optimizing=True) for _ in range(2)])*1000
       return tm
-    except Exception:
+    except (Exception, AssertionError):
       if DEBUG >= 3:
         import traceback
         traceback.print_exc()
@@ -42,7 +42,6 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
   if not opts: return "BASELINE"
   search_space = prod([len(x.choices) for x in opts])
   st = time.perf_counter()
-  budget = getenv("BUDGET", 200)
   optimizer = ng.optimizers.NGOpt(parametrization=ng.p.Tuple(*opts), budget=min(search_space, budget))
   recommendation = optimizer.minimize(opt)
   et = time.perf_counter() - st
@@ -51,10 +50,8 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
 
 # optimization
 global_db = None
-def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, bufs):
+def kernel_optimize(k:Linearizer, budget:int):
   global global_db
-
-  k.process()
   skey = str(k.key)
 
   if getenv("KOPT") == 2 and global_db is None:
@@ -67,16 +64,20 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, buf
     # don't optimize variable shapes
     choice = "BASELINE"
   else:
+    # allocate buffers to execute kopt.
+    bufs = [Device[k.opts.device].buffer(x.st.views[0].size(), x.dtype) for x in k.bufs if isinstance(x, MemBuffer)]
+
     # get baseline
     def get_baseline():
-      k = create_k()
+      k.reset()
       k.hand_coded_optimizations()
-      prg = to_prg(k)
+      prg = Device[k.opts.device].to_program(k)
       return min([prg.exec(bufs, force_wait=True, optimizing=True) for _ in range(5)])*1000
-    choice = kernel_optimize_search(k, create_k, to_prg, get_baseline(), bufs)
+    choice = kernel_optimize_search(k, Device[k.opts.device].to_program, get_baseline(), bufs, budget)
     if global_db is not None:
       global_db[skey] = choice
       global_db.sync()
 
+  k.reset()
   if choice == "BASELINE": k.hand_coded_optimizations()
   else: k.apply_auto_opt(choice)

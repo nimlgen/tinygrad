@@ -150,6 +150,10 @@ class OptimizedKernel(Kernel):
         self.local_dims += 1
     self.simplify_ones()
 
+  def auto_optimization(self, budget=getenv("BUDGET", 200)):
+    from tinygrad.codegen.search import kernel_optimize
+    kernel_optimize(self, budget)
+
   def required_optimizations(self, early_only=False):
     for buf_index,buf in enumerate(self.bufs):
       unit_stride_axes_mul_4 = [i for i in self.sts[buf_index].unit_stride_axes(ignore_valid=True) if self.sts[buf_index].shape[i]%4 == 0]
@@ -160,8 +164,6 @@ class OptimizedKernel(Kernel):
           self.upcast()
 
   def hand_coded_optimizations(self, use_tensor_cores=getenv("TC", 1)):
-    self.process()
-
     # if there's images in the earlybufs, we have to make an axis the 4 loading one
     self.required_optimizations(early_only=True)
 

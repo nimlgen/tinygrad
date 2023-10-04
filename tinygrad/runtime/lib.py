@@ -1,7 +1,7 @@
 import ctypes
 import numpy as np
 from collections import defaultdict, deque
-from typing import TypeVar, Type, Any, Dict, Deque, Tuple
+from typing import TypeVar, Type, Any, Dict, Deque, Tuple, Union
 from tinygrad.helpers import DType, dtypes, prod, GlobalCounters, ImageDType
 
 _T = TypeVar("_T")
