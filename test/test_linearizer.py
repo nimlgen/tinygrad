@@ -113,8 +113,7 @@ def helper_linearizer_opt(r:Tensor, opts=[]):
   wanna_output = None
   realized_ast, real_bufs = helper_realized_ast(r)
 
-  def check_opt(x, create_k, to_prg):
-    k = create_k()
+  def check_opt(x, k, to_prg):
     k.reset()
     k.apply_auto_opt(x)
     prg = to_prg(k)
@@ -136,7 +135,8 @@ def helper_linearizer_opt(r:Tensor, opts=[]):
   prg.exec(real_bufs, force_wait=True)
   np.testing.assert_allclose(wanna_output, real_bufs[0].toCPU(), atol=1e-4, rtol=1e-4)
   for x in opts: # Check custom transformations if any.
-    check_opt(x, lambda: Linearizer(realized_ast), Device[Device.DEFAULT].to_program)
+    lin = Linearizer(realized_ast)
+    check_opt(x, lin, Device[Device.DEFAULT].to_program)
 
 class TestLinearizerOpts(unittest.TestCase):
   def test_local_and_grouped_reduce(self):

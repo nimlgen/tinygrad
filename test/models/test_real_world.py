@@ -4,8 +4,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn import optim
 from tinygrad.nn.state import get_parameters
 from tinygrad.jit import TinyJit, JIT_SUPPORTED_DEVICE
-from tinygrad.ops import GlobalCounters, LazyOp, LoadOps
-from tinygrad.ops import Device
+from tinygrad.ops import GlobalCounters, LazyOp, LoadOps, Device
 from tinygrad.helpers import CI, dtypes, getenv, prod
 from tinygrad.codegen.search import kernel_optimize_opts
 
@@ -14,12 +13,12 @@ from examples.hlb_cifar10 import SpeedyResNet
 from examples.llama import Transformer as LLaMaTransformer, MODEL_PARAMS as LLAMA_MODEL_PARAMS
 from examples.stable_diffusion import UNetModel
 
-def kopt_search_hook(k, create_k, to_prg, baseline, bufs):
+def kopt_search_hook(k, to_prg, baseline, bufs, budget):
   import nevergrad as ng
   wanna_output = bufs[0].toCPU().copy()
   def check_opt(x):
     try:
-      k = create_k()
+      k.reset()
       k.apply_auto_opt(x)
       prg = to_prg(k)
       first_tm = prg.exec(bufs, force_wait=True, optimizing=True)
@@ -30,7 +29,6 @@ def kopt_search_hook(k, create_k, to_prg, baseline, bufs):
   opts = kernel_optimize_opts(k)
   if not opts: return "BASELINE"
   search_space = prod([len(x.choices) for x in opts])
-  budget = getenv("BUDGET", 20) # THIS IS TEST BUDGET
   optimizer = ng.optimizers.NGOpt(parametrization=ng.p.Tuple(*opts), budget=min(search_space, budget))
   recommendation = optimizer.minimize(check_opt)
   return recommendation.value if recommendation.loss < baseline else "BASELINE"
