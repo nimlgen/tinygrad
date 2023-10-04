@@ -1,4 +1,3 @@
-from typing import Callable
 import time
 from tinygrad.codegen.linearizer import Linearizer, MemBuffer
 from tinygrad.helpers import DEBUG, prod, getenv
