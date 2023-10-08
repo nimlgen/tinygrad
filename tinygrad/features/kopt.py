@@ -13,11 +13,13 @@ def kernel_optimize_opts(k:Linearizer):
   import nevergrad as ng
   opts = []
   for i in range(k.first_reduce):
+    if (k.full_shape[i].__class__ is not int): continue
     # TODO: the upcast always happen first, you might want to reverse this?
     # TODO: the order of the locals might improve things too
     opts.append(ng.p.TransitionChoice([(i,s,"U") for s in get_divisors(k.full_shape[i], max_div=8)]))
     opts.append(ng.p.TransitionChoice([(i,s,"L") for s in get_divisors(k.full_shape[i], min_div=4)]))
   for i in range(k.shape_len-k.first_reduce):
+    if (k.full_shape[k.first_reduce+i].__class__ is not int): continue
     opts.append(ng.p.TransitionChoice([(i,s,"R") for s in get_divisors(k.full_shape[k.first_reduce+i], max_div=8)]))
     opts.append(ng.p.TransitionChoice([(i,s,"G") for s in get_divisors(k.full_shape[k.first_reduce+i], min_div=4) if all(st.shape[k.first_reduce+i] % s == 0 or st.shape[k.first_reduce+i] == 1 for st in k.sts)]))
   return opts
@@ -62,11 +64,9 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, buf
 
   if global_db is not None and skey in global_db:
     choice = global_db[skey]
-  elif k.has_variable_shape():
-    # don't optimize variable shapes
-    choice = "BASELINE"
   else:
-    var_vals = {k:k.min for k in var_vals_from_ast(k.ast)}
+    # When optimizing with symbolic, choose the mid for all vars during optimization.
+    var_vals = {k:k.min+(k.max-k.min)//2 for k in var_vals_from_ast(k.ast)}
     # get baseline
     def get_baseline():
       k = create_k()
