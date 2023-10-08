@@ -171,6 +171,10 @@ class OptimizedKernel(Kernel):
           self.shift_to(unit_stride_axes_mul_4[0], 4)
           self.upcast()
 
+  def auto_optimization(self):
+    from tinygrad.features.kopt import kernel_optimize
+    kernel_optimize(self)
+
   def hand_coded_optimizations(self, use_tensor_cores=getenv("TC", 1)):
     # if there's images in the earlybufs, we have to make an axis the 4 loading one
     self.required_optimizations(early_only=True)

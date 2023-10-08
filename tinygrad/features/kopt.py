@@ -1,8 +1,9 @@
 from typing import Callable
 import time
-from tinygrad.codegen.linearizer import Linearizer
+from tinygrad.codegen.linearizer import Linearizer, MemBuffer
 from tinygrad.helpers import DEBUG, prod, getenv
 from tinygrad.lazy import var_vals_from_ast
+from tinygrad.ops import Device, Compiled
 
 def get_divisors(n, min_div = 1, max_div = 512):
   if min_div > 1: yield 1
@@ -51,9 +52,10 @@ def kernel_optimize_search(k:Linearizer, create_k:Callable[[], Linearizer], to_p
 
 # optimization
 global_db = None
-def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, bufs, key):
+def kernel_optimize(orig_k:Linearizer):
   global global_db
 
+  key = orig_k.ast
   skey = str(key)
 
   if getenv("KOPT") == 2 and global_db is None:
@@ -62,21 +64,23 @@ def kernel_optimize(k:Linearizer, create_k:Callable[[], Linearizer], to_prg, buf
 
   if global_db is not None and skey in global_db:
     choice = global_db[skey]
-  elif k.has_variable_shape():
+  elif orig_k.has_variable_shape():
     # don't optimize variable shapes
     choice = "BASELINE"
   else:
-    var_vals = {k:k.min for k in var_vals_from_ast(k.ast)}
+    device: Compiled = Device[orig_k.opts.device]
+    bufs = [device.buffer(x.st.views[0].size(), x.dtype) for x in orig_k.bufs if isinstance(x, MemBuffer)]
+    var_vals = {k:k.min for k in var_vals_from_ast(orig_k.ast)}
     # get baseline
     def get_baseline():
-      k = create_k()
+      k = Linearizer(orig_k.ast, orig_k.opts)
       k.hand_coded_optimizations()
-      prg = to_prg(k)
+      prg = device.to_program(k)
       return min([prg.exec(bufs, var_vals, force_wait=True, optimizing=True) for _ in range(5)])*1000
-    choice = kernel_optimize_search(k, create_k, to_prg, get_baseline(), bufs, var_vals)
+    choice = kernel_optimize_search(orig_k, lambda: Linearizer(orig_k.ast, orig_k.opts), device.to_program, get_baseline(), bufs, var_vals)
     if global_db is not None:
       global_db[skey] = choice
       global_db.sync()
 
-  if choice == "BASELINE": k.hand_coded_optimizations()
-  else: k.apply_auto_opt(choice)
+  if choice == "BASELINE": orig_k.hand_coded_optimizations()
+  else: orig_k.apply_auto_opt(choice)
