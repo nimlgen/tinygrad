@@ -1,7 +1,7 @@
 from typing import NamedTuple, Optional, List, Tuple, cast, Dict
 import itertools
 from tinygrad.ops import LazyOp, FlopCounter, get_lazyop_info, ReduceOps, MemBuffer, BufferOps, Device, Compiled
-from tinygrad.helpers import dedup, dtypes, colored, ImageDType, DType, all_int
+from tinygrad.helpers import dedup, dtypes, colored, ImageDType, DType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import sint
 from tinygrad.shape.view import strides_for_shape
