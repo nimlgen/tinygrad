@@ -317,12 +317,12 @@ class Linearizer(OptimizedKernel):
         end_loop(loop_local_idxs)
 
         # Logariphmic group reduce. TODO: Unify for other cases as well?
-        if len(self.group_for_reduce) == 1 and not self.upcast_in_mid_reduce_axes and self.group_for_reduce[0] > 16:
+        if len(self.group_for_reduce) == 1 and not self.upcast_in_mid_reduce_axes and self.group_for_reduce[0] > 2:
           reduce_len = self.group_for_reduce[0]
           target_reduce_len = int(2 ** int(math.ceil(math.log2(reduce_len/2))))
           assert reduce_len >= target_reduce_len and 2 * target_reduce_len >= reduce_len
 
-          while reduce_len > 16:
+          while reduce_len > 2:
             first_half_idxs = local_idxs[:self.local_dims] + [local_idxs[self.local_dims]]
             second_half_idxs = local_idxs[:self.local_dims] + [local_idxs[self.local_dims] + NumNode(target_reduce_len)]
 
@@ -336,7 +336,7 @@ class Linearizer(OptimizedKernel):
 
             end_loop(if_indexes)
 
-            self.uop(UOps.BARRIER, None, (), cachable=False)
+            if reduce_len > 32: self.uop(UOps.BARRIER, None, (), cachable=False)
             self.load_cache.clear()
 
             reduce_len, target_reduce_len = target_reduce_len, target_reduce_len//2
