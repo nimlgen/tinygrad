@@ -88,13 +88,15 @@ class RawHIPBuffer(RawBufferCopyInOut, RawBufferTransfer):
 
 class HIPProgram:
   def __init__(self, name:str, prg:str, binary=False):
+    self.modules, self.prgs = [], []
+    self.timing_start, self.timing_end = hip.hipEventCreate(), hip.hipEventCreate()
+
     prg = prg if binary else self.compile(prg, name)
 
     if DEBUG >= 6:
       asm = early_exec((["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], prg))
       print('\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x]))
 
-    self.modules, self.prgs = [], []
     for i in range(HIP.device_count):
       hip.hipSetDevice(i)
       self.modules.append(hip.hipModuleLoadData(prg))
@@ -112,20 +114,20 @@ class HIPProgram:
 
   def __call__(self, global_size, local_size, *args, wait=False):
     hip.hipSetDevice(args[0]._device)
-    if wait:
-      start, end = hip.hipEventCreate(), hip.hipEventCreate()
-      hip.hipEventRecord(start)
+    if wait: hip.hipEventRecord(self.timing_start)
     class PackageStruct(ctypes.Structure):
       _fields_ = [(f'field{idx}', ctypes.c_void_p if not isinstance(args[idx], int) else ctypes.c_int) for idx in range(len(args))]
     struct = PackageStruct(*[data._buf if not isinstance(data, int) else np.int32(data) for data in args])
     hip.hipModuleLaunchKernel(self.prgs[args[0]._device], global_size[0], global_size[1], global_size[2], local_size[0], local_size[1], local_size[2], 0, 0, struct)
     if wait:
-      hip.hipEventRecord(end)
-      hip.hipEventSynchronize(end)
-      return hip.hipEventElapsedTime(start, end)*1e-3
+      hip.hipEventRecord(self.timing_end)
+      hip.hipEventSynchronize(self.timing_end)
+      return hip.hipEventElapsedTime(self.timing_start, self.timing_end)*1e-3
 
   def __del__(self):
     for module in self.modules: hip.hipModuleUnload(module)
+    hip.hipEventDestroy(self.timing_start)
+    hip.hipEventDestroy(self.timing_end)
 
 renderer = functools.partial(uops_to_cstyle, CStyleLanguage(
   kernel_prefix = "#include <hip/hip_common.h>\n#define INFINITY (__builtin_inff())\n#define NAN (__builtin_nanf(\"\"))" + """
