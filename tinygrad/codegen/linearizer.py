@@ -336,7 +336,7 @@ class Linearizer(OptimizedKernel):
 
             end_loop(if_indexes)
 
-            if reduce_len > 32: self.uop(UOps.BARRIER, None, (), cachable=False)
+            self.uop(UOps.BARRIER, None, (), cachable=False)
             self.load_cache.clear()
 
             reduce_len, target_reduce_len = target_reduce_len, target_reduce_len//2
