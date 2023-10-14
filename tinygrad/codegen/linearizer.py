@@ -106,9 +106,9 @@ class Linearizer(OptimizedKernel):
 
           if valid.min == 0:
             valid_rendered = valid.render(self.render_ops, self)
-            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx, valid_rendered, self.const(invalid_value, localtype)))
+            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx, valid_rendered, self.const(invalid_value, localtype)), cachable=False)
           else:
-            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx))
+            self.load_cache[key] = self.uop(UOps.LOAD, localtype, (buf_uop, rendered_idx), cachable=False)
       ret.append(self.uop(UOps.GEP, dtypes.float32, (self.load_cache[key],), rep_idx[dim]) if dim is not None else self.load_cache[key])
     return ret
 
@@ -316,8 +316,37 @@ class Linearizer(OptimizedKernel):
         self.uop(UOps.BARRIER, None, (), cachable=False)
         end_loop(loop_local_idxs)
 
-        # create new late reduce local loops and replace local_idxs that have been used
-        end_local_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce and i not in self.upcast_in_mid_reduce_axes else 0) for i in range(0, self.first_reduce+len(self.group_for_reduce))]
+        # Logariphmic group reduce. TODO: Unify for other cases as well?
+        if len(self.group_for_reduce) == 1 and not self.upcast_in_mid_reduce_axes and self.group_for_reduce[0] > 16:
+          reduce_len = self.group_for_reduce[0]
+          target_reduce_len = int(2 ** int(math.ceil(math.log2(reduce_len/2))))
+          assert reduce_len >= target_reduce_len and 2 * target_reduce_len >= reduce_len
+
+          while reduce_len > 16:
+            first_half_idxs = local_idxs[:self.local_dims] + [local_idxs[self.local_dims]]
+            second_half_idxs = local_idxs[:self.local_dims] + [local_idxs[self.local_dims] + NumNode(target_reduce_len)]
+
+            if_indexes = [Variable(f"tidx0", local_idxs[self.local_dims]>=(reduce_len-target_reduce_len), 0)]
+            render_loop(if_indexes)
+
+            loaded_buffers["LOCAL_BUFFER"] = self.global_load(-1, fake_global_idxs+second_half_idxs+fake_reduce_idxs+upcast_idxs)
+            loaded_buffers["STORE_LOCAL_BUFFER"] = self.global_load(-1, fake_global_idxs+first_half_idxs+fake_reduce_idxs+upcast_idxs)
+            res = self.ast_parse(LazyOp(BinaryOps.ADD, ("STORE_LOCAL_BUFFER", "LOCAL_BUFFER")), [], loaded_buffers, do_reduce=True) # type: ignore
+            self.global_store(-1, fake_global_idxs+first_half_idxs+fake_reduce_idxs+upcast_idxs, res)
+
+            end_loop(if_indexes)
+
+            self.uop(UOps.BARRIER, None, (), cachable=False)
+            self.load_cache.clear()
+
+            reduce_len, target_reduce_len = target_reduce_len, target_reduce_len//2
+
+          # create new late reduce local loops and replace local_idxs that have been used
+          end_local_idxs = [Variable(f"tidx{i}", 0, reduce_len-1 if i >= self.first_reduce else 0) for i in range(0, self.first_reduce+len(self.group_for_reduce))]
+        else:
+          # create new late reduce local loops and replace local_idxs that have been used
+          end_local_idxs = [Variable(f"tidx{i}", 0, self.full_shape[i]-1 if i >= self.first_reduce and i not in self.upcast_in_mid_reduce_axes else 0) for i in range(0, self.first_reduce+len(self.group_for_reduce))]
+
         local_idxs = local_idxs[:self.local_dims] + end_local_idxs[self.global_dims + self.local_dims:]
 
         # if any group_for_reduce items aren't reduces, upcast them here
