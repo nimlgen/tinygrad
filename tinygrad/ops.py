@@ -177,17 +177,26 @@ class GraphBatchExecutor(BasicBatchExecutor):
   def split_into_graphs(self, jit_cache:List[Tuple[Any, Any, Any]]):
     # Splitting the JIT cache into batches to enable parallel execution (cpu+gpu). Batch sizes follow a logarithmic pattern: 4, 4, 8, 16, 32, and so on.
     # This helps push tasks to the GPU while the CPU updates the next graph.
-    for i in range(2, max(math.ceil(math.log2(len(jit_cache))), 2) + 1):
-      self.create_graph(jit_cache[(1<<(i-1) if i > 2 else 0):(1<<i)])
+    batched_jit_cache = collections.defaultdict(list)
+    for i,jc in enumerate(jit_cache): batched_jit_cache[self.batch(i)].append(jc)
+    for k,v in batched_jit_cache.items(): self.create_graph(v)
 
+  # 4, 4, 8, 16, 32, 64, 64, 64
   def exec(self, jit_cache: List[Tuple[Any, Any, Any]], updatable_entries):
     if not self.graphs: return super().exec(jit_cache, updatable_entries) # No graph is created, switch to basic executor.
     update_keys_per_batch = collections.defaultdict(list)
-    for j in updatable_entries.keys(): update_keys_per_batch[max(0, math.ceil(math.log2(j+1))-2)].append(j)
+    for j in updatable_entries.keys(): update_keys_per_batch[self.batch(j)].append(j)
     for instid in range(len(self.graphs)):
+      # print(instid, len(update_keys_per_batch[instid]))
       for jcid in update_keys_per_batch[instid]: self.update_node(instid, jcid, jit_cache[jcid][0], jit_cache[jcid][1], jit_cache[jcid][2], updated_args=updatable_entries[jcid])
       self.exec_instance(instid)
     super().recalc_stat(jit_cache)
+
+  def batch(self, j): # return max(0, math.ceil(math.log2(j+1))-2)
+    return 0
+    # if j < 64: return max(0, math.ceil(math.log2(j+1))-2)
+    # else: return (j // 64) + 4
+    # return max(0, math.ceil(math.log2(j+1))-2)
 
   def create_graph(self, jit_cache: List[Tuple[Any, Any, Any]]): raise NotImplementedError("must be implemented")
   def update_node(self, instid, jcid, prg, pargs, variables, updated_args=None): raise NotImplementedError("must be implemented")
@@ -290,7 +299,7 @@ class Compiled:
       assert k.info.dtype == output.dtype, f"linearizer must match dtype. linearizer wants {k.info.dtype} but buffer is {output.dtype}"
       if not getenv("NOOPT"):
         if not (used_tensor_cores:=k.apply_tensor_cores(getenv("TC", 1))): k.hand_coded_optimizations()
-        if BEAM >= 1 and not vars_from_ast(ast):
+        if BEAM >= 1:
           lins = [(("tc" if used_tensor_cores else "hc"), k)]
           # allocate a scratch buffer if output buffer is also input
           test_rawbuffers = [type(rawbuffers[0])(rawbuffers[0].size, rawbuffers[0].dtype), *rawbuffers[1:]] if rawbuffers[0] in rawbuffers[1:] else rawbuffers

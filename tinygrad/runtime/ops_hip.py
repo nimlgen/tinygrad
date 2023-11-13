@@ -50,10 +50,19 @@ class HIPGraph(GraphBatchExecutor):
     graph, graph_node = hip.hipGraphCreate(), None
 
     # Capture nodes.
+    deps_mapper = {}
     for prg, pargs, variables in jit_cache:
       global_size, local_size = prg.launch_dims(variables)
       params = hip.buildKernelNodeParams(*pargs, *variables.values(), func=prg.clprg.prgs[pargs[0]._device], grid=global_size, block=local_size)
-      graph_node = hip.hipGraphAddKernelNode(graph, [graph_node] if graph_node else [], params)
+      
+      # Building deps
+      dependencies = []
+      for i in pargs[1:]:
+        if i in deps_mapper:
+          dependencies.append(deps_mapper[i])
+      
+      graph_node = hip.hipGraphAddKernelNode(graph, dependencies, params)
+      deps_mapper[pargs[0]] = graph_node
       self.jc_info.append((graph_node, params))
 
     self.graphs.append((hip.hipGraphInstantiate(graph), graph))
@@ -64,13 +73,19 @@ class HIPGraph(GraphBatchExecutor):
     hip.updateKernelNodeParams(params, *pargs, *variables.values(), grid=global_size, block=local_size, updated_args=updated_args)
     hip.hipGraphExecKernelNodeSetParams(self.graphs[instid][0], graph_node, params)
 
-  def exec_instance(self, instid): hip.hipGraphLaunch(self.graphs[instid][0])
+  def exec_instance(self, instid):
+    start, end = hip.hipEventCreate(), hip.hipEventCreate()
+    hip.hipEventRecord(start)
+    hip.hipGraphLaunch(self.graphs[instid][0])
+    hip.hipEventRecord(end)
+    hip.hipEventSynchronize(end)
+    print("GPU-only time is", hip.hipEventElapsedTime(start, end)*1e-3)
 
 class RawHIPBuffer(RawBufferCopyInOut, RawBufferTransfer):
   def __init__(self, size, dtype, device=HIP.default_device, buf=None, allocator=HIP.allocator): super().__init__(size, dtype, buf=buf, allocator=allocator, **{'device': int(device)})
   def _copyin(self, x:np.ndarray):
     hip.hipSetDevice(self._device)
-    hip.hipMemcpyAsync(self._buf, np.require(x, requirements='C').ctypes.data, self.size * self.dtype.itemsize, hip.hipMemcpyHostToDevice, 0)
+    hip.hipMemcpyAsync(self._buf, np.require(x, requirements='C').ctypes.data_as(ctypes.c_void_p), self.size * self.dtype.itemsize, hip.hipMemcpyHostToDevice, 0)
   def _copyout(self, x:np.ndarray):
     hip.hipSetDevice(self._device)
     hip.hipMemcpy(x.ctypes.data, self._buf, self.size * self.dtype.itemsize, hip.hipMemcpyDeviceToHost)

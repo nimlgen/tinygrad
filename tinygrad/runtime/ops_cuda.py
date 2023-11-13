@@ -70,10 +70,20 @@ class CUDAGraph(GraphBatchExecutor):
     try:
       graph, graph_node = cuda.Graph(), None # type: ignore
 
+      deps_mapper = {}
       for prg, pargs, variables in jit_cache:
         global_size, local_size = prg.launch_dims(variables)
         cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*pargs, *variables.values()]]
-        graph_node = graph.add_kernel_node(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=prg.clprg.prg, dependencies=[graph_node] if graph_node else [])
+
+        # Building deps
+        dependencies = [graph_node] if graph_node is not None else []
+        # [graph_node] if graph_node is not None else []
+        # for i in pargs[1:]:
+        #   if i in deps_mapper:
+        #     dependencies.append(deps_mapper[i])
+
+        graph_node = graph.add_kernel_node(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=prg.clprg.prg, dependencies=dependencies)
+        deps_mapper[pargs[0]] = graph_node
         self.jc_info.append(graph_node)
 
       self.graphs.append((graph.instantiate(), graph))
@@ -86,7 +96,13 @@ class CUDAGraph(GraphBatchExecutor):
     cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*pargs, *variables.values()]]
     self.graphs[instid][0].kernel_node_set_params(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=prg.clprg.prg, kernel_node=self.jc_info[jcid])
 
-  def exec_instance(self, instid): self.graphs[instid][0].launch()
+  def exec_instance(self, instid):
+    start, end = cuda.Event(), cuda.Event()
+    start.record()
+    self.graphs[instid][0].launch()
+    end.record()
+    end.synchronize()
+    print("GPU-only exec time is ", start.time_till(end)*1e-3)
 
 @diskcache
 def compile_cuda(prg) -> bytes: return cuda_compile(prg, target="ptx", no_extern_c=True, options=['-Wno-deprecated-gpu-targets'])

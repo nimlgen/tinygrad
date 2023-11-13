@@ -8,12 +8,12 @@ from collections import defaultdict
 from tinygrad.tensor import Tensor
 
 from tinygrad.codegen.kernel import Opt, OptOps
-actions = flatten([[Opt(op=OptOps.UPCAST, axis=axis, amt=amt) for amt in [0,2,3,4,7]] for axis in range(6)])
-actions += flatten([[Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,4]] for axis in range(4)])
-actions += flatten([[Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,13,16,29]] for axis in range(5)])
-actions += flatten([[Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [13,16,29,32,256]] for axis in range(3)])
+actions = flatten([[Opt(op=OptOps.UPCAST, axis=axis, amt=amt) for amt in [0,2,3,4,7,8]] for axis in range(6)])
+actions += flatten([[Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,2,3,4,8]] for axis in range(4)])
+actions += flatten([[Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,9,13,16,29,32,48,64,128]] for axis in range(5)])
+actions += flatten([[Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [13,16,29,32,48,64,128,256]] for axis in range(3)])
 actions += [
-  Opt(op=OptOps.LOCAL, axis=0, amt=32),
+  # Opt(op=OptOps.LOCAL, axis=0, amt=32),
   Opt(op=OptOps.GROUP, axis=0, amt=4), Opt(op=OptOps.GROUP, axis=0, amt=8), Opt(op=OptOps.GROUP, axis=1, amt=8),
   Opt(op=OptOps.UPCASTMID, axis=1, amt=4),
   Opt(op=OptOps.NOLOCALS),
@@ -23,7 +23,7 @@ actions += [
 def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=True, max_global_size=65536, cnt=3, disable_cache=False, clear_l2=False) -> float:
   key = {"ast": str(lin.ast), "opts": str(lin.applied_opts), "allow_test_size": allow_test_size, "max_global_size": max_global_size}
   if not disable_cache and CACHELEVEL >= 2 and (val:=diskcache_get("time_linearizer", key)) is not None: return min(val)
-  var_vals = {k:k.min for k in vars_from_ast(lin.ast)}
+  var_vals = {k:k.min+(k.max-k.min)//2 for k in vars_from_ast(lin.ast)}
   try:
     lin.linearize()
     prg = cast(Compiled, Device[Device.DEFAULT]).to_program(lin)
@@ -54,10 +54,10 @@ def time_linearizer(lin:Linearizer, rawbufs:List[RawBuffer], allow_test_size=Tru
       tms.append(prg.clprg(global_size, local_size, *rawbufs, *var_vals.values(), wait=True)*factor)
     prg.global_size = real_global_size
   except Exception:
-    #import traceback; traceback.print_exc()
-    #print("FAILED")
-    #print(lin.ast)
-    #print(lin.applied_opts)
+    # import traceback; traceback.print_exc()
+    # print("FAILED")
+    # print(lin.ast)
+    # print(lin.applied_opts)
     tms = [float('inf')]
   if CACHELEVEL >= 2: diskcache_put("time_linearizer", key, tms)
   return min(tms)

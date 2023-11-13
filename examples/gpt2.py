@@ -17,6 +17,11 @@ from tinygrad.shape.symbolic import Variable
 
 MAX_CONTEXT = 128
 
+if getenv("FP16", 0):
+  Tensor.default_type = dtypes.float16
+else:
+  Tensor.default_type = dtypes.float32
+
 class LayerNorm:
   def __init__(self, dim, eps=1e-5):
     self.eps = eps
@@ -87,7 +92,7 @@ class Transformer:
     self.lm_head = linear(dim, vocab_size, bias=False)
 
   def embed(self, tokens:Tensor, pos:Tensor):
-    tok_emb = self.wte(tokens)
+    tok_emb = self.wte(tokens, upto=50304)
     pos_emb = self.wpe(pos)
     h = tok_emb + pos_emb
     if getenv("FP16"): h = h.half()
@@ -185,7 +190,9 @@ class GPT2:
                     (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=timing):
           probs = self.model(Tensor([toks[start_pos:]]), start_pos, temperature)
         probs_np = probs.numpy()
+        # print(sum(probs_np))
         tok = int(np.random.choice(len(probs_np), p=probs_np))
+        # tok = 0
       start_pos = len(toks)
       toks.append(tok)
       output = self.tokenizer.decode(toks)

@@ -48,6 +48,8 @@ class CStyleLanguage(NamedTuple):
     assert self.float4 is not None, "cast is not supported on this platform"
     if var_dtype == dtypes._float4: return f"{self.float4}({','.join(x)})"
     if var_dtype == dtypes._float2: return f"{self.float4.replace('float4', 'float2')}({','.join(x)})"
+    if var_dtype == dtypes._half4: return f"{self.float4.replace('float4', 'half4')}({','.join(x)})"
+    if var_dtype == dtypes._half2: return f"{self.float4.replace('float4', 'half2')}({','.join(x)})"
     if var_dtype == dtypes._int2: return f"{self.float4.replace('float4', 'int2')}({','.join(x)})"
     raise NotImplementedError(f"no cast for {var_dtype}")
 
@@ -84,11 +86,14 @@ class CStyleLanguage(NamedTuple):
   def render_conditional(self, cond: str, x:str, y:str) -> str:
     return f"({cond})?({x}):{y}"
 
-  def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,DType]], local_size:List[int], prekernel:List[str]) -> str:
+  def render_kernel(self, function_name:str, kernel:List[str], bufs:List[Tuple[str,DType]], global_size, local_size:List[int], prekernel:List[str]) -> str:
     tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n" if any(isinstance(dtype, ImageDType) for _,dtype in bufs) else ""
     buftypes = [(name,f"{'read_only' if i > 0 else 'write_only'} image2d_t" if dtype.name.startswith('image') else
                 self.arg_int_prefix if dtype == dtypes._arg_int32 else
                 ("const " if i > 0 else "")+self.buffer_prefix+dtype.name+"*"+self.buffer_suffix) for i,(name,dtype) in enumerate(bufs)]
+    # threads_per_block = 1024 * 82
+    # global_size = [(x.max if x.__class__ is not int else x) for x in global_size]
+    # print(global_size, prod(global_size))
     prg = ''.join([f"{self.kernel_prefix}void {f'__launch_bounds__ ({prod(local_size)}, 1) ' if self.launch_bounds else ''}{function_name}(",] +
     [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
     [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
@@ -108,6 +113,7 @@ class CStyleLanguage(NamedTuple):
 
 def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> Tuple[str, Dict]:
   local_size: List[int] = []
+  global_size: List[int] = []
   kernel,prekernel,bufs = [],[],[]
   #pend_close = None
   depth = 1
@@ -176,6 +182,7 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> Tu
     elif uop == UOps.SPECIAL:
       xid = lang.gid if args[1].startswith("g") else (lang.xid if args[1].startswith("i") else lang.lid)
       kk(f"{lang.size_prefix} {args[1]} = {xid[args[0]]}; /* {args[2]} */")
+      if args[1].startswith("g"): global_size.append(args[2])
       if args[1].startswith("l"): local_size.append(args[2])
       r[u] = args[1]
     elif uop == UOps.CONST:
@@ -209,4 +216,4 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> Tu
     else:
       raise RuntimeError(f"failed to render {uop}")
 
-  return lang.render_kernel(function_name, kernel, bufs, local_size, prekernel), {}
+  return lang.render_kernel(function_name, kernel, bufs, global_size, local_size, prekernel), {}

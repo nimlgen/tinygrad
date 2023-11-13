@@ -332,8 +332,17 @@ def sym_rename(s) -> str: return f"s{sym_rename.cache_info().currsize}"
 def sym_render(a: Union[Node, int], ops=None, ctx=None) -> str: return str(a) if isinstance(a, int) else a.render(ops, ctx)
 def sym_infer(a: Union[Node, int], var_vals: Dict[Variable, int]) -> int:
   if isinstance(a, (int, float)): return a
+  
+  # Check the cache
+  var_vals_key = tuple(var_vals.items())
+  if not hasattr(sym_infer, "_cache"): sym_infer._cache = {}
+  if (a, var_vals_key) in sym_infer._cache: return sym_infer._cache[(a, var_vals_key)]
+
   ret = a.substitute({k:Variable.num(v) for k, v in var_vals.items()})
   assert isinstance(ret, NumNode), f"sym_infer didn't produce NumNode from {a} with {var_vals}"
+  
+  # Cache the result
+  sym_infer._cache[(a, var_vals_key)] = ret.b
   return ret.b
 
 # symbolic int
