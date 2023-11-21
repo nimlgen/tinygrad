@@ -1,13 +1,14 @@
 import subprocess, time, re, hashlib, tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any, Union
 import numpy as np
 from pycuda.compiler import compile as cuda_compile
 from tinygrad.helpers import DEBUG, getenv, colored, diskcache
-from tinygrad.ops import Compiled
-from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, LRUAllocator
+from tinygrad.ops import Compiled, BatchExecutor, JitItem, CompiledASTRunner, update_stats
+from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, LRUAllocator, RawBuffer
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.renderer.cuda import CUDARenderer
+from tinygrad.shape.symbolic import Variable, Node
 
 def pretty_ptx(s):
   # all expressions match `<valid_before><expr><valid_after>` and replace it with `<valid_before>color(<expr>)<valid_after>`
@@ -86,10 +87,46 @@ class CUDAProgram:
       end.synchronize()
       return start.time_till(end)*1e-3
 
+class CUDABatchExecutor(BatchExecutor):
+  def __init__(self, jit_cache: List[JitItem], input_rawbuffers: Dict[Union[int, str], RawBuffer], var_vals: Dict[Variable, int]):
+    super().__init__(jit_cache, input_rawbuffers, var_vals)
+    self.graph, self.graph_node = cuda.Graph(), None # type: ignore
+    self.jc_info: List[Any] = []
+
+    output_to_graph_node = {}
+    for ji in jit_cache:
+      global_size, local_size = prg.launch_dims(var_vals)
+      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *var_vals.values()]]
+      graph_node = graph.add_kernel_node(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=ji.prg.clprg.prg, dependencies=[output_to_graph_node[gn] for gn in ji.rawbufs[1:] if gn in output_to_graph_node])
+      output_to_graph_node[ji.rawbufs[0]] = graph_node
+      self.jc_info.append(graph_node)
+    self.instance = self.graph.instantiate()
+
+  def __call__(self, input_rawbuffers: Dict[Union[int, str], RawBuffer], var_vals: Dict[Variable, int], wait=False):
+    for (j,i),input_name in self.input_replace.items(): self.jit_cache[j].rawbufs[i] = input_rawbuffers[input_name]
+    for j,ji in enumerate(self.jit_cache):
+      global_size, local_size = prg.launch_dims(var_vals)
+      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *var_vals.values()]]
+      self.instance.kernel_node_set_params(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=ji.prg.clprg.prg, kernel_node=self.jc_info[j])
+
+    if wait:
+      start, end = cuda.Event(), cuda.Event()
+      start.record()
+    self.instance.launch()
+
+    if wait:
+      end.record()
+      end.synchronize()
+      et = start.time_till(end)*1e-3
+    else: et = None
+
+    update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers), jit=True, num_kernels=len(self.jit_cache))
+    return et
+
 if getenv("TRITON") == 1:
   from tinygrad.renderer.triton import uops_to_triton
   CUDABuffer = Compiled(RawCUDABuffer, LinearizerOptions(supports_float4=False, supports_float4_alu=False, global_max = [65535, 65535, 2147483647], local_max = [64, 1024, 1024], has_shared=False),
                         uops_to_triton, lambda x: x.encode('utf-8'), CUDAProgram, cuda.Context.synchronize)
 else:
   CUDABuffer = Compiled(RawCUDABuffer, LinearizerOptions(supports_float4=False if getenv("PTX") else True, supports_float4_alu=False, global_max = [65535, 65535, 2147483647], local_max = [64, 1024, 1024]),
-                        CUDARenderer, compile_cuda, CUDAProgram, cuda.Context.synchronize)
+                        CUDARenderer, compile_cuda, CUDAProgram, cuda.Context.synchronize, CUDABatchExecutor)
