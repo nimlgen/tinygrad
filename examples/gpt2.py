@@ -11,9 +11,14 @@ from tinygrad.jit import TinyJit
 import tiktoken
 from tinygrad.nn.state import torch_load, load_state_dict
 from extra.utils import fetch_as_file
-from tinygrad.helpers import GlobalCounters, Timing, DEBUG, getenv
+from tinygrad.helpers import GlobalCounters, Timing, DEBUG, getenv, dtypes
 
 MAX_CONTEXT = 128
+
+if getenv("FP16", 0):
+  Tensor.default_type = dtypes.float16
+else:
+  Tensor.default_type = dtypes.float32
 
 class Attention:
   def __init__(self, dim, n_heads):

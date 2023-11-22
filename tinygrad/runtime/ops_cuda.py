@@ -94,10 +94,13 @@ class CUDABatchExecutor(BatchExecutor):
     self.jc_info: List[Any] = []
 
     output_to_graph_node = {}
+    for (j,i),input_name in self.input_replace.items(): jit_cache[j].rawbufs[i] = input_rawbuffers[input_name]
     for ji in jit_cache:
-      global_size, local_size = prg.launch_dims(var_vals)
-      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *var_vals.values()]]
-      graph_node = graph.add_kernel_node(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=ji.prg.clprg.prg, dependencies=[output_to_graph_node[gn] for gn in ji.rawbufs[1:] if gn in output_to_graph_node])
+      global_size, local_size = ji.prg.launch_dims(var_vals)
+      vs = [var_vals[x] for x in ji.prg.vars]
+      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *vs]]
+      # print([output_to_graph_node[gn] for gn in ji.rawbufs[1:] if gn in output_to_graph_node])
+      graph_node = self.graph.add_kernel_node(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=ji.prg.clprg.prg, dependencies=[output_to_graph_node[gn] for gn in ji.rawbufs[1:] if gn in output_to_graph_node])
       output_to_graph_node[ji.rawbufs[0]] = graph_node
       self.jc_info.append(graph_node)
     self.instance = self.graph.instantiate()
@@ -105,8 +108,9 @@ class CUDABatchExecutor(BatchExecutor):
   def __call__(self, input_rawbuffers: Dict[Union[int, str], RawBuffer], var_vals: Dict[Variable, int], wait=False):
     for (j,i),input_name in self.input_replace.items(): self.jit_cache[j].rawbufs[i] = input_rawbuffers[input_name]
     for j,ji in enumerate(self.jit_cache):
-      global_size, local_size = prg.launch_dims(var_vals)
-      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *var_vals.values()]]
+      global_size, local_size = ji.prg.launch_dims(var_vals)
+      vs = [var_vals[x] for x in ji.prg.vars]
+      cuda_args = [x._buf if isinstance(x, RawCUDABuffer) else np.int32(x) for x in [*ji.rawbufs, *vs]]
       self.instance.kernel_node_set_params(*cuda_args, block=tuple(local_size), grid=tuple(global_size), func=ji.prg.clprg.prg, kernel_node=self.jc_info[j])
 
     if wait:
