@@ -60,14 +60,14 @@ class CUDAGraph:
 
     et = self.graph_launch(self.instance, None, wait=wait)
     update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers),
-                 jit=jit, num_kernels=len(self.jit_cache), device=f"<GPU>:{self.device}")
+                 jit=jit, num_kernels=len(self.jit_cache), device=f"<GPU>:{self.device.device_id}") # TODO: HIP is broken now...
     return et
 
   def __del__(self):
     check(cuda.cuGraphDestroy(self.graph))
     check(cuda.cuGraphExecDestroy(self.instance))
 
-  def set_device(self): pass
+  def set_device(self): check(cuda.cuCtxSetCurrent(self.device.context))
   def encode_args_info(self): return (cuda.CUdeviceptr_v2, (1,2,0))
   def graph_create(self): return init_c_var(cuda.CUgraph(), lambda x: check(cuda.cuGraphCreate(ctypes.byref(x), 0)))
   def graph_instantiate(self, graph):
