@@ -71,6 +71,9 @@ class CUDAAllocator(LRUAllocator):
   def copyout(self, dest:memoryview, src):
     check(cuda.cuCtxSetCurrent(self.device.context))
     check(cuda.cuMemcpyDtoH_v2(from_mv(dest), src, len(dest)))
+  def transfer(self, dest:T, src:T, sz:int):
+    check(cuda.cuCtxSetCurrent(self.device.context))
+    check(cuda.cuMemcpyDtoD_v2(dest, src, sz)) # TODO: cuMemcpyDtoDAsync_v2
 
 class CUDADevice(Compiled):
   def __init__(self, device:str):
