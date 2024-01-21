@@ -12,11 +12,9 @@ from tinygrad.shape.symbolic import sym_infer
 from tinygrad.codegen.kernel import Opt, OptOps
 actions = [Opt(op=OptOps.UPCAST, axis=axis, amt=amt) for amt in [0,2,3,4,7] for axis in range(6)]
 actions += [Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,4] for axis in range(4)]
-actions += [Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,13,16,29] for axis in range(5)]
-actions += [Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [13,16,29,32,256] for axis in range(3)]
-actions += [Opt(op=OptOps.PADTO, axis=axis, amt=amt) for amt in [32] for axis in range(7)]
-actions += [Opt(op=OptOps.LOCAL, axis=0, amt=32), Opt(op=OptOps.UPCASTMID, axis=1, amt=4),
-            Opt(op=OptOps.GROUP, axis=0, amt=4), Opt(op=OptOps.GROUP, axis=0, amt=8), Opt(op=OptOps.GROUP, axis=1, amt=8),]
+actions += [Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,13,16,29,32,64,128] for axis in range(5)]
+actions += [Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [4,8,12,16,29,32,64,128,256] for axis in range(3)]
+actions += [Opt(op=OptOps.UPCASTMID, axis=1, amt=4)]
 if getenv("NOLOCALS"): actions += [Opt(op=OptOps.NOLOCALS)]
 
 def _get_test_global_size(global_size, max_global_size, var_vals):
@@ -74,10 +72,13 @@ def bufs_from_lin(lin:Linearizer) -> List[Buffer]:
 def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Linearizer]:
   acted_lins = {0:lin} if include_0 else {}
   for i,a in enumerate(actions):
+    pad_opt = None
     if a.axis is not None and a.axis >= lin.shape_len: continue
     if a.axis is not None and lin.full_shape[a.axis] == a.amt and Opt(a.op, a.axis, 0) in actions: continue
+    if a.axis is not None and a.amt !=0 and lin.full_shape[a.axis] % a.amt != 0 and a.amt >= 32: pad_opt = Opt(op=OptOps.PADTO, axis=a.axis, amt=a.amt)
     lin2 = lin.copy()
     try:
+      if pad_opt is not None: lin2.apply_opt(pad_opt) # Apply pad additionally...
       lin2.apply_opt(a)
       up, lcl = 1, 1
       for s,c in zip(lin2.full_shape, lin2.colors()):
