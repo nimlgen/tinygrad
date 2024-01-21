@@ -447,9 +447,12 @@ class Kernel:
       self.dont_use_locals = True
     elif opt.op == OptOps.PADTO:
       assert not self.ast.vars(), "does not work with symbolic shape"
-      assert axis < self.first_reduce, "cannot pad a reduce axis"
       padded = False
       for i,st in enumerate(self.sts):
+        if axis >= self.first_reduce and i == 0:
+          assert self.sts[i].shape[axis] == 1, "this should be reduce"
+          continue # skip the result of reduce, since we do not pad it.
+
         assert self.sts[i].shape[axis] > amt//2, "pad adds more than double the work"
         if (ru := round_up(self.sts[i].shape[axis], amt) - self.sts[i].shape[axis]):
           # pad right seems to be faster
