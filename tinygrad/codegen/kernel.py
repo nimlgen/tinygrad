@@ -21,7 +21,8 @@ class Opt:
   op: OptOps
   axis: Optional[int] = None
   amt: Optional[int] = None
-  def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, amt={self.amt})"
+  pad: bool = False
+  def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, amt={self.amt}, pad={self.pad})"
 
 @dataclass(frozen=True)
 class TensorCore:
@@ -397,7 +398,6 @@ class Kernel:
 
   def apply_opt(self, opt:Opt):
     assert not self.dont_use_locals or opt.op not in {OptOps.LOCAL, OptOps.LASTLOCAL, OptOps.GROUP, OptOps.GROUPTOP, OptOps.UPCASTMID}, "not using locals"  # noqa: E501
-    self.applied_opts.append(opt)
     if opt.axis is not None:
       axis = opt.axis + (self.first_reduce if opt.op == OptOps.UNROLL else (self.first_reduce+len(self.group_for_reduce) if opt.op in [OptOps.GROUP, OptOps.GROUPTOP] else 0))  # noqa: E501
     else:
@@ -405,6 +405,7 @@ class Kernel:
     if opt.amt is not None:
       amt = opt.amt if opt.amt != 0 else self.full_shape[axis]
       assert isinstance(amt, int) and amt != 1, "shift/padto of amt 1 or Node is meaningless"
+      if opt.pad and self.full_shape[axis] % amt != 0: self.apply_opt(Opt(op=OptOps.PADTO, axis=axis, amt=amt))
       if opt.op != OptOps.PADTO: assert self.full_shape[axis] % amt == 0, "no longer valid shift"
     else:
       amt = -1
@@ -447,15 +448,20 @@ class Kernel:
       self.dont_use_locals = True
     elif opt.op == OptOps.PADTO:
       assert not self.ast.vars(), "does not work with symbolic shape"
-      assert axis < self.first_reduce, "cannot pad a reduce axis"
       padded = False
       for i,st in enumerate(self.sts):
+        if axis >= self.first_reduce and i == 0:
+          assert self.sts[i].shape[axis] == 1, "this should be reduce"
+          continue # skip the result of reduce, since we do not pad it.
+
         assert self.sts[i].shape[axis] > amt//2, "pad adds more than double the work"
         if (ru := round_up(self.sts[i].shape[axis], amt) - self.sts[i].shape[axis]):
           # pad right seems to be faster
           self.sts[i] = st.pad(((0,0),) * axis + ((0,ru),) + ((0,0),) * (len(st.shape)-axis-1))
           padded = True
       assert padded, "nothing was padded"
+
+    self.applied_opts.append(opt)
     return self.simplify_ones()
 
   def required_optimizations(self):
