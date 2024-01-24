@@ -107,11 +107,6 @@ class Kernel():
       assert kern_info is not None
       return kern_info
 
-def launch_kernel(kernel, extra):
-  # Set args from extra
-
-  extra
-
 class GPUBuffer():
   def __init__(self, sz, agent):
     pass

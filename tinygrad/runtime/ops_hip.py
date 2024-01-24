@@ -11,6 +11,9 @@ from tinygrad.runtime.compiler.hip_comgr import compile_hip
 
 # The default HIP stream is used for everything.
 MOCKHIP = getenv("MOCKHIP") # for CI. don't run kernels, only check if they compile
+HSA = getenv("HSA")
+
+if HSA: import extra.hsa.hsa as hsa
 
 class HIPCompiler(Compiler):
   linearizer_opts = LinearizerOptions("HIP")
@@ -39,6 +42,8 @@ class HIPProgram:
       print('\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x]))
 
     if MOCKHIP: return
+    if HSA:
+      self.prg = hsa.Kernel(self.device.device, lib, name)
     hip_set_device(self.device)
     self.module = init_c_var(hip.hipModule_t(), lambda x: check(hip.hipModuleLoadData(ctypes.byref(x), lib)))
     self.prg = init_c_var(hip.hipFunction_t(), lambda x: check(hip.hipModuleGetFunction(ctypes.byref(x), self.module, name.encode("utf-8"))))
@@ -48,6 +53,10 @@ class HIPProgram:
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
     if MOCKHIP: return float("inf")
+    if HSA:
+      hsa.launch_kernel(self.device, self.prg, global_size, local_size, encode_args_cuda_style(args, vals, hip.hipDeviceptr_t, marks=(1,2,3))[0])
+      return float("inf")
+
     hip_set_device(self.device)
     if not hasattr(self, "vargs"):
       self.c_args = init_c_struct_t(tuple([(f'f{i}', hip.hipDeviceptr_t) for i in range(len(args))] +
@@ -139,9 +148,11 @@ class HIPDevice(Compiled):
     self.track_cross_buffer: List[Any] = []
     self.peers: Set[int] = set()
 
+    if HSA: self.hsa_queue = hsa.Queue(self.device)
+
     from tinygrad.runtime.graph.hip import HIPGraph
     super().__init__(device, MallocAllocator if MOCKHIP else HIPAllocator(self), HIPCompiler(self.arch),
-                     functools.partial(HIPProgram, self.device), HIPGraph)
+                     functools.partial(HIPProgram, self.device), HIPGraph if not HSA else None)
   def synchronize(self):
     hip_set_device(self.device)
     check(hip.hipDeviceSynchronize())
