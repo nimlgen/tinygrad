@@ -82,8 +82,8 @@ class Kernel():
   def handle(self): return self.kernel_handle
 
   def get_binary_info(self, binary):
-    with open("/home/nimlgen/amd.elf", 'wb') as file:
-      file.write(binary)
+    # with open("/home/nimlgen/amd.elf", 'wb') as file:
+    #   file.write(binary)
 
     from io import BytesIO
     from elftools.elf.elffile import ELFFile
@@ -151,9 +151,11 @@ if __name__ == "__main__":
   print("dev:", ctypes.string_at(buf).decode()) # gfx1100 is here!
 
   check(hsa.hsa_agent_get_info(agent, hsa.HSA_AGENT_INFO_QUEUE_MAX_SIZE, ctypes.byref(queue_size := ctypes.c_uint32())))
+  check(hsa.hsa_agent_get_info(agent, hsa.HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES, ctypes.byref(coop_queues := ctypes.c_uint32())))
   print("max queue size:", queue_size.value)
+  print("support coop queues:", coop_queues.value) # gfx1100 supports coops queue
 
-  UINT32_MAX = (2 << 32) - 1
+  UINT32_MAX = (1 << 32) - 1
   hsa_queue_ptr_t = ctypes.POINTER(hsa.hsa_queue_t)
   null_func = ctypes.CFUNCTYPE(None, hsa.hsa_status_t, ctypes.POINTER(hsa.struct_hsa_queue_s), ctypes.POINTER(None))()
   check(hsa.hsa_queue_create(agent, queue_size, hsa.HSA_QUEUE_TYPE_SINGLE, null_func, None, UINT32_MAX, UINT32_MAX, ctypes.byref(queue := hsa_queue_ptr_t())))
@@ -233,7 +235,7 @@ if __name__ == "__main__":
 
   print("***** waiting kernel")
 
-  sigval = hsa.hsa_signal_wait_acquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (2 << 64) - 1, hsa.HSA_WAIT_STATE_BLOCKED)
+  sigval = hsa.hsa_signal_wait_acquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_BLOCKED)
 
   
   ans = memoryview(bytearray(2 * 32 * 4 * 4))

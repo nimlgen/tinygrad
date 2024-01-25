@@ -71,7 +71,11 @@ class Queue:
 
     null_func = ctypes.CFUNCTYPE(None, hsa.hsa_status_t, ctypes.POINTER(hsa.struct_hsa_queue_s), ctypes.POINTER(None))()
     self.hw_queue = init_c_var(ctypes.POINTER(hsa.hsa_queue_t)(), lambda x: check(hsa.hsa_queue_create(self.agent, queue_size, hsa.HSA_QUEUE_TYPE_SINGLE, null_func, None, (1<<32)-1, (1<<32)-1, ctypes.byref(x))))
+    self.hw_base_address = ctypes.cast(self.hw_queue.contents.base_address, ctypes.POINTER(hsa.hsa_kernel_dispatch_packet_t))
     self.last_signal = None
+
+    hsa.hsa_amd_queue_set_priority(self.hw_queue, hsa.HSA_AMD_QUEUE_PRIORITY_HIGH) # calls hsa.hsaKmtUpdateQueue()
+
 
   def submit(self, cmds):
     index = None
@@ -79,15 +83,14 @@ class Queue:
       check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t()))) # TODO: Better sync
 
       index = hsa.hsa_queue_add_write_index_screlease(self.hw_queue, 1)
-      base_address = ctypes.cast(self.hw_queue.contents.base_address, ctypes.POINTER(hsa.hsa_kernel_dispatch_packet_t))
-      dispatch_packet_ptr = ctypes.pointer(base_address[index & (self.hw_queue.contents.size - 1)])
+      dispatch_packet_ptr = ctypes.pointer(self.hw_base_address[index & (self.hw_queue.contents.size - 1)])
 
       # Fill the packet for the given command.
       dispatch_packet_ptr.contents.completion_signal = signal
       cmd.fill_aql_packet(dispatch_packet_ptr)
 
       self.last_signal = signal
-      
+
     hsa.hsa_signal_store_relaxed(self.hw_queue.contents.doorbell_signal, index)
     # st = time.perf_counter()
     self.wait() # FIXME
@@ -96,7 +99,7 @@ class Queue:
   # TODO: Better sync
   def wait(self):
     if self.last_signal is None: return
-    hsa.hsa_signal_wait_scacquire(self.last_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (2 << 64) - 1, hsa.HSA_WAIT_STATE_BLOCKED)
+    hsa.hsa_signal_wait_scacquire(self.last_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_BLOCKED)
     self.last_signal = None
 
 
@@ -111,8 +114,6 @@ class ExecCommand(Command):
   def fill_aql_packet(self, packet_ptr):
     grid_size = tuple(int(g*l) for g,l in zip(self.global_size, self.local_size))
 
-    packet_ptr.contents.setup |= 1 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS
-
     packet_ptr.contents.workgroup_size_x = self.local_size[0]
     packet_ptr.contents.workgroup_size_y = self.local_size[1]
     packet_ptr.contents.workgroup_size_z = self.local_size[2]
@@ -122,13 +123,15 @@ class ExecCommand(Command):
     packet_ptr.contents.kernel_object = self.prg.handle
     packet_ptr.contents.kernarg_address = self.kernargs
     packet_ptr.contents.group_segment_size = self.prg.group_segment_size
-    packet_ptr.contents.private_segment_size = 16 << 10 # self.prg.private_segment_size
+    packet_ptr.contents.private_segment_size = self.prg.private_segment_size
 
     header = 0
-    header |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE
-    header |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE
+    header |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE
+    header |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
     header |= hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE
 
+    cnt = max(1, sum(g > 1 for g in grid_size))
+    packet_ptr.contents.setup = cnt << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS
     packet_ptr.contents.header = header
 
 class CopyCommand(Command):
@@ -140,7 +143,7 @@ def launch_kernel(dev, prg, global_size, local_size, extra):
 
   # dev.synchronize() # for debug
 
-  # Temprory, think this could be better
+  # Temporary, think this could be better
   kernarg_region = find_mem_zone(dev.device, hsa.HSA_REGION_SEGMENT_GLOBAL, hsa.HSA_REGION_GLOBAL_FLAG_KERNARG)
   kernargs = init_c_var(ctypes.c_void_p(), lambda x: check(hsa.hsa_memory_allocate(kernarg_region, args_sz, ctypes.byref(x))))
   ctypes.memmove(kernargs, extra[1], args_sz)
