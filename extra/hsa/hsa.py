@@ -103,7 +103,11 @@ class Queue:
 
     kernarg_region = find_mem_zone(device_id, hsa.HSA_REGION_SEGMENT_GLOBAL, hsa.HSA_REGION_GLOBAL_FLAG_KERNARG)
     self.kernargs = init_c_var(ctypes.c_void_p(), lambda x: check(hsa.hsa_memory_allocate(kernarg_region, 16 << 20, ctypes.byref(x)))).value
-    
+
+    # profiling, do not see any performance loss
+    check(hsa.hsa_system_get_info(hsa.HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, ctypes.byref(gpu_freq := ctypes.c_uint64())))
+    self.clocks_to_time = 1 / gpu_freq.value # TODO: double check
+    check(hsa.hsa_amd_profiling_set_profiler_enabled(self.hw_queue, 1))
 
   def alloc_kernargs(self, sz):
     alignment = 16
@@ -111,8 +115,8 @@ class Queue:
     self.kernargs = (self.kernargs + sz + alignment - 1) & ~(alignment - 1)
     return res
 
-  def submit_kernel(self, prg, global_size, local_size, kernargs):
-    # check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+  def submit_kernel(self, prg, global_size, local_size, kernargs, profile):
+    if profile: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
 
     # index = hsa.hsa_queue_load_write_index_scacquire(self.hw_queue)
     
@@ -129,12 +133,16 @@ class Queue:
     packet.private_segment_size = prg.private_segment_size
     packet.setup = exec_setup
     packet.header = exec_header
-    # packet.completion_signal = signal
+    if profile: packet.completion_signal = signal
 
     self.write_addr += 64
     self.next_doorbell_index += 1
-    # self.all_signals.append(signal)
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
+
+    if profile:
+      hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
+      check(hsa.hsa_amd_profiling_get_dispatch_time(self.agent, signal, ctypes.byref(timings := hsa.hsa_amd_profiling_dispatch_time_t())))
+      return (timings.end - timings.start) * self.clocks_to_time
 
   def submit_barrier(self, need_signal=False):
     check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
@@ -274,9 +282,7 @@ class ExecCommand(Command):
 class CopyCommand(Command):
   def __init__(self): pass
 
-def launch_kernel(dev, prg, global_size, local_size, args, vals, args_struct_t, wait=False):
-  # wait = True
-
+def launch_kernel(dev, prg, global_size, local_size, args, vals, args_struct_t, profile=False):
   kernargs = None
   if prg.kernargs_segment_size.value > 0:
     kernargs = dev.hsa_queue.alloc_kernargs(prg.kernargs_segment_size.value)
@@ -284,5 +290,7 @@ def launch_kernel(dev, prg, global_size, local_size, args, vals, args_struct_t, 
     for i in range(len(args)): args_st.__setattr__(f'f{i}', args[i])
     for i in range(len(vals)): args_st.__setattr__(f'v{i}', vals[i])
 
-  dev.hsa_queue.submit_kernel(prg, global_size, local_size, kernargs)
-  if wait: dev.hsa_queue.wait()
+  return dev.hsa_queue.submit_kernel(prg, global_size, local_size, kernargs, profile=profile)
+  # if wait:
+  #   dev.hsa_queue.wait()
+  #   return float("inf")

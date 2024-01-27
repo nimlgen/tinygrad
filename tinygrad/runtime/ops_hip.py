@@ -44,29 +44,31 @@ class HIPProgram:
     if MOCKHIP: return
     if HSA:
       self.prg = hsa.Kernel(self.device.device, lib, name)
-    hip_set_device(self.device)
-    self.module = init_c_var(hip.hipModule_t(), lambda x: check(hip.hipModuleLoadData(ctypes.byref(x), lib)))
-    self.prg = init_c_var(hip.hipFunction_t(), lambda x: check(hip.hipModuleGetFunction(ctypes.byref(x), self.module, name.encode("utf-8"))))
+    else:
+      hip_set_device(self.device.device)
+      self.module = init_c_var(hip.hipModule_t(), lambda x: check(hip.hipModuleLoadData(ctypes.byref(x), lib)))
+      self.prg = init_c_var(hip.hipFunction_t(), lambda x: check(hip.hipModuleGetFunction(ctypes.byref(x), self.module, name.encode("utf-8"))))
 
   def __del__(self):
     if hasattr(self, 'module'): check(hip.hipModuleUnload(self.module))
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
     if MOCKHIP: return float("inf")
+    hip_set_device(self.device.device)
+    if not hasattr(self, "args_struct_t"):
+      self.args_struct_t = init_c_struct_t(tuple([(f'f{i}', hip.hipDeviceptr_t) for i in range(len(args))] +
+                                            [(f'v{i}', ctypes.c_int) for i in range(len(vals))]))
+    if not HSA:
+      if not hasattr(self, "vargs"):
+        self.c_args = self.args_struct_t(*args, *vals)
+        self.vargs = (ctypes.c_void_p * 5)(ctypes.c_void_p(1), ctypes.cast(ctypes.byref(self.c_args), ctypes.c_void_p),
+                                          ctypes.c_void_p(2), ctypes.cast(ctypes.byref(ctypes.c_size_t(ctypes.sizeof(self.c_args))), ctypes.c_void_p),
+                                          ctypes.c_void_p(3))
+      else:
+        for i in range(len(args)): self.c_args.__setattr__(f'f{i}', args[i])
+        for i in range(len(vals)): self.c_args.__setattr__(f'v{i}', vals[i])
     if HSA:
-      hsa.launch_kernel(self.device, self.prg, global_size, local_size, encode_args_cuda_style(args, vals, hip.hipDeviceptr_t, marks=(1,2,3))[0])
-      return float("inf")
-
-    hip_set_device(self.device)
-    if not hasattr(self, "vargs"):
-      self.c_args = init_c_struct_t(tuple([(f'f{i}', hip.hipDeviceptr_t) for i in range(len(args))] +
-                                          [(f'v{i}', ctypes.c_int) for i in range(len(vals))]))(*args, *vals)
-      self.vargs = (ctypes.c_void_p * 5)(ctypes.c_void_p(1), ctypes.cast(ctypes.byref(self.c_args), ctypes.c_void_p),
-                                         ctypes.c_void_p(2), ctypes.cast(ctypes.byref(ctypes.c_size_t(ctypes.sizeof(self.c_args))), ctypes.c_void_p),
-                                         ctypes.c_void_p(3))
-    else:
-      for i in range(len(args)): self.c_args.__setattr__(f'f{i}', args[i])
-      for i in range(len(vals)): self.c_args.__setattr__(f'v{i}', vals[i])
+      return hsa.launch_kernel(self.device, self.prg, global_size, local_size, args, vals, self.args_struct_t, profile=wait)
     if wait:
       evs = [init_c_var(hip.hipEvent_t(), lambda x: hip.hipEventCreate(ctypes.byref(x), 0)) for _ in range(2)]
       check(hip.hipEventRecord(evs[0], None))
@@ -143,6 +145,7 @@ class HIPAllocator(LRUAllocator):
 class HIPDevice(Compiled):
   def __init__(self, device:str=""):
     self.device = int(device.split(":")[1]) if ":" in device else 0
+    # print(self.device)
     self.arch = init_c_var(hip.hipDeviceProp_t(), lambda x: check(hip.hipGetDeviceProperties(x, self.device))).gcnArchName.decode() if not MOCKHIP else "gfx1100"  # noqa: E501
     self.pending_copyin: List[ctypes.c_void_p] = []
     self.track_cross_buffer: List[Any] = []
@@ -152,8 +155,10 @@ class HIPDevice(Compiled):
 
     from tinygrad.runtime.graph.hip import HIPGraph
     super().__init__(device, MallocAllocator if MOCKHIP else HIPAllocator(self), HIPCompiler(self.arch),
-                     functools.partial(HIPProgram, self.device), HIPGraph if not HSA else None)
+                     functools.partial(HIPProgram, self), HIPGraph if not HSA else None)
   def synchronize(self):
+    # print("called")
+    if HSA: self.hsa_queue.wait()
     hip_set_device(self.device)
     check(hip.hipDeviceSynchronize())
     for opaque in self.pending_copyin: check(hip.hipFree(opaque))
