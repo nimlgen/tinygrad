@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, functools, subprocess, io
+import ctypes, functools, subprocess, io, atexit
 from typing import Tuple, TypeVar, List, Any, cast, Set
 import tinygrad.runtime.autogen.hip as hip
 from tinygrad.helpers import DEBUG, getenv, init_c_var
@@ -39,7 +39,10 @@ class HSAProgram:
     self.group_segment_size = init_c_var(ctypes.c_uint32(), lambda x: check(hsa.hsa_executable_symbol_get_info(self.kernel, hsa.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE, ctypes.byref(x))))
     self.private_segment_size = init_c_var(ctypes.c_uint32(), lambda x: check(hsa.hsa_executable_symbol_get_info(self.kernel, hsa.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE, ctypes.byref(x))))
 
-  def __del__(self): pass # TODO
+    check(hsa.hsa_code_object_reader_destroy(code_reader))
+
+  def __del__(self):
+    if hasattr(self, 'exec'): check(hsa.hsa_executable_destroy(self.exec))
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
     if not hasattr(self, "args_struct_t"):
@@ -55,6 +58,7 @@ class HSAProgram:
 
     return self.device.hw_queue.submit_kernel(self, global_size, local_size, kernargs, profile=wait)
 
+T = TypeVar("T")
 class HSAAllocator(LRUAllocator):
   def __init__(self, device:HSADevice):
     self.device = device
@@ -77,32 +81,38 @@ class HSAAllocator(LRUAllocator):
 
   def copyout(self, dest:memoryview, src:T):
     self.device.synchronize()
-    check(hsa.hsa_amd_memory_lock(from_mv(dest), len(dest), ctypes.byref(self.device.agent), 1, ctypes.byref(gpu_addr := ctypes.c_void_p())))
+    agents = [HSADevice.cpu_agent, self.device.agent]
+    c_agents = (hsa.hsa_agent_t * len(agents))(*agents)
+    check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), len(dest), c_agents, len(agents), HSADevice.cpu_memory_pool, 0, ctypes.byref(addr := ctypes.c_void_p())))
     check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(copy_signal := hsa.hsa_signal_t())))
-    check(hsa.hsa_amd_memory_async_copy(gpu_addr, self.device.agent, src, self.device.agent, len(dest), 0, None, copy_signal))
+    check(hsa.hsa_amd_memory_async_copy(addr, HSADevice.cpu_agent, src, self.device.agent, len(dest), 0, None, copy_signal))
     hsa.hsa_signal_wait_scacquire(copy_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     check(hsa.hsa_amd_memory_unlock(from_mv(dest)))
+    check(hsa.hsa_signal_destroy(copy_signal))
 
   def transfer(self, dest:T, src:T, sz:int): assert False, "not supported atm"
 
 class HSADevice(Compiled):
-  hsa_initted = False
+  cpu_agent = None
+  cpu_memory_pool = None
   def __init__(self, device:str=""):
-    if not HSADevice.hsa_initted:
+    if not HSADevice.cpu_agent:
       check(hsa.hsa_init())
-      HSADevice.hsa_initted = True
+      atexit.register(lambda: hsa.hsa_shut_down())
+      HSADevice.cpu_agent = find_hsa_agent(hsa.HSA_DEVICE_TYPE_CPU, device_id=0)
+      HSADevice.cpu_memory_pool = find_memory_pool(HSADevice.cpu_agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_CPU)
 
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.agent = find_hsa_agent(hsa.HSA_DEVICE_TYPE_GPU, device_id=self.device_id)
     self.gpu_memory_pool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_GPU)
     self.kernargs_memory_pool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, flags=hsa.HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT)
     self.old_kernarg_region = find_old_mem_zone(self.agent, hsa.HSA_REGION_SEGMENT_GLOBAL, hsa.HSA_REGION_GLOBAL_FLAG_KERNARG)
-    self.hw_queue = HWQueue(self.agent)
+    self.hw_queue = HWQueue(self.agent, HSADevice.cpu_agent, HSADevice.cpu_memory_pool)
 
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_NAME, ctypes.byref(agent_name_buf := ctypes.create_string_buffer(256))))
     self.arch = ctypes.string_at(agent_name_buf).decode()
 
-    self.kernarg_pool_sz = 16 << 20
+    self.kernarg_pool_sz = 64 << 20
     self.kernarg_ptr = init_c_var(ctypes.c_void_p(), lambda x: check(hsa.hsa_memory_allocate(self.old_kernarg_region, self.kernarg_pool_sz, ctypes.byref(x)))).value
     self.kernarg_next = self.kernarg_ptr
 
@@ -112,16 +122,24 @@ class HSADevice(Compiled):
 
   def synchronize(self):
     self.hw_queue.wait()
+    # print("sync s1")
 
     for opaque in self.pending_copyin: check(hsa.hsa_amd_memory_unlock(from_mv(opaque)))
+    # print("sync s2")
     self.pending_copyin.clear()
+    # self.write_barriers.clear()
     self.kernarg_next = self.kernarg_ptr
+    self.prev_copy = None
+    # print("sync exit")
 
   def select_sdma(self, sz): return hsa.HSA_AMD_SDMA_ENGINE_0
 
   # TODO: need something smarter here...
   def alloc_kernargs(self, sz):
+    # return init_c_var(ctypes.c_void_p(), lambda x: check(hsa.hsa_memory_allocate(self.old_kernarg_region, sz, ctypes.byref(x)))).value
+
     result = self.kernarg_next
-    self.kernarg_next = (self.kernarg_next + sz + 15) & ~(15) # align to 16 bytes
+    self.kernarg_next = (self.kernarg_next + sz + 15) & (~15) # align to 16 bytes
+    # print(hex(self.kernarg_next))
     assert self.kernarg_next <= self.kernarg_ptr + self.kernarg_pool_sz, "no space for kernargs"
     return result

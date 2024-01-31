@@ -1,6 +1,8 @@
-import ctypes, functools
+import ctypes, functools, time
 import gpuctypes.hsa as hsa
-from tinygrad.helpers import init_c_var
+from tinygrad.helpers import init_c_var, getenv
+
+DEBUG_HSA = getenv("DEBUG_HSA", 0)
 
 def check(status):
   if status != 0: raise RuntimeError(f"HSA Error {status}")
@@ -8,12 +10,13 @@ def check(status):
 # Precalulated AQL info
 AQL_PACKET_SIZE = ctypes.sizeof(hsa.hsa_kernel_dispatch_packet_t)
 EMPTY_SIGNAL = hsa.hsa_signal_t()
+# hsa.hsa_signal_create(0, 0, None, ctypes.byref(EMPTY_SIGNAL := hsa.hsa_signal_t()))
 
 DISPATCH_KERNEL_SETUP = 3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS
 DISPATCH_KERNEL_HEADER = 0
 DISPATCH_KERNEL_HEADER |= 1 << hsa.HSA_PACKET_HEADER_BARRIER
 DISPATCH_KERNEL_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE
-DISPATCH_KERNEL_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
+DISPATCH_KERNEL_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE # HSA_FENCE_SCOPE_AGENT?
 DISPATCH_KERNEL_HEADER |= hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE
 
 BARRIER_HEADER = 0
@@ -22,26 +25,90 @@ BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_
 BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
 BARRIER_HEADER |= hsa.HSA_PACKET_TYPE_BARRIER_AND << hsa.HSA_PACKET_HEADER_TYPE
 
+PM4_HDR_IT_OPCODE_NOP = 0x10
+PM4_HDR_IT_OPCODE_INDIRECT_BUFFER = 0x3F
+PM4_HDR_IT_OPCODE_RELEASE_MEM = 0x49
+PM4_HDR_IT_OPCODE_ACQUIRE_MEM = 0x58
+
+def PM4_HDR_SHADER_TYPE(x): return (x & 0x1) << 1
+def PM4_HDR_IT_OPCODE(x): return (x & 0xFF) << 8
+def PM4_HDR_COUNT(x): return (x & 0x3FFF) << 16
+def PM4_HDR_TYPE(x): return (x & 0x3) << 30
+def PM4_HDR(it_opcode, pkt_size_dw, gfxip_ver):
+    return (PM4_HDR_SHADER_TYPE(1 if gfxip_ver == 7 else 0) |
+            PM4_HDR_IT_OPCODE(it_opcode) |
+            PM4_HDR_COUNT(pkt_size_dw - 2) |
+            PM4_HDR_TYPE(3))
+def PM4_INDIRECT_BUFFER_DW1_IB_BASE_LO(x): return (x & 0x3FFFFFFF) << 2
+def PM4_INDIRECT_BUFFER_DW2_IB_BASE_HI(x): return (x & 0xFFFF) << 0
+def PM4_INDIRECT_BUFFER_DW3_IB_SIZE(x): return (x & 0xFFFFF) << 0
+def PM4_INDIRECT_BUFFER_DW3_IB_VALID(x): return (x & 0x1) << 23
+
+def PM4_ACQUIRE_MEM_DW1_COHER_CNTL(x): return (x & 0x7FFFFFFF) << 0
+PM4_ACQUIRE_MEM_COHER_CNTL_TC_WB_ACTION_ENA = 1 << 18
+PM4_ACQUIRE_MEM_COHER_CNTL_TC_ACTION_ENA = 1 << 23
+PM4_ACQUIRE_MEM_COHER_CNTL_SH_KCACHE_ACTION_ENA = 1 << 27
+PM4_ACQUIRE_MEM_COHER_CNTL_SH_ICACHE_ACTION_ENA = 1 << 29
+def PM4_ACQUIRE_MEM_DW2_COHER_SIZE(x): return (x & 0xFFFFFFFF) << 0
+def PM4_ACQUIRE_MEM_DW3_COHER_SIZE_HI(x): return (x & 0xFF) << 0
+def PM4_ACQUIRE_MEM_DW7_GCR_CNTL(x): return (x & 0x7FFFF) << 0
+def PM4_ACQUIRE_MEM_GCR_CNTL_GLI_INV(x): return (x & 0x3) << 0
+PM4_ACQUIRE_MEM_GCR_CNTL_GLK_INV = 1 << 7
+PM4_ACQUIRE_MEM_GCR_CNTL_GLV_INV = 1 << 8
+PM4_ACQUIRE_MEM_GCR_CNTL_GL1_INV = 1 << 9
+PM4_ACQUIRE_MEM_GCR_CNTL_GL2_INV = 1 << 14
+def PM4_RELEASE_MEM_DW1_EVENT_INDEX(x): return (x & 0xF) << 8
+PM4_RELEASE_MEM_EVENT_INDEX_AQL = 0x7
+
+class AmdAqlPm4Ib(ctypes.Structure):
+    _fields_ = [
+        ("header", ctypes.c_uint16),
+        ("amd_format", ctypes.c_uint8),
+        ("reserved0", ctypes.c_uint8),
+        ("ib_jump_cmd", ctypes.c_uint32 * 4),
+        ("dw_cnt_remain", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32 * 8),
+        ("completion_signal", hsa.hsa_signal_t)
+    ]
+    _pack_ = 1
+amd_aql_pm4_ib_t = AmdAqlPm4Ib
+
+
 class HWQueue:
-  def __init__(self, agent, sz=-1):
+  def __init__(self, agent, cpu_agent, cpu_memory_pool, sz=-1):
     self.agent = agent
     self.signals = []
 
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_QUEUE_MAX_SIZE, ctypes.byref(max_queue_size := ctypes.c_uint32())))
-    queue_size = min(max_queue_size, sz) if sz != -1 else max_queue_size
+    queue_size = min(max_queue_size.value, sz) if sz != -1 else max_queue_size.value
 
     null_func = ctypes.CFUNCTYPE(None, hsa.hsa_status_t, ctypes.POINTER(hsa.struct_hsa_queue_s), ctypes.POINTER(None))()
     self.hw_queue = init_c_var(ctypes.POINTER(hsa.hsa_queue_t)(), lambda x: check(hsa.hsa_queue_create(self.agent, queue_size, hsa.HSA_QUEUE_TYPE_SINGLE, null_func, None, (1<<32)-1, (1<<32)-1, ctypes.byref(x))))
+
     self.write_addr = self.hw_queue.contents.base_address
+    self.write_end = self.hw_queue.contents.base_address + (64 * self.hw_queue.contents.size) - 1
     self.next_doorbell_index = -1
 
     check(hsa.hsa_amd_profiling_set_profiler_enabled(self.hw_queue, 1))
     check(hsa.hsa_system_get_info(hsa.HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, ctypes.byref(gpu_freq := ctypes.c_uint64())))
     self.clocks_to_time = 1 / gpu_freq.value # TODO: double check
 
+    agents = (hsa.hsa_agent_t * 2)(agent, cpu_agent)
+    check(hsa.hsa_amd_memory_pool_allocate(cpu_memory_pool, 0x1000, 0, ctypes.byref(pm4_buf := ctypes.c_void_p())))
+    check(hsa.hsa_amd_agents_allow_access(2, agents, None, pm4_buf))
+    self.pm4_buf = ctypes.cast(pm4_buf, ctypes.POINTER(ctypes.c_uint32))
+    self.pm4_buf_address = pm4_buf.value
+
+  def __del__(self): pass # TODO
+
   def submit_kernel(self, prg, global_size, local_size, kernargs, profile):
+    if DEBUG_HSA >= 2: print(f"queue.submit_kernel({global_size=}, {local_size=})")
     if profile: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
 
+    # TODO: optimize
+    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
+
+    ctypes.memset(self.write_addr, 0, 64)
     packet = hsa.hsa_kernel_dispatch_packet_t.from_address(self.write_addr)
     packet.workgroup_size_x = local_size[0]
     packet.workgroup_size_y = local_size[1]
@@ -53,40 +120,89 @@ class HWQueue:
     packet.kernarg_address = kernargs
     packet.group_segment_size = prg.group_segment_size
     packet.private_segment_size = prg.private_segment_size
+    if profile: packet.completion_signal.handle = signal.handle
     packet.setup = DISPATCH_KERNEL_SETUP
     packet.header = DISPATCH_KERNEL_HEADER
-    if profile: packet.completion_signal = signal
 
     self.write_addr += AQL_PACKET_SIZE
-    self.next_doorbell_index += 1
+    if self.write_addr > self.write_end:
+      self.write_addr = self.hw_queue.contents.base_address
+    hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
 
     if profile:
       hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
       check(hsa.hsa_amd_profiling_get_dispatch_time(self.agent, signal, ctypes.byref(timings := hsa.hsa_amd_profiling_dispatch_time_t())))
+      check(hsa.hsa_signal_destroy(signal))
       return (timings.end - timings.start) * self.clocks_to_time
 
-  def submit_barrier(self):
+  def submit_barrier(self, wait_signals=None):
+    if DEBUG_HSA >= 2: print(f"queue.submit_barrier({wait_signals=})")
+
+    assert wait_signals is None or len(wait_signals) < 5
     check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
 
+    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
+
+    ctypes.memset(self.write_addr, 0, 64)
     packet = hsa.hsa_barrier_and_packet_t.from_address(self.write_addr)
-    packet.dep_signal[0] = EMPTY_SIGNAL
-    packet.dep_signal[1] = EMPTY_SIGNAL
-    packet.dep_signal[2] = EMPTY_SIGNAL
-    packet.dep_signal[3] = EMPTY_SIGNAL
-    packet.dep_signal[4] = EMPTY_SIGNAL
-    packet.completion_signal = signal
+    packet.dep_signal[0].handle = wait_signals[0].handle if wait_signals and len(wait_signals) > 0 else 0
+    packet.dep_signal[1].handle = wait_signals[1].handle if wait_signals and len(wait_signals) > 1 else 0
+    packet.dep_signal[2].handle = wait_signals[2].handle if wait_signals and len(wait_signals) > 2 else 0
+    packet.dep_signal[3].handle = wait_signals[3].handle if wait_signals and len(wait_signals) > 3 else 0
+    packet.dep_signal[4].handle = wait_signals[4].handle if wait_signals and len(wait_signals) > 4 else 0
+    packet.completion_signal.handle = signal.handle
     packet.header = BARRIER_HEADER
 
     self.signals.append(signal)
     self.write_addr += AQL_PACKET_SIZE
-    self.next_doorbell_index += 1
+    if self.write_addr > self.write_end: 
+      self.write_addr = self.hw_queue.contents.base_address
+    hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
 
+  def submit_pm4(self, cmd, cmd_size_dw):
+    # TODO: check isa version, this works only for isa >= 9
+    for i in range(cmd_size_dw): self.pm4_buf[i] = cmd[i]
+
+    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+
+    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
+
+    ctypes.memset(self.write_addr, 0, 64)
+    packet = amd_aql_pm4_ib_t.from_address(self.write_addr)
+    packet.header = hsa.HSA_PACKET_TYPE_VENDOR_SPECIFIC << hsa.HSA_PACKET_HEADER_TYPE
+    packet.amd_format = 0x1 # AMD_AQL_FORMAT_PM4_IB
+
+    packet.ib_jump_cmd[0] = PM4_HDR(PM4_HDR_IT_OPCODE_INDIRECT_BUFFER, 4, 11)
+    packet.ib_jump_cmd[1] = PM4_INDIRECT_BUFFER_DW1_IB_BASE_LO(self.pm4_buf_address >> 2)
+    packet.ib_jump_cmd[2] = PM4_INDIRECT_BUFFER_DW2_IB_BASE_HI(self.pm4_buf_address >> 32)
+    packet.ib_jump_cmd[3] = PM4_INDIRECT_BUFFER_DW3_IB_SIZE(cmd_size_dw) | PM4_INDIRECT_BUFFER_DW3_IB_VALID(1)
+    packet.dw_cnt_remain = 0xA # wtf?
+    packet.completion_signal.handle = signal.handle
+
+    self.write_addr += AQL_PACKET_SIZE
+    if self.write_addr > self.write_end: 
+      self.write_addr = self.hw_queue.contents.base_address
+    hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
+    hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
+
+    hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
+    check(hsa.hsa_signal_destroy(signal))
+
+    for i in range(cmd_size_dw): self.pm4_buf[i] = 0
+
   def wait(self):
+    if DEBUG_HSA >= 2: print("queue.wait()")
     self.submit_barrier()
     for sig in self.signals:
-      hsa.hsa_signal_wait_scacquire(sig, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
+      if DEBUG_HSA >= 4:
+        # Debug active wait
+        while hsa.hsa_signal_load_scacquire(sig) != 0:
+          print("rw", hsa.hsa_queue_load_read_index_scacquire(self.hw_queue), hsa.hsa_queue_load_write_index_scacquire(self.hw_queue))
+      else:
+        hsa.hsa_signal_wait_scacquire(sig, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
+      check(hsa.hsa_signal_destroy(sig))
     self.signals.clear()
 
 @functools.lru_cache(None)
