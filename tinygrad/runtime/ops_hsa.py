@@ -130,7 +130,7 @@ class HSADevice(Compiled):
       HSADevice.cpu_agent = find_hsa_agent(hsa.HSA_DEVICE_TYPE_CPU, device_id=0)
       HSADevice.cpu_memory_pool = find_memory_pool(HSADevice.cpu_agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_CPU)
 
-    self.device_id = int(device.split(":")[1]) if ":" in device else 2
+    self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.agent = find_hsa_agent(hsa.HSA_DEVICE_TYPE_GPU, device_id=self.device_id)
     self.gpu_memory_pool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_GPU)
     self.kernargs_memory_pool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, flags=hsa.HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT)
@@ -159,11 +159,11 @@ class HSADevice(Compiled):
   def synchronize(self):
     for sig in self.resource_to_signal.values():
       if sig[1] == USAGE_MEM: self.hw_queue.signals.append(sig[0])
-      else: self.dev.acquired_signals.append(sig)
+      else: self.acquired_signals.append(sig[0])
     self.hw_queue.wait()
     for opaque in self.pending_copyin: check(hsa.hsa_amd_memory_unlock(from_mv(opaque)))
     for opaque in self.delayed_free: check(hsa.hsa_amd_memory_pool_free(opaque))
-    for sig in self.acquired_signals: hsa.hsa_signal_store_screlease(sig, 1)
+    for sig in self.acquired_signals: hsa.hsa_signal_store_relaxed(sig, 1)
     self.signal_pool.extend(self.acquired_signals)
     self.pending_copyin.clear()
     self.resource_to_signal.clear()
@@ -174,7 +174,7 @@ class HSADevice(Compiled):
   def select_sdma(self, sz): return hsa.HSA_AMD_SDMA_ENGINE_0
   def alloc_signal(self):
     if len(self.signal_pool): return self.signal_pool.pop()
-    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+    check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t())))
     return signal
 
   def alloc_kernargs(self, sz):

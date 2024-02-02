@@ -10,7 +10,6 @@ def check(status):
 # Precalulated AQL info
 AQL_PACKET_SIZE = ctypes.sizeof(hsa.hsa_kernel_dispatch_packet_t)
 EMPTY_SIGNAL = hsa.hsa_signal_t()
-# hsa.hsa_signal_create(0, 0, None, ctypes.byref(EMPTY_SIGNAL := hsa.hsa_signal_t()))
 
 DISPATCH_KERNEL_SETUP = 3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS
 DISPATCH_KERNEL_HEADER = 0
@@ -102,10 +101,10 @@ class HWQueue:
 
   def __del__(self): pass # TODO
 
-  def submit_kernel(self, prg, global_size, local_size, kernargs, signals=[]):
+  def submit_kernel(self, prg, global_size, local_size, kernargs, signals=None):
     if DEBUG_HSA >= 2: print(f"queue.submit_kernel({global_size=}, {local_size=})")
 
-    if len(signals):
+    if signals is not None and len(signals):
       for i in range(0, len(signals), 5): self.submit_barrier(wait_signals=signals[i:i+5], need_signal=False)
 
     signal = self.dev.alloc_signal()
@@ -142,14 +141,16 @@ class HWQueue:
     assert wait_signals is None or len(wait_signals) < 5
     if need_signal: signal = self.dev.alloc_signal()
 
-    ctypes.memset(self.write_addr, 0, 64)
     packet = hsa.hsa_barrier_and_packet_t.from_address(self.write_addr)
-    packet.dep_signal[0].handle = wait_signals[0].handle if wait_signals and len(wait_signals) > 0 else 0
-    packet.dep_signal[1].handle = wait_signals[1].handle if wait_signals and len(wait_signals) > 1 else 0
-    packet.dep_signal[2].handle = wait_signals[2].handle if wait_signals and len(wait_signals) > 2 else 0
-    packet.dep_signal[3].handle = wait_signals[3].handle if wait_signals and len(wait_signals) > 3 else 0
-    packet.dep_signal[4].handle = wait_signals[4].handle if wait_signals and len(wait_signals) > 4 else 0
-    if need_signal: packet.completion_signal.handle = signal.handle
+    packet.reserved0 = 0
+    packet.reserved1 = 0
+    packet.dep_signal[0] = wait_signals[0] if wait_signals and len(wait_signals) > 0 else EMPTY_SIGNAL
+    packet.dep_signal[1] = wait_signals[1] if wait_signals and len(wait_signals) > 1 else EMPTY_SIGNAL
+    packet.dep_signal[2] = wait_signals[2] if wait_signals and len(wait_signals) > 2 else EMPTY_SIGNAL
+    packet.dep_signal[3] = wait_signals[3] if wait_signals and len(wait_signals) > 3 else EMPTY_SIGNAL
+    packet.dep_signal[4] = wait_signals[4] if wait_signals and len(wait_signals) > 4 else EMPTY_SIGNAL
+    packet.reserved2 = 0
+    if need_signal: packet.completion_signal = signal
     packet.header = BARRIER_HEADER
 
     if need_signal: self.signals.append(signal)
