@@ -75,8 +75,9 @@ amd_aql_pm4_ib_t = AmdAqlPm4Ib
 
 
 class HWQueue:
-  def __init__(self, agent, cpu_agent, cpu_memory_pool, sz=-1):
-    self.agent = agent
+  def __init__(self, dev, cpu_agent, cpu_memory_pool, sz=-1):
+    self.dev = dev
+    self.agent = dev.agent
     self.signals = []
 
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_QUEUE_MAX_SIZE, ctypes.byref(max_queue_size := ctypes.c_uint32())))
@@ -93,7 +94,7 @@ class HWQueue:
     check(hsa.hsa_system_get_info(hsa.HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, ctypes.byref(gpu_freq := ctypes.c_uint64())))
     self.clocks_to_time = 1 / gpu_freq.value # TODO: double check
 
-    agents = (hsa.hsa_agent_t * 2)(agent, cpu_agent)
+    agents = (hsa.hsa_agent_t * 2)(self.agent, cpu_agent)
     check(hsa.hsa_amd_memory_pool_allocate(cpu_memory_pool, 0x1000, 0, ctypes.byref(pm4_buf := ctypes.c_void_p())))
     check(hsa.hsa_amd_agents_allow_access(2, agents, None, pm4_buf))
     self.pm4_buf = ctypes.cast(pm4_buf, ctypes.POINTER(ctypes.c_uint32))
@@ -107,31 +108,30 @@ class HWQueue:
     if len(signals):
       for i in range(0, len(signals), 5): self.submit_barrier(wait_signals=signals[i:i+5], need_signal=False)
 
-    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+    signal = self.dev.alloc_signal()
 
-    # TODO: optimize
-    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
-
-    ctypes.memset(self.write_addr, 0, 64)
     packet = hsa.hsa_kernel_dispatch_packet_t.from_address(self.write_addr)
     packet.workgroup_size_x = local_size[0]
     packet.workgroup_size_y = local_size[1]
     packet.workgroup_size_z = local_size[2]
+    packet.reserved0 = 0
     packet.grid_size_x = global_size[0] * local_size[0]
     packet.grid_size_y = global_size[1] * local_size[1]
     packet.grid_size_z = global_size[2] * local_size[2]
+    packet.private_segment_size = prg.private_segment_size
+    packet.group_segment_size = prg.group_segment_size
     packet.kernel_object = prg.handle
     packet.kernarg_address = kernargs
-    packet.group_segment_size = prg.group_segment_size
-    packet.private_segment_size = prg.private_segment_size
+    packet.reserved2 = 0
     packet.completion_signal = signal
     packet.setup = DISPATCH_KERNEL_SETUP
     packet.header = DISPATCH_KERNEL_HEADER
 
+    self.next_doorbell_index += 1
     self.write_addr += AQL_PACKET_SIZE
     if self.write_addr > self.write_end:
       self.write_addr = self.hw_queue.contents.base_address
-    hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
+    hsa.hsa_queue_store_write_index_relaxed(self.hw_queue, self.next_doorbell_index + 1)
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
 
     return signal
@@ -140,9 +140,7 @@ class HWQueue:
     if DEBUG_HSA >= 2: print(f"queue.submit_barrier({wait_signals=})")
 
     assert wait_signals is None or len(wait_signals) < 5
-    if need_signal: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
-
-    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
+    if need_signal: signal = self.dev.alloc_signal()
 
     ctypes.memset(self.write_addr, 0, 64)
     packet = hsa.hsa_barrier_and_packet_t.from_address(self.write_addr)
@@ -155,6 +153,7 @@ class HWQueue:
     packet.header = BARRIER_HEADER
 
     if need_signal: self.signals.append(signal)
+    self.next_doorbell_index += 1
     self.write_addr += AQL_PACKET_SIZE
     if self.write_addr > self.write_end: 
       self.write_addr = self.hw_queue.contents.base_address
@@ -165,9 +164,9 @@ class HWQueue:
     # TODO: check isa version, this works only for isa >= 9
     for i in range(cmd_size_dw): self.pm4_buf[i] = cmd[i]
 
-    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+    signal = self.dev.alloc_signal()
 
-    self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
+    # self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
 
     ctypes.memset(self.write_addr, 0, 64)
     packet = amd_aql_pm4_ib_t.from_address(self.write_addr)
@@ -181,6 +180,7 @@ class HWQueue:
     packet.dw_cnt_remain = 0xA
     packet.completion_signal.handle = signal.handle
 
+    self.next_doorbell_index += 1
     self.write_addr += AQL_PACKET_SIZE
     if self.write_addr > self.write_end: 
       self.write_addr = self.hw_queue.contents.base_address
@@ -188,7 +188,7 @@ class HWQueue:
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
 
     hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
-    check(hsa.hsa_signal_destroy(signal))
+    self.dev.acquired_signals.append(signal)
 
     for i in range(cmd_size_dw): self.pm4_buf[i] = 0
 
@@ -202,7 +202,7 @@ class HWQueue:
           print("rw", hsa.hsa_queue_load_read_index_scacquire(self.hw_queue), hsa.hsa_queue_load_write_index_scacquire(self.hw_queue))
       else:
         hsa.hsa_signal_wait_scacquire(sig, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
-      check(hsa.hsa_signal_destroy(sig))
+      self.dev.acquired_signals.append(sig)
     self.signals.clear()
 
 @functools.lru_cache(None)
