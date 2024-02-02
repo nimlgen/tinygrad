@@ -101,9 +101,13 @@ class HWQueue:
 
   def __del__(self): pass # TODO
 
-  def submit_kernel(self, prg, global_size, local_size, kernargs, profile):
+  def submit_kernel(self, prg, global_size, local_size, kernargs, signals=[]):
     if DEBUG_HSA >= 2: print(f"queue.submit_kernel({global_size=}, {local_size=})")
-    if profile: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+
+    if len(signals):
+      for i in range(0, len(signals), 5): self.submit_barrier(wait_signals=signals[i:i+5], need_signal=False)
+
+    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
 
     # TODO: optimize
     self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
@@ -120,7 +124,7 @@ class HWQueue:
     packet.kernarg_address = kernargs
     packet.group_segment_size = prg.group_segment_size
     packet.private_segment_size = prg.private_segment_size
-    if profile: packet.completion_signal.handle = signal.handle
+    packet.completion_signal = signal
     packet.setup = DISPATCH_KERNEL_SETUP
     packet.header = DISPATCH_KERNEL_HEADER
 
@@ -130,17 +134,13 @@ class HWQueue:
     hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
     hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
 
-    if profile:
-      hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
-      check(hsa.hsa_amd_profiling_get_dispatch_time(self.agent, signal, ctypes.byref(timings := hsa.hsa_amd_profiling_dispatch_time_t())))
-      check(hsa.hsa_signal_destroy(signal))
-      return (timings.end - timings.start) * self.clocks_to_time
+    return signal
 
-  def submit_barrier(self, wait_signals=None):
+  def submit_barrier(self, wait_signals=None, need_signal=True):
     if DEBUG_HSA >= 2: print(f"queue.submit_barrier({wait_signals=})")
 
     assert wait_signals is None or len(wait_signals) < 5
-    check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
+    if need_signal: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(signal := hsa.hsa_signal_t())))
 
     self.next_doorbell_index = hsa.hsa_queue_load_write_index_relaxed(self.hw_queue)
 
@@ -151,10 +151,10 @@ class HWQueue:
     packet.dep_signal[2].handle = wait_signals[2].handle if wait_signals and len(wait_signals) > 2 else 0
     packet.dep_signal[3].handle = wait_signals[3].handle if wait_signals and len(wait_signals) > 3 else 0
     packet.dep_signal[4].handle = wait_signals[4].handle if wait_signals and len(wait_signals) > 4 else 0
-    packet.completion_signal.handle = signal.handle
+    if need_signal: packet.completion_signal.handle = signal.handle
     packet.header = BARRIER_HEADER
 
-    self.signals.append(signal)
+    if need_signal: self.signals.append(signal)
     self.write_addr += AQL_PACKET_SIZE
     if self.write_addr > self.write_end: 
       self.write_addr = self.hw_queue.contents.base_address
@@ -178,7 +178,7 @@ class HWQueue:
     packet.ib_jump_cmd[1] = PM4_INDIRECT_BUFFER_DW1_IB_BASE_LO(self.pm4_buf_address >> 2)
     packet.ib_jump_cmd[2] = PM4_INDIRECT_BUFFER_DW2_IB_BASE_HI(self.pm4_buf_address >> 32)
     packet.ib_jump_cmd[3] = PM4_INDIRECT_BUFFER_DW3_IB_SIZE(cmd_size_dw) | PM4_INDIRECT_BUFFER_DW3_IB_VALID(1)
-    packet.dw_cnt_remain = 0xA # wtf?
+    packet.dw_cnt_remain = 0xA
     packet.completion_signal.handle = signal.handle
 
     self.write_addr += AQL_PACKET_SIZE
@@ -235,11 +235,14 @@ def find_memory_pool(agent, segtyp=-1, flags=-1, location=-1):
 
     if flags != -1:
       check(hsa.hsa_amd_memory_pool_get_info(mem_pool, hsa.HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, ctypes.byref(fgs := hsa.hsa_amd_memory_pool_global_flag_t())))
-      if fgs.value != flags: return hsa.HSA_STATUS_SUCCESS
+      if (fgs.value & flags) == flags: return hsa.HSA_STATUS_SUCCESS
 
     if location != -1:
       check(hsa.hsa_amd_memory_pool_get_info(mem_pool, hsa.HSA_AMD_MEMORY_POOL_INFO_LOCATION, ctypes.byref(loc := hsa.hsa_amd_memory_pool_location_t())))
       if loc.value != location: return hsa.HSA_STATUS_SUCCESS
+
+    check(hsa.hsa_amd_memory_pool_get_info(mem_pool, hsa.HSA_AMD_MEMORY_POOL_INFO_SIZE, ctypes.byref(sz := ctypes.c_size_t())))
+    if sz == 0: return hsa.HSA_STATUS_SUCCESS
 
     ret = ctypes.cast(data, ctypes.POINTER(hsa.hsa_amd_memory_pool_t))
     ret[0] = mem_pool
