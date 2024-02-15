@@ -177,7 +177,8 @@ class HSADevice(Compiled):
       check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t())))
       self.signal_pool.append(signal)
 
-    super().__init__(device, HSAAllocator(self), HSACompiler(self.arch), functools.partial(HSAProgram, self), None)
+    from tinygrad.runtime.graph.hsa import HSAGraph
+    super().__init__(device, HSAAllocator(self), HSACompiler(self.arch), functools.partial(HSAProgram, self), HSAGraph)
 
   def synchronize(self):
     self.hw_queue.wait()

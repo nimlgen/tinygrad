@@ -87,13 +87,29 @@ class HWQueue:
 
     return signal
 
+  def blit_packets(self, packet_addr, packet_cnt):
+    if self.available_packet_slots < packet_cnt: self._wait_queue(packet_cnt)
+
+    tail_blit_packets = min(((self.write_addr_end + 1) - self.write_addr) // 64, packet_cnt)
+    rem_packet_cnt = packet_cnt - tail_blit_packets
+    ctypes.memmove(self.write_addr, packet_addr, AQL_PACKET_SIZE * tail_blit_packets)
+    self.write_addr += AQL_PACKET_SIZE * tail_blit_packets
+    if self.write_addr > self.write_addr_end: self.write_addr = self.hw_queue.contents.base_address
+    if tail_blit_packets > 0:
+      ctypes.memmove(self.write_addr, packet_addr + AQL_PACKET_SIZE * tail_blit_packets, AQL_PACKET_SIZE * rem_packet_cnt)
+      self.write_addr += AQL_PACKET_SIZE * rem_packet_cnt
+
+    self.next_doorbell_index += packet_cnt
+    hsa.hsa_queue_store_write_index_screlease(self.hw_queue, self.next_doorbell_index + 1)
+    hsa.hsa_signal_store_screlease(self.hw_queue.contents.doorbell_signal, self.next_doorbell_index)
+
   def wait(self):
     signal = self.submit_barrier(need_signal=True)
     hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     self.available_packet_slots = self.queue_size
 
-  def _wait_queue(self):
-    while self.available_packet_slots == 0:
+  def _wait_queue(self, need_packets=1):
+    while self.available_packet_slots < need_packets:
       rindex = hsa.hsa_queue_load_read_index_relaxed(self.hw_queue)
       self.available_packet_slots = self.queue_size - (self.next_doorbell_index - rindex)
 

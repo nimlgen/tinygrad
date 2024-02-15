@@ -4,7 +4,7 @@ import functools, itertools, operator
 from tinygrad.nn.state import get_parameters
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, merge_dicts, getenv, all_int, Context, GRAPH, flatten, GraphException
-from tinygrad.device import Compiled, JITRunner, CompiledASTRunner, Buffer
+from tinygrad.device import Compiled, JITRunner, CompiledASTRunner, Buffer, BufferXfer
 from tinygrad.tensor import Tensor
 from tinygrad.lazy import LazyBuffer
 from tinygrad.features.multi import MultiLazyBuffer
@@ -56,12 +56,17 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
 
   for i,ji in enumerate(jit_cache):
     # If the jit item can potentially be graphed, put it in a batch.
-    can_be_graphed = isinstance(ji.prg, CompiledASTRunner) and ji.prg.device.graph
-    if can_be_graphed:
-      assert isinstance(ji.prg, CompiledASTRunner)
+    device = None
+    if isinstance(ji.prg, CompiledASTRunner): device = ji.prg.device
+    elif isinstance(ji.prg, BufferXfer): device = ji.rawbufs[0].d
+
+    can_be_graphed = isinstance(ji.prg, CompiledASTRunner) or (isinstance(ji.prg, BufferXfer) and device.dname.startswith("HSA"))
+    if can_be_graphed and device.graph:
       # If the device changed we flush the batch early and append this item for the next batch.
-      if current_device is not None and ji.prg.device != current_device: flush()
-      current_device = ji.prg.device
+      # Hsa graph is multidevice, but overall this logic is not good for HIP as well.
+      hsa_devices = current_device is not None and current_device.dname.startswith("HSA") and device.dname.startswith("HSA")
+      if current_device is not None and not hsa_devices and device != current_device: flush()
+      current_device = device
       current_batch.append(ji)
 
     # The flush is done when (1) ji is the last one, (2) the size of batch exceeds the maximum batch size or
