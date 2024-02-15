@@ -74,7 +74,7 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
     if len(current_batch) > 0 and (i==len(jit_cache)-1 or len(current_batch) >= getenv("JIT_BATCH_SIZE", 64) or not can_be_graphed): flush()
 
     # If the jit item cannot be graphed, put it right into the final cache after the flush.
-    if not can_be_graphed: graphed_jit_cache.append(ji)
+    if not can_be_graphed or device.graph is None: graphed_jit_cache.append(ji)
   return graphed_jit_cache
 
 # *** JIT ***

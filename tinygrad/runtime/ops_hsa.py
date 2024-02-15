@@ -59,6 +59,9 @@ class HSAAllocator(LRUAllocator):
     self.device = device
     super().__init__()
 
+  def full_synchronize(self):
+    for d in HSADevice.devices: d.synchronize()
+
   def _alloc(self, size:int):
     c_agents = (hsa.hsa_agent_t * len(HSADevice.devices))(*[dev.agent for dev in HSADevice.devices])
     check(hsa.hsa_amd_memory_pool_allocate(self.device.gpu_mempool, size, 0, ctypes.byref(buf := ctypes.c_void_p())))
@@ -125,7 +128,8 @@ class HSAAllocator(LRUAllocator):
     self.device.hw_queue.submit_barrier(wait_signals=wait_signals)
 
   def copyout(self, dest:memoryview, src:T):
-    self.device.synchronize()
+    # self.device.synchronize()
+    self.full_synchronize()
     copy_signal = self.device.alloc_signal(reusable=True)
     c_agents = (hsa.hsa_agent_t*2)(*[HSADevice.cpu_agent, self.device.agent])
     check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), dest.nbytes, c_agents, 2, HSADevice.cpu_mempool, 0, ctypes.byref(addr:=ctypes.c_void_p())))

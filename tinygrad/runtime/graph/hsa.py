@@ -83,46 +83,36 @@ class HSAGraph:
       if isinstance(ji.prg, CompiledASTRunner):
         wait_signals = []
         for buf in ji.rawbufs:
-          if buf not in self.resourse_to_signal: continue
-          if isinstance(self.resourse_to_signal[buf], hsa.hsa_signal_t):
-            wait_signals.append(self.resourse_to_signal[buf])
+          if buf._buf not in self.resourse_to_signal: continue
+          if isinstance(self.resourse_to_signal[buf._buf], hsa.hsa_signal_t):
+            wait_signals.append(self.resourse_to_signal[buf._buf])
           else:
-            assert self.resourse_to_signal[buf][1] == ji.prg.device, "input used on another device (not supported)"
+            assert self.resourse_to_signal[buf._buf][1] == ji.prg.device, "input used on another device (not supported)"
 
         for i in range(0, len(wait_signals), 5):
           self.add_barrier_packet(ji.prg.device, wait_signals[i:i+5], EMPTY_SIGNAL)
 
         self.packets.append(self.add_exec_packet(ji.prg.device, ji, self.ji_kernelargs_addr[j], var_vals))
         for buf in ji.rawbufs:
-          self.resourse_to_signal[buf] = (self.packets[-1], ji.prg.device)
+          self.resourse_to_signal[buf._buf] = (self.packets[-1], ji.prg.device)
       elif isinstance(ji.prg, BufferXfer):
         dest, src = ji.rawbufs[0:2]
         wait_signals = [self.kickoff_signals[dest.d], self.kickoff_signals[src.d]]
-        # if dest._buf in self.resourse_to_signal:
-        #   wait_signals.append(self.dependency_as_signal(dest._buf, dest.d))
-        # if src._buf in self.resourse_to_signal:
-        #   wait_signals.append(self.dependency_as_signal(src._buf, src.d))
+        if dest._buf in self.resourse_to_signal:
+          wait_signals.append(self.dependency_as_signal(dest._buf, dest.d))
+        if src._buf in self.resourse_to_signal:
+          wait_signals.append(self.dependency_as_signal(src._buf, src.d))
 
         sync_signal = self.alloc_signal()
         self.signals_to_reset.append(sync_signal)
-
-        sync_signal_1 = self.alloc_signal()
-        sync_signal_2 = self.alloc_signal()
-        self.signals_to_reset.append(sync_signal_1)
-        self.signals_to_reset.append(sync_signal_2)
-        self.add_barrier_packet(src.d, [], sync_signal_1)
-        self.add_barrier_packet(dest.d, [], sync_signal_2)
-        wait_signals += [sync_signal_1, sync_signal_2]
 
         c_wait_signal = (hsa.hsa_signal_t * len(wait_signals))(*wait_signals)
         self.transfers.append((dest._buf, dest.d.agent, src._buf, src.d.agent, dest.nbytes, len(wait_signals),
                                c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0))
 
-        self.add_barrier_packet(src.d, [sync_signal], EMPTY_SIGNAL)
-        self.add_barrier_packet(dest.d, [sync_signal], EMPTY_SIGNAL)
-        # self.resourse_to_signal[src._buf] = sync_signal
-        # self.resourse_to_signal[dest._buf] = sync_signal
-        # self.signal_to_devices[sync_signal.handle] = [dest.d, src.d]
+        self.resourse_to_signal[src._buf] = sync_signal
+        self.resourse_to_signal[dest._buf] = sync_signal
+        self.signal_to_devices[sync_signal.handle] = [dest.d, src.d]
       else: assert False
 
     # Signaling we have finished
