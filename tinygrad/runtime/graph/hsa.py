@@ -1,7 +1,7 @@
 from typing import List, Any, Dict, cast, Optional, Set
-import ctypes, collections
+import ctypes, collections, time, heapq
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import dedup, unwrap2, GraphException
+from tinygrad.helpers import getenv, GraphException
 from tinygrad.device import Buffer, CompiledASTRunner, BufferXfer, update_stats
 from tinygrad.shape.symbolic import Variable
 from tinygrad.runtime.ops_hsa import HSADevice
@@ -11,15 +11,17 @@ from tinygrad.features.jit import JitItem, get_input_replace, get_jit_stats, \
 import tinygrad.runtime.autogen.hsa as hsa
 from tinygrad.runtime.driver.hsa import *
 
-# Multidevice graph implementation
 class HSAGraph:
   def __init__(self, jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     self.jit_cache = jit_cache
-    self.input_replace = get_input_replace(jit_cache, input_rawbuffers)
-    self.op_estimate, self.mem_estimate = get_jit_stats(jit_cache)
-    self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(jit_cache)
-    self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(jit_cache)
-    self.jc_idxs_with_updatable_rawbufs = list(set([x[0] for x in self.input_replace.keys()]))
+
+    # Optimize jit cache for more optimial kernel execution
+    if getenv("HSA_OPT_JC", 0): self.optimize_jc()
+
+    self.input_replace = get_input_replace(self.jit_cache, input_rawbuffers)
+    self.op_estimate, self.mem_estimate = get_jit_stats(self.jit_cache)
+    self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(self.jit_cache)
+    self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(self.jit_cache)
     self.devices: Set[HSADevice] = set()
 
     # Check all jit items are compatible.
@@ -41,7 +43,7 @@ class HSAGraph:
     self.c_aql_packets_addr = {}
     self.packet_off = {}
     for dev in self.devices:
-      self.packets_count[dev] = len(jit_cache) + 300 # TODO: fixme
+      self.packets_count[dev] = len(self.jit_cache) + 300 # TODO: fixme
       self.c_aql_packets[dev] = (hsa.hsa_kernel_dispatch_packet_t * self.packets_count[dev])()
       self.c_aql_packets_addr[dev] = ctypes.addressof(self.c_aql_packets[dev])
       self.packet_off[dev] = ctypes.addressof(self.c_aql_packets[dev])
@@ -65,76 +67,99 @@ class HSAGraph:
       for i in range(len(ji.prg.vars)): self.ji_kernelargs_structs[j].__setattr__(f'v{i}', var_vals[ji.prg.vars[i]])
 
     # Build packets for hwqueues.
-    self.barrier_packets = {}
     self.packets = []
     self.transfers = []
     self.kickoff_signals = {dev:self.alloc_signal() for dev in self.devices}
     self.finish_signal = self.alloc_signal() # This is a special signal, we cannot run this graph instance while it's running.
     self.signals_to_reset = []
-    self.resourse_to_signal = {}
-    self.signal_to_devices = {}
+    r_resourse_to_signal = {}
+    w_resourse_to_signal = {}
+    signal_to_devices = {}
 
     # Special packet to wait for the world.
     self.signals_to_reset += list(self.kickoff_signals.values())
-    for dev in self.devices:
-      self.barrier_packets[dev] = self.add_barrier_packet(dev, [], self.kickoff_signals[dev])
+    for dev in self.devices: self.add_barrier_packet(dev, [], self.kickoff_signals[dev])
 
+    copies = 0
     for j,ji in enumerate(self.jit_cache):
       if isinstance(ji.prg, CompiledASTRunner):
+        # continue # ignor
         wait_signals = []
-        for buf in ji.rawbufs:
-          if buf._buf not in self.resourse_to_signal: continue
-          if isinstance(self.resourse_to_signal[buf._buf], hsa.hsa_signal_t):
-            wait_signals.append(self.resourse_to_signal[buf._buf])
-          else:
-            assert self.resourse_to_signal[buf._buf][1] == ji.prg.device, "input used on another device (not supported)"
+        for i,buf in enumerate(ji.rawbufs):
+          sigs = []
+          if i == 0 and buf._buf in r_resourse_to_signal: sigs.append(r_resourse_to_signal.pop(buf._buf))
+          if buf._buf in w_resourse_to_signal: sigs.append(w_resourse_to_signal[buf._buf])
+          for sig in sigs:
+            if isinstance(sig, hsa.hsa_signal_t):
+              wait_signals.append(sig)
+            else:
+              assert sig[1] == ji.prg.device, "input used on another device (not supported)"
 
         for i in range(0, len(wait_signals), 5):
           self.add_barrier_packet(ji.prg.device, wait_signals[i:i+5], EMPTY_SIGNAL)
 
         self.packets.append(self.add_exec_packet(ji.prg.device, ji, self.ji_kernelargs_addr[j], var_vals))
-        for buf in ji.rawbufs:
-          self.resourse_to_signal[buf._buf] = (self.packets[-1], ji.prg.device)
+        for i,buf in enumerate(ji.rawbufs):
+          if i == 0: w_resourse_to_signal[buf._buf] = (self.packets[-1], ji.prg.device)
+          else: r_resourse_to_signal[buf._buf] = (self.packets[-1], ji.prg.device)
       elif isinstance(ji.prg, BufferXfer):
         dest, src = ji.rawbufs[0:2]
-        wait_signals = [self.kickoff_signals[dest.d], self.kickoff_signals[src.d]]
-        if dest._buf in self.resourse_to_signal:
-          wait_signals.append(self.dependency_as_signal(dest._buf, dest.d))
-        if src._buf in self.resourse_to_signal:
-          wait_signals.append(self.dependency_as_signal(src._buf, src.d))
+        copies += dest.nbytes
+        self.packets.append(None)
+        # continue
+        dest_h, src_h = False, False
+        wait_signals = []
+        # wait_signals = [self.kickoff_signals[dest.d], self.kickoff_signals[src.d]]
+        if dest._buf in w_resourse_to_signal:
+          wait_signals.append(self.dependency_as_signal(w_resourse_to_signal, dest._buf, dest.d))
+          w_resourse_to_signal.pop(dest._buf)
+          dest_h = True
+        if dest._buf in r_resourse_to_signal:
+          wait_signals.append(self.dependency_as_signal(r_resourse_to_signal, dest._buf, dest.d))
+          r_resourse_to_signal.pop(dest._buf)
+          dest_h = True
+        
+        if src._buf in w_resourse_to_signal:
+          wait_signals.append(self.dependency_as_signal(w_resourse_to_signal, src._buf, src.d))
+          src_h = True
+
+        if src_h == False: wait_signals.append(self.kickoff_signals[src.d])
+        if dest_h == False: wait_signals.append(self.kickoff_signals[dest.d])
+
+        # print(f"transfer {hex(src._buf)} -> {hex(dest._buf)}")
 
         sync_signal = self.alloc_signal()
         self.signals_to_reset.append(sync_signal)
 
         c_wait_signal = (hsa.hsa_signal_t * len(wait_signals))(*wait_signals)
         self.transfers.append((dest._buf, dest.d.agent, src._buf, src.d.agent, dest.nbytes, len(wait_signals),
-                               c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0))
+                               c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
 
-        self.resourse_to_signal[src._buf] = sync_signal
-        self.resourse_to_signal[dest._buf] = sync_signal
-        self.signal_to_devices[sync_signal.handle] = [dest.d, src.d]
+        r_resourse_to_signal[src._buf] = sync_signal
+        w_resourse_to_signal[dest._buf] = sync_signal
+        signal_to_devices[sync_signal.handle] = [dest.d, src.d]
       else: assert False
 
+    # print("COPY", copies / 1e6, "mb")
+
     # Signaling we have finished
-    self.wait_signals_to_finish = collections.defaultdict(list)
-    for _,v in self.resourse_to_signal.items():
+    wait_signals_to_finish = collections.defaultdict(list)
+    for v in list(w_resourse_to_signal.values()) + list(r_resourse_to_signal.values()):
       if not isinstance(v, hsa.hsa_signal_t): continue
-      for dev in self.signal_to_devices[v.handle]:
-        self.wait_signals_to_finish[dev].append(v)
+      for dev in signal_to_devices[v.handle]:
+        wait_signals_to_finish[dev].append(v)
 
     for dev in self.devices:
-      wait_signals = self.wait_signals_to_finish[dev]
+      wait_signals = wait_signals_to_finish[dev]
       if len(wait_signals): # TODO: remove if here
         for i in range(0, len(wait_signals), 5):
           self.add_barrier_packet(dev, wait_signals[i:i+5], self.finish_signal if i+5 >= len(wait_signals) else EMPTY_SIGNAL)
       else:
         self.add_barrier_packet(dev, [], self.finish_signal)
 
-    for dev in self.devices:
-      self.packets_count[dev] = (self.packet_off[dev] - self.c_aql_packets_addr[dev]) // 64
+    for dev in self.devices: self.packets_count[dev] = (self.packet_off[dev] - self.c_aql_packets_addr[dev]) // AQL_PACKET_SIZE
     for sig in self.signals_to_reset: hsa.hsa_signal_store_relaxed(sig, 0)
     hsa.hsa_signal_store_relaxed(self.finish_signal, 0)
-    self.gpus = ",".join([str(dev.device_id) for dev in self.devices])
 
   def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False, jit=False) -> Optional[float]:    
     # Wait and restore signals
@@ -165,7 +190,7 @@ class HSAGraph:
       dev.hw_queue.blit_packets(self.c_aql_packets_addr[dev], self.packets_count[dev])
 
     for transfer_data in self.transfers:
-      check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data, True))
+      check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data)) # check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2]))
 
     et = None
     if wait:
@@ -174,7 +199,7 @@ class HSAGraph:
       et = (timings.end - timings.start) / 1e9
 
     update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers),
-                 jit=jit, num_kernels=len(self.jit_cache), device=f"HSA:{self.gpus}")
+                 jit=jit, num_kernels=len(self.jit_cache), device="HSA")
 
   def add_exec_packet(self, dev, ji, args, var_vals):
     global_size, local_size = ji.prg.launch_dims(var_vals)
@@ -194,7 +219,7 @@ class HSAGraph:
     packet.completion_signal = EMPTY_SIGNAL
     packet.setup = DISPATCH_KERNEL_SETUP
     packet.header = DISPATCH_KERNEL_HEADER
-    self.packet_off[dev] += 64
+    self.packet_off[dev] += AQL_PACKET_SIZE
     return packet
 
   def add_barrier_packet(self, dev, wait_signals, completion_signal):
@@ -206,20 +231,102 @@ class HSAGraph:
     barrier_packet.reserved2 = 0
     barrier_packet.completion_signal = completion_signal
     barrier_packet.header = BARRIER_HEADER
-    self.packet_off[dev] += 64
+    self.packet_off[dev] += AQL_PACKET_SIZE
     return barrier_packet
 
   def alloc_signal(self):
     check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t())))
     return signal
 
-  def dependency_as_signal(self, dep, dep_dev):
-    if isinstance(self.resourse_to_signal[dep], hsa.hsa_signal_t):
-      return self.resourse_to_signal[dep]
+  def dependency_as_signal(self, rs, dep, dep_dev):
+    if isinstance(rs[dep], hsa.hsa_signal_t):
+      return rs[dep]
     else:
-      packet, packet_dev = self.resourse_to_signal[dep]
+      packet, packet_dev = rs[dep]
       assert packet_dev == dep_dev, "transfer packet used on another device last time"
       if packet.completion_signal.handle == EMPTY_SIGNAL.handle:
         packet.completion_signal = self.alloc_signal()
         self.signals_to_reset.append(packet.completion_signal)
       return packet.completion_signal
+
+  def optimize_jc(self):
+    self.ji_prio = {}
+    self.ji_deps = {}
+
+    for j,ji in enumerate(self.jit_cache):
+      self.ji_prio[j] = -1 if isinstance(ji.prg, BufferXfer) else 0
+      self.ji_deps[j] = set()
+
+    self.last_w_access = {}
+    self.last_r_access = {}
+    for j,ji in enumerate(self.jit_cache):
+      if isinstance(ji.prg, CompiledASTRunner):
+        self.ji_prio[j] = -1
+        for buf in ji.rawbufs:
+          if buf._buf in self.last_w_access:
+            dep_ji, dep_idx = self.jit_cache[self.last_w_access[buf._buf]], self.last_w_access[buf._buf]
+            if isinstance(dep_ji.prg, BufferXfer): self.ji_prio[j] += 1 # bigger prio, should be at the end
+            self.ji_deps[j].add(dep_idx)
+        if ji.rawbufs[0]._buf in self.last_r_access:
+          dep_ji, dep_idx = self.jit_cache[self.last_r_access[ji.rawbufs[0]._buf]], self.last_r_access[ji.rawbufs[0]._buf]
+          if isinstance(dep_ji.prg, BufferXfer): self.ji_prio[j] += 1 # bigger prio, should be at the end
+          self.ji_deps[j].add(dep_idx)
+
+        self.last_w_access[ji.rawbufs[0]._buf] = j
+        for buf in ji.rawbufs[1:]: self.last_r_access[buf._buf] = j
+      elif isinstance(ji.prg, BufferXfer):
+        dest, src = ji.rawbufs[0:2]
+        if src._buf in self.last_w_access:
+          dep_ji, dep_idx = self.jit_cache[self.last_w_access[src._buf]], self.last_w_access[src._buf]
+          self.ji_prio[dep_idx] -= ji.rawbufs[0].nbytes # lower prio, should be at the start to kickoff it earlier
+          self.ji_deps[j].add(dep_idx)
+
+        if dest._buf in self.last_w_access:
+          dep_ji, dep_idx = self.jit_cache[self.last_w_access[dest._buf]], self.last_w_access[dest._buf]
+          self.ji_prio[dep_idx] -= ji.rawbufs[0].nbytes # lower prio, should be at the start to kickoff it earlier
+          self.ji_deps[j].add(dep_idx)
+
+        if dest._buf in self.last_r_access:
+          dep_ji, dep_idx = self.jit_cache[self.last_r_access[dest._buf]], self.last_r_access[dest._buf]
+          self.ji_prio[dep_idx] -= ji.rawbufs[0].nbytes # lower prio, should be at the start to kickoff it earlier
+          self.ji_deps[j].add(dep_idx)
+
+        self.last_r_access[src._buf] = j
+        self.last_w_access[dest._buf] = j
+      else: assert False
+  
+    def toposort(graph, key=None):
+      # init the indegree for each node
+      nodes = graph.keys() | set([node for adjacents in graph.values() for node in adjacents])
+      in_degree = {node: 0 for node in nodes}
+
+      # compute the indegree
+      for k, adjacents in graph.items():
+        for node in adjacents:
+          in_degree[node] += 1
+
+      # init the heap with the nodes with indegree 0 and priority given by key
+      heap = [(key(node), node) for node, degree in in_degree.items() if degree == 0]
+      heapq.heapify(heap)
+
+      top_order = []
+      while heap:  # heap is not empty
+        _, node = heapq.heappop(heap)  # get the element with highest priority and remove from heap
+        top_order.append(node)  # add to topological order
+        for adjacent in graph.get(node, []):  # iter over the neighbors of the node
+          in_degree[adjacent] -= 1
+          if in_degree[adjacent] == 0:  # if the node has in_degree 0 add to the heap with priority given by key
+            heapq.heappush(heap, (key(adjacent), adjacent))
+
+      return top_order
+    
+    ji_deps_rev = {}
+    for j in range(len(self.jit_cache)): ji_deps_rev[j] = []
+    for k, v in self.ji_deps.items():
+      for x in v: ji_deps_rev[x].append(k)
+    order = toposort(ji_deps_rev, self.ji_prio.get)
+    assert len(order) == len(self.jit_cache)
+
+    new_jit_cache = []
+    for i in range(len(self.jit_cache)): new_jit_cache.append(self.jit_cache[order[i]])
+    self.jit_cache = new_jit_cache

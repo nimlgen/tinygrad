@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable, List, Tuple, Dict, cast, Union, Optional, TypeVar, Generic
-import functools, itertools, operator
+import functools, itertools, operator, time, collections
 from tinygrad.nn.state import get_parameters
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, merge_dicts, getenv, all_int, Context, GRAPH, flatten, GraphException
@@ -33,20 +33,51 @@ def get_jc_idxs_with_updatable_launch_dims(jit_cache: List[JitItem]) -> List[int
 def get_jc_idxs_with_updatable_var_vals(jit_cache: List[JitItem]) -> List[int]:
   return [j for j,ji in enumerate(jit_cache) if isinstance(ji.prg, CompiledASTRunner) and ji.prg.vars]
 
+def reorder_jit_cache(jit_cache: List[JitItem]):
+  # Reorder jit cache for more optimal multidevice load.
+  ji_per_device = collections.defaultdict(list)
+  new_jit_cache = []
+  def __flush():
+    devs = list(ji_per_device.keys())
+    add_any = True 
+    while add_any:
+      add_any = False
+      for dev in devs:
+        if len(ji_per_device[dev]) > 0:
+          new_jit_cache.append(ji_per_device[dev].pop(0))
+          add_any = True
+
+  for ji in jit_cache:
+    if isinstance(ji.prg, CompiledASTRunner):
+      if not ji.prg.device.dname.startswith("HSA"): return jit_cache
+      ji_per_device[ji.prg.device].append(ji)
+    elif isinstance(ji.prg, BufferXfer):
+      if not ji.rawbufs[0].d.dname.startswith("HSA") or not ji.rawbufs[1].d.dname.startswith("HSA"): return jit_cache
+      __flush()
+      new_jit_cache.append(ji)
+    else: 
+      return jit_cache
+  __flush()
+  assert len(new_jit_cache) == len(jit_cache)
+  return new_jit_cache
+
 def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]) -> List[JitItem]:
   # Split JIT cache into batches for faster graph execution.
   # This allows the accelerator to run some batches while subsequent graphs are still being updated.
+  jit_cache = reorder_jit_cache(jit_cache)
+  max_batch_size = getenv("JIT_BATCH_SIZE", 16)
   graphed_jit_cache: List[JitItem] = []
   current_batch: List[JitItem] = []
   current_device: Union[Compiled, None] = None
 
   # Flush the current batch.
   def flush():
-    nonlocal current_batch, current_device
+    nonlocal current_batch, current_device, max_batch_size
     assert current_device is not None
     try:
       if len(current_batch) <= 1: raise GraphException("only one kernel doesn't graph")
       graphed_jit_cache.append(JitItem(current_device.graph(current_batch, input_rawbuffers, var_vals), cast(List[Optional[Buffer]], input_rawbuffers))) # noqa: E501
+      max_batch_size = min(max_batch_size * 2, 1024)
       if DEBUG >= 2: print(f"\tJIT GRAPHing batch with {len(current_batch)} kernels on device {current_device}")
     except GraphException as e:
       graphed_jit_cache.extend(current_batch)
@@ -71,7 +102,7 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
 
     # The flush is done when (1) ji is the last one, (2) the size of batch exceeds the maximum batch size or
     # (3) the current jit item cannot be graphed, so the current batch is flushed before such a jit item is added.
-    if len(current_batch) > 0 and (i==len(jit_cache)-1 or len(current_batch) >= getenv("JIT_BATCH_SIZE", 64) or not can_be_graphed): flush()
+    if len(current_batch) > 0 and (i==len(jit_cache)-1 or len(current_batch) >= max_batch_size or not can_be_graphed): flush()
 
     # If the jit item cannot be graphed, put it right into the final cache after the flush.
     if not can_be_graphed or device.graph is None: graphed_jit_cache.append(ji)
@@ -164,6 +195,7 @@ class _CacheCollector:
 
   def start(self, var_vals:Optional[Dict[Variable, int]]=None):
     self.cache = []
+    self.hold_ref = []
     self.placeholders: WeakKeyDictionary[Buffer, PlaceHolder] = WeakKeyDictionary()
     self.var_vals = var_vals if var_vals is not None else {}
 
@@ -173,6 +205,7 @@ class _CacheCollector:
     # NOTE: this is making an assumption that 0 is special
     # TODO: this is wrong for sync and wait
     if len(rawbufs): self.placeholders[rawbufs[0]] = PlaceHolder(rawbufs[0])
+    if isinstance(prg, BufferXfer): self.hold_ref += rawbufs[0:2]
     self.cache.append((prg, [self.placeholders.get(x, x) if isinstance(x, Buffer) else x for x in rawbufs]))
 
   def finish(self) -> List[JitItem]:
