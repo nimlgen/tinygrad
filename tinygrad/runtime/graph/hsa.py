@@ -28,14 +28,14 @@ class HSAGraph:
     kernargs_size: Dict[HSADevice, int] = collections.defaultdict(int)
     for ji in self.jit_cache:
       if isinstance(ji.prg, CompiledASTRunner):
-        if not isinstance(ji.prg.device, HSADevice): raise GraphException
         self.devices.add(ji.prg.device)
-        kernargs_size[ji.prg.device] += (ctypes.sizeof(ji.prg.clprg.args_struct_t) + 15) & ~15 if isinstance(ji.prg, CompiledASTRunner) else 0
+        kernargs_size[ji.prg.device] += (ctypes.sizeof(ji.prg.clprg.args_struct_t) + 15) & ~15
       elif isinstance(ji.prg, BufferXfer):
-        for x in ji.rawbufs[0:2]:
-          if not isinstance(x.d, HSADevice): raise GraphException
-          self.devices.add(x.d)
+        for x in ji.rawbufs[0:2]: self.devices.add(x.d)
       else: raise GraphException
+
+    # Check all devices are HSA.
+    if any(not isinstance(d, HSADevice) for d in self.devices): raise GraphException
 
     # Allocate queues
     self.packets_count = {}

@@ -59,9 +59,6 @@ class HSAAllocator(LRUAllocator):
     self.device = device
     super().__init__()
 
-  def full_synchronize(self):
-    for d in HSADevice.devices: d.synchronize()
-
   def _alloc(self, size:int):
     c_agents = (hsa.hsa_agent_t * len(HSADevice.devices))(*[dev.agent for dev in HSADevice.devices])
     check(hsa.hsa_amd_memory_pool_allocate(self.device.gpu_mempool, size, 0, ctypes.byref(buf := ctypes.c_void_p())))
@@ -69,7 +66,7 @@ class HSAAllocator(LRUAllocator):
     return buf.value
 
   def _free(self, opaque:T):
-    self.full_synchronize()
+    HSADevice.synchronize_system()
     check(hsa.hsa_amd_memory_pool_free(opaque))
 
   def copyin(self, dest:T, src: memoryview):
@@ -127,8 +124,7 @@ class HSAAllocator(LRUAllocator):
     self.device.hw_queue.submit_barrier(wait_signals=wait_signals)
 
   def copyout(self, dest:memoryview, src:T):
-    # self.device.synchronize()
-    self.full_synchronize()
+    HSADevice.synchronize_system()
     copy_signal = self.device.alloc_signal(reusable=True)
     c_agents = (hsa.hsa_agent_t*2)(*[HSADevice.cpu_agent, self.device.agent])
     check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), dest.nbytes, c_agents, 2, HSADevice.cpu_mempool, 0, ctypes.byref(addr:=ctypes.c_void_p())))
@@ -194,6 +190,10 @@ class HSADevice(Compiled):
     self.delayed_free.clear()
 
     self.kernarg_next_addr = self.kernarg_start_addr
+
+  @staticmethod
+  def synchronize_system():
+    for d in HSADevice.devices: d.synchronize()
 
   def alloc_signal(self, reusable=False):
     if len(self.signal_pool): signal = self.signal_pool.pop()
