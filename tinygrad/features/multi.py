@@ -1,13 +1,70 @@
 from __future__ import annotations
 from typing import Optional, Union, Any, Tuple, List
-import functools, itertools, operator
+import functools, itertools, operator, collections
 from tinygrad.helpers import all_same, dedup, round_up, prod, DEBUG
 from tinygrad.dtype import DType, Scalar
 from tinygrad.ops import BinaryOps, LoadOps, UnaryOps, TernaryOps, ReduceOps
 from tinygrad.lazy import LazyBuffer
 from tinygrad.shape.shapetracker import sint
 
+def ring_allreduce_chenuy(op: ReduceOps, lbs: List[LazyBuffer]):
+  from tinygrad import Tensor
+  assert all_same([lb.shape[0] for lb in lbs]), "allreduce with uneven shards is undefined"
+  bop = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX}[op]
+  ds = [lb.device for lb in lbs]
+  shlbs = [to_sharded([rlb] * len(ds), 1) for rlb in lbs]
+
+  reduced = []
+  # transpose to make rings
+  for i, lbs in enumerate(zip(*shlbs)):
+    # rotate each ring to have a different start
+    lbs:List[LazyBuffer] = lbs[(i+1):] + lbs[:(i+1)]
+    lb:LazyBuffer = lbs[0]
+    # ring for scatter reduce
+    for dest in lbs[1:]:
+      lb = lb.copy_to_device(dest.device).e(BinaryOps.ADD, dest)
+    reduced.append(lb)
+
+  gathered = collections.defaultdict(lambda: [None] * len(ds))
+  for lb in reduced:
+    for dest in ds:
+      gathered[dest][ds.index(lb.device)] = lb.copy_to_device(dest)
+
+  catted = {}
+  for device, lbs in gathered.items():
+    catted[device] = Tensor.stack([Tensor(lb, device=lb.device) for lb in lbs], 1).flatten(end_dim=2).lazydata
+
+  return list(catted.values())
+
+def ring_allreduce(op: ReduceOps, lbs: List[LazyBuffer]):
+  # assert all_int(lbs[0].shape), f"does not support symbolic shape {lbs[0].shape}"
+  assert all_same([lb.shape[0] for lb in lbs]), "allreduce with uneven shards is undefined"
+  bop = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX}[op]
+
+  n_lbs, dim = len(lbs), prod(lbs[0].shape)
+  base, left = dim // n_lbs, dim % n_lbs
+  c_lens = [base + 1 if left - i > 0 else base for i in range(n_lbs)]
+  acc = 0; chunks = [(acc, (acc := acc + i)) for i in c_lens if i > 0] # noqa: E702
+  chunked = [[lb.reshape((dim,)).shrink(((s,e),)) for s,e in chunks] for lb in lbs]
+
+  # Scatter-reduce step
+  for step in range(n_lbs - 1):
+    for i in range(len(chunks)):
+      s, r = (i+step)%n_lbs, (i+step+1)%n_lbs
+      chunked[r][i] = chunked[r][i].e(bop, chunked[s][i].copy_to_device(chunked[r][i].device))
+
+  # Allgather step
+  for step in range(n_lbs - 1):
+    for i in range(len(chunks)):
+      s, r = (i+step-1)%n_lbs, (i+step)%n_lbs
+      chunked[r][i] = chunked[s][i].copy_to_device(chunked[r][i].device)
+
+  # Assemble chunks back
+  pads = [((s,dim-e),) for s,e in chunks]
+  return [functools.reduce(lambda x,y: x.e(BinaryOps.ADD, y), [c.pad(pads[i]) for i,c in enumerate(lb_c)]).reshape(lbs[0].shape) for lb_c in chunked]
+
 def all_reduce(op:ReduceOps, lbs):
+  return ring_allreduce(op, lbs)
   # TODO: replace this with ring reduce
   bop = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX}[op]
   return [functools.reduce(lambda x,y: x.e(bop, y), [x.copy_to_device(lb.device) for x in lbs]) for lb in lbs]

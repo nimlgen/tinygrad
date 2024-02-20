@@ -26,6 +26,10 @@ COPY_BARRIER_HEADER  = hsa.HSA_FENCE_SCOPE_NONE << hsa.HSA_PACKET_HEADER_SCACQUI
 COPY_BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_NONE << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
 COPY_BARRIER_HEADER |= hsa.HSA_PACKET_TYPE_BARRIER_AND << hsa.HSA_PACKET_HEADER_TYPE
 
+COPY_DISPATCH_KERNEL_HEADER  = hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE
+COPY_DISPATCH_KERNEL_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
+COPY_DISPATCH_KERNEL_HEADER |= hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE
+
 kCopyAlignedVecWidth = 4
 kCopyAlignedUnroll = 1
 class CopyAligned(ctypes.Structure):
@@ -63,7 +67,7 @@ class HWQueue:
     self.available_packet_slots = self.queue_size
     # self.copy_kern_object = None
 
-    check(hsa.hsa_amd_queue_set_priority(self.hw_queue, hsa.HSA_AMD_QUEUE_PRIORITY_HIGH))
+    # check(hsa.hsa_amd_queue_set_priority(self.hw_queue, hsa.HSA_AMD_QUEUE_PRIORITY_HIGH))
     check(hsa.hsa_amd_profiling_set_profiler_enabled(self.hw_queue, 1))
 
   def __del__(self):

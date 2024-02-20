@@ -11,12 +11,14 @@ from tinygrad.features.jit import JitItem, get_input_replace, get_jit_stats, \
 import tinygrad.runtime.autogen.hsa as hsa
 from tinygrad.runtime.driver.hsa import *
 
+USE_OLD_TRANSFERS = False
+
 class HSAGraph:
   def __init__(self, jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     self.jit_cache = jit_cache
 
     # Optimize jit cache for more optimial kernel execution
-    if getenv("HSA_OPT_JC", 0): self.optimize_jc()
+    # if getenv("HSA_OPT_JC", 1): self.optimize_jc()
 
     self.input_replace = get_input_replace(self.jit_cache, input_rawbuffers)
     self.op_estimate, self.mem_estimate = get_jit_stats(self.jit_cache)
@@ -147,7 +149,7 @@ class HSAGraph:
         sync_signal = self.alloc_signal()
         self.signals_to_reset.append(sync_signal)
 
-        if False:
+        if USE_OLD_TRANSFERS:
           c_wait_signal = (hsa.hsa_signal_t * len(wait_signals))(*wait_signals)
           self.transfers.append((dest._buf, dest.d.agent, src._buf, src.d.agent, dest.nbytes, len(wait_signals),
                                 c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
@@ -159,7 +161,7 @@ class HSAGraph:
         signal_to_devices[sync_signal.handle] = [dest.d, src.d]
       else: assert False
 
-    # print("COPY", copies / 1e6, "mb")
+    print("COPY", copies / 1e6, "mb - ", len(self.transfers))
 
     # Signaling we have finished
     wait_signals_to_finish = collections.defaultdict(list)
@@ -210,9 +212,9 @@ class HSAGraph:
     for dev in self.devices:
       dev.hw_queue.blit_packets(self.c_aql_packets_addr[dev], self.packets_count[dev])
 
-    if False:
+    if USE_OLD_TRANSFERS:
       for transfer_data in self.transfers:
-        check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data)) # check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2]))
+        check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2])) # check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2]))
     else:
       for dev in self.devices:
         if self.copy_packets_count[dev] > 0: dev.copy_queue.blit_packets(self.c_copy_packets_addr[dev], self.copy_packets_count[dev])
@@ -265,13 +267,13 @@ class HSAGraph:
     src = x_src._buf
     cp_dev = x_dest.d
 
-    assert src & 0x3 == dest & 0x3, "only aligned supported"
+    assert src & 0x3 == dest & 0x3 and src & 0x3 == 0, "only aligned supported"
     assert wait_signals is None or len(wait_signals) < 5 # TODO: remove this
 
     if cp_dev.copy_kern_object is None: 
       cp_dev.copy_kern_object = int(input(f"dai handle {cp_dev.device_id}: "), base=10)
 
-    num_cus_ = 30
+    num_cus_ = 96
     num_workitems = 64 * 4 * num_cus_
     phase1_size = min(size, (0x100 - dest & 0xFF) & 0xFF)
     phase2_block = num_workitems * 4 * kCopyAlignedUnroll * kCopyAlignedVecWidth
@@ -317,8 +319,8 @@ class HSAGraph:
     packet.kernarg_address = kernargs
     packet.reserved2 = 0
     packet.completion_signal = completion_signal
-    packet.setup = DISPATCH_KERNEL_SETUP
-    packet.header = DISPATCH_KERNEL_HEADER
+    packet.setup = 1 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS
+    packet.header = COPY_DISPATCH_KERNEL_HEADER
     self.copy_packet_off[cp_dev] += AQL_PACKET_SIZE
 
   def alloc_signal(self):

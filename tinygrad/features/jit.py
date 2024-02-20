@@ -82,6 +82,7 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
     except GraphException as e:
       graphed_jit_cache.extend(current_batch)
       if DEBUG >= 2: print(f"\tJIT GRAPHing failed batch with {len(current_batch)} kernels on device {current_device}: {e}")
+      print(current_batch)
     current_batch = []
     current_device = None
 
