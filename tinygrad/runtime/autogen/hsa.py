@@ -30,6 +30,7 @@ def char_pointer_cast(string, encoding='utf-8'):
 
 _libraries = {}
 _libraries['libhsa-runtime64.so'] = ctypes.CDLL('/opt/rocm/lib/libhsa-runtime64.so')
+# _libraries['libhsa-runtime64.so'] = ctypes.CDLL('/home/nimlgen/amd/ROCR-Runtime/src/build/libhsa-runtime64.so')
 class AsDictMixin:
     @classmethod
     def as_dict(cls, self):

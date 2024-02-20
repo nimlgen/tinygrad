@@ -5,7 +5,7 @@ import tinygrad.runtime.autogen.hsa as hsa
 from tinygrad.helpers import DEBUG, init_c_var, from_mv, round_up, to_mv, init_c_struct_t
 from tinygrad.device import Compiled, LRUAllocator
 from tinygrad.runtime.ops_hip import HIPCompiler
-from tinygrad.runtime.driver.hsa import check, find_agent, find_memory_pool, HWQueue
+from tinygrad.runtime.driver.hsa import check, find_agent, find_memory_pool, HWQueue, load_copy_code
 
 HSACompiler = HIPCompiler
 
@@ -28,9 +28,10 @@ class HSAProgram:
     self.group_segment_size = init_c_var(ctypes.c_uint32(), lambda x: check(hsa.hsa_executable_symbol_get_info(self.kernel, hsa.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE, ctypes.byref(x)))).value # noqa: E501
     self.private_segment_size = init_c_var(ctypes.c_uint32(), lambda x: check(hsa.hsa_executable_symbol_get_info(self.kernel, hsa.HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE, ctypes.byref(x)))).value # noqa: E501
 
-    check(hsa.hsa_code_object_reader_destroy(code_reader))
+    # check(hsa.hsa_code_object_reader_destroy(code_reader))
 
   def __del__(self):
+    HSADevice.synchronize_system()
     if hasattr(self, 'exec'): check(hsa.hsa_executable_destroy(self.exec))
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
@@ -125,10 +126,11 @@ class HSAAllocator(LRUAllocator):
 
   def copyout(self, dest:memoryview, src:T):
     HSADevice.synchronize_system()
-    copy_signal = self.device.alloc_signal(reusable=True)
+    # copy_signal = self.device.alloc_signal(reusable=True)
     c_agents = (hsa.hsa_agent_t*2)(*[HSADevice.cpu_agent, self.device.agent])
     check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), dest.nbytes, c_agents, 2, HSADevice.cpu_mempool, 0, ctypes.byref(addr:=ctypes.c_void_p())))
-    check(hsa.hsa_amd_memory_async_copy(addr, HSADevice.cpu_agent, src, self.device.agent, dest.nbytes, 0, None, copy_signal))
+    # check(hsa.hsa_amd_memory_async_copy(addr, HSADevice.cpu_agent, src, self.device.agent, dest.nbytes, 0, None, copy_signal))
+    copy_signal = self.device.copy_queue.submit_copy(ctypes.addressof(ctypes.c_char.from_buffer(dest)), src, dest.nbytes, [], True)
     hsa.hsa_signal_wait_scacquire(copy_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     check(hsa.hsa_amd_memory_unlock(from_mv(dest)))
 
@@ -157,6 +159,8 @@ class HSADevice(Compiled):
     self.gpu_mempool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_GPU)
     self.kernargs_pool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, flags=hsa.HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT)
     self.hw_queue = HWQueue(self)
+    self.copy_queue = HWQueue(self)
+    # self.copy_prog = HSAProgram(self, "CopyAligned", bytes(kCodeCopyAligned11))
     HSADevice.devices.append(self)
 
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_NAME, ctypes.byref(agent_name_buf := ctypes.create_string_buffer(256))))
@@ -176,11 +180,13 @@ class HSADevice(Compiled):
       check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t())))
       self.signal_pool.append(signal)
 
+    self.copy_kern_object = load_copy_code(self, 32, 12)
+
     from tinygrad.runtime.graph.hsa import HSAGraph
     super().__init__(device, HSAAllocator(self), HSACompiler(self.arch), functools.partial(HSAProgram, self), HSAGraph)
 
   def synchronize(self):
-    self.hw_queue.wait()
+    self.hw_queue.wait() # hw queue is a sync place for copy_queue as well
 
     for sig in self.reusable_signals: hsa.hsa_signal_silent_store_relaxed(sig, 1)
     self.signal_pool.extend(self.reusable_signals)

@@ -32,6 +32,7 @@ class HSAGraph:
         kernargs_size[ji.prg.device] += (ctypes.sizeof(ji.prg.clprg.args_struct_t) + 15) & ~15
       elif isinstance(ji.prg, BufferXfer):
         for x in ji.rawbufs[0:2]: self.devices.add(x.d)
+        kernargs_size[ji.rawbufs[0].d] += 128 # copy is on dest device...
       else: raise GraphException
 
     # Check all devices are HSA.
@@ -47,6 +48,16 @@ class HSAGraph:
       self.c_aql_packets[dev] = (hsa.hsa_kernel_dispatch_packet_t * self.packets_count[dev])()
       self.c_aql_packets_addr[dev] = ctypes.addressof(self.c_aql_packets[dev])
       self.packet_off[dev] = ctypes.addressof(self.c_aql_packets[dev])
+
+    self.copy_packets_count = {}
+    self.c_copy_packets = {}
+    self.c_copy_packets_addr = {}
+    self.copy_packet_off = {}
+    for dev in self.devices:
+      self.copy_packets_count[dev] = len(self.jit_cache) + 300 # TODO: fixme
+      self.c_copy_packets[dev] = (hsa.hsa_kernel_dispatch_packet_t * self.copy_packets_count[dev])()
+      self.c_copy_packets_addr[dev] = ctypes.addressof(self.c_copy_packets[dev])
+      self.copy_packet_off[dev] = ctypes.addressof(self.c_copy_packets[dev])
 
     # Allocate kernel args.
     kernargs_ptrs: Dict[HSADevice, int] = dict()
@@ -65,6 +76,11 @@ class HSAGraph:
       kernargs_ptrs[dev] += (ctypes.sizeof(ji.prg.clprg.args_struct_t) + 15) & ~15
       for i in range(len(ji.rawbufs)): self.ji_kernelargs_structs[j].__setattr__(f'f{i}', ji.rawbufs[i]._buf)
       for i in range(len(ji.prg.vars)): self.ji_kernelargs_structs[j].__setattr__(f'v{i}', var_vals[ji.prg.vars[i]])
+
+    for j,ji in enumerate(self.jit_cache):
+      if not isinstance(ji.prg, BufferXfer): continue
+      self.ji_kernelargs_addr[j] = kernargs_ptrs[ji.rawbufs[0].d]
+      kernargs_ptrs[ji.rawbufs[0].d] += 128
 
     # Build packets for hwqueues.
     self.packets = []
@@ -131,9 +147,12 @@ class HSAGraph:
         sync_signal = self.alloc_signal()
         self.signals_to_reset.append(sync_signal)
 
-        c_wait_signal = (hsa.hsa_signal_t * len(wait_signals))(*wait_signals)
-        self.transfers.append((dest._buf, dest.d.agent, src._buf, src.d.agent, dest.nbytes, len(wait_signals),
-                               c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+        if False:
+          c_wait_signal = (hsa.hsa_signal_t * len(wait_signals))(*wait_signals)
+          self.transfers.append((dest._buf, dest.d.agent, src._buf, src.d.agent, dest.nbytes, len(wait_signals),
+                                c_wait_signal, sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+        else:
+          self.add_copy_packet(dest, src, self.ji_kernelargs_addr[j], wait_signals, sync_signal)
 
         r_resourse_to_signal[src._buf] = sync_signal
         w_resourse_to_signal[dest._buf] = sync_signal
@@ -157,7 +176,9 @@ class HSAGraph:
       else:
         self.add_barrier_packet(dev, [], self.finish_signal)
 
-    for dev in self.devices: self.packets_count[dev] = (self.packet_off[dev] - self.c_aql_packets_addr[dev]) // AQL_PACKET_SIZE
+    for dev in self.devices:
+      self.packets_count[dev] = (self.packet_off[dev] - self.c_aql_packets_addr[dev]) // AQL_PACKET_SIZE
+      self.copy_packets_count[dev] = (self.copy_packet_off[dev] - self.c_copy_packets_addr[dev]) // AQL_PACKET_SIZE
     for sig in self.signals_to_reset: hsa.hsa_signal_store_relaxed(sig, 0)
     hsa.hsa_signal_store_relaxed(self.finish_signal, 0)
 
@@ -189,8 +210,12 @@ class HSAGraph:
     for dev in self.devices:
       dev.hw_queue.blit_packets(self.c_aql_packets_addr[dev], self.packets_count[dev])
 
-    for transfer_data in self.transfers:
-      check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data)) # check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2]))
+    if False:
+      for transfer_data in self.transfers:
+        check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data)) # check(hsa.hsa_amd_memory_async_copy(*transfer_data[:-2]))
+    else:
+      for dev in self.devices:
+        if self.copy_packets_count[dev] > 0: dev.copy_queue.blit_packets(self.c_copy_packets_addr[dev], self.copy_packets_count[dev])
 
     et = None
     if wait:
@@ -233,6 +258,68 @@ class HSAGraph:
     barrier_packet.header = BARRIER_HEADER
     self.packet_off[dev] += AQL_PACKET_SIZE
     return barrier_packet
+
+  def add_copy_packet(self, x_dest, x_src, kernargs, wait_signals, completion_signal):
+    size = x_dest.nbytes
+    dest = x_dest._buf
+    src = x_src._buf
+    cp_dev = x_dest.d
+
+    assert src & 0x3 == dest & 0x3, "only aligned supported"
+    assert wait_signals is None or len(wait_signals) < 5 # TODO: remove this
+
+    if cp_dev.copy_kern_object is None: 
+      cp_dev.copy_kern_object = int(input(f"dai handle {cp_dev.device_id}: "), base=10)
+
+    num_cus_ = 30
+    num_workitems = 64 * 4 * num_cus_
+    phase1_size = min(size, (0x100 - dest & 0xFF) & 0xFF)
+    phase2_block = num_workitems * 4 * kCopyAlignedUnroll * kCopyAlignedVecWidth
+    phase2_size = ((size - phase1_size) // phase2_block) * phase2_block
+    phase3_size = ((size - phase1_size - phase2_size) // 4) * 4
+
+    copy_st = CopyAligned.from_address(kernargs)
+    copy_st.phase1_src_start = src
+    copy_st.phase1_dst_start = dest
+    copy_st.phase2_src_start = src + phase1_size
+    copy_st.phase2_dst_start = dest + phase1_size
+    copy_st.phase3_src_start = src + phase1_size + phase2_size
+    copy_st.phase3_dst_start = dest + phase1_size + phase2_size
+    copy_st.phase4_src_start = src + phase1_size + phase2_size + phase3_size
+    copy_st.phase4_dst_start = dest + phase1_size + phase2_size + phase3_size
+    copy_st.phase4_src_end = src + size
+    copy_st.phase4_dst_end = dest + size
+    copy_st.num_workitems = num_workitems
+
+    global_size, local_size = (num_workitems, 1, 1), (64, 1, 1)
+    
+    barrier_packet = hsa.hsa_barrier_and_packet_t.from_address(self.copy_packet_off[cp_dev])
+    barrier_packet.reserved0 = 0
+    barrier_packet.reserved1 = 0
+    for i in range(5):
+      barrier_packet.dep_signal[i] = wait_signals[i] if wait_signals and len(wait_signals) > i else EMPTY_SIGNAL
+    barrier_packet.reserved2 = 0
+    barrier_packet.completion_signal = EMPTY_SIGNAL
+    barrier_packet.header = COPY_BARRIER_HEADER
+    self.copy_packet_off[cp_dev] += AQL_PACKET_SIZE
+
+    packet = hsa.hsa_kernel_dispatch_packet_t.from_address(self.copy_packet_off[cp_dev])
+    packet.workgroup_size_x = local_size[0]
+    packet.workgroup_size_y = local_size[1]
+    packet.workgroup_size_z = local_size[2]
+    packet.reserved0 = 0
+    packet.grid_size_x = global_size[0]
+    packet.grid_size_y = global_size[1]
+    packet.grid_size_z = global_size[2]
+    packet.private_segment_size = 0
+    packet.group_segment_size = 0
+    packet.kernel_object = cp_dev.copy_kern_object
+    packet.kernarg_address = kernargs
+    packet.reserved2 = 0
+    packet.completion_signal = completion_signal
+    packet.setup = DISPATCH_KERNEL_SETUP
+    packet.header = DISPATCH_KERNEL_HEADER
+    self.copy_packet_off[cp_dev] += AQL_PACKET_SIZE
 
   def alloc_signal(self):
     check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t())))
