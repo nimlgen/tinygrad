@@ -28,14 +28,14 @@ def check(status):
   if status != 0: raise RuntimeError(f"HIP Error {status}, {ctypes.string_at(hip.hipGetErrorString(status)).decode()}")
 
 class HIPProgram:
-  def __init__(self, device:int, name:str, lib:bytes):
-    self.device, self.name, self.lib = device, name, lib
+  def __init__(self, device_id:int, name:str, lib:bytes):
+    self.device_id, self.name, self.lib = device_id, name, lib
 
     if DEBUG >= 6:
       asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
       print('\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x]))
 
-    hip_set_device(self.device)
+    hip_set_device(self.device_id)
     self.module = init_c_var(hip.hipModule_t(), lambda x: check(hip.hipModuleLoadData(ctypes.byref(x), lib)))
     self.prg = init_c_var(hip.hipFunction_t(), lambda x: check(hip.hipModuleGetFunction(ctypes.byref(x), self.module, name.encode("utf-8"))))
 
@@ -43,7 +43,7 @@ class HIPProgram:
     if hasattr(self, 'module'): check(hip.hipModuleUnload(self.module))
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
-    hip_set_device(self.device)
+    hip_set_device(self.device_id)
     if not hasattr(self, "vargs"):
       self.c_args = init_c_struct_t(tuple([(f'f{i}', hip.hipDeviceptr_t) for i in range(len(args))] +
                                           [(f'v{i}', ctypes.c_int) for i in range(len(vals))]))(*args, *vals)
@@ -80,10 +80,10 @@ class HIPAllocator(LRUAllocator):
     self.full_synchronize()
     return super().free_cache()
   def _alloc(self, size:int):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     return init_c_var(hip.hipDeviceptr_t(), lambda x: check(hip.hipMalloc(ctypes.byref(x), size)))
   def _alloc_with_options(self, size:int, options:BufferOptions):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     if options.uncached:
       return init_c_var(hip.hipDeviceptr_t(), lambda x: check(hip.hipExtMallocWithFlags(ctypes.byref(x), size, 3)))  # hipDeviceMallocUncached = 3
     elif options.host:
@@ -92,7 +92,7 @@ class HIPAllocator(LRUAllocator):
       raise Exception("no options")
   def _free(self, opaque:T): check(hip.hipFree(opaque))
   def copy_from_fd(self, dest, fd, offset, size):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     if not hasattr(self, 'hb'):
       self.hb = [self._alloc_with_options(CHUNK_SIZE, BufferOptions(host=True)) for _ in range(2)]
       self.hb_events = [None, None]
@@ -116,17 +116,17 @@ class HIPAllocator(LRUAllocator):
       self.hb_polarity = (self.hb_polarity+1) % len(self.hb)
       minor_offset = 0 # only on the first
   def copyin(self, dest:T, src: memoryview):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     host_mem = self._alloc_with_options(len(src), BufferOptions(host=True))
     self.device.pending_copyin.append(host_mem)
     ctypes.memmove(host_mem, from_mv(src), len(src))
     check(hip.hipMemcpyAsync(dest, host_mem, len(src), hip.hipMemcpyHostToDevice, None))
   def copyout(self, dest:memoryview, src:T):
     self.full_synchronize()
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     check(hip.hipMemcpy(from_mv(dest), src, len(dest), hip.hipMemcpyDeviceToHost))
   def transfer(self, dest:T, src:T, sz:int, **kwargs):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     check(hip.hipMemcpyAsync(dest, src, sz, hip.hipMemcpyDeviceToDevice, None))
 
 class HIPSyncEvent(JITRunner):
@@ -135,7 +135,7 @@ class HIPSyncEvent(JITRunner):
     super().__init__()
   def __call__(self, rawbufs:List[Buffer], var_vals, wait=False, jit=False):
     to_mv(rawbufs[0]._buf, 4).cast("I")[0] = 0
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     check(hip.hipStreamWriteValue32(None, rawbufs[0]._buf, 1, 0))
     update_stats(colored("sync", "red"), 0, 0, {}, None, 1, jit, device=self.dname)
 
@@ -144,7 +144,7 @@ class HIPWaitEvent(JITRunner):
     self.device, self.dname = cast(HIPDevice, Device[device]), device
     super().__init__()
   def __call__(self, rawbufs:List[Buffer], var_vals, wait=False, jit=False):
-    hip_set_device(self.device.device)
+    hip_set_device(self.device.device_id)
     check(hip.hipStreamWaitValue32(None, rawbufs[0]._buf, 1, 1, 0xFFFFFFFF))
     update_stats(colored("wait", "RED"), 0, 0, {}, None, 1, jit, device=self.dname)
 
@@ -160,7 +160,7 @@ if getenv("HIPCPU"):
 
 class HIPDevice(Compiled):
   def __init__(self, device:str=""):
-    self.device = int(device.split(":")[1]) if ":" in device else 0
+    self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.pending_copyin: List[ctypes.c_void_p] = []
     self.track_cross_buffer: List[Any] = []
     self.peers: Set[int] = set()
@@ -168,19 +168,19 @@ class HIPDevice(Compiled):
     if getenv("HIPCPU"):
       super().__init__(device, MallocAllocator, HIPCompiler("gfx1100"), RHIPProgram)
     else:
-      self.arch = init_c_var(hip.hipDeviceProp_t(), lambda x: check(hip.hipGetDeviceProperties(x, self.device))).gcnArchName.decode()
+      self.arch = init_c_var(hip.hipDeviceProp_t(), lambda x: check(hip.hipGetDeviceProperties(x, self.device_id))).gcnArchName.decode()
       from tinygrad.runtime.graph.hip import HIPGraph
       super().__init__(device, HIPAllocator(self), HIPCompiler(self.arch),
-                      functools.partial(HIPProgram, self.device), HIPGraph)
+                      functools.partial(HIPProgram, self.device_id), HIPGraph)
   def synchronize(self):
     if getenv("HIPCPU"): return
-    hip_set_device(self.device)
+    hip_set_device(self.device_id)
     check(hip.hipDeviceSynchronize())
     for opaque in self.pending_copyin: check(hip.hipFree(opaque))
     self.track_cross_buffer.clear()
     self.pending_copyin.clear()
   def enable_peer(self, dnum):
-    if self.device == dnum or dnum in self.peers: return
-    hip_set_device(self.device)
+    if self.device_id == dnum or dnum in self.peers: return
+    hip_set_device(self.device_id)
     check(hip.hipDeviceEnablePeerAccess(dnum, 0))
     self.peers.add(dnum)

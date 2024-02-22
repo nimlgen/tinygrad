@@ -2,12 +2,12 @@ from typing import List, Any, Dict, cast, Optional
 import Metal
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import dedup, unwrap2, GraphException
-from tinygrad.device import Buffer, CompiledASTRunner, update_stats
+from tinygrad.device import Buffer, CompiledASTRunner, JITGraphRunner, update_stats
 from tinygrad.features.jit import JitItem, get_input_replace, get_jit_stats, get_jc_idxs_with_updatable_launch_dims
 from tinygrad.shape.symbolic import Variable
 from tinygrad.runtime.ops_metal import MetalDevice
 
-class MetalGraph:
+class MetalGraph(JITGraphRunner):
   def __init__(self, device:MetalDevice, jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     if not all(isinstance(ji.prg, CompiledASTRunner) for ji in jit_cache): raise GraphException
 
