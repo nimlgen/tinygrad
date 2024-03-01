@@ -15,11 +15,11 @@ class LARS(Optimizer):
     for i, t in enumerate(self.params):
       assert t.grad is not None
       g = t.grad.realize()
-      t_ = t.detach()
+      w = t.detach()
 
       if t not in self.skip_list:
         g_norm = (g * g).sum().sqrt()
-        w_norm = (t_ * t_).sum().sqrt()
+        w_norm = (w * w).sum().sqrt()
         trust_ratio = (w_norm > 0).where((g_norm > 0).where(
             self.eta * w_norm / (g_norm + self.weight_decay * w_norm + self.eps),
           1.0), 1.0)
