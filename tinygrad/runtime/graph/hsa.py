@@ -1,6 +1,6 @@
-import ctypes, collections, time, itertools
+import ctypes, collections, time, itertools, heapq
 from typing import List, Any, Dict, cast, Optional, Union
-from tinygrad.helpers import GraphException, init_c_var
+from tinygrad.helpers import GraphException, init_c_var, getenv
 from tinygrad.device import Compiled, Buffer, CompiledASTRunner, BufferXfer, MultiDeviceJITGraph, update_stats
 from tinygrad.shape.symbolic import Variable
 from tinygrad.runtime.ops_hsa import HSADevice
@@ -28,10 +28,11 @@ class VirtAQLQueue(AQLQueue):
 class HSAGraph(MultiDeviceJITGraph):
   def __init__(self, jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     self.jit_cache = jit_cache
-    self.input_replace = get_input_replace(jit_cache, input_rawbuffers)
-    self.op_estimate, self.mem_estimate = get_jit_stats(jit_cache) #type:ignore
-    self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(jit_cache)
-    self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(jit_cache)
+
+    self.input_replace = get_input_replace(self.jit_cache, input_rawbuffers)
+    self.op_estimate, self.mem_estimate = get_jit_stats(self.jit_cache)
+    self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(self.jit_cache)
+    self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(self.jit_cache)
 
     # Check all jit items are compatible.
     compiled_devices = set()

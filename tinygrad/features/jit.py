@@ -33,18 +33,109 @@ def get_jc_idxs_with_updatable_launch_dims(jit_cache: List[JitItem]) -> List[int
 def get_jc_idxs_with_updatable_var_vals(jit_cache: List[JitItem]) -> List[int]:
   return [j for j,ji in enumerate(jit_cache) if isinstance(ji.prg, CompiledASTRunner) and ji.prg.vars]
 
+import collections, heapq
+
+def optimize_jc(jit_cache):
+  ji_prio = {}
+  ji_deps = {}
+
+  for j,ji in enumerate(jit_cache):
+    ji_prio[j] = -1 if isinstance(ji.prg, BufferXfer) else 0
+    ji_deps[j] = set()
+
+  last_w_access = {}
+  last_r_access = collections.defaultdict(list)
+  for j,ji in enumerate(jit_cache):
+    if isinstance(ji.prg, CompiledASTRunner):
+      ji_prio[j] = -1
+
+      for buf in ji.rawbufs:
+        if buf._buf in last_w_access:
+          dep_ji, dep_idx = jit_cache[last_w_access[buf._buf]], last_w_access[buf._buf]
+          if isinstance(dep_ji.prg, BufferXfer): ji_prio[j] += 1 # bigger prio, should be at the end
+          ji_deps[j].add(dep_idx)
+      if ji.rawbufs[0]._buf in last_r_access:
+        dep_ids = last_r_access.pop(ji.rawbufs[0]._buf)
+        for dep_idx in dep_ids:
+          dep_ji = jit_cache[dep_idx]
+          if isinstance(dep_ji.prg, BufferXfer): ji_prio[j] += 1 # bigger prio, should be at the end
+          ji_deps[j].add(dep_idx)
+      last_w_access[ji.rawbufs[0]._buf] = j
+      for buf in ji.rawbufs[1:]: last_r_access[buf._buf].append(j)
+    elif isinstance(ji.prg, BufferXfer):
+      dest, src = ji.rawbufs[0:2]
+      if src._buf in last_w_access:
+        dep_ji, dep_idx = jit_cache[last_w_access[src._buf]], last_w_access[src._buf]
+        ji_prio[dep_idx] -= dest.nbytes # lower prio, should be at the start to kickoff it earlier
+        ji_deps[j].add(dep_idx)
+
+      if dest._buf in last_w_access:
+        dep_ji, dep_idx = jit_cache[last_w_access[dest._buf]], last_w_access[dest._buf]
+        ji_prio[dep_idx] -= dest.nbytes # lower prio, should be at the start to kickoff it earlier
+        ji_deps[j].add(dep_idx)
+
+      if dest._buf in last_r_access:
+        dep_ids = last_r_access.pop(dest._buf)
+        for dep_idx in dep_ids:
+          dep_ji = jit_cache[dep_idx]
+          ji_prio[dep_idx] -= dest.nbytes # lower prio, should be at the start to kickoff it earlier
+          ji_deps[j].add(dep_idx)
+      last_r_access[src._buf].append(j)
+      last_w_access[dest._buf] = j
+    else: assert False
+
+  def toposort(graph, key=None):
+    # init the indegree for each node
+    nodes = graph.keys() | set([node for adjacents in graph.values() for node in adjacents])
+    in_degree = {node: 0 for node in nodes}
+
+    # compute the indegree
+    for k, adjacents in graph.items():
+      for node in adjacents:
+        in_degree[node] += 1
+
+    # init the heap with the nodes with indegree 0 and priority given by key
+    heap = [(key(node), node) for node, degree in in_degree.items() if degree == 0]
+    heapq.heapify(heap)
+
+    top_order = []
+    while heap:  # heap is not empty
+      _, node = heapq.heappop(heap)  # get the element with highest priority and remove from heap
+      top_order.append(node)  # add to topological order
+      for adjacent in graph.get(node, []):  # iter over the neighbors of the node
+        in_degree[adjacent] -= 1
+        if in_degree[adjacent] == 0:  # if the node has in_degree 0 add to the heap with priority given by key
+          heapq.heappush(heap, (key(adjacent), adjacent))
+
+    return top_order
+  
+  ji_deps_rev = {}
+  for j in range(len(jit_cache)): ji_deps_rev[j] = []
+  for k, v in ji_deps.items():
+    for x in v: ji_deps_rev[x].append(k)
+  order = toposort(ji_deps_rev, ji_prio.get)
+  assert len(order) == len(jit_cache)
+
+  new_jit_cache = []
+  for i in range(len(jit_cache)): new_jit_cache.append(jit_cache[order[i]])
+  return new_jit_cache
+
 def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]) -> List[JitItem]:
   # Split JIT cache into batches for faster graph execution.
   # This allows the accelerator to run some batches while subsequent graphs are still being updated.
+  jit_cache = optimize_jc(jit_cache)
+
+  max_batch_size = getenv("JIT_BATCH_SIZE", 16)
   graphed_jit_cache: List[JitItem] = []
   current_batch: List[JitItem] = []
   current_device: Optional[Compiled] = None
 
   def flush_batch():
-    nonlocal current_batch, current_device
+    nonlocal current_batch, current_device, max_batch_size
     try:
       if len(current_batch) <= 1 or current_device is None: raise GraphException("only one kernel doesn't graph")
       graphed_jit_cache.append(JitItem(current_device.graph(current_batch, input_rawbuffers, var_vals), cast(List[Optional[Buffer]], input_rawbuffers))) # noqa: E501
+      max_batch_size = max_batch_size * 2
       if DEBUG >= 2: print(f"\tJIT GRAPHing batch with {len(current_batch)} kernels on device {current_device}")
     except GraphException as e:
       graphed_jit_cache.extend(current_batch)
@@ -58,7 +149,7 @@ def apply_graph_to_jit(jit_cache: List[JitItem], input_rawbuffers: List[Buffer],
     elif isinstance(ji.prg, BufferXfer) and ji.rawbufs[0] and ji.rawbufs[0].d.dname.startswith("HSA"): ji_graph_dev = ji.rawbufs[0].d
 
     can_be_graphed = ji_graph_dev and ji_graph_dev.graph
-    can_extend_graph_batch = can_be_graphed and len(current_batch) < getenv("JIT_BATCH_SIZE", 64) and (ji_graph_dev == current_device or
+    can_extend_graph_batch = can_be_graphed and len(current_batch) < max_batch_size and (ji_graph_dev == current_device or
       (isinstance(ji_graph_dev.graph, type) and issubclass(ji_graph_dev.graph, MultiDeviceJITGraph) and type(ji_graph_dev) == type(current_device))) #type:ignore
     if not can_extend_graph_batch and len(current_batch) > 0: flush_batch()
 
