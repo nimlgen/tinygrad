@@ -2,11 +2,11 @@ from __future__ import annotations
 import ctypes, functools, subprocess, io, atexit
 from typing import Tuple, TypeVar, List, Dict
 import tinygrad.runtime.autogen.hsa as hsa
-from tinygrad.helpers import DEBUG, init_c_var, from_mv, round_up, to_mv, init_c_struct_t
-from tinygrad.device import Compiled, LRUAllocator, BufferOptions
+from tinygrad.helpers import DEBUG, init_c_var, from_mv, round_up, to_mv, init_c_struct_t, prod
+from tinygrad.device import Compiled, LRUAllocator, BufferOptions, BufferXfer
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.runtime.ops_hip import HIPCompiler
-from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue
+from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue, load_copy_code
 
 class HSACompiler(HIPCompiler):
   linearizer_opts = LinearizerOptions("HSA", has_tensor_cores=True)
@@ -163,6 +163,7 @@ class HSADevice(Compiled):
     self.agent = HSADevice.agents[hsa.HSA_DEVICE_TYPE_GPU][self.device_id]
     self.gpu_mempool = find_memory_pool(self.agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_GPU)
     self.hw_queue = AQLQueue(self)
+    self.copy_queue = AQLQueue(self)
     HSADevice.devices.append(self)
 
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_NAME, ctypes.byref(agent_name_buf := ctypes.create_string_buffer(256))))
@@ -183,6 +184,8 @@ class HSADevice(Compiled):
     # Finish init: preallocate some signals + space for kernargs
     self.signal_pool = [init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(x)))) for _ in range(4096)]
     self._new_kernargs_region(16 << 20) # initial region size is 16mb
+
+    self.copy_progs = {}
 
   def synchronize(self):
     self.hw_queue.wait()
@@ -221,3 +224,25 @@ class HSADevice(Compiled):
     self.kernarg_pool_sz: int = sz
 
   def flush_hdp(self): self.hdp_flush.HDP_MEM_FLUSH_CNTL[0] = 1
+
+class HSABufferXfer(BufferXfer):
+  def __init__(self, si):
+    self.copy_size = si.out.size
+    if self.copy_size < (4 << 10) or True:
+      from tinygrad.ops import BufferOps, LazyOp, MemBuffer
+      from tinygrad.device import Device
+      from tinygrad.shape.shapetracker import ShapeTracker
+      key = (prod(si.out.shape), si.out.dtype)
+      if key not in Device[si.out.device].copy_progs: 
+        st = ShapeTracker.from_shape((prod(si.out.shape),))
+        copy_ast = LazyOp(BufferOps.STORE, (LazyOp(BufferOps.LOAD, (), MemBuffer(1, si.out.dtype, st)), ), MemBuffer(0, si.out.dtype, st))
+        lin = Device[si.out.device].get_linearizer(copy_ast)
+        Device[si.out.device].copy_progs[key] = Device[si.out.device].to_program(lin)
+      self.device = Device[si.out.device]
+      self.prg = self.device.copy_progs[key]
+      self.clprg = self.prg.clprg
+      self.vars = []
+    super().__init__()
+  def copy(self, dest, src):
+    if hasattr(self, 'prg'): self.prg(rawbufs=[dest, src], var_vals=[])
+    else: super().copy(dest, src)

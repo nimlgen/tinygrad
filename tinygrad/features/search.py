@@ -94,6 +94,16 @@ def get_linearizer_actions(lin:Linearizer, include_0=True) -> Dict[int, Lineariz
   return acted_lins
 
 beam_pool = None
+
+def has_beam_search(lin:Linearizer, rawbufs, amt:int, allow_test_size=True) -> Linearizer:
+  global beam_pool
+  key = {"ast": lin.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": lin.opts.device}
+  if (val:=diskcache_get("beam_search", key)) is not None and not getenv("IGNORE_BEAM_CACHE") and CACHELEVEL >= 1:
+    ret = lin.copy()
+    for o in val[len(lin.applied_opts):]: ret.apply_opt(o)
+    return ret
+  return None
+
 def beam_search(lin:Linearizer, rawbufs, amt:int, allow_test_size=True) -> Linearizer:
   global beam_pool
   key = {"ast": lin.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": lin.opts.device}

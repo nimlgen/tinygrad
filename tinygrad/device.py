@@ -151,18 +151,37 @@ class Allocator:
   def copyout(self, dest:memoryview, src): raise NotImplementedError("need copyout")
 
 class LRUAllocator(Allocator):  # pylint: disable=abstract-method
-  def __init__(self): self.cache: Dict[Tuple[int, Optional[BufferOptions]], Any] = defaultdict(list)
+  def __init__(self): 
+    self.cache: Dict[Tuple[int, Optional[BufferOptions]], Any] = defaultdict(list)
+    self.random_cache: Dict[Tuple[int, Optional[BufferOptions]], Any] = []
   def alloc(self, size:int, options:Optional[BufferOptions]=None):
+    self.random_cache.append(self.__alloc(size, options))
+    return self.random_cache[-1]
+  def __alloc(self, size:int, options:Optional[BufferOptions]=None):
     if len(c := self.cache[(size, options)]): return c.pop()
     try: return super().alloc(size, options)
     except (RuntimeError, MemoryError):
       self.free_cache()
-      return super().alloc(size, options)
-  def free_cache(self):
+      return self.__alloc22(size, options)
+  def __alloc22(self, size:int, options:Optional[BufferOptions]=None):
+    if len(c := self.cache[(size, options)]): return c.pop()
+    try: return super().alloc(size, options)
+    except (RuntimeError, MemoryError):
+      # raise RuntimeError("ss")
+      self.free_cache(random=True)
+      return self.__alloc22(size, options)
+  def free_cache(self, random=False):
     for opaques in self.cache.values():
       for opaque in opaques: self._free(opaque)
       opaques.clear()
+    if random:
+      if len(self.random_cache) == 0: raise RuntimeError("ss")
+      import random
+      for _ in range(min(4, len(self.random_cache))):
+        print(random.randint(0, len(self.random_cache) - 1))
+        self._free(self.random_cache.pop(random.randint(0, len(self.random_cache) - 1)))
   def free(self, opaque:Any, size:int, options:Optional[BufferOptions]=None):
+    self.random_cache.remove(opaque)
     if getenv("LRU", 1) and (options is None or not options.signal): self.cache[(size, options)].append(opaque)
     else: self._free(opaque)
 
@@ -259,12 +278,17 @@ class Compiled:
           lins[-1][1].hand_coded_optimizations()
         kb = Linearizer(ast, self.compiler.linearizer_opts)
         kb.required_optimizations()
-        from tinygrad.features.search import beam_search, time_linearizer, bufs_from_lin
-        test_rawbuffers = bufs_from_lin(kb)    # allocate scratch buffers for optimization
-        lins.append((f"beam{BEAM.value}", beam_search(kb, test_rawbuffers, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))))
-        timed = sorted([(nm, tk, time_linearizer(tk, test_rawbuffers, allow_test_size=False, clear_l2=True)) for nm, tk in lins], key=lambda x: x[2])
-        if DEBUG >= 1: print("  <  ".join(f"{nm:6s} : {lin.colored_shape(30, dense=True)} : {tm*1e6:8.2f} us" for nm, lin, tm in timed))
-        k = timed[0][1]
+        from tinygrad.features.search import has_beam_search, beam_search, time_linearizer, bufs_from_lin
+        bm=has_beam_search(kb, [], BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))
+        if bm is not None:
+          # lins.append((f"beam{BEAM.value}", bm))
+          k = bm
+        else:
+          test_rawbuffers = bufs_from_lin(kb)    # allocate scratch buffers for optimization
+          lins.append((f"beam{BEAM.value}", beam_search(kb, test_rawbuffers, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))))
+          timed = sorted([(nm, tk, time_linearizer(tk, test_rawbuffers, allow_test_size=False, clear_l2=True)) for nm, tk in lins], key=lambda x: x[2])
+          if DEBUG >= 1: print("  <  ".join(f"{nm:6s} : {lin.colored_shape(30, dense=True)} : {tm*1e6:8.2f} us" for nm, lin, tm in timed))
+          k = timed[0][1]
     return k
 
   @functools.lru_cache(None)    # pylint: disable=method-cache-max-size-none

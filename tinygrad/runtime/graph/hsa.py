@@ -3,11 +3,11 @@ from typing import List, Any, Dict, cast, Optional, Union
 from tinygrad.helpers import GraphException, init_c_var
 from tinygrad.device import Compiled, Buffer, CompiledASTRunner, BufferXfer, MultiDeviceJITGraph, update_stats
 from tinygrad.shape.symbolic import Variable
-from tinygrad.runtime.ops_hsa import HSADevice
+from tinygrad.runtime.ops_hsa import HSADevice, HSABufferXfer
 from tinygrad.features.jit import JitItem, get_input_replace, get_jit_stats, \
                                   get_jc_idxs_with_updatable_launch_dims, get_jc_idxs_with_updatable_var_vals
 import tinygrad.runtime.autogen.hsa as hsa
-from tinygrad.runtime.driver.hsa import check, AQLQueue, AQL_PACKET_SIZE, EMPTY_SIGNAL
+from tinygrad.runtime.driver.hsa import check, AQLQueue, AQL_PACKET_SIZE, EMPTY_SIGNAL, COPY_BARRIER_HEADER
 
 def dedup_signals(signals): return [hsa.hsa_signal_t(hndl) for hndl in set([x.handle for x in signals if isinstance(x, hsa.hsa_signal_t)])]
 
@@ -37,7 +37,7 @@ class HSAGraph(MultiDeviceJITGraph):
     compiled_devices = set()
     for ji in self.jit_cache:
       if isinstance(ji.prg, CompiledASTRunner): compiled_devices.add(ji.prg.device)
-      elif isinstance(ji.prg, BufferXfer):
+      elif isinstance(ji.prg, HSABufferXfer):
         for x in ji.rawbufs[0:2]: compiled_devices.add(cast(Buffer, x).d)
       else: raise GraphException
     if any(not isinstance(d, HSADevice) for d in compiled_devices): raise GraphException
@@ -48,12 +48,13 @@ class HSAGraph(MultiDeviceJITGraph):
     kernargs_size: Dict[HSADevice, int] = collections.defaultdict(int)
     for ji in self.jit_cache:
       if isinstance(ji.prg, CompiledASTRunner): kernargs_size[cast(HSADevice, ji.prg.device)] += (ctypes.sizeof(ji.prg.clprg.args_struct_t)+15) & ~15
+      if isinstance(ji.prg, HSABufferXfer) and hasattr(ji.prg, 'prg'): kernargs_size[cast(HSADevice, ji.rawbufs[0].d)] += (ctypes.sizeof(ji.prg.prg.clprg.args_struct_t) + 15) & ~15
     kernargs_ptrs: Dict[Compiled, int] = {dev:dev.allocator._alloc(sz) for dev,sz in kernargs_size.items()}
 
     # Fill initial arguments.
     self.ji_kargs_structs: Dict[int, ctypes.Structure] = {}
     for j,ji in enumerate(self.jit_cache):
-      if not isinstance(ji.prg, CompiledASTRunner): continue
+      if not isinstance(ji.prg, CompiledASTRunner) and not (isinstance(ji.prg, HSABufferXfer) and hasattr(ji.prg, 'prg')): continue
       self.ji_kargs_structs[j] = ji.prg.clprg.args_struct_t.from_address(kernargs_ptrs[ji.prg.device])
       kernargs_ptrs[ji.prg.device] += (ctypes.sizeof(ji.prg.clprg.args_struct_t) + 15) & ~15
       for i in range(len(ji.rawbufs)): self.ji_kargs_structs[j].__setattr__(f'f{i}', cast(Buffer, ji.rawbufs[i])._buf)
@@ -61,6 +62,7 @@ class HSAGraph(MultiDeviceJITGraph):
 
     # Build queues.
     self.virt_aql_queues: Dict[Compiled, VirtAQLQueue] = {dev:VirtAQLQueue(dev, 2*len(self.jit_cache)+16) for dev in self.devices}
+    self.virt_copy_aql_queues: Dict[Compiled, VirtAQLQueue] = {dev:VirtAQLQueue(dev, 2*len(self.jit_cache)+16) for dev in self.devices}
     self.packets = {}
     self.transfers = []
     self.signals_to_reset: List[hsa.hsa_signal_t] = []
@@ -73,6 +75,7 @@ class HSAGraph(MultiDeviceJITGraph):
     for dev in self.devices: self.kickoff_signals[dev] = self.virt_aql_queues[dev].submit_barrier(need_signal=True)
     self.signals_to_reset += list(self.kickoff_signals.values())
 
+    cp = 0
     for j,ji in enumerate(self.jit_cache):
       if isinstance(ji.prg, CompiledASTRunner):
         wait_signals = self.access_resources(read=ji.rawbufs[1:], write=ji.rawbufs[0:1], new_dependency=j, sync_with_aql_packets=False)
@@ -80,17 +83,27 @@ class HSAGraph(MultiDeviceJITGraph):
           self.virt_aql_queues[ji.prg.device].submit_barrier(wait_signals=wait_signals[i:i+5])
         self.packets[j] = hsa.hsa_kernel_dispatch_packet_t.from_address(self.virt_aql_queues[ji.prg.device].write_addr)
         self.virt_aql_queues[ji.prg.device].submit_kernel(ji.prg.clprg, *ji.prg.launch_dims(var_vals), ctypes.addressof(self.ji_kargs_structs[j])) #type:ignore
-      elif isinstance(ji.prg, BufferXfer):
+        # self.virt_aql_queues[ji.prg.device].submit_kernel(ji.prg.clprg, [1,1,1], [1,1,1], ctypes.addressof(self.ji_kargs_structs[j])) #type:ignore
+      elif isinstance(ji.prg, HSABufferXfer):
         dest, src = [cast(Buffer, x) for x in ji.rawbufs[0:2]]
         dest_dev, src_dev = cast(HSADevice, dest.d), cast(HSADevice, src.d)
+        cp += dest.nbytes
         sync_signal = init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(x))))
         self.signals_to_reset.append(sync_signal)
         signals_to_devices[sync_signal.handle] = [dest_dev, src_dev]
 
         wait_signals = self.access_resources(read=[src], write=[dest], new_dependency=sync_signal, sync_with_aql_packets=True)
-        self.transfers.append((dest._buf, dest_dev.agent, src._buf, src_dev.agent, dest.nbytes, len(wait_signals),
+        if hasattr(ji.prg, 'prg'):
+          for i in range(0, len(wait_signals), 5):
+            self.virt_copy_aql_queues[dest_dev].submit_barrier(wait_signals=wait_signals[i:i+5], header=COPY_BARRIER_HEADER)
+          self.virt_copy_aql_queues[dest_dev].submit_kernel(ji.prg.prg.clprg, [1,1,1], [1,1,1], ctypes.addressof(self.ji_kargs_structs[j]),
+                                                            completion_signal=sync_signal, need_signal=True)
+        else:
+          self.transfers.append((dest._buf, dest_dev.agent, src._buf, src_dev.agent, dest.nbytes, len(wait_signals),
                               (hsa.hsa_signal_t*len(wait_signals))(*wait_signals), sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
 
+    print("COPY: ", cp / 1e6, "mb")
+    
     # Wait for all active signals to finish the graph
     wait_signals_to_finish: Dict[HSADevice, List[hsa.hsa_signal_t]] = collections.defaultdict(list)
     for v in dedup_signals(list(self.w_dependency_map.values()) + list(itertools.chain.from_iterable(self.r_dependency_map.values()))):
@@ -109,6 +122,7 @@ class HSAGraph(MultiDeviceJITGraph):
 
   def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False, jit=False) -> Optional[float]:
     # Wait and restore signals
+    st = time.perf_counter_ns()
     hsa.hsa_signal_wait_scacquire(self.finish_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     for sig in self.signals_to_reset: hsa.hsa_signal_silent_store_relaxed(sig, 1)
     hsa.hsa_signal_silent_store_relaxed(self.finish_signal, len(self.devices))
@@ -131,13 +145,25 @@ class HSAGraph(MultiDeviceJITGraph):
       self.packets[j].grid_size_x = gl[0] * lc[0]
       self.packets[j].grid_size_y = gl[1] * lc[1]
       self.packets[j].grid_size_z = gl[2] * lc[2]
+    # print(f"hsa graph 0x: {(time.perf_counter_ns() - st)*1e-6} ms")
+
+    st = time.perf_counter_ns()
 
     for dev in self.devices:
       dev.flush_hdp()
       dev.hw_queue.blit_packets(self.virt_aql_queues[dev].queue_base, self.virt_aql_queues[dev].packets_count)
 
+    for dev in self.devices:
+      dev.copy_queue.blit_packets(self.virt_copy_aql_queues[dev].queue_base, self.virt_copy_aql_queues[dev].packets_count)
+    # print(f"hsa graph blit: {(time.perf_counter_ns() - st)*1e-6} ms")
+
     for transfer_data in self.transfers:
       check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data))
+
+    st = time.perf_counter_ns()
+    # for transfer_data in self.transfers:
+    #   check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data))
+    # print(f"hsa graph trans: {(time.perf_counter_ns() - st)*1e-6} ms")
 
     et = None
     if wait:
