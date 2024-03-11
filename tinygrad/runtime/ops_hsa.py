@@ -6,7 +6,7 @@ from tinygrad.helpers import DEBUG, init_c_var, from_mv, round_up, to_mv, init_c
 from tinygrad.device import Compiled, LRUAllocator, BufferOptions
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.runtime.ops_hip import HIPCompiler
-from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue
+from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue, SDMAQueue, hsa_signal_event_id, hsa_signal_event_mailbox_ptr
 
 class HSACompiler(HIPCompiler):
   linearizer_opts = LinearizerOptions("HSA", has_tensor_cores=True)
@@ -86,8 +86,9 @@ class HSAAllocator(LRUAllocator):
     sync_signal = self.device.hw_queue.submit_barrier(need_signal=True)
     mem = self._alloc_with_options(src.nbytes, BufferOptions(host=True))
     ctypes.memmove(mem, from_mv(src), src.nbytes)
-    check(hsa.hsa_amd_memory_async_copy_on_engine(dest, self.device.agent, mem, HSADevice.cpu_agent, src.nbytes,
-                                                  1, ctypes.byref(sync_signal), copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+    # check(hsa.hsa_amd_memory_async_copy_on_engine(dest, self.device.agent, mem, HSADevice.cpu_agent, src.nbytes,
+    #                                               1, ctypes.byref(sync_signal), copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+    self.device.sdma_queue.submit_copy(dest, mem, src.nbytes, wait_signals=[sync_signal], completion_signal=copy_signal)
     self.device.hw_queue.submit_barrier(wait_signals=[copy_signal])
     self.device.delayed_free.append(mem)
 
@@ -133,7 +134,7 @@ class HSAAllocator(LRUAllocator):
     copy_signal = self.device.alloc_signal(reusable=True)
     c_agents = (hsa.hsa_agent_t*2)(self.device.agent, HSADevice.cpu_agent)
     check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), dest.nbytes, c_agents, 2, HSADevice.cpu_mempool, 0, ctypes.byref(addr:=ctypes.c_void_p())))
-    check(hsa.hsa_amd_memory_async_copy(addr, HSADevice.cpu_agent, src, self.device.agent, dest.nbytes, 0, None, copy_signal))
+    self.device.sdma_queue.submit_copy(addr.value, src, dest.nbytes, completion_signal=copy_signal)
     hsa.hsa_signal_wait_scacquire(copy_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     check(hsa.hsa_amd_memory_unlock(from_mv(dest)))
 
@@ -141,8 +142,7 @@ class HSAAllocator(LRUAllocator):
     copy_signal = dest_dev.alloc_signal(reusable=False)
     sync_signal_1 = src_dev.hw_queue.submit_barrier(need_signal=True)
     sync_signal_2 = dest_dev.hw_queue.submit_barrier(need_signal=True)
-    c_wait_signal = (hsa.hsa_signal_t*2)(sync_signal_1, sync_signal_2)
-    check(hsa.hsa_amd_memory_async_copy_on_engine(dest, dest_dev.agent, src, src_dev.agent, sz, 2, c_wait_signal, copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True)) # noqa: E501
+    self.device.sdma_queue.submit_copy(addr.value, src, dest.nbytes, wait_signals=[sync_signal_1, sync_signal_2], completion_signal=copy_signal)
     src_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
     dest_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
 
@@ -165,6 +165,9 @@ class HSADevice(Compiled):
     self.hw_queue = AQLQueue(self)
     HSADevice.devices.append(self)
 
+    check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_NODE, ctypes.byref(node_id := ctypes.c_uint32())))
+    self.node_id = node_id
+
     check(hsa.hsa_agent_get_info(self.agent, hsa.HSA_AGENT_INFO_NAME, ctypes.byref(agent_name_buf := ctypes.create_string_buffer(256))))
     self.arch = ctypes.string_at(agent_name_buf).decode()
 
@@ -183,6 +186,8 @@ class HSADevice(Compiled):
     # Finish init: preallocate some signals + space for kernargs
     self.signal_pool = [init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(x)))) for _ in range(4096)]
     self._new_kernargs_region(16 << 20) # initial region size is 16mb
+
+    self.sdma_queue = SDMAQueue(self)
 
   def synchronize(self):
     self.hw_queue.wait()

@@ -1,5 +1,7 @@
 import ctypes, collections
+import tinygrad.runtime.autogen.hsakmt as hsakmt
 import tinygrad.runtime.autogen.hsa as hsa
+from tinygrad.device import BufferOptions
 from tinygrad.helpers import init_c_var
 
 def check(status):
@@ -21,6 +23,8 @@ BARRIER_HEADER  = 1 << hsa.HSA_PACKET_HEADER_BARRIER
 BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE
 BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE
 BARRIER_HEADER |= hsa.HSA_PACKET_TYPE_BARRIER_AND << hsa.HSA_PACKET_HEADER_TYPE
+
+SDMA_MAX_COPY_SIZE = 0x3fffe0
 
 class AQLQueue:
   def __init__(self, device, sz=-1):
@@ -124,6 +128,165 @@ class AQLQueue:
 
   def _alloc_signal(self, reusable=False): return self.device.alloc_signal(reusable=reusable)
 
+class SDMAQueue:
+  def __init__(self, device):
+    self.queue_size = 1 << 20
+    self.queue_start = device.allocator._alloc_with_options(self.queue_size, BufferOptions(host=True))
+    self.write_addr = self.queue_start
+
+    hsakmt.hsaKmtCreateQueue(device.node_id, hsakmt.HSA_QUEUE_SDMA, 100, hsakmt.HSA_QUEUE_PRIORITY_MAXIMUM, self.queue_start, self.queue_size, None,
+                             ctypes.byref(queue_desc := hsakmt.HsaQueueResource()))
+    self.queue_desc = queue_desc
+    self.next_doorbell_index = 0
+
+  def __del__(self):
+    pass
+
+  def _build_poll_cmd(self, addr, value):
+    cmd = hsakmt.SDMA_PKT_POLL_REGMEM.from_address(self.write_addr)
+    cmd.HEADER_UNION.op = hsakmt.SDMA_OP_POLL_REGMEM
+    cmd.HEADER_UNION.mem_poll = 1
+    cmd.HEADER_UNION.func = 0x3 # is equal
+    cmd.ADDR_LO_UNION.addr_31_0 = addr & 0xffffffff
+    cmd.ADDR_HI_UNION.addr_63_32 = (addr >> 32) & 0xffffffff
+
+    cmd.VALUE_UNION.value = value
+
+    cmd.MASK_UNION.mask = 0xffffffff; # the whole content.
+
+    cmd.DW5_UNION.interval = 0x04
+    cmd.DW5_UNION.retry_count = 0xfff # retry forever.
+
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_POLL_REGMEM)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_POLL_REGMEM)
+
+  def _build_atomic_dec_cmd(self, addr):
+    cmd = hsakmt.SDMA_PKT_ATOMIC.from_address(self.write_addr)
+
+    cmd.HEADER_UNION.op = hsakmt.SDMA_OP_ATOMIC
+    cmd.HEADER_UNION.operation = hsakmt.SDMA_ATOMIC_ADD64
+    cmd.ADDR_LO_UNION.addr_31_0 = addr & 0xffffffff
+    cmd.ADDR_HI_UNION.addr_63_32 = (addr >> 32) & 0xffffffff
+
+    cmd.SRC_DATA_LO_UNION.src_data_31_0 = 0xffffffff
+    cmd.SRC_DATA_HI_UNION.src_data_63_32 = 0xffffffff
+
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_ATOMIC)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_ATOMIC)
+    return cmd
+
+  def _build_cache_cmd(self, invalidate=False):
+    cmd = hsakmt.SDMA_PKT_GCR.from_address(self.write_addr)
+
+    cmd.HEADER_UNION.op = hsakmt.SDMA_OP_GCR
+    cmd.HEADER_UNION.sub_op = hsakmt.SDMA_SUBOP_USER_GCR
+    cmd.WORD2_UNION.GCR_CONTROL_GL2_WB = 1
+    cmd.WORD2_UNION.GCR_CONTROL_GLK_WB = 1
+
+    if invalidate:
+      cmd.WORD2_UNION.GCR_CONTROL_GL2_INV = 1
+      cmd.WORD2_UNION.GCR_CONTROL_GL1_INV = 1
+      cmd.WORD2_UNION.GCR_CONTROL_GLV_INV = 1
+      cmd.WORD2_UNION.GCR_CONTROL_GLK_INV = 1
+
+    # TODO: They inv the whole cache, try the required part only?
+    cmd.WORD2_UNION.GCR_CONTROL_GL2_RANGE = 0
+
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_GCR)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_GCR)
+    return cmd
+
+  def _build_hdp_cmd(self):
+    cmd = hsakmt.SDMA_PKT_HDP_FLUSH.from_address(self.write_addr)
+    cmd.DW_0_DATA = 0x8
+    cmd.DW_1_DATA = 0x0
+    cmd.DW_2_DATA = 0x80000000
+    cmd.DW_3_DATA = 0x0
+    cmd.DW_4_DATA = 0x0
+    cmd.DW_5_DATA = 0x0
+
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_HDP_FLUSH)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_HDP_FLUSH)
+  
+  def _build_fence_cmd(self, fence_addr, value):
+    cmd = hsakmt.SDMA_PKT_FENCE.from_address(self.write_addr)
+    cmd.HEADER_UNION.op = hsakmt.SDMA_OP_FENCE
+    cmd.ADDR_LO_UNION.addr_31_0 = fence_addr & 0xffffffff
+    cmd.ADDR_HI_UNION.addr_63_32 = (fence_addr >> 32) & 0xffffffff
+    cmd.DATA_UNION.data = value
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_FENCE)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_FENCE)
+    return cmd
+
+  def _build_trap_cmd(self, event_id):
+    cmd = hsakmt.SDMA_PKT_TRAP.from_address(self.write_addr)
+    cmd.HEADER_UNION.op = hsakmt.SDMA_OP_TRAP
+    cmd.INT_CONTEXT_UNION.int_ctx = event_id
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_TRAP)
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_TRAP)
+    return cmd
+
+  def _build_cp_cmd(self, dest, src, sz):
+    copies_commands = (sz + SDMA_MAX_COPY_SIZE - 1) // SDMA_MAX_COPY_SIZE
+    copied = 0
+
+    for _ in range(copies_commands):
+      copy_size = min(sz - copied, SDMA_MAX_COPY_SIZE)
+      src_off = src + copied
+      dest_off = dest + copied
+
+      cmd = hsakmt.SDMA_PKT_COPY_LINEAR.from_address(self.write_addr)
+      cmd.HEADER_UNION.op = hsakmt.SDMA_OP_COPY
+      cmd.HEADER_UNION.sub_op = hsakmt.SDMA_SUBOP_COPY_LINEAR
+      cmd.COUNT_UNION.count = copy_size - 1
+
+      cmd.SRC_ADDR_LO_UNION.src_addr_31_0 = src_off & 0xffffffff
+      cmd.SRC_ADDR_HI_UNION.src_addr_63_32 = (src_off >> 32) & 0xffffffff
+
+      cmd.DST_ADDR_LO_UNION.dst_addr_31_0 = dest_off & 0xffffffff
+      cmd.DST_ADDR_HI_UNION.dst_addr_63_32 = (dest_off >> 32) & 0xffffffff
+
+      copied += copy_size
+
+    self.write_addr += ctypes.sizeof(hsakmt.SDMA_PKT_COPY_LINEAR) * copies_commands
+    self.next_doorbell_index += ctypes.sizeof(hsakmt.SDMA_PKT_COPY_LINEAR) * copies_commands
+
+  def _ring_doorbell(self):
+    self.queue_desc.Queue_write_ptr[0] = self.next_doorbell_index
+    self.queue_desc.Queue_DoorBell[0] = self.next_doorbell_index
+
+  def submit_copy(self, dest, src, nbytes, wait_signals=None, completion_signal=None):
+    if wait_signals is not None:
+      for sig in wait_signals:
+        check(hsa.hsa_amd_signal_value_pointer(sig, ctypes.byref(val_ptr := ctypes.POINTER(ctypes.c_int64)())))
+        self._build_poll_cmd(ctypes.addressof(val_ptr.contents), 0)
+        self._build_poll_cmd(ctypes.addressof(val_ptr.contents) + 4, 0)
+
+    self._build_hdp_cmd()
+    self._build_cache_cmd(invalidate=True)
+    self._build_cp_cmd(dest, src, nbytes)
+    self._build_cache_cmd()
+
+    # Signal we have finished.
+    if completion_signal is not None:
+      check(hsa.hsa_amd_signal_value_pointer(completion_signal, ctypes.byref(val_ptr := ctypes.POINTER(ctypes.c_int64)())))
+      mailbox_ptr = hsa_signal_event_mailbox_ptr(completion_signal)
+      event_id = hsa_signal_event_id(completion_signal)
+      self._build_atomic_dec_cmd(ctypes.addressof(val_ptr.contents))
+      self._build_fence_cmd(mailbox_ptr, event_id)
+      self._build_trap_cmd(event_id)
+
+    self._ring_doorbell()
+
+  def submit_signal_gang(self, out_signal):
+    check(hsa.hsa_amd_signal_value_pointer(out_signal, ctypes.byref(val_ptr := ctypes.POINTER(ctypes.c_int64)())))
+    mailbox_ptr = hsa_signal_event_mailbox_ptr(out_signal)
+    event_id = hsa_signal_event_id(out_signal)
+    self._build_atomic_dec_cmd(ctypes.addressof(val_ptr.contents))
+    self._build_fence_cmd(mailbox_ptr, event_id)
+    self._build_trap_cmd(event_id)
+    self._ring_doorbell()
+
 def scan_agents():
   agents = collections.defaultdict(list)
 
@@ -154,3 +317,13 @@ def find_memory_pool(agent, segtyp=-1, location=-1):
 
   hsa.hsa_amd_agent_iterate_memory_pools(agent, __filter_amd_memory_pools, ctypes.byref(region := hsa.hsa_amd_memory_pool_t()))
   return region
+
+def hsa_signal_event_mailbox_ptr(signal: hsa.hsa_signal_t):
+  # HACK: depends on ABI
+  check(hsa.hsa_amd_signal_value_pointer(signal, ctypes.byref(ptr := ctypes.POINTER(ctypes.c_int64)())))
+  return ptr[1]
+
+def hsa_signal_event_id(signal: hsa.hsa_signal_t):
+  # HACK: depends on ABI
+  check(hsa.hsa_amd_signal_value_pointer(signal, ctypes.byref(ptr := ctypes.POINTER(ctypes.c_int64)())))
+  return ptr[2]
