@@ -130,8 +130,8 @@ class AQLQueue:
 
 class SDMAQueue:
   def __init__(self, device):
-    self.queue_size = 1 << 20
-    self.queue_start = device.allocator._alloc_with_options(self.queue_size, BufferOptions(host=True))
+    self.queue_size = 8 << 20
+    self.queue_start = device.allocator._alloc(self.queue_size)
     self.write_addr = self.queue_start
     self.write_addr_end = self.write_addr + self.queue_size - 1
 
@@ -284,6 +284,17 @@ class SDMAQueue:
         self._build_fence_cmd(mailbox_ptr, event_id)
         self._build_trap_cmd(event_id)
 
+    self._ring_doorbell()
+
+  def blit(self, ptr, nbytes):
+    if self.write_addr + nbytes > self.write_addr_end:
+      ctypes.memset(self.write_addr, 0, self.write_addr_end - self.write_addr + 1) # NOP the ending
+      self.next_doorbell_index += self.write_addr_end - self.write_addr + 1
+      self.write_addr = self.queue_start
+
+    ctypes.memmove(self.write_addr, ptr, nbytes)
+    self.next_doorbell_index += nbytes
+    self.write_addr += nbytes
     self._ring_doorbell()
 
   def _submit_cmd(self, size):

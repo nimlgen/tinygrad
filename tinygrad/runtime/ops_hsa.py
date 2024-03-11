@@ -86,9 +86,9 @@ class HSAAllocator(LRUAllocator):
     sync_signal = self.device.hw_queue.submit_barrier(need_signal=True)
     mem = self._alloc_with_options(src.nbytes, BufferOptions(host=True))
     ctypes.memmove(mem, from_mv(src), src.nbytes)
-    # check(hsa.hsa_amd_memory_async_copy_on_engine(dest, self.device.agent, mem, HSADevice.cpu_agent, src.nbytes,
-    #                                               1, ctypes.byref(sync_signal), copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
-    self.device.sdma_queue.submit_copy(dest, mem, src.nbytes, wait_signals=[sync_signal], completion_signal=copy_signal)
+    check(hsa.hsa_amd_memory_async_copy_on_engine(dest, self.device.agent, mem, HSADevice.cpu_agent, src.nbytes,
+                                                  1, ctypes.byref(sync_signal), copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+    # self.device.sdma_queue.submit_copy(dest, mem, src.nbytes, wait_signals=[sync_signal], completion_signal=copy_signal)
     self.device.hw_queue.submit_barrier(wait_signals=[copy_signal])
     self.device.delayed_free.append(mem)
 
@@ -117,11 +117,11 @@ class HSAAllocator(LRUAllocator):
       self.hb_signals[self.hb_polarity] = self.device.alloc_signal(reusable=False)
 
       fo.readinto(to_mv(self.hb[self.hb_polarity], local_size))
-      # check(hsa.hsa_amd_memory_async_copy_on_engine(dest+copied_in, self.device.agent, self.hb[self.hb_polarity]+minor_offset, HSADevice.cpu_agent,
-      #                                               copy_size, 1, ctypes.byref(sync_signal), self.hb_signals[self.hb_polarity],
-      #                                               self.sdma[self.hb_polarity], True))
-      self.device.sdma_queue.submit_copy(dest+copied_in, self.hb[self.hb_polarity]+minor_offset, copy_size,
-                                         wait_signals=[sync_signal], completion_signal=self.hb_signals[self.hb_polarity])
+      check(hsa.hsa_amd_memory_async_copy_on_engine(dest+copied_in, self.device.agent, self.hb[self.hb_polarity]+minor_offset, HSADevice.cpu_agent,
+                                                    copy_size, 1, ctypes.byref(sync_signal), self.hb_signals[self.hb_polarity],
+                                                    self.sdma[self.hb_polarity], True))
+      # self.device.sdma_queue.submit_copy(dest+copied_in, self.hb[self.hb_polarity]+minor_offset, copy_size,
+      #                                    wait_signals=[sync_signal], completion_signal=self.hb_signals[self.hb_polarity])
       copied_in += copy_size
       self.hb_polarity = (self.hb_polarity + 1) % len(self.hb)
       minor_offset = 0 # only on the first
@@ -136,7 +136,7 @@ class HSAAllocator(LRUAllocator):
     copy_signal = self.device.alloc_signal(reusable=True)
     c_agents = (hsa.hsa_agent_t*2)(self.device.agent, HSADevice.cpu_agent)
     check(hsa.hsa_amd_memory_lock_to_pool(from_mv(dest), dest.nbytes, c_agents, 2, HSADevice.cpu_mempool, 0, ctypes.byref(addr:=ctypes.c_void_p())))
-    self.device.sdma_queue.submit_copy(addr.value, src, dest.nbytes, completion_signal=copy_signal)
+    check(hsa.hsa_amd_memory_async_copy(addr, HSADevice.cpu_agent, src, self.device.agent, dest.nbytes, 0, None, copy_signal))
     hsa.hsa_signal_wait_scacquire(copy_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     check(hsa.hsa_amd_memory_unlock(from_mv(dest)))
 
@@ -144,7 +144,8 @@ class HSAAllocator(LRUAllocator):
     copy_signal = dest_dev.alloc_signal(reusable=False)
     sync_signal_1 = src_dev.hw_queue.submit_barrier(need_signal=True)
     sync_signal_2 = dest_dev.hw_queue.submit_barrier(need_signal=True)
-    dest_dev.sdma_queue.submit_copy(dest, src, sz, wait_signals=[sync_signal_1, sync_signal_2], completion_signal=copy_signal)
+    c_wait_signal = (hsa.hsa_signal_t*2)(sync_signal_1, sync_signal_2)
+    check(hsa.hsa_amd_memory_async_copy_on_engine(dest, dest_dev.agent, src, src_dev.agent, sz, 2, c_wait_signal, copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True)) # noqa: E501
     src_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
     dest_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
 
@@ -153,6 +154,7 @@ class HSADevice(Compiled):
   agents: Dict[int, List[hsa.hsa_agent_t]] = {}
   cpu_agent: hsa.hsa_agent_t
   cpu_mempool: hsa.hsa_amd_memory_pool_t
+  interruptible_signal_pool: List[hsa.hsa_signal_t] = []
   def __init__(self, device:str=""):
     if not HSADevice.agents:
       check(hsa.hsa_init())
@@ -160,6 +162,11 @@ class HSADevice(Compiled):
       HSADevice.agents = scan_agents()
       HSADevice.cpu_agent = HSADevice.agents[hsa.HSA_DEVICE_TYPE_CPU][0]
       HSADevice.cpu_mempool = find_memory_pool(HSADevice.cpu_agent, segtyp=hsa.HSA_AMD_SEGMENT_GLOBAL, location=hsa.HSA_AMD_MEMORY_POOL_LOCATION_CPU)
+
+      for i in range(3072):
+        hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(signal := hsa.hsa_signal_t()))
+        if hsa_signal_event_mailbox_ptr(signal) == 0: break
+        HSADevice.interruptible_signal_pool.append(signal)
 
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.agent = HSADevice.agents[hsa.HSA_DEVICE_TYPE_GPU][self.device_id]

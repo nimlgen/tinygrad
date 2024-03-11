@@ -7,7 +7,7 @@ from tinygrad.runtime.ops_hsa import HSADevice
 from tinygrad.features.jit import JitItem, get_input_replace, get_jit_stats, \
                                   get_jc_idxs_with_updatable_launch_dims, get_jc_idxs_with_updatable_var_vals
 import tinygrad.runtime.autogen.hsa as hsa
-from tinygrad.runtime.driver.hsa import check, AQLQueue, AQL_PACKET_SIZE, EMPTY_SIGNAL
+from tinygrad.runtime.driver.hsa import check, AQLQueue, SDMAQueue, AQL_PACKET_SIZE, EMPTY_SIGNAL
 
 def dedup_signals(signals): return [hsa.hsa_signal_t(hndl) for hndl in set([x.handle for x in signals if isinstance(x, hsa.hsa_signal_t)])]
 
@@ -18,12 +18,22 @@ class VirtAQLQueue(AQLQueue):
     self.queue_base = self.write_addr = ctypes.addressof(self.virt_queue)
     self.packets_count = 0
     self.available_packet_slots = sz
-  def _wait_queue(self, need_packets=1): assert False, f"VirtQueue is too small to handle {self.packets_count+need_packets} packets!"
+  def _wait_queue(self, need_packets=1): assert False, f"VirtAQLQueue is too small to handle {self.packets_count+need_packets} packets!"
   def _submit_packet(self):
     self.write_addr += AQL_PACKET_SIZE
     self.packets_count += 1
     self.available_packet_slots -= 1
-  def _alloc_signal(self, reusable=False): return init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_signal_create(1, 0, None, ctypes.byref(x))))
+  def _alloc_signal(self, reusable=False): return init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(x))))
+
+class VirtSDMAQueue(SDMAQueue):
+  def __init__(self):
+    self.queue_size = 1 << 20
+    self.queue = (ctypes.c_char * self.queue_size)()
+    self.queue_start = ctypes.addressof(self.queue)
+    self.write_addr = self.queue_start
+    self.write_addr_end = self.write_addr + self.queue_size - 1
+    self.next_doorbell_index = 0
+  def _ring_doorbell(self): assert self.write_addr <= self.write_addr_end, "VirtSDMAQueue is too small"
 
 class HSAGraph(MultiDeviceJITGraph):
   def __init__(self, jit_cache: List[JitItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
@@ -61,6 +71,7 @@ class HSAGraph(MultiDeviceJITGraph):
 
     # Build queues.
     self.virt_aql_queues: Dict[Compiled, VirtAQLQueue] = {dev:VirtAQLQueue(dev, 2*len(self.jit_cache)+16) for dev in self.devices}
+    self.virt_sdma_queues: Dict[Compiled, VirtSDMAQueue] = {dev:VirtSDMAQueue() for dev in self.devices}
     self.packets = {}
     self.transfers = []
     self.signals_to_reset: List[hsa.hsa_signal_t] = []
@@ -83,13 +94,12 @@ class HSAGraph(MultiDeviceJITGraph):
       elif isinstance(ji.prg, BufferXfer):
         dest, src = [cast(Buffer, x) for x in ji.rawbufs[0:2]]
         dest_dev, src_dev = cast(HSADevice, dest.d), cast(HSADevice, src.d)
-        sync_signal = init_c_var(hsa.hsa_signal_t(), lambda x: check(hsa.hsa_amd_signal_create(1, 0, None, 0, ctypes.byref(x))))
+        sync_signal = HSADevice.interruptible_signal_pool.pop()
         self.signals_to_reset.append(sync_signal)
         signals_to_devices[sync_signal.handle] = [dest_dev, src_dev]
 
         wait_signals = self.access_resources(read=[src], write=[dest], new_dependency=sync_signal, sync_with_aql_packets=True)
-        self.transfers.append((dest._buf, dest_dev.agent, src._buf, src_dev.agent, dest.nbytes, len(wait_signals),
-                              (hsa.hsa_signal_t*len(wait_signals))(*wait_signals), sync_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
+        self.virt_sdma_queues[src_dev].submit_copy(dest._buf, src._buf, dest.nbytes, wait_signals=wait_signals, completion_signal=sync_signal)
 
     # Wait for all active signals to finish the graph
     wait_signals_to_finish: Dict[HSADevice, List[hsa.hsa_signal_t]] = collections.defaultdict(list)
@@ -136,8 +146,8 @@ class HSAGraph(MultiDeviceJITGraph):
       dev.flush_hdp()
       dev.hw_queue.blit_packets(self.virt_aql_queues[dev].queue_base, self.virt_aql_queues[dev].packets_count)
 
-    for transfer_data in self.transfers:
-      check(hsa.hsa_amd_memory_async_copy_on_engine(*transfer_data))
+    for dev in self.devices:
+      dev.sdma_queue.blit(self.virt_sdma_queues[dev].queue_start, self.virt_sdma_queues[dev].next_doorbell_index)
 
     et = None
     if wait:
