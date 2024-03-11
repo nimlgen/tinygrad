@@ -117,9 +117,11 @@ class HSAAllocator(LRUAllocator):
       self.hb_signals[self.hb_polarity] = self.device.alloc_signal(reusable=False)
 
       fo.readinto(to_mv(self.hb[self.hb_polarity], local_size))
-      check(hsa.hsa_amd_memory_async_copy_on_engine(dest+copied_in, self.device.agent, self.hb[self.hb_polarity]+minor_offset, HSADevice.cpu_agent,
-                                                    copy_size, 1, ctypes.byref(sync_signal), self.hb_signals[self.hb_polarity],
-                                                    self.sdma[self.hb_polarity], True))
+      # check(hsa.hsa_amd_memory_async_copy_on_engine(dest+copied_in, self.device.agent, self.hb[self.hb_polarity]+minor_offset, HSADevice.cpu_agent,
+      #                                               copy_size, 1, ctypes.byref(sync_signal), self.hb_signals[self.hb_polarity],
+      #                                               self.sdma[self.hb_polarity], True))
+      self.device.sdma_queue.submit_copy(dest+copied_in, self.hb[self.hb_polarity]+minor_offset, copy_size,
+                                         wait_signals=[sync_signal], completion_signal=self.hb_signals[self.hb_polarity])
       copied_in += copy_size
       self.hb_polarity = (self.hb_polarity + 1) % len(self.hb)
       minor_offset = 0 # only on the first
@@ -142,7 +144,7 @@ class HSAAllocator(LRUAllocator):
     copy_signal = dest_dev.alloc_signal(reusable=False)
     sync_signal_1 = src_dev.hw_queue.submit_barrier(need_signal=True)
     sync_signal_2 = dest_dev.hw_queue.submit_barrier(need_signal=True)
-    self.device.sdma_queue.submit_copy(addr.value, src, dest.nbytes, wait_signals=[sync_signal_1, sync_signal_2], completion_signal=copy_signal)
+    dest_dev.sdma_queue.submit_copy(dest, src, sz, wait_signals=[sync_signal_1, sync_signal_2], completion_signal=copy_signal)
     src_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
     dest_dev.hw_queue.submit_barrier(wait_signals=[copy_signal])
 
