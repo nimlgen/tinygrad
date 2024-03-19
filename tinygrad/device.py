@@ -116,7 +116,7 @@ class BufferCopy(JITRunner):
     et = None
     if wait or DEBUG >= 2:
       dest.d.synchronize()
-      if getenv("HSA_HANG_REPRO", 0) and dest.size == 576:
+      if getenv("HSA_HANG_REPRO", 0) and dest.size*dest.dtype.itemsize == 576:
         # it passes this time
         print("not reproduced this time") 
         exit(0)
