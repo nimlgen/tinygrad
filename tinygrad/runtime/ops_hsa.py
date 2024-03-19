@@ -6,7 +6,7 @@ from tinygrad.helpers import DEBUG, init_c_var, from_mv, round_up, to_mv, init_c
 from tinygrad.device import Compiled, LRUAllocator, BufferOptions
 from tinygrad.codegen.kernel import LinearizerOptions
 from tinygrad.runtime.ops_hip import HIPCompiler
-from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue, pm4_build_cache_inv_command
+from tinygrad.runtime.driver.hsa import check, scan_agents, find_memory_pool, AQLQueue
 
 PROFILE = getenv("PROFILE", 0)
 
@@ -120,6 +120,11 @@ class HSAAllocator(LRUAllocator):
     sync_signal = self.device.hw_queue.submit_barrier(need_signal=True)
     mem = self._alloc_with_options(src.nbytes, BufferOptions(host=True))
     ctypes.memmove(mem, from_mv(src), src.nbytes)
+
+    print(hsa.hsa_signal_load_acquire(copy_signal), "- value of copy_signal")
+    print(hsa.hsa_signal_load_acquire(sync_signal), "- value of sync_signal")
+    assert src.nbytes > 0
+
     check(hsa.hsa_amd_memory_async_copy_on_engine(dest, self.device.agent, mem, HSADevice.cpu_agent, src.nbytes,
                                                   1, ctypes.byref(sync_signal), copy_signal, hsa.HSA_AMD_SDMA_ENGINE_0, True))
     self.device.hw_queue.submit_barrier(wait_signals=[copy_signal])
@@ -260,16 +265,6 @@ class HSADevice(Compiled):
     self.kernarg_pool_sz: int = sz
 
   def flush_hdp(self): self.hdp_flush.HDP_MEM_FLUSH_CNTL[0] = 1
-  
-  def inv_cache(self):
-    if not hasattr(self, 'pm4_cache_inv_ib'):
-      pm4_inv_buffer = ctypes.cast(self.allocator._alloc_with_options(PAGE_SIZE, BufferOptions(host=True)), ctypes.POINTER(ctypes.c_uint32))
-      for i, value in enumerate(pm4_build_cache_inv_command()): pm4_inv_buffer[i] = value
-      self.pm4_cache_inv_ib = ctypes.addressof(pm4_inv_buffer.contents)
-
-    self.synchronize()
-    comp_signal = self.hw_queue.submit_pm4_ib(self.pm4_cache_inv_ib, 8 * 4, need_signal=True)
-    hsa.hsa_signal_wait_scacquire(comp_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
 
 def hsa_terminate():
   # Need to stop/delete aql queue before hsa shut down, this leads to gpu hangs.

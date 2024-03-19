@@ -1,6 +1,7 @@
 import ctypes, collections
 import tinygrad.runtime.autogen.hsa as hsa
 from tinygrad.helpers import init_c_var
+import code
 
 def check(status):
   if status != 0:
@@ -126,7 +127,16 @@ class AQLQueue:
 
   def wait(self):
     signal = self.submit_barrier(need_signal=True)
-    hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
+  
+    wait_time = 20 * 1000 * 1000 * 1000 # 20sec
+    ret = hsa.hsa_signal_wait_scacquire(signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, wait_time, hsa.HSA_WAIT_STATE_ACTIVE)
+    if ret != 0:
+      print(hsa.hsa_queue_load_read_index_relaxed(self.hw_queue))
+      print("hang, starting interactive mode")
+      context = globals().copy()
+      context.update(locals())
+      code.interact(local=context)
+      exit(1)
     self.available_packet_slots = self.queue_size
 
   def _wait_queue(self, need_packets=1):
@@ -144,27 +154,6 @@ class AQLQueue:
     self.available_packet_slots -= 1
 
   def _alloc_signal(self, reusable=False): return self.device.alloc_signal(reusable=reusable)
-
-## PM4 packets
-
-PM4_HDR_IT_OPCODE_INDIRECT_BUFFER = 0x3f
-PM4_INDIRECT_BUFFER_VALID = 1 << 23
-
-PM4_HDR_IT_OPCODE_ACQUIRE_MEM = 0x58
-PM4_ACQUIRE_MEM_GCR_CNTL_GLI_INV = 1 << 0
-PM4_ACQUIRE_MEM_GCR_CNTL_GLK_INV = 1 << 7
-PM4_ACQUIRE_MEM_GCR_CNTL_GLV_INV = 1 << 8
-PM4_ACQUIRE_MEM_GCR_CNTL_GL1_INV = 1 << 9
-PM4_ACQUIRE_MEM_GCR_CNTL_GL2_INV = 1 << 14
-
-def pm4_header(op, cmd_size): return 3 << 30 | ((cmd_size - 2) & 0x3FFF) << 16 | (((op) & 0xFF) << 8)
-def pm4_build_indirect_command(ib_addr, ib_sz):
-  return [pm4_header(PM4_HDR_IT_OPCODE_INDIRECT_BUFFER, 4), ib_addr & 0xffffffff, (ib_addr>>32) & 0xffffffff, (ib_sz//4) | PM4_INDIRECT_BUFFER_VALID]
-def pm4_build_cache_inv_command(addr=0, sz=0xffffffffff):
-  return [pm4_header(PM4_HDR_IT_OPCODE_ACQUIRE_MEM, 8), 0,
-          sz & 0xffffffff, (sz >> 32) & 0xffffffff, addr & 0xffffffff, (addr >> 32) & 0xffffffff, 0,
-          PM4_ACQUIRE_MEM_GCR_CNTL_GLI_INV | PM4_ACQUIRE_MEM_GCR_CNTL_GLK_INV | PM4_ACQUIRE_MEM_GCR_CNTL_GLV_INV | \
-          PM4_ACQUIRE_MEM_GCR_CNTL_GL1_INV | PM4_ACQUIRE_MEM_GCR_CNTL_GL2_INV ]
 
 ## Agents
 
