@@ -47,13 +47,20 @@ def get_fuzz_rawbuf_like(rawbuf, zero=False, size=None):
       rawbuf.copyin(mv)
   return rawbuf
 
-def run_linearizer(lin: Linearizer, rawbufs=None, var_vals=None):
+def to_program_nvrtc(device):
+  from tinygrad.runtime.ops_cuda import CUDACompiler
+  orig_compiler, device.compiler = device.compiler, CUDACompiler(device.arch)
+  prg = device.to_program(lin)
+  device.compiler = orig_compiler
+  return prg
+
+def run_linearizer(lin: Linearizer, rawbufs=None, var_vals=None, to_program_cb=None):
   if rawbufs is None: rawbufs = bufs_from_lin(lin)
   if var_vals is None: var_vals = {v: v.min for v in lin.ast[0].vars()}
 
   # TODO: images needs required_optimization
   try:
-    prg = device.to_program(lin)
+    prg = device.to_program(lin) if to_program_cb is None else to_program_cb(device)
   except Exception:
     traceback.print_exc()
     return "COMPILE_ERROR"
@@ -121,11 +128,18 @@ def fuzz_linearizer(lin: Linearizer):
   failures:DefaultDict[str, List[Tuple[Tuple[LazyOp,...],List[Opt]]]] = defaultdict(list)
   rawbufs, var_vals, ground_truth = None, None, None
 
+  FUZZ_PTX = getenv("PTX", 0)
   FUZZ_BEAM = getenv("FUZZ_BEAM", 0)
   FUZZ_MAX_SIZE = getenv("FUZZ_MAX_SIZE", 0)
   if FUZZ_MAX_SIZE > 0 and prod(lin.full_shape) > FUZZ_MAX_SIZE:
     print("skipping large kernel")
     return failures
+
+  if FUZZ_PTX:
+    rawbufs = get_fuzz_rawbufs(lin)
+    if run_linearizer(lin, rawbufs, var_vals, to_program_cb=to_program_nvrtc) != "PASS":
+      return {"BASELINE_ERROR": (lin.ast, lin.applied_opts)}
+    ground_truth = np.frombuffer(rawbufs[0].as_buffer(), rawbufs[0].dtype.np).copy()
 
   for depth in range(getenv("DEPTH", 1 if FUZZ_BEAM else 10)):
     next_lins = []
