@@ -57,7 +57,7 @@ generate_comgr() {
 }
 
 generate_kfd() {
-  clang2py /usr/include/linux/kfd_ioctl.h -o $BASE/kfd.py -k cdefstum
+  clang2py /usr/include/linux/kfd_ioctl.h /home/nimlgen/amd/hipruntime-03072024/include/hsa/amd_hsa_kernel_code.h -o $BASE/kfd.py -k cdefstum
   fixup $BASE/kfd.py
   sed -i "s\import ctypes\import ctypes, os\g" $BASE/kfd.py
   python3 -c "import tinygrad.runtime.autogen.kfd"

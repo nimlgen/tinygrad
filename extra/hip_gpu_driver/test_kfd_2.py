@@ -111,6 +111,12 @@ if __name__ == "__main__":
   #define KFD_MMAP_TYPE_SHIFT	62
   #define KFD_MMAP_TYPE_DOORBELL	(0x3ULL << KFD_MMAP_TYPE_SHIFT)
   evt = kio.create_event(fd, auto_reset=1)
+  print("ev_id", evt.event_id)
+
+  print(nq.write_pointer_address, nq.read_pointer_address)
+  write_addr = ring_base.va_addr
+  wr_pointer = ctypes.cast(nq.write_pointer_address, ctypes.POINTER(ctypes.c_uint64))
+  rd_pointer = ctypes.cast(nq.read_pointer_address, ctypes.POINTER(ctypes.c_uint64))
 
   BARRIER_HEADER  = 1 << hsa.HSA_PACKET_HEADER_BARRIER
   BARRIER_HEADER |= hsa.HSA_FENCE_SCOPE_SYSTEM << hsa.HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE
@@ -119,20 +125,27 @@ if __name__ == "__main__":
 
   EMPTY_SIGNAL = hsa.hsa_signal_t()
 
-  packet = hsa.hsa_barrier_and_packet_t.from_address(rw_ptr.va_addr+0x38)
+  packet = hsa.hsa_barrier_and_packet_t.from_address(write_addr)
   packet.reserved0 = 0
   packet.reserved1 = 0
   for i in range(5): packet.dep_signal[i] = EMPTY_SIGNAL
   packet.reserved2 = 0
-  packet.completion_signal = hsa.hsa_signal_t(evt.event_id)
+  packet.completion_signal = EMPTY_SIGNAL #hsa.hsa_signal_t(evt.event_id)
   packet.header = BARRIER_HEADER
+  write_addr += 64
 
   # ring doorbell
+  wr_pointer[0] = 1
   to_mv(doorbell, 4).cast("I")[0] = 1
+  print(to_mv(doorbell, 4).cast("I")[0])
 
-  evt_arr = (kfd.struct_kfd_event_data * 1)()
-  evt_arr[0].event_id = evt.event_id
-  kio.wait_events(fd, events_ptr=ctypes.addressof(evt_arr), num_events=1, wait_for_all=0, timeout=1000)
+  print("read", rd_pointer[0])
+  time.sleep(1)
+  print("read", rd_pointer[0])
+
+  # evt_arr = (kfd.struct_kfd_event_data * 1)()
+  # evt_arr[0].event_id = evt.event_id
+  # kio.wait_events(fd, events_ptr=ctypes.addressof(evt_arr), num_events=1, wait_for_all=0, timeout=1000)
 
   #nq = kio.create_queue(fd, ring_base_address=buf, ring_size=0x1000, gpu_id=GPU_ID,
   #                      queue_type=kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE,
