@@ -3,7 +3,7 @@ from typing import Tuple, List, Any
 import os, fcntl, ctypes, functools, re, pathlib, mmap, struct, errno, subprocess
 from tinygrad.device import Compiled, LRUAllocator, Compiler, CompilerOptions
 from tinygrad.buffer import BufferOptions
-from tinygrad.helpers import getenv, from_mv, init_c_struct_t, to_mv, round_up, DEBUG
+from tinygrad.helpers import getenv, from_mv, init_c_struct_t, to_mv, round_up, DEBUG, prod
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.runtime.driver.hip_comgr import compile_hip
 import tinygrad.runtime.autogen.kfd as kfd
@@ -115,9 +115,12 @@ regCOMPUTE_RESTART_X = 0x1bbb - SUB
 regCOMPUTE_STATIC_THREAD_MGMT_SE0 = 0x1bb6 - SUB
 regCOMPUTE_STATIC_THREAD_MGMT_SE2 = 0x1bb9 - SUB
 regCOMPUTE_STATIC_THREAD_MGMT_SE4 = 0x1bcb - SUB
+regCOMPUTE_WAVE_RESTORE_ADDR_LO = 0x1bd2 - SUB
+regCOMPUTE_WAVE_RESTORE_ADDR_HI = 0x1bd1 - SUB
 
 regBIF_BX_PF1_GPU_HDP_FLUSH_REQ = 0x0106
 regBIF_BX_PF1_GPU_HDP_FLUSH_DONE = 0x0107
+regCOMPUTE_VMID = 0x1bb4
 
 # VGT_EVENT_TYPE in navi10_enum.h
 CACHE_FLUSH_AND_INV_TS_EVENT = 0x14
@@ -180,25 +183,40 @@ class HWPM4Queue:
 
   def invalidate_cache(self):
     # overkill?
-    addr=0x0
+    addr=0xf1000
     sz=(1 << 64)-1
     gli=1
     glv=1
     glk=1
     gl1=1
     gl2=1
-    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_ACQUIRE_MEM, 6), 0, #0x80000000,
-               sz & 0xffffffff, (sz >> 32) & 0xff, addr & 0xffffffff, (addr >> 32) & 0xffffff, 0,
+    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_RELEASE_MEM, 6),
+               amd_gpu.PACKET3_RELEASE_MEM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | amd_gpu.PACKET3_RELEASE_MEM_EVENT_INDEX(5) | \
+               amd_gpu.PACKET3_RELEASE_MEM_GCR_GLV_INV | amd_gpu.PACKET3_RELEASE_MEM_GCR_GL1_INV | amd_gpu.PACKET3_RELEASE_MEM_GCR_GL2_INV | \
+               amd_gpu.PACKET3_RELEASE_MEM_GCR_GLM_WB | amd_gpu.PACKET3_RELEASE_MEM_GCR_GLM_INV | (1 << 24) | (1 << 30) | \
+               amd_gpu.PACKET3_RELEASE_MEM_GCR_GL2_INV | amd_gpu.PACKET3_RELEASE_MEM_GCR_GL2_WB | amd_gpu.PACKET3_RELEASE_MEM_GCR_SEQ,
+               0, 0, 0, 0, 0, 0]
+
+  #   ACQUIRE_MEM_PWS_2": {
+  #  "fields": [
+  #   {"bits": [11, 13], "enum_ref": "PWS_STAGE_SEL", "name": "PWS_STAGE_SEL"},
+  #   {"bits": [14, 15], "enum_ref": "PWS_COUNTER_SEL", "name": "PWS_COUNTER_SEL"},
+  #   {"bits": [17, 17], "name": "PWS_ENA2"},
+  #   {"bits": [18, 23], "name": "PWS_COUNT"}
+    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_ACQUIRE_MEM, 6), (1 << 17) | (5 << 11),
+               sz & 0xffffffff, (sz >> 32) & 0xff, addr & 0xffffffff, (addr >> 32) & 0xffffff, (1 << 31),
                amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(gli) | amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLK_INV(glk) | \
                amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLV_INV(glv) | amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GL1_INV(gl1) | \
-               amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_INV(gl2)]
+               amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GL2_INV(gl2) | amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_SEQ(1) | (1 << 31)]
     return self
 
   def exec(self, prg:AMDProgram, kernargs, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), completion_signal=None):
+    # local_size = global_size = (1,1,1)
+
     self.hdp_flush()
     self.invalidate_cache()
     code = hsa.amd_kernel_code_t.from_address(prg.handle)  # NOTE: this is wrong, it's not this object
-    assert code.kernel_code_properties & 0x400 == 0x400 # ENABLE_WAVEFRONT_SIZE32
+    assert (code.kernel_code_properties & 0x408) in [0x400, 0x408]  # ENABLE_WAVEFRONT_SIZE32
     assert code.workitem_private_segment_byte_size == 0
     assert code.max_scratch_backing_memory_byte_size == 0
     assert code.kernel_code_prefetch_byte_size == 0
@@ -208,9 +226,15 @@ class HWPM4Queue:
     #print(hex(code.compute_pgm_rsrc1), hex(code.compute_pgm_rsrc2))
     rsrc1, rsrc2 = code.compute_pgm_rsrc1, code.compute_pgm_rsrc2
 
+    # AMD moment: COMPUTE_PGM_RSRC needs priv=1 to prevent hardware traps
+    # rsrc1 |= 
+
+
     # this is required
-    lds_size = ((prg.group_segment_size+63)//64)&0x1FF
-    assert lds_size <= 0x80  # larger numbers stall the GPU
+    lds_size = (prg.group_segment_size + 511) // 512
+    # lds_size = 
+    # lds_size = ((prg.group_segment_size+63)//64)&0x1FF
+    # assert lds_size <= 0x80  # larger numbers stall the GPU
 
     # lds_size = 0x1ff
 
@@ -221,11 +245,27 @@ class HWPM4Queue:
     # rsrc2 |= ((prg.group_segment_size+31)//64) << 15
     # rsrc2 |= (prg.group_segment_size//32) << 15
     # user_sgpr =
+    num_cu = 96
+    num_se = 6
+    num_cu_per_se = num_cu // num_se
+    compute_resource_limits = 0
+    threads_per_threadgroup = prod(local_size)
+    waves_per_threadgroup = (threads_per_threadgroup + 31) // 32
+    threadgroups_per_cu = 1
+    if waves_per_threadgroup == 1: threadgroups_per_cu = 2
+    # print(waves_per_threadgroup)
+    compute_resource_limits = 0
+    compute_resource_limits |= ((waves_per_threadgroup % 4) == 0) << 22
+    if (num_cu_per_se % 4 and waves_per_threadgroup == 1): compute_resource_limits |= (1 << 23)
+    compute_resource_limits |= (2 << 0) | ((threadgroups_per_cu - 1) << 24)
 
+    # print(prg.device.wave_restore.va_addr&0xFFFFFFFF, prg.device.wave_restore.va_addr>>32)
     prog_addr = (prg.handle + code.kernel_code_entry_byte_offset) >> 8
-    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 6), regCOMPUTE_PGM_LO, prog_addr&0xFFFFFFFF, prog_addr>>32, 0, 0,
+    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 6), regCOMPUTE_PGM_LO, prog_addr&0xFFFFFFFF, prog_addr>>32, 0xbeaf0000, 0xffffffff,
                (prg.device.scratch.va_addr>>8)&0xFFFFFFFF, prg.device.scratch.va_addr>>40]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 2), regCOMPUTE_PGM_RSRC1, rsrc1, rsrc2 | (lds_size << 15)]
+    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 1), regCOMPUTE_WAVE_RESTORE_ADDR_LO, 0xf000]
+    self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 1), regCOMPUTE_WAVE_RESTORE_ADDR_HI, 0xf000]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 1), regCOMPUTE_TMPRING_SIZE, 0x00200200] # (waveSize << 12) | (numWaves)
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 4), regCOMPUTE_RESTART_X, 0,0,0,0]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 2), regCOMPUTE_STATIC_THREAD_MGMT_SE0, 0xFFFFFFFF,0xFFFFFFFF]
@@ -234,8 +274,10 @@ class HWPM4Queue:
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 2), regCOMPUTE_USER_DATA_0, kernargs&0xFFFFFFFF, kernargs>>32]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 8), regCOMPUTE_START_X, 0,0,0, local_size[0],local_size[1],local_size[2],0,0]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 1), regCOMPUTE_RESOURCE_LIMITS, 0]
+    # self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_SET_SH_REG, 1), regCOMPUTE_VMID, 0x1]
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_DISPATCH_DIRECT, 3),
                global_size[0],global_size[1],global_size[2], CS_W32_EN | FORCE_START_AT_000 | COMPUTE_SHADER_EN]
+              #  global_size[0],global_size[1],global_size[2], (1 << 17) | CS_W32_EN | (1 << 12) | FORCE_START_AT_000 | COMPUTE_SHADER_EN]
 
     # have to self wait since flush doesn't work
     self.signal(sig:=AMDDevice._get_signal())
@@ -281,11 +323,29 @@ class HWPM4Queue:
     return self
 
   def submit(self, device:AMDDevice):
+    # diff = device.pm4_write_pointer[0] - device.pm4_read_pointer[0]
+    # while 2 * len(self.q) > device.pm4_ring.size // 4 - diff:
+    #   diff = device.pm4_write_pointer[0] - device.pm4_read_pointer[0]
+    #   print("dai, wtf", device.pm4_write_pointer[0])
+      # print(2 * len(self.q), diff, device.pm4_write_pointer[0], device.pm4_read_pointer[0])
+
+    # self.signal(device.signal_sdma, 0x33)
+
     wptr = device.pm4_write_pointer[0]
     pm4_buffer_view = to_mv(device.pm4_ring.va_addr, device.pm4_ring.size).cast("I")
+    rem = (device.pm4_ring.size // 4 - (wptr%(device.pm4_ring.size//4)))
+    assert rem >= 0
+    if len(self.q) >= rem:
+      for i in range(rem): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = amd_gpu.PACKET3(amd_gpu.PACKET3_NOP, 0x3FFF)
+      wptr += rem
+
     for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
     device.pm4_write_pointer[0] = wptr + len(self.q)
     device.pm4_doorbell[0] = wptr + len(self.q)
+    # print("signal", device.pm4_write_pointer[0], device.pm4_read_pointer[0])
+
+    # device._wait_signal(device.signal_sdma, value=0x33)
+
     return self
 
 # prebuilt sdma packets
@@ -350,7 +410,7 @@ class AMDProgram:
     self.device, self.name, self.lib = device, name, lib
 
     if DEBUG >= 6:
-      asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
+      asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-a', '-'], input=lib)
       print('\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x]))
 
     _phoff, _shoff, _flags, _ehsize, _phentsize, _phnum, _shentsize, _shnum, _shstrndx = struct.unpack_from("<QQIHHHHHH", self.lib, 0x20)
@@ -378,8 +438,8 @@ class AMDProgram:
     if hasattr(self, 'lib_gpu'): self.device._gpu_free(self.lib_gpu)
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
-    if self.device.kernargs_ptr + self.kernargs_segment_size > (self.device.kernargs.va_addr + self.device.kernargs.size):
-      self.device.kernargs_ptr = self.device.kernargs.va_addr
+    # if self.device.kernargs_ptr + self.kernargs_segment_size > (self.device.kernargs.va_addr + self.device.kernargs.size):
+    #   self.device.kernargs_ptr = self.device.kernargs.va_addr
     assert self.device.kernargs_ptr + self.kernargs_segment_size <= (self.device.kernargs.va_addr + self.device.kernargs.size), "kernargs overrun"
     if not hasattr(self, "args_struct_t"):
       self.args_struct_t = init_c_struct_t(tuple([(f'f{i}', ctypes.c_void_p) for i in range(len(args))] +
@@ -393,6 +453,7 @@ class AMDProgram:
     HWPM4Queue().exec(self, self.device.kernargs_ptr, global_size, local_size,
                       self.device.completion_signal if wait else None).submit(self.device)
     self.device.kernargs_ptr += self.kernargs_segment_size
+    self.device.kernargs_ptr = round_up(self.device.kernargs_ptr, 64)
 
     if wait:
       self.device._wait_signal(self.device.completion_signal)
@@ -408,8 +469,10 @@ class AMDAllocator(LRUAllocator):
 
   def _alloc(self, size:int, options:BufferOptions):
     try:
-      if options.host: return self.device._gpu_alloc(size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, public=True)
-      else: return self.device._gpu_alloc(size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, public=True)
+      if options.host: x = self.device._gpu_alloc(size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, public=True)
+      else: x = self.device._gpu_alloc(size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, public=True)
+      assert x.va_addr != 0
+      return x
     except OSError as e:
       if e.errno == errno.ENOMEM: raise MemoryError("Cannot allocate memory") from e
       else: raise
@@ -438,6 +501,8 @@ class AMDAllocator(LRUAllocator):
   #  self.device._wait_signal(self.device.signal_sdma)
 
   def copyin(self, dest, src: memoryview):
+    # pass
+    # self.device.synchronize()
     for i in range(0, src.nbytes, self.b[0].size):
       ctypes.memmove(self.b[1].va_addr, from_mv(src[i:]), lsize:=min(self.b[0].size, src.nbytes-i))
       if i != 0: self.device._wait_signal(self.device.signal_sdma)
@@ -446,13 +511,14 @@ class AMDAllocator(LRUAllocator):
     self.device._wait_signal(self.device.signal_sdma)
 
   def copyout(self, dest:memoryview, src):
-    self.device.synchronize()
+    self.device.synchronize_system()
     for i in range(0, dest.nbytes, self.b[0].size):
       self.device._submit_sdma(self.b[0].va_addr, src.va_addr+i, lsize:=min(self.b[0].size, dest.nbytes-i), completion_signal=self.device.signal_sdma)
       self.device._wait_signal(self.device.signal_sdma)
       ctypes.memmove(from_mv(dest[i:]), self.b[0].va_addr, lsize)
 
   def transfer(self, dest, src, sz:int, src_dev:AMDDevice, dest_dev:AMDDevice):
+    # pass
     dest_dev._gpu_map(src)
     q = HWPM4Queue().signal(sig := AMDDevice._get_signal())
     HWCopyQueue().wait(sig).copy(dest.va_addr, src.va_addr, sz).signal(sigc := AMDDevice._get_signal()).submit(dest_dev)
@@ -466,6 +532,8 @@ class AMDDevice(Compiled):
   signals_page:Any = None
   signal_number:int = 16
   gpus:List[pathlib.Path] = []
+  svm_vaddr: int = 0x3000000000
+  devices = []
 
   def _gpu_map(self, mem):
     if self.gpu_id in getattr(mem, "mapped_gpu_ids", []): return
@@ -474,14 +542,17 @@ class AMDDevice(Compiled):
     stm = kio.map_memory_to_gpu(self.kfd, handle=mem.handle, device_ids_array_ptr=ctypes.addressof(c_gpus), n_devices=len(mem.mapped_gpu_ids))
     assert stm.n_success == len(mem.mapped_gpu_ids)
 
-  def _gpu_alloc(self, size:int, flags:int, uncached=False, public=False, map_to_gpu=True):
+  def _gpu_alloc(self, size:int, flags:int, uncached=False, public=False, map_to_gpu=True, va_addr=None):
+    if va_addr is not None: va = va_addr
+    else: AMDDevice.svm_vaddr = round_up((va := AMDDevice.svm_vaddr) + size, 2 << 20)
+
     flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
     if uncached: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
     if public: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
     if flags & kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR:
-      buf = addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0)
+      buf = addr = libc.mmap(va, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0)
     else:
-      buf, addr = 0, libc.mmap(0, size, 0, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
+      buf, addr = 0, libc.mmap(va, size, 0, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
     assert addr != 0xffffffffffffffff
     mem = kio.alloc_memory_of_gpu(self.kfd, va_addr=addr, size=size, gpu_id=self.gpu_id, flags=flags, mmap_offset=buf)
     if not (flags & kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR):
@@ -514,16 +585,16 @@ class AMDDevice(Compiled):
     return ret
 
   @classmethod
-  def _wait_signal(self, signal:hsa.amd_signal_t, timeout=10000, skip_check=False):
+  def _wait_signal(self, signal:hsa.amd_signal_t, value=0, timeout=10000, skip_check=False):
     assert signal.event_id != 0, "can't wait on this signal"
     evt_arr = (kfd.struct_kfd_event_data * 1)()
     evt_arr[0].event_id = signal.event_id
     ret = kio.wait_events(AMDDevice.kfd, events_ptr=ctypes.addressof(evt_arr), num_events=1, wait_for_all=1, timeout=timeout)
     if ret.wait_result != 0: raise RuntimeError(f"wait_result: {ret.wait_result}, {timeout} ms TIMEOUT!")
 
-    #val = signal.value
-    #while val != 0: val = signal.value
-    assert skip_check or signal.value == 0, f"not set to 0, but {signal.value}"
+    val = signal.value
+    while val != value: val = signal.value
+    assert skip_check or signal.value == value, f"not set to {value}, but {signal.value}"
 
   def __init__(self, device:str=""):
     if AMDDevice.kfd == -1:
@@ -549,12 +620,13 @@ class AMDDevice(Compiled):
     self.completion_signal = AMDDevice._get_signal(self.device_id*2, sync_event=sync_event)
     self.signal_sdma = AMDDevice._get_signal(self.device_id*2+1, sync_event=kio.create_event(AMDDevice.kfd, auto_reset=1))
 
-    self.gart_aql = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.aql_ring = self._gpu_alloc(0x100000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.eop_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.kernargs = self._gpu_alloc(0x1000000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.kernargs_ptr = self.kernargs.va_addr
-    self.ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    # self.gart_aql = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
+    # self.aql_ring = self._gpu_alloc(0x100000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
+    # self.eop_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    # self._gpu_alloc(0x1000000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x20000000000 + 0x1000000000 * self.device_id)
+    self.kernargs = self._gpu_alloc(0x4000000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x50000000000 + 0x1000000000 * self.device_id)
+    self.kernargs_ptr = self.kernargs.va_addr + 0x3000000
+    # self.ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
 
     # scratch setup
     max_cu_id = self.properties['simd_count'] // self.properties['simd_per_cu'] - 1
@@ -562,7 +634,21 @@ class AMDDevice(Compiled):
     self.max_private_segment_size = 4096
     wave_scratch_len = round_up(((max_wave_id + 1) * self.max_private_segment_size), 256) # gfx11 requires alignment of 256
     self.scratch_len = (max_cu_id + 1) * self.properties['max_slots_scratch_cu'] * wave_scratch_len
-    self.scratch = self._gpu_alloc(self.scratch_len, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    self.scratch = self._gpu_alloc(self.scratch_len, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x40000000000 + 0x1000000000 * self.device_id)
+
+    # PM4 Queue
+    self.pm4_ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x58000000000 + 0x1000000000 * self.device_id)
+    # print(self.pm4_ctx_save_restore_address.va_addr)
+    self.eop_pm4_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x60000000000 + 0x1000000000 * self.device_id)
+    self.gart_pm4 = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True, va_addr=0x20000000000 + 0x1000000000 * self.device_id)
+    self.pm4_ring = self._gpu_alloc(0x100000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True, va_addr=0x18000000000 + 0x1000000000 * self.device_id)
+    self.pm4_queue = kio.create_queue(AMDDevice.kfd, ring_base_address=self.pm4_ring.va_addr, ring_size=self.pm4_ring.size, gpu_id=self.gpu_id,
+      queue_type=kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE, queue_priority=kfd.KFD_MAX_QUEUE_PRIORITY,
+      eop_buffer_address=self.eop_pm4_buffer.va_addr, eop_buffer_size=self.eop_pm4_buffer.size,
+      # TODO: are these needed? (i know eop is)
+      ctx_save_restore_address=self.pm4_ctx_save_restore_address.va_addr, ctx_save_restore_size=self.pm4_ctx_save_restore_address.size,
+      ctl_stack_size = 0xa000,
+      write_pointer_address=self.gart_pm4.va_addr, read_pointer_address=self.gart_pm4.va_addr+8)
 
     # SDMA Queue
     self.gart_sdma = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
@@ -580,22 +666,11 @@ class AMDDevice(Compiled):
     self.sdma_doorbell = to_mv(self.doorbells + self.sdma_queue.doorbell_offset - self.doorbells_base, 4).cast("I")
     self.sdma_doorbell_value = 0
 
-    # PM4 Queue
-    self.pm4_ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.eop_pm4_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.gart_pm4 = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.pm4_ring = self._gpu_alloc(0x100000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.pm4_queue = kio.create_queue(AMDDevice.kfd, ring_base_address=self.pm4_ring.va_addr, ring_size=self.pm4_ring.size, gpu_id=self.gpu_id,
-      queue_type=kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE, queue_priority=kfd.KFD_MAX_QUEUE_PRIORITY,
-      eop_buffer_address=self.eop_pm4_buffer.va_addr, eop_buffer_size=self.eop_pm4_buffer.size,
-      # TODO: are these needed? (i know eop is)
-      ctx_save_restore_address=self.pm4_ctx_save_restore_address.va_addr, ctx_save_restore_size=self.pm4_ctx_save_restore_address.size,
-      ctl_stack_size = 0xa000,
-      write_pointer_address=self.gart_pm4.va_addr, read_pointer_address=self.gart_pm4.va_addr+8)
-
     self.pm4_read_pointer = to_mv(self.pm4_queue.read_pointer_address, 8).cast("Q")
     self.pm4_write_pointer = to_mv(self.pm4_queue.write_pointer_address, 8).cast("Q")
     self.pm4_doorbell = to_mv(self.doorbells + self.pm4_queue.doorbell_offset - self.doorbells_base, 4).cast("I")
+
+    self.devices.append(self)
 
     super().__init__(device, AMDAllocator(self), AMDCompiler(self.arch), functools.partial(AMDProgram, self))
 
@@ -613,14 +688,19 @@ class AMDDevice(Compiled):
   def _submit_cache_inv(self, addr=0x0, sz=(1 << 64)-1, gli=0, glv=0, glk=0, gl1=0, gl2=0):
     HWPM4Queue().invalidate_cache().signal(self.completion_signal).submit(self)
     self._wait_signal(self.completion_signal)
-    assert (wp:=(self.pm4_write_pointer[0]%(self.pm4_ring.size//4))) == (rp:=self.pm4_read_pointer[0]), \
-      f"didn't run {wp} != {rp} len {self.pm4_ring.size//4}"
+    # assert (wp:=(self.pm4_write_pointer[0]%(self.pm4_ring.size//4))) == (rp:=self.pm4_read_pointer[0]), \
+      # f"didn't run {wp} != {rp} len {self.pm4_ring.size//4}"
 
   def synchronize(self):
     HWPM4Queue().signal(self.completion_signal).submit(self)
     self._wait_signal(self.completion_signal)
-    assert (wp:=(self.pm4_write_pointer[0]%(self.pm4_ring.size//4))) == (rp:=self.pm4_read_pointer[0]), \
-      f"didn't run {wp} != {rp} len {self.pm4_ring.size//4}"
+    # assert (wp:=(self.pm4_write_pointer[0]%(self.pm4_ring.size//4))) == (rp:=self.pm4_read_pointer[0]), \
+    #   f"didn't run {wp} != {rp} len {self.pm4_ring.size//4}"
 
     # reset kernargs
-    self.kernargs_ptr = self.kernargs.va_addr
+    # self.kernargs = self._gpu_alloc(0x4000000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM, va_addr=0x50000000000 + 0x1000000000 * self.device_id)
+    self.kernargs_ptr = self.kernargs.va_addr + 0x3000000
+
+  @staticmethod
+  def synchronize_system():
+    for d in AMDDevice.devices: d.synchronize()
