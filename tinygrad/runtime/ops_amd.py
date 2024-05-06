@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List, Any, cast
-import os, fcntl, ctypes, functools, re, pathlib, mmap, struct, errno, subprocess, time
+import os, fcntl, ctypes, functools, re, pathlib, mmap, struct, errno, subprocess, time, array
 from tinygrad.device import Compiled, LRUAllocator, Compiler, CompilerOptions
 from tinygrad.buffer import BufferOptions
 from tinygrad.helpers import getenv, from_mv, init_c_struct_t, to_mv, round_up, DEBUG
@@ -258,8 +258,16 @@ class HWPM4Queue:
     wptr = device.pm4_write_pointer[0]
     pm4_buffer_view = to_mv(device.pm4_ring.va_addr, device.pm4_ring.size).cast("I")
     for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
-    device.pm4_write_pointer[0] = wptr + len(self.q)
-    device.pm4_doorbell[0] = wptr + len(self.q)
+
+    tail_blit_dword = min(((device.pm4_ring.size//4) - wptr % (device.pm4_ring.size//4)), len(self.q))
+    pm4_buffer_view[wptr%(device.pm4_ring.size//4):wptr%(device.pm4_ring.size//4)+tail_blit_dword] = array.array('I', self.q[:tail_blit_dword])
+    wptr += tail_blit_dword
+    if (rem_packet_cnt := len(self.q) - tail_blit_dword) > 0:
+      pm4_buffer_view[wptr%(device.pm4_ring.size//4):wptr%(device.pm4_ring.size//4)+rem_packet_cnt] = array.array('I', self.q[tail_blit_dword:])
+      wptr += rem_packet_cnt
+
+    device.pm4_write_pointer[0] = wptr# + len(self.q)
+    device.pm4_doorbell[0] = wptr# + len(self.q)
     return self
 
 # prebuilt sdma packets
@@ -340,6 +348,7 @@ class AMDProgram:
     self.group_segment_size = lib_gpu_view.cast("I")[entry_point//4]
     self.private_segment_size = lib_gpu_view.cast("I")[entry_point//4 + 1]
     self.kernargs_segment_size = lib_gpu_view.cast("I")[entry_point//4 + 2]
+    self.program_args_offset = 0
     assert self.private_segment_size <= self.device.max_private_segment_size, \
       f"{self.private_segment_size=} > {self.device.max_private_segment_size=}"
 
@@ -379,8 +388,9 @@ class AMDAllocator(LRUAllocator):
   def __init__(self, device:AMDDevice):
     self.device = device
     # NOTE: KFD_IOC_ALLOC_MEM_FLAGS_GTT doesn't work here for readinto
-    self.b = [self.device._gpu_alloc(SDMA_MAX_COPY_SIZE*4, kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, public=True) for _ in range(2)]
+    self.b = [self.device._gpu_alloc(SDMA_MAX_COPY_SIZE, kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, public=True) for _ in range(16)]
     self.b_timeline = [0] * len(self.b)
+    self.b_next = 0
     super().__init__()
 
   def _alloc(self, size:int, options:BufferOptions):
@@ -416,13 +426,13 @@ class AMDAllocator(LRUAllocator):
 
   def copyin(self, dest, src: memoryview):
     for i in range(0, src.nbytes, self.b[0].size):
-      self.b, self.b_timeline = self.b[::-1], self.b_timeline[::-1]
+      self.b_next = (self.b_next + 1) % len(self.b)
       AMDDevice._wait_signal(self.device.timeline_signal, self.b_timeline[0])
-      ctypes.memmove(self.b[0].va_addr, from_mv(src[i:]), lsize:=min(self.b[0].size, src.nbytes-i))
+      ctypes.memmove(self.b[self.b_next].va_addr, from_mv(src[i:]), lsize:=min(self.b[0].size, src.nbytes-i))
       HWCopyQueue().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
-                   .copy(dest.va_addr+i, self.b[0].va_addr, lsize) \
+                   .copy(dest.va_addr+i, self.b[self.b_next].va_addr, lsize) \
                    .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
-      self.b_timeline[0] = self.device.timeline_value
+      self.b_timeline[self.b_next] = self.device.timeline_value
       self.device.timeline_value += 1
 
   def copyout(self, dest:memoryview, src):
@@ -579,7 +589,9 @@ class AMDDevice(Compiled):
     self.pm4_write_pointer = to_mv(self.pm4_queue.write_pointer_address, 8).cast("Q")
     self.pm4_doorbell = to_mv(self.doorbells + self.pm4_queue.doorbell_offset - self.doorbells_base, 4).cast("I")
 
-    super().__init__(device, AMDAllocator(self), AMDCompiler(self.arch), functools.partial(AMDProgram, self))
+    from tinygrad.runtime.graph.hcq import HCQGraph
+    super().__init__(device, AMDAllocator(self), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
+                     functools.partial(HCQGraph, AMDDevice, HWPM4Queue, HWCopyQueue))
 
   def synchronize(self):
     AMDDevice._wait_signal(self.timeline_signal, self.timeline_value - 1)
