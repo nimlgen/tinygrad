@@ -257,7 +257,7 @@ class HWPM4Queue:
   def submit(self, device:AMDDevice):
     wptr = device.pm4_write_pointer[0]
     pm4_buffer_view = to_mv(device.pm4_ring.va_addr, device.pm4_ring.size).cast("I")
-    for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
+    # for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
 
     tail_blit_dword = min(((device.pm4_ring.size//4) - wptr % (device.pm4_ring.size//4)), len(self.q))
     pm4_buffer_view[wptr%(device.pm4_ring.size//4):wptr%(device.pm4_ring.size//4)+tail_blit_dword] = array.array('I', self.q[:tail_blit_dword])
@@ -427,7 +427,7 @@ class AMDAllocator(LRUAllocator):
   def copyin(self, dest, src: memoryview):
     for i in range(0, src.nbytes, self.b[0].size):
       self.b_next = (self.b_next + 1) % len(self.b)
-      AMDDevice._wait_signal(self.device.timeline_signal, self.b_timeline[0])
+      AMDDevice._wait_signal(self.device.timeline_signal, self.b_timeline[self.b_next])
       ctypes.memmove(self.b[self.b_next].va_addr, from_mv(src[i:]), lsize:=min(self.b[0].size, src.nbytes-i))
       HWCopyQueue().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
                    .copy(dest.va_addr+i, self.b[self.b_next].va_addr, lsize) \

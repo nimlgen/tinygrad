@@ -97,7 +97,7 @@ class HCQGraph(MultiGraphRunner):
       # if dev in self.copy_queues: self.comp_queues[dev].wait(self.copy_signal[dev], value=self.copy_signal_val[dev])
       # self.comp_queues[dev].wait(self.comp_signal[dev], value=self.comp_signal_val[dev])
       for cdev in self.devices:
-        if cdev in self.copy_queues: self.comp_queues[dev].wait(self.copy_signal[cdev], value=self.copy_signal_val[cdev])
+        if self.copy_signal_val[cdev] > 0: self.comp_queues[dev].wait(self.copy_signal[cdev], value=self.copy_signal_val[cdev])
       # self.comp_queues[dev].signal(self.comp_signal[dev], 0xffffffff) # finish sign
       self.queues_list.append((self.comp_queues.pop(dev), dev))
       if self.copy_signal_val[dev] > 0: self.queues_list.append((self.copy_queues.pop(dev), dev))
