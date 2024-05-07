@@ -97,7 +97,7 @@ class HWComputeQueue:
     prg.qmd.constant_buffer_addr_lower_0 = kernargs & 0xffffffff
     prg.qmd.constant_buffer_addr_upper_0 = kernargs >> 32
     self.q += [nvmethod(1, nv_gpu.NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI, 1), (1 << 12) | (1 << 4) | (1 << 0)]
-    self.q += [nvmethod(1, nv_gpu.NVC6C0_SET_INLINE_QMD_ADDRESS_A, 0x42), *nvdata64((kernargs + round_up(prg.kernargs_segment_size, 1 << 8)) >> 8)]
+    self.q += [nvmethod(1, nv_gpu.NVC6C0_SET_INLINE_QMD_ADDRESS_A, 0x42), *nvdata64((kernargs + round_up(prg.constbuffer_segment_size, 1 << 8)) >> 8)]
     self.q += [x for x in to_mv(ctypes.addressof(prg.qmd), ctypes.sizeof(prg.qmd)).cast("I")]
     return self
 
@@ -208,7 +208,8 @@ class NVProgram:
                             constant_buffer_size_shifted4_0=0x190, constant_buffer_valid_0=1, constant_buffer_invalidate_0=1)
 
     # NV's kernargs is constbuffer (size 0x160), then arguments to the kernel follows. Kernargs also appends QMD at the end of the kernel.
-    self.kernargs_segment_size = round_up((0 if constant_buffers_data[0].nbytes in constant_buffers_data else 0), 1 << 8) + (8 << 8)
+    self.constbuffer_segment_size = constant_buffers_data[0].nbytes if 0 in constant_buffers_data else 0
+    self.kernargs_segment_size = round_up(self.constbuffer_segment_size, 1 << 8) + (8 << 8)
     self.kernargs_offset = 0x160
 
     # constant buffer 0 is filled for each program, no need to copy it from elf (it's just zeroes)
@@ -233,22 +234,24 @@ class NVProgram:
 
   def __call__(self, *args, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1), vals:Tuple[int, ...]=(), wait=False):
     if prod(local_size) > 1024 or self.max_threads < prod(local_size): raise RuntimeError("Too many resources requsted for launch")
+    if not hasattr(self, "args_struct_t"):
+      self.args_struct_t = init_c_struct_t(tuple([(f'f{i}', ctypes.c_void_p) for i in range(len(args))] +
+                                                 [(f'v{i}', ctypes.c_int) for i in range(len(vals))]))
 
     if self.device.kernargs_ptr >= (self.device.kernargs_page.base + self.device.kernargs_page.length - self.kernargs_segment_size):
       self.device.kernargs_ptr = self.device.kernargs_page.base
 
     kernargs = [arg_half for arg in args for arg_half in nvdata64_le(arg.base)] + [val for val in vals]
-    kernargs_ptr = self.device.kernargs_ptr
-    self.device.kernargs_ptr += self.kernargs_segment_size
 
     queue = HWComputeQueue()
     queue.wait(self.device.timeline_signal, self.device.timeline_value - 1)
     if wait: queue.signal(self.device.time_event_st, timestamp=True)
-    queue.copy_from_cpu(kernargs_ptr, self.constbuffer_0 + kernargs)
-    queue.exec(self, kernargs_ptr, global_size, local_size)
+    queue.copy_from_cpu(self.device.kernargs_ptr, self.constbuffer_0 + kernargs)
+    queue.exec(self, self.device.kernargs_ptr, global_size, local_size)
     if wait: queue.signal(self.device.time_event_en, timestamp=True)
     queue.signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
     self.device.timeline_value += 1
+    self.device.kernargs_ptr += self.kernargs_segment_size
 
     if wait:
       self.device._wait_signal(self.device.timeline_signal, self.device.timeline_value - 1)
