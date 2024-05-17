@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List, Any, cast
-import os, fcntl, ctypes, ctypes.util, functools, re, pathlib, mmap, struct, errno, subprocess, time
+import os, fcntl, ctypes, ctypes.util, functools, re, pathlib, mmap, struct, errno, subprocess, time, array
 from tinygrad.device import Compiled, Compiler, BufferOptions, LRUAllocator
 from tinygrad.helpers import getenv, from_mv, init_c_struct_t, to_mv, round_up, DEBUG
 from tinygrad.renderer.cstyle import AMDRenderer
@@ -112,7 +112,7 @@ FORCE_START_AT_000 = 1 << 2
 CS_W32_EN = 1 << 15
 
 class HWPM4Queue:
-  def __init__(self): self.q = []
+  def __init__(self): self.q, self.binded_device = [], None
   def ptr(self) -> int: return len(self.q)
 
   def hdp_flush(self):
@@ -137,6 +137,7 @@ class HWPM4Queue:
     return self
 
   def exec(self, prg:AMDProgram, kernargs, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1)):
+    assert self.binded_device is None, "Cannot update queue which binded device"
     self.hdp_flush()
     self.invalidate_cache()
 
@@ -167,13 +168,9 @@ class HWPM4Queue:
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_EVENT_WRITE, 0), amd_gpu.EVENT_TYPE(7) | amd_gpu.EVENT_INDEX(4)]
     return self
 
-  def update_exec(self, cmd_ptr, global_size, local_size):
-    # Patch the exec cmd with new launch dims
-    assert self.q[cmd_ptr + 67] == amd_gpu.PACKET3(amd_gpu.PACKET3_DISPATCH_DIRECT, 3),"The pointer does not point to a packet of this type"
-    self.q[cmd_ptr + 59 : cmd_ptr + 62] = local_size
-    self.q[cmd_ptr + 68 : cmd_ptr + 71] = global_size
-
   def wait(self, signal:hsa.amd_signal_t, value=0):
+    assert self.binded_device is None, "Cannot update queue which binded device"
+
     addr = ctypes.addressof(signal) + SIGNAL_VALUE_OFFSET
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_WAIT_REG_MEM, 5),
       amd_gpu.WAIT_REG_MEM_MEM_SPACE(1) | amd_gpu.WAIT_REG_MEM_OPERATION(0) | amd_gpu.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_GEQ) | \
@@ -181,6 +178,8 @@ class HWPM4Queue:
     return self
 
   def timestamp(self, addr):
+    assert self.binded_device is None, "Cannot update queue which binded device"
+
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_RELEASE_MEM, 6),
       # event_index__mec_release_mem__end_of_pipe = 5
       amd_gpu.PACKET3_RELEASE_MEM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS_EVENT) | amd_gpu.PACKET3_RELEASE_MEM_EVENT_INDEX(5),
@@ -190,6 +189,8 @@ class HWPM4Queue:
     return self
 
   def signal(self, signal:hsa.amd_signal_t, value=0):
+    assert self.binded_device is None, "Cannot update queue which binded device"
+
     # NOTE: this needs an EOP buffer on the queue or it will NULL pointer
     addr = ctypes.addressof(signal) + SIGNAL_VALUE_OFFSET
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_RELEASE_MEM, 6),
@@ -216,12 +217,48 @@ class HWPM4Queue:
         signal.event_id]
     return self
 
+  def update_exec(self, cmd_ptr, global_size, local_size):
+    # Patch the exec cmd with new launch dims
+    assert self.q[cmd_ptr + 67] == amd_gpu.PACKET3(amd_gpu.PACKET3_DISPATCH_DIRECT, 3),"The pointer does not point to a packet of this type"
+    self.q[cmd_ptr + 59 : cmd_ptr + 62] = array.array('I', local_size)
+    self.q[cmd_ptr + 68 : cmd_ptr + 71] = array.array('I', global_size)
+
+  def update_signal(self, cmd_ptr, signal, value):
+    # Patch the exec cmd with new launch dims
+    # assert self.q[cmd_ptr + 67] == amd_gpu.PACKET3(amd_gpu.PACKET3_DISPATCH_DIRECT, 3),"The pointer does not point to a packet of this type"
+    addr = ctypes.addressof(signal) + SIGNAL_VALUE_OFFSET
+    self.q[cmd_ptr + 3 : cmd_ptr + 5] = array.array('I', [addr & 0xFFFFFFFF, addr>>32])
+    self.q[cmd_ptr + 5 : cmd_ptr + 7] = array.array('I', [value & 0xFFFFFFFF, value >> 32])
+    if signal.event_mailbox_ptr != 0:
+      self.q[cmd_ptr + 11 : cmd_ptr + 13] = array.array('I', [signal.event_mailbox_ptr & 0xFFFFFFFF, signal.event_mailbox_ptr >> 32])
+      self.q[cmd_ptr + 13 : cmd_ptr + 15] = array.array('I', [signal.event_id & 0xFFFFFFFF, signal.event_id >> 32])
+
+  def update_wait(self, cmd_ptr, signal, value):
+    # Patch the exec cmd with new launch dims
+    # assert self.q[cmd_ptr + 67] == amd_gpu.PACKET3(amd_gpu.PACKET3_DISPATCH_DIRECT, 3),"The pointer does not point to a packet of this type"
+    addr = ctypes.addressof(signal) + SIGNAL_VALUE_OFFSET
+    self.q[cmd_ptr + 2 : cmd_ptr + 4] = array.array('I', [addr & 0xFFFFFFFF, addr>>32])
+    self.q[cmd_ptr + 4] = value
+
+  def bind(self, device:AMDDevice):
+    self.binded_device, self.next_doorbell = device, 1
+    self.hw_queue, self.hw_read_pointer, self.hw_write_pointer, self.hw_doorbell = device._alloc_compute_queue(len(self.q) * 4)
+    hw_view = to_mv(self.hw_queue.va_addr, self.hw_queue.size).cast("I")
+    for i, value in enumerate(self.q): hw_view[i] = value
+    self.q = hw_view # all updates now in the hw queue rn.
+
   def submit(self, device:AMDDevice):
-    wptr = device.pm4_write_pointer[0]
-    pm4_buffer_view = to_mv(device.pm4_ring.va_addr, device.pm4_ring.size).cast("I")
-    for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
-    device.pm4_write_pointer[0] = wptr + len(self.q)
-    device.pm4_doorbell[0] = wptr + len(self.q)
+    if self.binded_device == device:
+      self.hw_read_pointer[0] = 0
+      self.hw_write_pointer[0] = len(self.q)
+      self.hw_doorbell[0] = self.next_doorbell
+      self.next_doorbell += 1
+    else:
+      wptr = device.pm4_write_pointer[0]
+      pm4_buffer_view = to_mv(device.pm4_ring.va_addr, device.pm4_ring.size).cast("I")
+      for i, value in enumerate(self.q): pm4_buffer_view[(wptr+i)%(device.pm4_ring.size//4)] = value
+      device.pm4_write_pointer[0] = wptr + len(self.q)
+      device.pm4_doorbell[0] = wptr + len(self.q)
     return self
 
 # prebuilt sdma packets
@@ -532,26 +569,28 @@ class AMDDevice(Compiled):
     self.sdma_doorbell_value = 0
 
     # PM4 Queue
-    self.pm4_ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.eop_pm4_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
-    self.gart_pm4 = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.pm4_ring = self._gpu_alloc(0x100000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    self.pm4_queue = kio.create_queue(AMDDevice.kfd, ring_base_address=self.pm4_ring.va_addr, ring_size=self.pm4_ring.size, gpu_id=self.gpu_id,
-      queue_type=kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE, queue_priority=kfd.KFD_MAX_QUEUE_PRIORITY,
-      eop_buffer_address=self.eop_pm4_buffer.va_addr, eop_buffer_size=self.eop_pm4_buffer.size,
-      # TODO: are these needed? (i know eop is)
-      ctx_save_restore_address=self.pm4_ctx_save_restore_address.va_addr, ctx_save_restore_size=self.pm4_ctx_save_restore_address.size,
-      ctl_stack_size = 0xa000,
-      write_pointer_address=self.gart_pm4.va_addr, read_pointer_address=self.gart_pm4.va_addr+8)
-
-    self.pm4_read_pointer = to_mv(self.pm4_queue.read_pointer_address, 8).cast("Q")
-    self.pm4_write_pointer = to_mv(self.pm4_queue.write_pointer_address, 8).cast("Q")
-    self.pm4_doorbell = to_mv(self.doorbells + self.pm4_queue.doorbell_offset - self.doorbells_base, 8).cast("Q")
+    self.pm4_ring, self.pm4_read_pointer, self.pm4_write_pointer, self.pm4_doorbell = self._alloc_compute_queue(0x100000)
 
     from tinygrad.runtime.graph.hcq import HCQGraph
     super().__init__(device, AMDAllocator(self), AMDRenderer(), HSACompiler(self.arch),
                      functools.partial(AMDProgram, self),
                      functools.partial(HCQGraph, AMDDevice, HWPM4Queue, HWCopyQueue))
+
+  def _alloc_compute_queue(self, sz):
+    pm4_ctx_save_restore_address = self._gpu_alloc(0x2C02000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    eop_pm4_buffer = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    gart_pm4 = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
+    pm4_ring = self._gpu_alloc(round_up(sz, (2 << 20)), kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
+    pm4_queue = kio.create_queue(AMDDevice.kfd, ring_base_address=pm4_ring.va_addr, ring_size=pm4_ring.size, gpu_id=self.gpu_id,
+      queue_type=kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE, queue_priority=kfd.KFD_MAX_QUEUE_PRIORITY,
+      eop_buffer_address=eop_pm4_buffer.va_addr, eop_buffer_size=eop_pm4_buffer.size,
+      ctx_save_restore_address=pm4_ctx_save_restore_address.va_addr, ctx_save_restore_size=pm4_ctx_save_restore_address.size,
+      ctl_stack_size = 0xa000, write_pointer_address=gart_pm4.va_addr, read_pointer_address=gart_pm4.va_addr+8)
+
+    pm4_read_pointer = to_mv(pm4_queue.read_pointer_address, 8).cast("Q")
+    pm4_write_pointer = to_mv(pm4_queue.write_pointer_address, 8).cast("Q")
+    pm4_doorbell = to_mv(self.doorbells + pm4_queue.doorbell_offset - self.doorbells_base, 8).cast("Q")
+    return (pm4_ring, pm4_read_pointer, pm4_write_pointer, pm4_doorbell)
 
   def synchronize(self):
     AMDDevice._wait_signal(self.timeline_signal, self.timeline_value - 1)
