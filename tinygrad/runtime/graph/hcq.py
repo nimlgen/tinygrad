@@ -55,6 +55,8 @@ class HCQGraph(MultiGraphRunner):
     self.kickoff_ptr = {}
     self.last_signal_ptr = {}
     self.first_wait_ptr = {}
+    self.cp_kickoff_ptr = {}
+    self.cp_first_wait_ptr = {}
     
     self.exec_ptrs: Dict[int, Tuple[Any, int]] = {}
     self.copy_to_devs: Dict[Compiled, Set[Compiled]] = {dev: set() for dev in self.devices}
@@ -64,6 +66,11 @@ class HCQGraph(MultiGraphRunner):
       self.comp_queues[dev].wait(dev.timeline_signal, dev.timeline_value - 1)
       self.kickoff_ptr[dev] = self.comp_queues[dev].ptr()
       self.comp_queues[dev].wait(self.kickoff_signal, self.kickoff_value)
+
+      self.cp_first_wait_ptr[dev] = self.copy_queues[dev].ptr()
+      self.copy_queues[dev].wait(dev.timeline_signal, dev.timeline_value - 1)
+      self.cp_kickoff_ptr[dev] = self.copy_queues[dev].ptr()
+      self.copy_queues[dev].wait(self.kickoff_signal, self.kickoff_value)
 
     for j,ji in enumerate(self.jit_cache):
       if isinstance(ji.prg, CompiledRunner):
@@ -97,9 +104,11 @@ class HCQGraph(MultiGraphRunner):
       self.comp_queues[dev].signal(dev.timeline_signal, dev.timeline_value)
 
       self.queue_list.append((self.comp_queues[dev], dev))
-      if self.copy_signal_val[dev] > 0: self.queue_list.append((self.copy_queues.pop(dev), dev))
+      if self.copy_signal_val[dev] > 0: self.queue_list.append((self.copy_queues[dev], dev))
 
-    for dev in self.devices: self.comp_queues[dev].bind(dev)
+    for dev in self.devices:
+      self.comp_queues[dev].bind(dev)
+      if self.copy_signal_val[dev] > 0: self.copy_queues[dev].bind(dev)
 
   def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False) -> Optional[float]:
     # Wait and restore signals
@@ -127,10 +136,14 @@ class HCQGraph(MultiGraphRunner):
       self.comp_queues[dev].update_wait(self.first_wait_ptr[dev], dev.timeline_signal, dev.timeline_value - 1)
       self.comp_queues[dev].update_wait(self.kickoff_ptr[dev], self.kickoff_signal, self.kickoff_value)
       self.comp_queues[dev].update_signal(self.last_signal_ptr[dev], dev.timeline_signal, dev.timeline_value)
+
+      if self.copy_signal_val[dev] > 0:
+        self.copy_queues[dev].update_wait(self.cp_first_wait_ptr[dev], dev.timeline_signal, dev.timeline_value - 1)
+        self.copy_queues[dev].update_wait(self.cp_kickoff_ptr[dev], self.kickoff_signal, self.kickoff_value)
       # self.comp_hcq_t().wait(dev.timeline_signal, dev.timeline_value - 1) \
       #                  .wait(self.kickoff_signal, self.kickoff_value).submit(dev)
-      self.copy_hcq_t().wait(dev.timeline_signal, dev.timeline_value - 1) \
-                       .wait(self.kickoff_signal, self.kickoff_value).submit(dev)
+      # self.copy_hcq_t().wait(dev.timeline_signal, dev.timeline_value - 1) \
+      #                  .wait(self.kickoff_signal, self.kickoff_value).submit(dev)
 
       self.graph_timeline[dev] = dev.timeline_value
       dev.timeline_value += 1
