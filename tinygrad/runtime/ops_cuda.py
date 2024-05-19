@@ -112,6 +112,7 @@ class CUDAProgram:
       else:
         for i in range(len(args)): self.c_args.__setattr__(f'f{i}', args[i])
         for i in range(len(vals)): self.c_args.__setattr__(f'v{i}', vals[i])
+    # print("call")
     return cu_time_execution(lambda: check(cuda.cuLaunchKernel(self.prg, *global_size, *local_size, 0, None, None, self.vargs)), enable=wait)
 
 class CUDAAllocator(LRUAllocator):
@@ -132,9 +133,9 @@ class CUDAAllocator(LRUAllocator):
     ctypes.memmove(host_mem, from_mv(src), len(src))
     check(cuda.cuMemcpyHtoDAsync_v2(dest, host_mem, len(src), None))
   def copyout(self, dest:memoryview, src):
-    CUDADevice.synchronize_system()
     check(cuda.cuCtxSetCurrent(self.device.context))
-    check(cuda.cuMemcpyDtoH_v2(from_mv(dest), src, len(dest)))
+    check(cuda.cuMemcpyDtoHAsync_v2(from_mv(dest), src, len(dest), None))
+    # CUDADevice.synchronize_system()
   def transfer(self, dest, src, sz:int, src_dev, dest_dev):
     check(cuda.cuCtxSetCurrent(src_dev.context))
     check(cuda.cuEventCreate(ctypes.byref(sync_event := cuda.CUevent()), 0))

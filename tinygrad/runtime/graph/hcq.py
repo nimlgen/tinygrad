@@ -51,6 +51,7 @@ class HCQGraph(MultiGraphRunner):
     self.kickoff_signal = self.devices[0]._get_signal(value=0)
     self.kickoff_value = 0
     self.graph_timeline = {dev: 0 for dev in self.devices}
+    self.prevv = {dev: 0 for dev in self.devices}
 
     self.kickoff_ptr = {}
     self.last_signal_ptr = {}
@@ -75,31 +76,49 @@ class HCQGraph(MultiGraphRunner):
     for j,ji in enumerate(self.jit_cache):
       if isinstance(ji.prg, CompiledRunner):
         deps = self.access_resources(ji.bufs[(outs:=ji.prg.p.outcount):], ji.bufs[:outs], (self.comp_signal[ji.prg.device], sig_val:=j+1))
-        deps = [x for x in deps if x != self.comp_signal[ji.prg.device]] # remove wait for the same queue as all operations are ordered.
+        # print(deps, self.comp_signal[ji.prg.device], self.comp_signal_val[ji.prg.device])
+        if hasattr(self.comp_queues[ji.prg.device], 'chain_exec') and len(deps) == 1 and id(deps[0][0]) == id(self.comp_signal[ji.prg.device]):
+          # print("chain", deps[0][0], self.comp_signal[ji.prg.device], deps[0][0] == self.comp_signal[ji.prg.device])
+
+          self.prevv[ji.prg.device] = True
+          self.exec_ptrs[j] = (self.comp_queues[ji.prg.device], self.comp_queues[ji.prg.device].ptr())
+          self.comp_queues[ji.prg.device].chain_exec(self.exec_ptrs[self.comp_signal_val[ji.prg.device] - 1][1], None, self.kargs_addrs[j],
+                                                     *ji.prg.p.launch_dims(var_vals), signal=self.comp_signal[ji.prg.device], signal_value=sig_val)
+                                        #  .signal(self.comp_signal[ji.prg.device], sig_val)
+        else:
+          if self.prevv[ji.prg.device]: 
+            self.comp_queues[ji.prg.device].signal(self.comp_signal[ji.prg.device], self.comp_signal_val[ji.prg.device])
+            self.prevv[ji.prg.device] = False
+          deps = [x for x in deps if id(x[0]) != id(self.comp_signal[ji.prg.device])]
+          # deps.append((self.comp_signal[ji.prg.device], self.comp_signal_val[ji.prg.device]))
+          for sig, val in deps: self.comp_queues[ji.prg.device].wait(sig, val)
+          self.exec_ptrs[j] = (self.comp_queues[ji.prg.device], self.comp_queues[ji.prg.device].ptr())
+          self.comp_queues[ji.prg.device].exec(None, self.kargs_addrs[j], *ji.prg.p.launch_dims(var_vals)) \
+                                         .signal(self.comp_signal[ji.prg.device], sig_val)
         self.comp_signal_val[ji.prg.device] = sig_val
+        # for sig, val in deps: self.comp_queues[ji.prg.device].wait(sig, val)
 
-        for sig, val in deps: self.comp_queues[ji.prg.device].wait(sig, val)
-
-        self.exec_ptrs[j] = (self.comp_queues[ji.prg.device], self.comp_queues[ji.prg.device].ptr())
-        self.comp_queues[ji.prg.device].exec(ji.prg.clprg, self.kargs_addrs[j], *ji.prg.p.launch_dims(var_vals)) \
-                                       .signal(self.comp_signal[ji.prg.device], sig_val)
+        # self.exec_ptrs[j] = (self.comp_queues[ji.prg.device], self.comp_queues[ji.prg.device].ptr())
+        # self.comp_queues[ji.prg.device].exec(ji.prg.clprg, self.kargs_addrs[j], *ji.prg.p.launch_dims(var_vals),
+        #   signal=self.comp_signal[ji.prg.device], signal_value=sig_val)
+                                      #  .signal(self.comp_signal[ji.prg.device], sig_val)
       elif isinstance(ji.prg, BufferXfer):
         dest, src = [cast(Buffer, x) for x in ji.bufs[0:2]]
         Device[src.device]._gpu_map(dest._buf) #type: ignore
 
         deps = self.access_resources([src], [dest], (self.copy_signal[Device[src.device]], sig_val:=j+1))
+        deps = [x for x in deps if id(x[0]) != id(self.copy_signal[Device[src.device]])] # remove wait for the same queue as all operations are ordered.
         deps.append((self.copy_signal[Device[src.device]], self.copy_signal_val[Device[src.device]]))
         self.copy_signal_val[Device[src.device]] = sig_val
 
         for sig,val in deps: self.copy_queues[Device[src.device]].wait(sig, val)
-        self.copy_queues[Device[src.device]].copy(dest._buf.va_addr, src._buf.va_addr, dest.nbytes) \
-                                            .signal(self.copy_signal[Device[src.device]], sig_val)
+        self.copy_queues[Device[src.device]].signal(self.copy_signal[Device[src.device]], sig_val)
         self.copy_to_devs[Device[dest.device]].add(Device[src.device])
 
     for dev in self.devices:
       if self.copy_signal_val[dev] > 0: self.comp_queues[dev].wait(self.copy_signal[dev], self.copy_signal_val[dev])
-      for dep_dev in self.copy_to_devs: self.comp_queues[dev].wait(self.copy_signal[dep_dev], self.copy_signal_val[dep_dev])
-      
+      for dep_dev in self.copy_to_devs[dev]: self.comp_queues[dev].wait(self.copy_signal[dep_dev], self.copy_signal_val[dep_dev])
+
       self.last_signal_ptr[dev] = self.comp_queues[dev].ptr()
       self.comp_queues[dev].signal(dev.timeline_signal, dev.timeline_value)
 
@@ -120,26 +139,26 @@ class HCQGraph(MultiGraphRunner):
     dev._set_signal(self.kickoff_signal, self.kickoff_value)
 
     # Update rawbuffers
-    for (j,i),input_idx in self.input_replace.items():
-      self.ji_kargs_structs[j].__setattr__(f'f{i}', input_rawbuffers[input_idx]._buf.va_addr)
+    # for (j,i),input_idx in self.input_replace.items():
+    #   self.ji_kargs_structs[j].__setattr__(f'f{i}', input_rawbuffers[input_idx]._buf.va_addr)
 
     # Update var_vals
-    for j in self.jc_idx_with_updatable_var_vals:
-      for i,v in enumerate(cast(CompiledRunner, self.jit_cache[j].prg).p.vars):
-        self.ji_kargs_structs[j].__setattr__(f'v{i}', var_vals[v])
+    # for j in self.jc_idx_with_updatable_var_vals:
+    #   for i,v in enumerate(cast(CompiledRunner, self.jit_cache[j].prg).p.vars):
+    #     self.ji_kargs_structs[j].__setattr__(f'v{i}', var_vals[v])
 
-    for j in self.jc_idx_with_updatable_launch_dims:
-      queue, cmd_ptr = self.exec_ptrs[j]
-      queue.update_exec(cmd_ptr, *cast(CompiledRunner, self.jit_cache[j].prg).p.launch_dims(var_vals))
+    # for j in self.jc_idx_with_updatable_launch_dims:
+    #   queue, cmd_ptr = self.exec_ptrs[j]
+    #   queue.update_exec(cmd_ptr, *cast(CompiledRunner, self.jit_cache[j].prg).p.launch_dims(var_vals))
 
     for dev in self.devices:
       self.comp_queues[dev].update_wait(self.first_wait_ptr[dev], dev.timeline_signal, dev.timeline_value - 1)
-      self.comp_queues[dev].update_wait(self.kickoff_ptr[dev], self.kickoff_signal, self.kickoff_value)
+      self.comp_queues[dev].update_wait(self.kickoff_ptr[dev], self.kickoff_signal, 0)
       self.comp_queues[dev].update_signal(self.last_signal_ptr[dev], dev.timeline_signal, dev.timeline_value)
 
       if self.copy_signal_val[dev] > 0:
         self.copy_queues[dev].update_wait(self.cp_first_wait_ptr[dev], dev.timeline_signal, dev.timeline_value - 1)
-        self.copy_queues[dev].update_wait(self.cp_kickoff_ptr[dev], self.kickoff_signal, self.kickoff_value)
+        self.copy_queues[dev].update_wait(self.cp_kickoff_ptr[dev], self.kickoff_signal, 0)
       # self.comp_hcq_t().wait(dev.timeline_signal, dev.timeline_value - 1) \
       #                  .wait(self.kickoff_signal, self.kickoff_value).submit(dev)
       # self.copy_hcq_t().wait(dev.timeline_signal, dev.timeline_value - 1) \
