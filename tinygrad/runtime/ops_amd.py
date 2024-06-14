@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Tuple, List, Any, cast
 import os, fcntl, ctypes, ctypes.util, functools, re, pathlib, mmap, struct, errno, subprocess, time, array
-from tinygrad.device import Compiled, Compiler, CompileError, BufferOptions, LRUAllocator
+from tinygrad.device import Compiled, Compiler, CompileError, BufferOptions, LRUAllocator, HCQCompatAllocator, HCQCompatCompiled
 from tinygrad.helpers import getenv, from_mv, init_c_struct_t, to_mv, round_up, DEBUG
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.runtime.driver.hip_comgr import compile_hip
@@ -377,7 +377,7 @@ class AMDProgram:
       self.device._wait_signal(self.device.timeline_signal, self.device.timeline_value - 1)
       return (self.device.timeline_signal.end_ts - self.device.timeline_signal.start_ts) / 1e8
 
-class AMDAllocator(LRUAllocator):
+class AMDAllocator(HCQCompatAllocator):
   def __init__(self, device:AMDDevice):
     self.device = device
     # NOTE: KFD_IOC_ALLOC_MEM_FLAGS_GTT doesn't work here for readinto
@@ -395,63 +395,9 @@ class AMDAllocator(LRUAllocator):
       else: raise
 
   def _free(self, gpumem, options:BufferOptions): self.device._gpu_free(gpumem)
-  #def as_buffer(self, src:Any) -> memoryview:
-  #  self.device.synchronize()
-  #  return to_mv(src.va_addr, src.size)
-
-  #def copy_from_fd(self, dest, fd, offset, size):
-  #  fo = io.FileIO(fd, "a+b", closefd=False)
-  #  fo.seek(offset - (minor_offset:=offset % PAGE_SIZE))
-  #  copied_in, total_copy_size = 0, round_up(size+minor_offset, PAGE_SIZE)
-  #  for i in range(0, size+minor_offset, self.b[0].size):
-  #    local_size = min(self.b[0].size, total_copy_size-i)
-  #    copy_size = min(local_size-minor_offset, size-copied_in)
-  #    if copy_size == 0: break
-
-  #    fo.readinto(to_mv(self.b[1].va_addr, local_size))
-  #    if i != 0: self.device._wait_signal(self.device.signal_sdma)
-  #    self.b = self.b[::-1]
-  #    self.device._submit_sdma(dest.va_addr+copied_in, self.b[0].va_addr+minor_offset, copy_size, completion_signal=self.device.signal_sdma)
-
-  #    copied_in += copy_size
-  #    minor_offset = 0 # only on the first
-  #  self.device._wait_signal(self.device.signal_sdma)
-
-  def copyin(self, dest, src: memoryview):
-    for i in range(0, src.nbytes, self.b[0].size):
-      self.b_next = (self.b_next + 1) % len(self.b)
-      AMDDevice._wait_signal(self.device.timeline_signal, self.b_timeline[self.b_next])
-      ctypes.memmove(self.b[self.b_next].va_addr, from_mv(src[i:]), lsize:=min(self.b[self.b_next].size, src.nbytes-i))
-      HWCopyQueue().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
-                   .copy(dest.va_addr+i, self.b[self.b_next].va_addr, lsize) \
-                   .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
-      self.b_timeline[self.b_next] = self.device.timeline_value
-      self.device.timeline_value += 1
-
-  def copyout(self, dest:memoryview, src):
-    self.device.synchronize()
-    for i in range(0, dest.nbytes, self.b[0].size):
-      HWCopyQueue().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
-                   .copy(self.b[0].va_addr, src.va_addr+i, lsize:=min(self.b[0].size, dest.nbytes-i)) \
-                   .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
-      AMDDevice._wait_signal(self.device.timeline_signal, self.device.timeline_value)
-      self.device.timeline_value += 1
-
-      ctypes.memmove(from_mv(dest[i:]), self.b[0].va_addr, lsize)
-
-  def transfer(self, dest, src, sz:int, src_dev:AMDDevice, dest_dev:AMDDevice):
-    src_dev._gpu_map(dest)
-    HWCopyQueue().wait(src_dev.timeline_signal, src_dev.timeline_value - 1) \
-                 .wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1) \
-                 .copy(dest.va_addr, src.va_addr, sz) \
-                 .signal(src_dev.timeline_signal, src_dev.timeline_value).submit(src_dev)
-    HWPM4Queue().wait(src_dev.timeline_signal, src_dev.timeline_value).submit(dest_dev)
-    src_dev.timeline_value += 1
-
-  def offset(self, buf, size:int, offset:int): return type(buf)(va_addr=buf.va_addr + offset, size=size)
 
 MAP_FIXED, MAP_NORESERVE = 0x10, 0x400
-class AMDDevice(Compiled):
+class AMDDevice(HCQCompatCompiled):
   kfd:int = -1
   event_page:Any = None  # TODO: fix types in kfd, Optional[kfd.struct_kfd_ioctl_alloc_memory_of_gpu_args]
   signals_page:Any = None
@@ -584,9 +530,7 @@ class AMDDevice(Compiled):
     self.pm4_write_pointer = to_mv(self.pm4_queue.write_pointer_address, 8).cast("Q")
     self.pm4_doorbell = to_mv(self.doorbells + self.pm4_queue.doorbell_offset - self.doorbells_base, 8).cast("Q")
 
-    from tinygrad.runtime.graph.hcq import HCQGraph
-    super().__init__(device, AMDAllocator(self), AMDRenderer(), AMDCompiler(self.arch),
-                     functools.partial(AMDProgram, self), functools.partial(HCQGraph, AMDDevice, HWPM4Queue, HWCopyQueue))
+    super().__init__(device, AMDAllocator(self), AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self), HWPM4Queue, HWCopyQueue)
 
   def synchronize(self):
     AMDDevice._wait_signal(self.timeline_signal, self.timeline_value - 1)

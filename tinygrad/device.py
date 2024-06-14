@@ -3,7 +3,7 @@ import multiprocessing
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import List, Optional, Dict, Tuple, Any
-import importlib, inspect, functools, pathlib, os, ctypes
+import importlib, inspect, functools, pathlib, os, ctypes, json, atexit
 from tinygrad.helpers import getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, flat_mv, from_mv
 from tinygrad.dtype import DType, ImageDType
 from tinygrad.renderer import Renderer
@@ -183,3 +183,66 @@ class Compiled:
     self.dname, self.allocator, self.compiler, self.runtime, self.graph = device, allocator, compiler if compiler else Compiler(), runtime, graph
     self.renderer = renderer if renderer else Renderer()
   def synchronize(self): pass  # override this in your device
+
+# **************** HCQ Compatible Compiled Devices ****************
+
+class HCQCompatComiled(Compiled):
+  signals_pool: List[Any] = []
+
+  def __init__(self, device:str, allocator:Allocator, renderer:Optional[Renderer], compiler:Optional[Compiler], runtime, comp_queue_t, copy_queue_t):
+    assert hasattr(self, 'timeline_signal') and hasattr(self, 'timeline_value'), "Device implementation did not create timeline signal"
+
+    self.hw_compute_queue_t, self.hw_copy_queue_t = comp_queue_t, copy_queue_t
+
+    from tinygrad.runtime.graph.hcq import HCQGraph
+    super().__init__(device, allocator, renderer, compiler, runtime, HCQGraph)
+
+  @classmethod
+  def _set_signal(self, sig, value): pass # sets value on gpu for a signal
+
+  @classmethod
+  def _get_signal(self, value=0, **kwargs): pass # sets value on gpu for a signal
+
+  @classmethod
+  def _wait_signal(self, signal, value=0, timeout=10000): pass # waits for a singal value
+
+class HCQCompatAllocator(LRUAllocator):
+  def __init__(self, device: HCQCompatComiled, max_copy_size=(2 << 20)):
+    self.device = device
+    self.b = [self._alloc(min((2 << 20), max_copy_size), BufferOptions(host=True)) for _ in range(32)]
+    self.b_timeline = [0] * len(self.b)
+    self.b_next = 0
+    super().__init__()
+
+  def copyin(self, dest, src: memoryview):
+    for i in range(0, src.nbytes, self.b[0].size):
+      self.b_next = (self.b_next + 1) % len(self.b)
+      self.device._wait_signal(self.device.timeline_signal, self.b_timeline[self.b_next])
+      ctypes.memmove(self.b[self.b_next].va_addr, from_mv(src[i:]), lsize:=min(self.b[self.b_next].size, src.nbytes-i))
+      self.device.hw_copy_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+                                   .copy(dest.va_addr+i, self.b[self.b_next].va_addr, lsize) \
+                                   .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
+      self.b_timeline[self.b_next] = self.device.timeline_value
+      self.device.timeline_value += 1
+
+  def copyout(self, dest:memoryview, src):
+    self.device.synchronize()
+    for i in range(0, dest.nbytes, self.b[0].size):
+      self.device.hw_copy_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+                                   .copy(self.b[0].va_addr, src.va_addr+i, lsize:=min(self.b[0].size, dest.nbytes-i)) \
+                                   .signal(self.device.timeline_signal, self.device.timeline_value).submit(self.device)
+      self.device._wait_signal(self.device.timeline_signal, self.device.timeline_value)
+      self.device.timeline_value += 1
+
+      ctypes.memmove(from_mv(dest[i:]), self.b[0].va_addr, lsize)
+
+  def transfer(self, dest, src, sz: int, src_dev: HCQCompatComiled, dest_dev: HCQCompatComiled):
+    src_dev._gpu_map(dest)
+    self.device.hw_copy_queue_t().wait(src_dev.timeline_signal, src_dev.timeline_value - 1) \
+                                 .wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1) \
+                                 .copy(dest.va_addr, src.va_addr, sz) \
+                                 .signal(src_dev.timeline_signal, src_dev.timeline_value).submit(src_dev)
+    self.device.hw_compute_queue_t().wait(src_dev.timeline_signal, src_dev.timeline_value).submit(dest_dev)
+    src_dev.timeline_value += 1
+
+  def offset(self, buf, size:int, offset:int): return type(buf)(va_addr=buf.va_addr + offset, size=size)
