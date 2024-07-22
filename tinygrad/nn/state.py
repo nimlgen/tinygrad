@@ -116,6 +116,7 @@ def load_state_dict(model, state_dict:Dict[str, Tensor], strict=True, verbose=Tr
   start_mem_used = GlobalCounters.mem_used
   with Timing("loaded weights in ", lambda et_ns: f", {(GlobalCounters.mem_used-start_mem_used)/1e9:.2f} GB loaded at {(GlobalCounters.mem_used-start_mem_used)/et_ns:.2f} GB/s"):  # noqa: E501
     model_state_dict = get_state_dict(model)
+    model_state_dict = dict(sorted(model_state_dict.items(), key=lambda item: -item[1].nbytes()))
     if DEBUG >= 1 and len(state_dict) > len(model_state_dict):
       print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - model_state_dict.keys())))
     for k,v in (t := tqdm(model_state_dict.items(), disable=CI or not verbose)):
@@ -124,8 +125,9 @@ def load_state_dict(model, state_dict:Dict[str, Tensor], strict=True, verbose=Tr
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
       if isinstance((mlb:=v.lazydata), MultiLazyBuffer):
-        if isinstance(state_dict[k].lazydata, MultiLazyBuffer): v.replace(state_dict[k]).realize()
-        else: v.replace(state_dict[k].shard(mlb.device, mlb.axis)).realize()
+        # if isinstance(state_dict[k].lazydata, MultiLazyBuffer): v.replace(state_dict[k]).realize()
+        # else: v.replace(state_dict[k].shard(mlb.device, mlb.axis)).realize()
+        v.replace(state_dict[k].shard(mlb.device, mlb.axis, mlb.splits)).realize()
       else: v.replace(state_dict[k].to(v.device)).realize()
       if consume: del state_dict[k]
 

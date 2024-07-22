@@ -320,20 +320,30 @@ class Tensor:
     if self.grad is not None and real.grad is not None: self.grad.lazydata = real.grad.lazydata
     self.lazydata = real.lazydata
 
-  def shard(self, devices:Tuple[str, ...], axis:Optional[int]=None) -> Tensor:
+  def shard(self, devices:Tuple[str, ...], axis:Optional[int]=None, splits=None) -> Tensor:
     """
     Shards the tensor across the given devices.
     """
-    assert isinstance(self.lazydata, LazyBuffer), "can't shard a MultiLazyBuffer"
+    # assert isinstance(self.lazydata, LazyBuffer), "can't shard a MultiLazyBuffer"
     canonical_devices = tuple(Device.canonicalize(x) for x in devices)
     if axis is not None and axis < 0: axis += len(self.shape)
-    return Tensor(MultiLazyBuffer.from_sharded(self.lazydata, canonical_devices, axis), device=canonical_devices, requires_grad=self.requires_grad)
+    if axis is not None:
+      if splits is None: splits = 1
+      if isinstance(splits, int):
+        assert self.shape[axis] % splits == 0
+        sz = self.shape[axis] // (splits * len(devices)) * splits
+        extra = (self.shape[axis] // splits) % len(devices)
+        splits = [min(self.shape[axis], sz * (i + 1) + splits * min(i + 1, extra)) for i in range(len(devices))]
+    else:
+      assert splits is None
+    if isinstance(self.lazydata, MultiLazyBuffer) and (self.device, self.lazydata.axis, self.lazydata.splits) == (canonical_devices, axis, splits): return self
+    return Tensor(MultiLazyBuffer.from_sharded(self.lazydata, canonical_devices, axis, splits=splits), device=canonical_devices, requires_grad=self.requires_grad)
 
-  def shard_(self, devices:Tuple[str, ...], axis:Optional[int]=None):
+  def shard_(self, devices:Tuple[str, ...], axis:Optional[int]=None, splits=None):
     """
     Shards the tensor across the given devices in place.
     """
-    self.lazydata = self.shard(devices, axis).lazydata
+    self.lazydata = self.shard(devices, axis, splits=splits).lazydata
     return self
 
   @staticmethod
