@@ -1,4 +1,4 @@
-import sys, pickle, atexit
+import sys, pickle, atexit, statistics
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Tuple, List, Dict, Optional, Set, DefaultDict, Union, cast, get_args
@@ -318,14 +318,17 @@ def _graph_schedule(outs:List[LazyBuffer], seen:Set[LazyBuffer]):
 
 # *** DAG ordering: breadth first search ***
 
-def _approx_si_time(si):
+def _approx_si_time(si, runs=5):
   from tinygrad.engine.realize import lower_schedule_item
 
-  if si.ast.op in {MetaOps.KERNEL, MetaOps.COPY}:
+  if si.ast.op is MetaOps.KERNEL or (si.ast.op is MetaOps.COPY and si.outputs[0].device.split(":")[0] == si.inputs[0].device.split(":")[0]):
     eg = lower_schedule_item(si)
     var_vals = {k:(k.max+k.min)//2 for k in si.ast.vars()}
-    exec_time = eg.run(var_vals=var_vals, wait=True)
-    return int(exec_time * 1e6)
+
+    # print(si.ast.op)
+    exec_time = []
+    for i in range(runs): exec_time.append(eg.run(var_vals=var_vals, wait=True, dell=False))
+    return max(1, int(statistics.median(exec_time) * 1e7))
   else: return 1
 
 def _si_exec_unit(si):
@@ -333,98 +336,117 @@ def _si_exec_unit(si):
   elif si.ast.op is MetaOps.COPY and si.outputs[0].device.split(":")[0] == si.inputs[0].device.split(":")[0]: return (si.inputs[0].device, 'copy')
   return 'aux'
 
+ILP_CACHE = {}
 def ilp_sched(prescheduled, graph, old_schedule, old_order, lb_to_num):
+  # https://www.sciencedirect.com/science/article/pii/S0898122197001843
   if len(prescheduled) < 100: return old_schedule
 
-  # https://www.sciencedirect.com/science/article/pii/S0898122197001843
+  # print(old_order)
 
-  sis = {lb_to_num[lb]:ScheduleItem(ps[1], tuple(x.buffer for x in ps[0]+ps[2] if x.size != 0), ps[4]) for lb,ps in prescheduled.items()}
-  exec_time = {i:_approx_si_time(si) for i,si in sis.items()}
-  deps = [(lb_to_num[ps[0][0]], lb_to_num[x]) for ps in prescheduled.values() for x in graph[ps[0][0]]]
+  cache_key = hash(tuple(old_order))
+  if cache_key in ILP_CACHE:
+    new_schedule, new_order = ILP_CACHE[cache_key]
 
-  # devices = 0
-  exec_units_cmds = defaultdict(list) # devices (copy/exec queue) + one aux (need this?)
-  for i,si in sis.items(): exec_units_cmds[_si_exec_unit(si)].append(i)
+  else:
+    BATCH_SIZE = 768
+    new_schedule, new_order = [], []
+    for batch_st in range(0, len(old_order), BATCH_SIZE):
+      batch_ids = old_order[batch_st:batch_st+BATCH_SIZE]
+      old_sched = old_schedule[batch_st:batch_st+BATCH_SIZE]
 
-  for k,v in exec_units_cmds.items(): print(k, len(v))
+      sis = {}
+      for bid,sched in zip(batch_ids, old_sched): sis[bid] = sched
 
-  import pulp
-  I = sis.keys()
-  K = exec_units_cmds.keys()
-  T_max = sum(exec_time.values()) # TODO: bad, but ok for now
+      exec_time = {i:_approx_si_time(si) for i,si in sis.items()}
+      # print(exec_time)
+      deps = [(lb_to_num[ps[0][0]], lb_to_num[x]) for ps in prescheduled.values() for x in graph[ps[0][0]] if lb_to_num[ps[0][0]] in batch_ids and lb_to_num[x] in batch_ids]
+      print(sis.keys(), deps)
 
-  prob = pulp.LpProblem("sched", pulp.LpMinimize)
-  start_time = pulp.LpVariable.dicts("start", I, lowBound=0, upBound=T_max, cat='Continuous')
-  using = pulp.LpVariable.dicts("using", ((i, j) for i in I for j in I if i < j), cat='Binary')
-  makespan = pulp.LpVariable("makespan", lowBound=0, cat='Continuous')
-  prob += makespan
+      # devices = 0
+      exec_units_cmds = defaultdict(list) # devices (copy/exec queue) + one aux (need this?)
+      for i,si in sis.items(): exec_units_cmds[_si_exec_unit(si)].append(i)
 
-  # Define deps
-  for i, j in deps: prob += start_time[i] + exec_time[i] <= start_time[j]
+      max_makespan = 0
+      for k,v in exec_units_cmds.items(): max_makespan = max(max_makespan, sum(exec_time[x] for x in v))
 
-  # Exec units constraints
-  for k in K:
-    for i in exec_units_cmds[k]:
-      for j in exec_units_cmds[k]:
-        if i < j:
-          prob += start_time[i] + exec_time[i] <= start_time[j] + T_max * (1 - using[i, j])
-          prob += start_time[j] + exec_time[j] <= start_time[i] + T_max * using[i, j]
+      for k,v in exec_units_cmds.items(): print(k, len(v))
 
-  # Limit on use of function units
-  for k in K:
-    prob += pulp.lpSum(
-      pulp.LpAffineExpression([(start_time[i], 1), (start_time[j], -1), (using[i, j], -T_max)])
-      for i in exec_units_cmds[k] for j in exec_units_cmds[k] if i < j
-    ) <= T_max - pulp.lpSum(exec_time[i] for i in exec_units_cmds[k])
+      import pulp
+      I = sis.keys()
+      K = exec_units_cmds.keys()
+      T_max = sum(exec_time.values()) # TODO: bad, but ok for now
 
-  for i in I: prob += start_time[i] + exec_time[i] <= makespan
+      prob = pulp.LpProblem("sched", pulp.LpMinimize)
+      start_time = pulp.LpVariable.dicts("start", I, lowBound=0, upBound=T_max, cat='Integer')
+      using = pulp.LpVariable.dicts("using", ((i, j) for i in I for j in I if i < j), cat='Binary')
+      makespan = pulp.LpVariable("makespan", lowBound=max_makespan, upBound=T_max, cat='Integer')
+      prob += makespan
 
-  prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=60, threads=10))
-  # print("Status:", pulp.LpStatus[prob.status])
-  # print(f"Optimal makespan = {pulp.value(makespan):.2f}")
+      # Define deps
+      print("Define deps")
+      for i, j in deps: prob += start_time[i] + exec_time[i] <= start_time[j]
 
-  # print(deps)
-  # for i in I:
-  #   start = pulp.value(start_time[i])
-  #   end = start + exec_time[i]
-  #   print(f"SI {i} starts at {start:.2f} and completes at {end:.2f}")
+      # Exec units constraints
+      print("Exec units constraints")
+      # for k in K:
+      #   for i in exec_units_cmds[k]:
+      #     for j in exec_units_cmds[k]:
+      #       if i < j:
+      #         prob += start_time[i] + exec_time[i] <= start_time[j] + T_max * (1 - using[i, j])
+      #         prob += start_time[j] + exec_time[j] <= start_time[i] + T_max * using[i, j]
 
-  order = sorted(range(len(sis)), key=lambda x: pulp.value(start_time[x]))
-  # rev_order = [order.index(x) for x in range(len(sis))]
-  new_schedule = [sis[x] for x in order]
-  # print(new_schedule)
+      # Limit on use of function units
+      print("Limit on use of function units")
+      # for k in K:
+      #   prob += pulp.lpSum(
+      #     pulp.LpAffineExpression([(start_time[i], 1), (start_time[j], -1), (using[i, j], -T_max)])
+      #     for i in exec_units_cmds[k] for j in exec_units_cmds[k] if i < j
+      #   ) <= T_max - pulp.lpSum(exec_time[i] for i in exec_units_cmds[k])
 
-  # Validate
-  # print(order)
-  # print(deps)
-  # for i, j in deps: assert order[i] < order[j], f"order is broken, {i} -> {j}"
+      for i in I: prob += start_time[i] + exec_time[i] <= makespan
 
+      print("solve")
+      prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=40, threads=64))
+      print("Status:", pulp.LpStatus[prob.status])
+      print(f"Optimal makespan = {pulp.value(makespan):.2f}")
+
+      # print(deps)
+      for i in I:
+        start = pulp.value(start_time[i])
+        end = start + exec_time[i]
+        print(f"Solved, SI {i} starts at {start:.2f} and completes at {end:.2f}")
+
+      local_order = sorted(I, key=lambda x: pulp.value(start_time[x]))
+      new_order += local_order
+      new_schedule += [sis[x] for x in local_order]
+    ILP_CACHE[cache_key] = (new_schedule, new_order)
+
+  global_sis = {lb_to_num[lb]:ScheduleItem(ps[1], tuple(x.buffer for x in ps[0]+ps[2] if x.size != 0), ps[4]) for lb,ps in prescheduled.items()}
+  gl_exec_time = {i:_approx_si_time(si) for i,si in global_sis.items()}
+  gl_deps = [(lb_to_num[ps[0][0]], lb_to_num[x]) for ps in prescheduled.values() for x in graph[ps[0][0]]]
   def _total_exec_time(exec_order):
     unit_busy_till = defaultdict(int)
     end_exec = defaultdict(lambda: -1)
 
     for idx in exec_order:
-      start_time = unit_busy_till[_si_exec_unit(sis[idx])]
-      for i, j in deps:
+      start_time = unit_busy_till[_si_exec_unit(global_sis[idx])]
+      for i, j in gl_deps:
         if j == idx:
           assert end_exec[i] != -1
           start_time = max(start_time, end_exec[i])
-      end_exec[idx] = start_time + exec_time[idx]
-      unit_busy_till[_si_exec_unit(sis[idx])] = end_exec[idx]
+      end_exec[idx] = start_time + gl_exec_time[idx]
+      unit_busy_till[_si_exec_unit(global_sis[idx])] = end_exec[idx]
 
     return max(list(unit_busy_till.values()) + [-1e9])
 
-  # old_mappings = []
-  # for si in old_schedule:
-
-  # print(old_order, order)
   old_exec_time = _total_exec_time(old_order)
-  new_exec_time = _total_exec_time(order)
+  new_exec_time = _total_exec_time(new_order)
+  assert len(new_order) == len(old_order)
 
   if old_exec_time != new_exec_time:
     percentage_change = ((old_exec_time - new_exec_time) / old_exec_time) * 100
     print(f"ILP_SCHED: Optimized execution time from {old_exec_time:.2f} to {new_exec_time:.2f} ({percentage_change:.2f}%)")
-  return new_schedule if new_exec_time < old_exec_time else old_schedule
+  return new_schedule #if new_exec_time < old_exec_time else old_schedule
 
 SCHEDULES: List = []
 def create_schedule_with_vars(outs:List[LazyBuffer], seen:Optional[Set[LazyBuffer]]=None) -> Tuple[List[ScheduleItem], Dict[Variable, int]]:

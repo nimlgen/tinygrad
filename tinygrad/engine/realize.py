@@ -171,7 +171,7 @@ class ExecItem:
   prg: Runner
   bufs: List[Optional[Buffer]]
   metadata: Optional[List[Metadata]] = None
-  def run(self, var_vals:Optional[Dict[Variable, int]]=None, wait=False, jit=False, do_update_stats=True) -> Optional[float]:
+  def run(self, var_vals:Optional[Dict[Variable, int]]=None, wait=False, dell=False, jit=False, do_update_stats=True) -> Optional[float]:
     bufs = [cast(Buffer, x) for x in self.bufs] if jit else [cast(Buffer, x).ensure_allocated() for x in self.bufs]
     et = self.prg(bufs, var_vals if var_vals is not None else {}, wait=wait or DEBUG >= 2)
     if do_update_stats:
@@ -186,6 +186,8 @@ class ExecItem:
               (str() if et is None else f"tm {ptm}/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({op_est/((et or 1e-20)*1e9):9.2f} GFLOPS {mem_est/((et or 1e-20)*1e9):6.1f}|{lds_est/((et or 1e-20)*1e9):<7.1f} GB/s)" +  # noqa: E501
                f" {[repr(m) if TRACEMETA >= 2 else str(m) for m in self.metadata] if self.metadata else ''}"))
       self.prg.first_run = False
+    if dell:
+      for x in self.bufs: x.do_del()
     return et
 
 def lower_schedule_item(si:ScheduleItem) -> ExecItem:

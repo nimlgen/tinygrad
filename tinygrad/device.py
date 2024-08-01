@@ -98,11 +98,17 @@ class Buffer:
     return self.__class__, (self.device, self.size, self.dtype, None, self.options, buf, self.lb_refcount)
   @property
   def nbytes(self): return self.size*self.dtype.itemsize
-  def __del__(self):
+  def do_del(self):
     if not hasattr(self, '_buf'): return
     if self._base is None:
       if not self.device.startswith("DISK"): GlobalCounters.mem_used -= self.nbytes
       self.allocator.free(self._buf, self.nbytes, self.options)
+      delattr(self, '_buf')
+  def __del__(self): self.do_del()
+    # if not hasattr(self, '_buf'): return
+    # if self._base is None:
+    #   if not self.device.startswith("DISK"): GlobalCounters.mem_used -= self.nbytes
+    #   self.allocator.free(self._buf, self.nbytes, self.options)
   def __repr__(self):
     return f"<buf real:{hasattr(self, '_buf')} device:{self.device} size:{self.size} dtype:{self.dtype}" + \
            (f" offset:{self.offset}" if hasattr(self, "base") else "") + \
