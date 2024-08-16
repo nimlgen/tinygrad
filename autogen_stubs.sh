@@ -214,6 +214,16 @@ generate_libc() {
   fixup $BASE/libc.py
 }
 
+generate_qcom() {
+  clang2py -k cdefstum \
+    extra/dsp/ion.h \
+    extra/dsp/msm_ion.h \
+    -o $BASE/qcom_dsp.py
+
+  fixup $BASE/qcom_dsp.py
+  python3 -c "import tinygrad.runtime.autogen.qcom_dsp"
+}
+
 if [ "$1" == "opencl" ]; then generate_opencl
 elif [ "$1" == "hip" ]; then generate_hip
 elif [ "$1" == "comgr" ]; then generate_comgr
@@ -223,6 +233,7 @@ elif [ "$1" == "hsa" ]; then generate_hsa
 elif [ "$1" == "kfd" ]; then generate_kfd
 elif [ "$1" == "nv" ]; then generate_nv
 elif [ "$1" == "amd" ]; then generate_amd
+elif [ "$1" == "qcom" ]; then generate_qcom
 elif [ "$1" == "io_uring" ]; then generate_io_uring
 elif [ "$1" == "libc" ]; then generate_libc
 elif [ "$1" == "all" ]; then generate_opencl; generate_hip; generate_comgr; generate_cuda; generate_nvrtc; generate_hsa; generate_kfd; generate_nv; generate_amd; generate_io_uring; generate_libc
