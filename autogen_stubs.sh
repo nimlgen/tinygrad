@@ -216,10 +216,11 @@ generate_libc() {
 
 generate_qcom() {
   clang2py -k cdefstum \
-    extra/dsp/ion.h \
-    extra/dsp/msm_ion.h \
-    extra/dsp/adsprpc_shared.h \
-    extra/dsp/remote_default.h \
+    extra/dsp/include/ion.h \
+    extra/dsp/include/msm_ion.h \
+    extra/dsp/include/adsprpc_shared.h \
+    extra/dsp/include/remote_default.h \
+    extra/dsp/include/apps_std.h \
     -o $BASE/qcom_dsp.py
 
   fixup $BASE/qcom_dsp.py
