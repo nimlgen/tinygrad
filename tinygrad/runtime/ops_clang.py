@@ -5,7 +5,7 @@ from tinygrad.helpers import cpu_time_execution, DEBUG, cpu_objdump
 from tinygrad.renderer.cstyle import ClangRenderer
 
 class ClangCompiler(Compiler):
-  def __init__(self, cachekey, args:Optional[List[str]]=None):
+  def __init__(self, cachekey="compile_clang", args:Optional[List[str]]=None):
     self.args = ['-march=native'] if args is None else args
     super().__init__(cachekey)
 
@@ -30,4 +30,4 @@ class ClangProgram:
 class ClangDevice(Compiled):
   def __init__(self, device:str):
     from tinygrad.runtime.graph.clang import ClangGraph
-    super().__init__(device, MallocAllocator, ClangRenderer(), ClangCompiler("compile_clang"), ClangProgram, ClangGraph)
+    super().__init__(device, MallocAllocator, ClangRenderer(), ClangCompiler(), ClangProgram, ClangGraph)
