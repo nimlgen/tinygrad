@@ -1,5 +1,6 @@
 import ctypes
 import os
+import sys
 import pathlib
 from hexdump import hexdump
 
@@ -12,6 +13,7 @@ def disasm_raw(buf):
       os.system(f'cd {pathlib.Path(__file__).parent} && gcc -shared disasm-a3xx.c -o disasm.so')
     fxn = ctypes.CDLL(shared.as_posix())['disasm']
   fxn(buf, len(buf))
+  sys.stdout.flush()
 
 def disasm(buf):
   END = b"\x00\x00\x00\x00\x00\x00\x00\x03"
