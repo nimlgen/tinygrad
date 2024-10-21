@@ -426,7 +426,9 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/d9883ab0-0e26-47fd-9612-950b95460d72/w_opencl_runtime_p_2024.2.0.980.exe" -OutFile "opencl_installer.exe"
           Start-Process ".\opencl_installer.exe" -ArgumentList "--s --x --f ocl" -Wait
-          clinfo
+          set PYTHONPATH=${{ github.workspace }} 
+          python3 -c "from tinygrad import Device; assert Device.DEFAULT in ['LLVM','CLANG','CUDA','GPU','AMD','NV'], Device.DEFAULT"
+
 
   # tests:
   #   strategy:
