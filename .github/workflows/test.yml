@@ -396,7 +396,7 @@ jobs:
         backend: [gpu]
 
     name: Tests on (${{ matrix.backend }}) (win)
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 20
 
     steps:
@@ -424,10 +424,8 @@ jobs:
         if: matrix.backend == 'gpu'
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri "https://github.com/intel/compute-runtime/releases/download/21.49.21786/intel-opencl-icd-21.49.21786-release-x64.zip" -OutFile "opencl-runtime.zip"
-          Expand-Archive -Path "opencl-runtime.zip" -DestinationPath "C:\Intel"
-          $env:Path += ";C:\Intel\Intel(R) OpenCL"
-          [Environment]::SetEnvironmentVariable("Path", $env:Path, [System.EnvironmentVariableTarget]::Machine)
+          Invoke-WebRequest -Uri "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/d9883ab0-0e26-47fd-9612-950b95460d72/w_opencl_runtime_p_2024.2.0.980.exe" -OutFile "opencl_installer.exe"
+          Start-Process ".\opencl_installer.exe" -ArgumentList "--s --x --f ocl" -Wait
           clinfo
 
   # tests:
