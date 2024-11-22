@@ -27,12 +27,15 @@ class GMC_IP:
     self.vm_config = 0x1fffe05 # 2 level, 1 gb huge pages
     self.init_mmhub()
 
-  def init_page_table_regs(self, block:Union["MM", "GC"], vmid=0):
-    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_START_ADDR_LO32").write((self.vm_base >> 12) & 0xffffffff)
-    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_START_ADDR_HI32").write(self.vm_base >> 44)
+  def init_page_table_regs(self, block:Union["MM", "GC"], vmid=0, base=None):
+    base = self.vm_base if base is None else base
+    end = base + (512 * (1 << 30)) - 1
 
-    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_END_ADDR_LO32").write((self.vm_end >> 12) & 0xffffffff)
-    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_END_ADDR_HI32").write(self.vm_end >> 44)
+    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_START_ADDR_LO32").write((base >> 12) & 0xffffffff)
+    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_START_ADDR_HI32").write(base >> 44)
+
+    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_END_ADDR_LO32").write((end >> 12) & 0xffffffff)
+    getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_END_ADDR_HI32").write(end >> 44)
 
     getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_BASE_ADDR_LO32").write((self.root_pt.pm.paddr & 0xffffffff) | 1)
     getattr(self.adev, f"reg{block}VM_CONTEXT{vmid}_PAGE_TABLE_BASE_ADDR_HI32").write((self.root_pt.pm.paddr >> 32) & 0xffffffff)
@@ -50,7 +53,7 @@ class GMC_IP:
     getattr(self.adev, f"reg{block}VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32").write(self.dummy_page_pm.paddr >> 12)
     getattr(self.adev, f"reg{block}VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32").write(self.dummy_page_pm.paddr >> 44)
 
-    getattr(self.adev, f"reg{block}VM_L2_PROTECTION_FAULT_CNTL2").write(0x000E0000) # TODO: write up!
+    getattr(self.adev, f"reg{block}VM_L2_PROTECTION_FAULT_CNTL2").write(0x000E0000 if block == "MM" else 0x60000) # TODO: write up!
 
   def init_tlb_regs(self, block:Union["MM", "GC"]):
     getattr(self.adev, f"reg{block}MC_VM_MX_L1_TLB_CNTL").write(0x00001859) # TODO: write up!
@@ -80,7 +83,7 @@ class GMC_IP:
       getattr(self.adev, f"reg{block}VM_INVALIDATE_ENG{i}_ADDR_RANGE_HI32").write(0x1f)
 
   def init_hub(self, block:Union["MM", "GC"]):
-    self.init_page_table_regs(block, vmid=0)
+    self.init_page_table_regs(block, vmid=0, base=0)
     self.init_system_aperture_regs(block)
     self.init_tlb_regs(block)
     self.init_cache_regs(block)
@@ -97,31 +100,30 @@ class GMC_IP:
   def init_gfxhub(self):
     print("GFXHUB init")
     self.init_hub("GC")
-    # self.init_page_table_regs("GC", vmid=8)
-    # self.enable_vm("GC", vmid=8)
+    self.init_page_table_regs("GC", vmid=8, base=0)
+    self.enable_vm("GC", vmid=8)
     self.gfx_enabled = True
 
   def flush_hdp(self): self.adev.wreg(0x1fc00, 0x0) # TODO: write up!
-  def flush_tlb_gfxhub(self, vmid, vmhub, flush_type):
-    assert vmid == 0 and vmhub == 0 and flush_type == 0
+  def flush_tlb_gfxhub(self, vmid, flush_type=0):
+    assert flush_type == 0
 
     self.flush_hdp()
 
-    self.adev.wreg(0x291c, 0xf80001)
-    while self.adev.rreg(0x292e) != 1: pass
+    self.adev.wreg(0x291c, 0xf80000 | (1 << vmid))
+    while (self.adev.rreg(0x292e) & (1 << vmid)) != (1 << vmid): pass
 
-  def flush_tlb_mmhub(self, vmid, vmhub, flush_type):
-    assert vmid == 0 and vmhub == 0 and flush_type == 0
+  def flush_tlb_mmhub(self, vmid, flush_type=0):
+    assert flush_type == 0
 
     self.flush_hdp()
 
-    self.adev.wreg(0x1a774, 0xf80001)
-    while self.adev.rreg(0x1a786) != 1: pass
-
-    self.adev.wreg(0x1a762, 0x0)
-    while self.adev.rreg(0x1a786) != 1: pass
-
-    self.adev.wreg(0x1a71b, 0x12104010)
+    x = self.adev.wait_reg(self.adev.regMMVM_INVALIDATE_ENG17_SEM, mask=0x1, value=0x1)
+    self.adev.regMMVM_INVALIDATE_ENG17_REQ.write(0xf80000 | (1 << vmid))
+    self.adev.wait_reg(self.adev.regMMVM_INVALIDATE_ENG17_ACK, mask=(1 << vmid), value=(1 << vmid))
+    self.adev.regMMVM_INVALIDATE_ENG17_SEM.write(0x0)
+    self.adev.regMMVM_L2_BANK_SELECT_RESERVED_CID2.read()
+    self.adev.regMMVM_L2_BANK_SELECT_RESERVED_CID2.write(0x12104010)
 
   def collect_pfs(self):
     gfx = self.adev.regGCVM_L2_PROTECTION_FAULT_STATUS.read()
@@ -159,4 +161,4 @@ class GMC_IP:
       raise RuntimeError(f"GFX FAULT: {client_mappings[cid]} {addr=:X}: {more_faults=}, {rw=}, {vmid=}, {mapping_error=} {permission_faults=}")
 
     mmhub = self.adev.regMMVM_L2_PROTECTION_FAULT_STATUS.read()
-    return gfx, mmhub
+    if mmhub: raise RuntimeError(f"MMHUB FAULT: {mmhub=}")

@@ -211,7 +211,18 @@ def lower_schedule(schedule:List[ScheduleItem]) -> Generator[ExecItem, None, Non
 
 capturing: List = []  # put classes with an add method in here
 
+SH = 0
 def run_schedule(schedule:List[ScheduleItem], var_vals:Optional[Dict[Variable, int]]=None, do_update_stats=True):
-  for ei in lower_schedule(schedule):
+  global SH
+  SH += 1
+  # if SH > 1: return
+
+  # x = [x for x in lower_schedule([schedule[8]])][0]
+  # for i in range(30): x.run(var_vals, do_update_stats=do_update_stats)
+
+  for x,ei in enumerate(lower_schedule(schedule)):
     if len(capturing) and CAPTURING: capturing[0].add(ei)
     ei.run(var_vals, do_update_stats=do_update_stats)
+
+    # if SH == 1 and x == 8:
+    #   for i in range(30): ei.run(var_vals, do_update_stats=do_update_stats)

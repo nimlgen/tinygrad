@@ -32,7 +32,7 @@ class GFX_IP:
     # self.init_csb()
     self.cp_resume()
 
-  def soc21_grbm_select(self, me, pipe, queue, vmid):
+  def soc21_grbm_select(self, me=0, pipe=0, queue=0, vmid=0):
     self.adev.regGRBM_GFX_CNTL.write((me << amdgpu_gc_11_0_0.GRBM_GFX_CNTL__MEID__SHIFT) |
       (pipe << amdgpu_gc_11_0_0.GRBM_GFX_CNTL__PIPEID__SHIFT) | (vmid << amdgpu_gc_11_0_0.GRBM_GFX_CNTL__VMID__SHIFT) |
       (queue << amdgpu_gc_11_0_0.GRBM_GFX_CNTL__QUEUEID__SHIFT))
@@ -50,23 +50,23 @@ class GFX_IP:
 
     # TODO: Read configs here
     for i in range(8, 16):
-      self.soc21_grbm_select(0, 0, 0, i)
-      self.adev.regSH_MEM_CONFIG.write(self.DEFAULT_SH_MEM_CONFIG)
-      self.adev.regSH_MEM_BASES.write((self.adev.gmc.private_aperture_base >> 48) | ((self.adev.gmc.shared_aperture_base >> 48) << 16))
-    self.soc21_grbm_select(0, 0, 0, 0)
+      self.soc21_grbm_select(vmid=i)
+      self.adev.regSH_MEM_CONFIG.write(0xc00c)
+      self.adev.regSH_MEM_BASES.write(0x10002)
+    self.soc21_grbm_select()
 
-    for i in range(8, 16):
-      # Initialize all compute VMIDs to have no GDS, GWS, or OA acccess. These should be enabled by FW for target VMIDs (?)
-      getattr(self.adev, f"regGDS_VMID{i}_BASE").write(0)
-      getattr(self.adev, f"regGDS_VMID{i}_SIZE").write(0)
-      getattr(self.adev, f"regGDS_GWS_VMID{i}").write(0)
-      getattr(self.adev, f"regGDS_OA_VMID{i}").write(0)
+    # for i in range(8, 16):
+    #   # Initialize all compute VMIDs to have no GDS, GWS, or OA acccess. These should be enabled by FW for target VMIDs (?)
+    #   getattr(self.adev, f"regGDS_VMID{i}_BASE").write(0)
+    #   getattr(self.adev, f"regGDS_VMID{i}_SIZE").write(0)
+    #   getattr(self.adev, f"regGDS_GWS_VMID{i}").write(0)
+    #   getattr(self.adev, f"regGDS_OA_VMID{i}").write(0)
 
   def cp_set_doorbell_range(self):
     self.adev.regCP_RB_DOORBELL_RANGE_LOWER.write(0x458)
     self.adev.regCP_RB_DOORBELL_RANGE_UPPER.write(0x7f8)
     self.adev.regCP_MEC_DOORBELL_RANGE_LOWER.write(0x0)
-    self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write(0x0)
+    self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write(0x450)
 
   def cp_compute_enable(self):
     self.adev.regCP_MEC_RS64_CNTL.write(0x3c000000)
@@ -83,30 +83,30 @@ class GFX_IP:
 
   def config_gfx_rs64(self):
     for pipe in range(2):
-      self.soc21_grbm_select(0, pipe, 0, 0)
+      self.soc21_grbm_select(pipe=pipe)
       self.adev.regCP_PFP_PRGRM_CNTR_START.write(0xc00)
       self.adev.regCP_PFP_PRGRM_CNTR_START_HI.write(0x1c000)
 
     # TODO: write up!
-    self.soc21_grbm_select(0, 0, 0, 0)
+    self.soc21_grbm_select()
     self.adev.regCP_ME_CNTL.write(0x153c0000)
     self.adev.regCP_ME_CNTL.write(0x15300000)
 
     for pipe in range(2):
-      self.soc21_grbm_select(0, pipe, 0, 0)
+      self.soc21_grbm_select(pipe=pipe)
       self.adev.regCP_ME_PRGRM_CNTR_START.write(0xc00)
       self.adev.regCP_ME_PRGRM_CNTR_START_HI.write(0x1c000)
 
-    self.soc21_grbm_select(0, 0, 0, 0)
+    self.soc21_grbm_select()
     self.adev.regCP_ME_CNTL.write(0x15300000)
     self.adev.regCP_ME_CNTL.write(0x15000000)
 
     for pipe in range(4):
-      self.soc21_grbm_select(1, pipe, 0, 0)
+      self.soc21_grbm_select(me=1, pipe=pipe)
       self.adev.regCP_MEC_RS64_PRGRM_CNTR_START.write(0xc00)
       self.adev.regCP_MEC_RS64_PRGRM_CNTR_START_HI.write(0x1c000)
 
-    self.soc21_grbm_select(0, 0, 0, 0)
+    self.soc21_grbm_select()
     self.adev.regCP_MEC_RS64_CNTL.write(0x400f0000)
     self.adev.regCP_MEC_RS64_CNTL.write(0x40000000)
 
@@ -115,22 +115,22 @@ class GFX_IP:
     self.adev.wait_reg(self.adev.regCP_STAT, value=0x0)
 
   def hqd_load(self, ring):
-    self.soc21_grbm_select(1, ring.pipe, ring.queue, 0)
+    self.soc21_grbm_select(me=1, pipe=ring.pipe, queue=ring.queue)
 
     mqd_mv = ring.mqd_mv.cast('I')
     for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.regoff, self.adev.regCP_HQD_PQ_WPTR_HI.regoff + 1)):
       self.adev.wreg(reg, mqd_mv[0x80 + i])
 
-    self.adev.regCP_HQD_PQ_BASE.write(ring.mqd.cp_hqd_pq_base_lo)
-    self.adev.regCP_HQD_PQ_BASE_HI.write(ring.mqd.cp_hqd_pq_base_hi)
+    # self.adev.regCP_HQD_PQ_BASE.write(ring.mqd.cp_hqd_pq_base_lo)
+    # self.adev.regCP_HQD_PQ_BASE_HI.write(ring.mqd.cp_hqd_pq_base_hi)
 
-    self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR.write(ring.mqd.cp_hqd_pq_rptr_report_addr_lo)
-    self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR_HI.write(ring.mqd.cp_hqd_pq_rptr_report_addr_hi)
+    # self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR.write(ring.mqd.cp_hqd_pq_rptr_report_addr_lo)
+    # self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR_HI.write(ring.mqd.cp_hqd_pq_rptr_report_addr_hi)
 
-    self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR.write(ring.mqd.cp_hqd_pq_wptr_poll_addr_lo)
-    self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR_HI.write(ring.mqd.cp_hqd_pq_wptr_poll_addr_hi)
+    # self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR.write(ring.mqd.cp_hqd_pq_wptr_poll_addr_lo)
+    # self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR_HI.write(ring.mqd.cp_hqd_pq_wptr_poll_addr_hi)
 
-    self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(1 << (ring.pipe * 4 + ring.queue)) # queue mask
+    # self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(1 << (ring.pipe * 4 + ring.queue)) # queue mask
 
     self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.write(ring.mqd.cp_hqd_pq_doorbell_control)
     self.adev.regCP_HQD_ACTIVE.write(0x1)
@@ -138,7 +138,7 @@ class GFX_IP:
     self.soc21_grbm_select(0, 0, 0, 0)
 
   def kcq_init(self):
-    self.kcq_ring = AMRing(self.adev, size=0x100000, me=1, pipe=0, queue=0, vmid=0, doorbell_index=((self.AMDGPU_NAVI10_DOORBELL_MEC_RING0) << 1))
+    self.kcq_ring = AMRing(self.adev, size=0x100000, me=1, pipe=0, queue=1, vmid=0, doorbell_index=((self.AMDGPU_NAVI10_DOORBELL_MEC_RING0) << 1))
     self.hqd_load(self.kcq_ring)
 
     # self.adev.mes.kiq_set_resources(0xffffffffffffffff) # full mask
@@ -162,14 +162,15 @@ class GFX_IP:
     #     break
 
     # print("GFX: kcq test done")
-    # for i in range(3):
-    #   print("Cool down", i)
-    time.sleep(1)
+    for i in range(5):
+      print("Cool down", i)
+      time.sleep(1)
+    # time.sleep(1)
 
   def cp_resume(self):
     self.cp_set_doorbell_range()
     self.cp_compute_enable()
-    # self.cp_gfx_enable()
+    self.cp_gfx_enable()
     # self.adev.mes.kiq_hw_init()
 
     self.kcq_init()

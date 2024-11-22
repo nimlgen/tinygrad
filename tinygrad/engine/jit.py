@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import TypeVar, Generic, Callable, List, Tuple, Union, Dict, cast, Optional, Any
-import functools, collections
+import functools, collections, time
 from tinygrad.tensor import Tensor
 from tinygrad.engine.lazy import LazyBuffer
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, dedup, partition
@@ -289,7 +289,9 @@ class TinyJit(Generic[ReturnType]):
       assert self.captured.expected_names == names, f"args mismatch in JIT: {self.captured.expected_names=} != {names}"
       assert self.captured.expected_st_vars_dtype_device == st_vars_dtype_device, \
         f"args mismatch in JIT: {self.captured.expected_st_vars_dtype_device=} != {st_vars_dtype_device=}"
+      st = time.perf_counter()
       ret = self.captured(input_buffers, var_vals)
+      print(f"JIT exec time in ms: {(time.perf_counter()-st)*1000:.2f}")
 
     self.cnt += 1
     return ret

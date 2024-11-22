@@ -1,17 +1,24 @@
 import os, ctypes, collections, time
 from tinygrad.runtime.autogen import libpciaccess
-from tinygrad.runtime.autogen import amdgpu_2, amdgpu_mp_13_0_0, amdgpu_nbio_4_3_0, amdgpu_discovery, amdgpu_mmhub_3_0_0, amdgpu_gc_11_0_0
+from tinygrad.runtime.autogen import amdgpu_2, amdgpu_mp_13_0_0, amdgpu_nbio_4_3_0, amdgpu_discovery, amdgpu_mmhub_3_0_0, amdgpu_gc_11_0_0, amdgpu_osssys_6_0_0
 from tinygrad.helpers import to_mv, mv_address
 
 from tinygrad.runtime.support.am.mm import MM, PhysicalMemory
 from tinygrad.runtime.support.am.firmware import Firmware
 from tinygrad.runtime.support.am.gmc import GMC_IP
 from tinygrad.runtime.support.am.soc21 import SOC21_IP
+from tinygrad.runtime.support.am.ih import IH_IP
 from tinygrad.runtime.support.am.smu import SMU_IP
 from tinygrad.runtime.support.am.psp import PSP_IP
 from tinygrad.runtime.support.am.gfx import GFX_IP
 from tinygrad.runtime.support.am.amring import AMRegister
 # from tinygrad.runtime.support.am.mes import MES_IP
+
+prev_rval = 0
+prev_read = 0
+
+prev_wval = 0
+prev_write = 0
 
 class AMDev:
   def __init__(self, pcidev):
@@ -22,7 +29,7 @@ class AMDev:
     self.mmio_cpu_addr, self.mmio = self._map_pci_range(bar=5, cast='I')
 
     self.start_discovery()
-    self._prepare_registers([("MP0", amdgpu_mp_13_0_0), ("NBIO", amdgpu_nbio_4_3_0), ("MMHUB", amdgpu_mmhub_3_0_0), ("GC", amdgpu_gc_11_0_0)])
+    self._prepare_registers([("MP0", amdgpu_mp_13_0_0), ("NBIO", amdgpu_nbio_4_3_0), ("MMHUB", amdgpu_mmhub_3_0_0), ("GC", amdgpu_gc_11_0_0), ("OSSSYS", amdgpu_osssys_6_0_0)])
 
     # Memory manager & firmware
     self.mm = MM(self, self.vram_size)
@@ -32,9 +39,12 @@ class AMDev:
     self.gmc = GMC_IP(self)
     self.soc21 = SOC21_IP(self)
     self.smu = SMU_IP(self)
+    # self.ih = IH_IP(self)
     self.psp = PSP_IP(self)
     self.gfx = GFX_IP(self)
     # self.mes = MES_IP(self)
+
+    # return
 
     if self.psp.is_sos_alive():
       print("sOS is alive, issue mode1 reset...")
@@ -43,9 +53,15 @@ class AMDev:
 
     self.soc21.init()
     self.gmc.init(self.mm.root_pt)
+    # self.ih.init()
+
+    # self.regRLC_SPM_MC_CNTL.write(0xf)
+
     self.psp.init()
     self.smu.init()
     self.gfx.init()
+
+    # self.regCP_INT_CNTL_RING0.write(0xc00000)
 
   def _map_pci_range(self, bar, cast='I'):
     ret = libpciaccess.pci_device_map_range(ctypes.byref(self.pcidev), self.pcidev.regions[bar].base_addr, size:=self.pcidev.regions[bar].size,
@@ -73,9 +89,16 @@ class AMDev:
     self.rreg(self.pcie_data_offset())
 
   def reg_off(self, ip, inst, reg, seg): return self.ip_base(ip, inst, seg) + reg
-  def rreg(self, reg): return self.indirect_rreg(reg) if reg > len(self.mmio) else self.mmio[reg]
+  def rreg(self, reg):
+    global prev_read, prev_rval
+    x = self.indirect_rreg(reg * 4) if reg > len(self.mmio) else self.mmio[reg]
+    # if reg != prev_read or x != prev_rval: print("Reading register", hex(reg), "with value", hex(x))
+    prev_rval = x
+    prev_read = reg
+    return x
   def wreg(self, reg, val):
-    if reg > len(self.mmio): self.indirect_wreg(reg, val)
+    # print("Writing register", hex(reg), "with value", hex(val))
+    if reg > len(self.mmio): self.indirect_wreg(reg * 4, val)
     else: self.mmio[reg] = val
 
   def wait_reg(self, reg, value, mask=0xffffffff):
@@ -84,7 +107,9 @@ class AMDev:
       time.sleep(0.001)
     raise Exception(f'wait_reg timeout reg=0x{reg.regoff:X} mask=0x{mask:X} value=0x{value:X} last_val=0x{rval}')
 
-  def wdoorbell64(self, index, val): self.doorbell64[index//2] = val
+  def wdoorbell64(self, index, val):
+    # print("Writing doorbell", hex(index), "with value", hex(val))
+    self.doorbell64[index//2] = val
 
   def ip_base(self, ip, inst, seg):
     ipid = amdgpu_discovery.__dict__.get(f"{ip}_HWIP")

@@ -112,6 +112,8 @@ class Buffer:
            (f" offset:{self.offset}" if hasattr(self, "base") else "") + (f" {self.options=}" if self.options is not None else "") + ">"
   def as_buffer(self, allow_zero_copy=False, force_zero_copy=False) -> memoryview:
     # zero copy with as_buffer (disabled by default due to use after free)
+    return memoryview(bytearray(self.nbytes))
+
     if (force_zero_copy or allow_zero_copy) and hasattr(self.allocator, 'as_buffer') and (self.options is None or self.options.image is None):
       return self.allocator.as_buffer(self._buf)
     assert not force_zero_copy, "force zero copy was passed, but copy is required"

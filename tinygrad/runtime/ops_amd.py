@@ -35,7 +35,7 @@ class AMDSignal(HCQSignal):
   def __init__(self, value=0, is_timeline=False):
     self._value_addr, self._timestamp_addr = (va:=AMDDevice.signals_pool.pop()), va + 8
     self._signal = to_mv(va - AMDDevice.signals_page.va_addr + AMDDevice.signals_page.cpu_addr, 16).cast("Q")
-    if is_timeline and not AMDDevice.driverless:
+    if is_timeline and not AMDDevice.driverless and False:
       self._event = kfd.AMDKFD_IOC_CREATE_EVENT(AMDDevice.kfd, auto_reset=1)
       self._event_mailbox_ptr = AMDDevice.event_page.va_addr + self._event.event_slot_index*8
       self._evt_array = (kfd.struct_kfd_event_data)(event_id=self._event.event_id)
@@ -46,6 +46,8 @@ class AMDSignal(HCQSignal):
   def _get_timestamp(self) -> decimal.Decimal: return decimal.Decimal(self._signal[1]) / decimal.Decimal(100)
   def _set_value(self, new_value:int): self._signal[0] = new_value
   def wait(self, value:int, timeout:int=getenv("HCQDEV_WAIT_TIMEOUT_MS", 30000)):
+    # time.sleep(1)
+
     start_time = time.time() * 1000
     while (time_spent:=time.time() * 1000 - start_time) < timeout:
       if self._signal[0] >= value: return
@@ -65,6 +67,10 @@ class AMDComputeQueue(HWComputeQueue):
       self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferOptions(cpu_access=True, nolru=True, uncached=True))
 
   def _acquire_mem(self, addr=0x0, sz=(1 << 64)-1, gli=1, glm=1, glk=1, glv=1, gl1=1, gl2=1):
+    # if AMDDevice.driverless:
+    #   addr += 0x7F0000000000
+      # sz = (512 * (1 << 30)) - 1
+
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_ACQUIRE_MEM, 6), 0, *data64_le(sz), *data64_le(addr), 0,
                amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLI_INV(gli) | \
                amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_INV(glm) | amd_gpu.PACKET3_ACQUIRE_MEM_GCR_CNTL_GLM_WB(glm) | \
@@ -88,13 +94,16 @@ class AMDComputeQueue(HWComputeQueue):
       *data64_le(address), *data64_le(value), cst]
 
   def _memory_barrier(self):
+    # pass
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_WAIT_REG_MEM, 5), amd_gpu.WAIT_REG_MEM_MEM_SPACE(0) | amd_gpu.WAIT_REG_MEM_OPERATION(1) | \
       amd_gpu.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_EQ) | amd_gpu.WAIT_REG_MEM_ENGINE(0), nbioreg(regBIF_BX_PF1_GPU_HDP_FLUSH_REQ),
       nbioreg(regBIF_BX_PF1_GPU_HDP_FLUSH_DONE), 0xffffffff, 0xffffffff, 0x20]
     self._acquire_mem()
 
   def _exec(self, prg, args_state, global_size:Tuple[int,int,int]=(1,1,1), local_size:Tuple[int,int,int]=(1,1,1)):
-    self._acquire_mem(gli=0, gl2=0)
+    # self._acquire_mem(gli=0, gl2=0)
+
+    # global_size = (128<<10,1,1)
 
     cmd_idx = self._cur_cmd_idx()
     user_regs = [*data64_le(prg.device.scratch.va_addr), 0xffffffff, 0xc00000] if prg.enable_private_segment_sgpr else []
@@ -139,18 +148,23 @@ class AMDComputeQueue(HWComputeQueue):
         dp.grid_size_x,dp.grid_size_y,dp.grid_size_z = [g*l for g,l in zip(global_size,[dp.workgroup_size_x,dp.workgroup_size_y,dp.workgroup_size_z])]
 
   def _wait(self, signal, value=0):
+    # pass
     self.q += [amd_gpu.PACKET3(amd_gpu.PACKET3_WAIT_REG_MEM, 5),
       amd_gpu.WAIT_REG_MEM_MEM_SPACE(1) | amd_gpu.WAIT_REG_MEM_OPERATION(0) | amd_gpu.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_GEQ) | \
       amd_gpu.WAIT_REG_MEM_ENGINE(0), *data64_le(signal._value_addr), value, 0xffffffff, 4]
 
-  def _timestamp(self, signal): self._release_mem(CACHE_FLUSH_AND_INV_TS_EVENT, mem_data_sel=3, mem_int_sel=0, address=signal._timestamp_addr)
+  def _timestamp(self, signal): 
+    pass
+    self._release_mem(CACHE_FLUSH_AND_INV_TS_EVENT, mem_data_sel=3, mem_int_sel=0, address=signal._timestamp_addr)
 
   def _signal(self, signal, value=0):
+    pass
+
     # NOTE: this needs an EOP buffer on the queue or it will NULL pointer
     self._release_mem(CACHE_FLUSH_AND_INV_TS_EVENT, mem_data_sel=1, mem_int_sel=2, address=signal._value_addr, value=value, cache_flush=True)
-    if signal._event_mailbox_ptr != 0:
-      self._release_mem(CACHE_FLUSH_AND_INV_TS_EVENT, mem_data_sel=1, mem_int_sel=2, address=signal._event_mailbox_ptr,
-                        value=signal._event.event_id, cst=signal._event.event_id, cache_flush=False)
+    # if signal._event_mailbox_ptr != 0:
+    #   self._release_mem(CACHE_FLUSH_AND_INV_TS_EVENT, mem_data_sel=1, mem_int_sel=2, address=signal._event_mailbox_ptr,
+    #                     value=signal._event.event_id, cst=signal._event.event_id, cache_flush=False)
 
   def _update_wait(self, cmd_idx, signal=None, value=None):
     if signal is not None: self._patch(cmd_idx, offset=2, data=data64_le(signal._value_addr))
@@ -176,12 +190,15 @@ class AMDComputeQueue(HWComputeQueue):
 
   def _submit(self, device):
     cmds = self.indirect_cmd if device == self.binded_device else self.q
+    # print(len(self.q))
 
     for i, value in enumerate(cmds): device.compute_queue.ring[(device.compute_queue.put_value + i) % len(device.compute_queue.ring)] = value
 
     device.compute_queue.put_value += len(cmds)
     device.compute_queue.write_ptr[0] = device.compute_queue.put_value
     device.compute_queue.doorbell[0] = device.compute_queue.put_value
+    # device.timeline_value -= 1
+    # time.sleep(1)
 
 SDMA_MAX_COPY_SIZE = 0x400000
 class AMDCopyQueue(HWCopyQueue):
@@ -270,6 +287,8 @@ class AMDProgram(HCQProgram):
   def __init__(self, device:AMDDevice, name:str, lib:bytes):
     # TODO; this API needs the type signature of the function and global_size/local_size
     self.device, self.name, self.lib = device, name, lib
+    # if self.name != ""
+
     image, sections, _ = elf_loader(self.lib)
     self.lib_gpu = self.device.allocator.alloc(round_up(image.nbytes, 0x1000), BufferOptions(cpu_access=True, nolru=True))
     ctypes.memmove(self.lib_gpu.cpu_addr, mv_address(image), image.nbytes)
@@ -323,13 +342,15 @@ class AMDPciAllocator(LRUAllocator):
   def __init__(self, device:AMDDevice):
     self.device = device
     super().__init__()
-  def _alloc(self, size:int, options:BufferOptions) -> HCQBuffer: return self.device._gpu_alloc(size, uncached=options.uncached)
-  def _free(self, opaque, options:BufferOptions): pass
-  def copyin(self, dest:HCQBuffer, src:memoryview): ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
+  def _alloc(self, size:int, options:BufferOptions) -> HCQBuffer: 
+    return self.device._gpu_alloc(size, uncached=options.uncached)
+  def _free(self, opaque, options:BufferOptions): pass # self.device._gpu_free(opaque)
+  def copyin(self, dest:HCQBuffer, src:memoryview): pass #ctypes.memmove(dest.cpu_addr, mv_address(src), src.nbytes)
   def copyout(self, dest:memoryview, src:HCQBuffer):
+    pass
     self.device.synchronize()
-    ctypes.memmove(from_mv(dest), src.cpu_addr, dest.nbytes)
-  def offset(self, buf:AMDPciBuffer, size:int, offset:int): return AMDPciBuffer(buf.va_addr+offset, size, buf.cpu_addr+offset, buf.vm)
+    # ctypes.memmove(from_mv(dest), src.cpu_addr, dest.nbytes)
+  def offset(self, buf:AMDPciBuffer, size:int, offset:int): return AMDPciBuffer(buf.va_addr+offset, size, buf.cpu_addr+offset)
 
 MAP_FIXED, MAP_NORESERVE = 0x10, 0x400
 
@@ -350,13 +371,14 @@ class AMDDevice(HCQCompiled):
   gpus:List[pathlib.Path] = []
 
   def __init__(self, device:str=""):
-    AMDDevice.driverless = not os.path.isdir('/sys/module/amdgpu/') or getenv("AMD_DRIVERLESS", 0)
+    AMDDevice.driverless = not os.path.isdir('/sys/module/amdgpu/') or bool(getenv("AMD_DRIVERLESS", 0))
+    print(AMDDevice.driverless)
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
 
-    self._setup_device = self._driver_setup_device if os.path.isdir('/sys/module/amdgpu/') else self._pci_setup_device
-    self._gpu_alloc = self._driver_gpu_alloc if os.path.isdir('/sys/module/amdgpu/') else self._pci_gpu_alloc
-    self._gpu_free = self._driver_gpu_free if os.path.isdir('/sys/module/amdgpu/') else self._pci_gpu_free
-    self._alloc_queue = self._driver_alloc_queue if os.path.isdir('/sys/module/amdgpu/') else self._pci_alloc_queue
+    self._setup_device = self._driver_setup_device if not AMDDevice.driverless else self._pci_setup_device
+    self._gpu_alloc = self._driver_gpu_alloc if not AMDDevice.driverless else self._pci_gpu_alloc
+    self._gpu_free = self._driver_gpu_free if not AMDDevice.driverless else self._pci_gpu_free
+    self._alloc_queue = self._driver_alloc_queue if not AMDDevice.driverless else self._pci_alloc_queue
 
     self._setup_device()
     self.target = int(self.properties['gfx_target_version'])
@@ -364,10 +386,11 @@ class AMDDevice(HCQCompiled):
     if self.target < 100300 or self.target >= 120000: raise RuntimeError(f"Unsupported arch: {self.arch}")
 
     if AMDDevice.event_page is None:
-      AMDDevice.signals_page = self._gpu_alloc(16 * 65536, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-      AMDDevice.event_page = self._gpu_alloc(0x8000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
+      AMDDevice.signals_page = self._gpu_alloc(16 * 65536, uncached=True)
       AMDDevice.signals_pool = [self.signals_page.va_addr + off for off in range(0, AMDDevice.signals_page.size, 16)]
-      if not AMDDevice.driverless: kfd.AMDKFD_IOC_CREATE_EVENT(AMDDevice.kfd, event_page_offset=AMDDevice.event_page.handle)
+      # if not AMDDevice.driverless: 
+      # AMDDevice.event_page = self._gpu_alloc(0x8000, uncached=True)  
+      # kfd.AMDKFD_IOC_CREATE_EVENT(AMDDevice.kfd, event_page_offset=AMDDevice.event_page.handle)
     elif not AMDDevice.driverless:
       self._gpu_map(AMDDevice.signals_page)
       self._gpu_map(AMDDevice.event_page)
@@ -394,15 +417,29 @@ class AMDDevice(HCQCompiled):
                                            eop_buffer_size=0x1000, ctl_stack_size=ctl_stack_size)
 
     if not self.driverless:
-      self.sdma_queue = self._alloc_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x100000)
+      # self.sdma_queue = self._alloc_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x100000)
 
       self.mem_fault_event = kfd.AMDKFD_IOC_CREATE_EVENT(AMDDevice.kfd, event_type=kfd.KFD_IOC_EVENT_MEMORY)
       self.hw_fault_event = kfd.AMDKFD_IOC_CREATE_EVENT(AMDDevice.kfd, event_type=kfd.KFD_IOC_EVENT_HW_EXCEPTION)
-      allocator, copy_queue_t = AMDDriverAllocator(self), AMDCopyQueue
+      allocator, copy_queue_t = AMDPciAllocator(self), None
     else: allocator, copy_queue_t = AMDPciAllocator(self), None
 
     super().__init__(device, allocator, AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
                      AMDSignal, AMDComputeQueue, copy_queue_t)
+
+    # z = []
+    # for i in range(30):
+    #   q = AMDComputeQueue()
+    #   x = AMDSignal()
+    #   q.timestamp(x)
+    #   z.append(x)
+    #   x = AMDSignal()
+    #   q.timestamp(x)
+    #   z.append(x)
+    #   q.submit(self)
+    #   time.sleep(0.01)
+    # for i in range(len(z)-1): print(z[i+1].timestamp - z[i].timestamp)
+
 
   def _driver_setup_device(self):
     if AMDDevice.kfd == -1:
@@ -421,11 +458,20 @@ class AMDDevice(HCQCompiled):
     kfd.AMDKFD_IOC_ACQUIRE_VM(AMDDevice.kfd, drm_fd=self.drm_fd, gpu_id=self.gpu_id)
 
   def _driver_gpu_alloc(self, size:int, host=False, uncached=False, cpu_access=False):
-    flags = kfd.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
-    if uncached: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT
-    else: flags |= (kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR if host else kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    # print("alloc", hex(size >> 12))
+    # if (size >> 12) == 0x400:
+    #   raise MemoryError("Cannot allocate memory: no memory is available.")
 
-    if cpu_access: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+    # print("host", host)
+
+    flags = kfd.KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | kfd.KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+    if uncached: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM
+    else: flags |= (kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+
+    # flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | kfd.KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | (kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT if host else kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+    # else: flags |= (kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR if host else kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
+
+    if cpu_access or True: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
 
     if host: buf = addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0)
     else: buf, addr = 0, libc.mmap(0, size, 0, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
@@ -462,11 +508,10 @@ class AMDDevice(HCQCompiled):
     assert stm.n_success == len(mem.mapped_gpu_ids)
 
   def _driver_alloc_queue(self, queue_type, ring_size, ctx_save_restore_size=None, eop_buffer_size=None, ctl_stack_size=0) -> AMDQueueDesc:
-    gart = self._gpu_alloc(0x1000, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    ring = self._gpu_alloc(ring_size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_GTT, uncached=True)
-    cwsr_ctx = self._gpu_alloc(round_up(ctx_save_restore_size + self.debug_memory_size, mmap.PAGESIZE),
-                               kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM) if ctx_save_restore_size else None
-    eop_buffer = self._gpu_alloc(eop_buffer_size, kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM) if eop_buffer_size else None
+    gart = self._gpu_alloc(0x1000, uncached=True)
+    ring = self._gpu_alloc(ring_size, uncached=True)
+    cwsr_ctx = self._gpu_alloc(round_up(ctx_save_restore_size + self.debug_memory_size, mmap.PAGESIZE)) if ctx_save_restore_size else None
+    eop_buffer = self._gpu_alloc(eop_buffer_size) if eop_buffer_size else None
     queue = kfd.AMDKFD_IOC_CREATE_QUEUE(AMDDevice.kfd, ring_base_address=ring.va_addr, ring_size=ring.size, gpu_id=self.gpu_id,
       queue_type=queue_type, queue_percentage=kfd.KFD_MAX_QUEUE_PERCENTAGE, queue_priority=kfd.KFD_MAX_QUEUE_PRIORITY,
       eop_buffer_address=eop_buffer.va_addr if eop_buffer else 0, eop_buffer_size=eop_buffer.size if eop_buffer else 0, ctl_stack_size=ctl_stack_size,
@@ -492,6 +537,7 @@ class AMDDevice(HCQCompiled):
       visible_devices = [int(x) for x in (getenv('VISIBLE_DEVICES', getenv('HIP_VISIBLE_DEVICES', ''))).split(',') if x.strip()]
       AMDDevice.gpus = [AMDDevice.gpus[x] for x in visible_devices] if visible_devices else AMDDevice.gpus
 
+    self.device_id += 1
     if self.device_id >= len(AMDDevice.gpus): raise RuntimeError(f"No device found for {device}. Requesting more devices than the system has?")
 
     libpciaccess.pci_device_probe(ctypes.byref(AMDDevice.gpus[self.device_id]))

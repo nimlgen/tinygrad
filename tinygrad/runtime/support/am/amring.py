@@ -14,11 +14,13 @@ class AMRing:
     self.mqd_mv = memoryview(bytearray(ctypes.sizeof(amdgpu_2.struct_v11_compute_mqd)))
     self.mqd = amdgpu_2.struct_v11_compute_mqd.from_address(mv_address(self.mqd_mv))
 
-    self.eop_vm = self.adev.mm.valloc(0x8000)
-    self.mqd_vm = self.adev.mm.valloc(len(self.mqd_mv))
-    self.rptr_vm = self.adev.mm.valloc(0x1000, uncached=True)
-    self.wptr_vm = self.adev.mm.valloc(0x1000, uncached=True)
-    self.ring_vm = self.adev.mm.valloc(self.size, uncached=True)
+    self.eop_vm = self.adev.mm.valloc(0x1000)
+    self.mqd_vm = self.adev.mm.valloc(2 << 20)
+    self.ring_vm = self.adev.mm.valloc(self.size + 0x1000, uncached=True)
+    self.wptr_vm = self.ring_vm.offset(self.size)
+    self.rptr_vm = self.ring_vm.offset(self.size + 0x8)
+    # self.wptr_vm = self.rptr_vm.offset(0x10)
+    
 
     self.rptr = self.rptr_vm.cpu_view().cast('Q')
     self.wptr = self.wptr_vm.cpu_view().cast('Q')
@@ -31,16 +33,16 @@ class AMRing:
     self.fill_mqd()
 
   def fill_mqd(self):
-    # self.mqd.header = 0xC0310800
-    # self.mqd.compute_pipelinestat_enable = 0x00000001
-    # self.mqd.compute_static_thread_mgmt_se0 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se1 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se2 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se3 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se4 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se5 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se6 = 0xffffffff
-    # self.mqd.compute_static_thread_mgmt_se7 = 0xffffffff
+    self.mqd.header = 0xC0310800
+    self.mqd.compute_pipelinestat_enable = 0x1
+    self.mqd.compute_static_thread_mgmt_se0 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se1 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se2 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se3 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se4 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se5 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se6 = 0xffffffff
+    self.mqd.compute_static_thread_mgmt_se7 = 0xffffffff
     # self.mqd.compute_misc_reserved = 0x00000007
 
     self.mqd.cp_mqd_base_addr_lo = self.mqd_vm.vaddr & 0xfffffffc
@@ -53,14 +55,14 @@ class AMRing:
     self.mqd.cp_hqd_quantum = 0x111
     self.mqd.cp_hqd_pq_base_lo = (self.ring_vm.vaddr >> 8) & 0xffffffff
     self.mqd.cp_hqd_pq_base_hi = (self.ring_vm.vaddr >> 40) & 0xffffffff
-    self.mqd.cp_hqd_pq_rptr = 0
+    # self.mqd.cp_hqd_pq_rptr = 0
     self.mqd.cp_hqd_pq_rptr_report_addr_lo = self.rptr_vm.vaddr & 0xfffffffc
     self.mqd.cp_hqd_pq_rptr_report_addr_hi = (self.rptr_vm.vaddr >> 32) & 0xffffffff
     self.mqd.cp_hqd_pq_wptr_poll_addr_lo = self.wptr_vm.vaddr & 0xfffffffc
     self.mqd.cp_hqd_pq_wptr_poll_addr_hi = (self.wptr_vm.vaddr >> 32) & 0xffffffff
     self.mqd.cp_hqd_pq_doorbell_control = (1 << 0x1e) | (self.doorbell_index << 2)
     # self.mqd.reserved_144 = 0
-    self.mqd.cp_hqd_pq_control = 0x10008511
+    self.mqd.cp_hqd_pq_control = 0x10000511
     # self.mqd.cp_hqd_ib_base_addr_lo = 0
     # self.mqd.cp_hqd_ib_base_addr_hi = 0
     # self.mqd.cp_hqd_ib_rptr = 0
@@ -75,7 +77,7 @@ class AMRing:
     # self.mqd.cp_hqd_atomic0_preop_hi = 0
     # self.mqd.cp_hqd_atomic1_preop_lo = 0
     # self.mqd.cp_hqd_atomic1_preop_hi = 0
-    self.mqd.cp_hqd_hq_status0 = 0x60004040 # wtf?
+    self.mqd.cp_hqd_hq_status0 = 0x20004000 # wtf?
     # self.mqd.cp_hqd_hq_control0 = 0
     self.mqd.cp_mqd_control = 0x100
     # self.mqd.cp_hqd_hq_status1 = 0
@@ -83,10 +85,10 @@ class AMRing:
     self.mqd.cp_hqd_eop_base_addr_lo = (self.eop_vm.vaddr >> 8) & 0xffffffff
     self.mqd.cp_hqd_eop_base_addr_hi = (self.eop_vm.vaddr >> 40) & 0xffffffff
     self.mqd.cp_hqd_eop_control = 0x9
-    self.mqd.cp_hqd_eop_rptr = 1 << amdgpu_gc_11_0_0.CP_HQD_EOP_RPTR__INIT_FETCHER__SHIFT
+    self.mqd.cp_hqd_eop_rptr = 0 # 1 << amdgpu_gc_11_0_0.CP_HQD_EOP_RPTR__INIT_FETCHER__SHIFT
 
-    # self.mqd.cp_hqd_eop_rptr = 0x400002a0
-    # self.mqd.cp_hqd_eop_wptr = 0x3ff82a0
+    # self.mqd.cp_hqd_eop_rptr = 0x40000000
+    # self.mqd.cp_hqd_eop_wptr = 0x3ff8000
     # self.mqd.cp_hqd_eop_done_events; // offset: 170  (0xAA)
     # self.mqd.cp_hqd_ctx_save_base_addr_lo; // offset: 171  (0xAB)
     # self.mqd.cp_hqd_ctx_save_base_addr_hi; // offset: 172  (0xAC)

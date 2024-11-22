@@ -22,11 +22,13 @@ class HCQGraph(MultiGraphRunner):
     # Fill initial arguments.
     self.ji_args: Dict[int, HCQArgsState] = {}
 
-    kargs_ptrs: Dict[Compiled, int] = {dev:buf.va_addr for dev,buf in self.kernargs_bufs.items()}
+    kargs_ptrs: Dict[Compiled, int] = {dev:(buf.va_addr, buf.cpu_addr) for dev,buf in self.kernargs_bufs.items()}
     for j,ji in enumerate(self.jit_cache):
       if not isinstance(ji.prg, CompiledRunner): continue
-      kargs_ptrs[ji.prg.device] = (kargs_ptr:=kargs_ptrs[ji.prg.device]) + round_up(ji.prg.clprg.kernargs_alloc_size, 16)
-      self.ji_args[j] = ji.prg.clprg.fill_kernargs([cast(Buffer, b)._buf for b in ji.bufs], [var_vals[v] for v in ji.prg.p.vars], kargs_ptr)
+
+      v,c = kargs_ptrs[ji.prg.device]
+      kargs_ptrs[ji.prg.device] = (v + round_up(ji.prg.clprg.kernargs_alloc_size, 16), c + round_up(ji.prg.clprg.kernargs_alloc_size, 16))
+      self.ji_args[j] = ji.prg.clprg.fill_kernargs([cast(Buffer, b)._buf for b in ji.bufs], [var_vals[v] for v in ji.prg.p.vars], (v,c))
 
     # Schedule Dependencies.
     # There are two types of queues on each device: copy and compute. Both must synchronize with all external operations before launching any
