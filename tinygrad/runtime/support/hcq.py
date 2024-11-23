@@ -369,7 +369,7 @@ class HCQCompiled(Compiled):
       if hasattr(self, 'on_device_hang'): self.on_device_hang()
       else: raise e
 
-    if hasattr(self, 'adev'): self.adev.gmc.collect_pfs()
+    # if hasattr(self, 'adev'): self.adev.gmc.collect_pfs()
 
     if self.timeline_value > (1 << 31): self._wrap_timeline_signal()
     if PROFILE:

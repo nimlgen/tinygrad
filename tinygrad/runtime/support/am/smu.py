@@ -35,7 +35,11 @@ class SMU_IP:
 
     return self.adev.rreg(self.param_reg) if read_back_arg else None
 
-  def mode1_reset(self): self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_Mode1Reset, 0, poll=True)
+  def mode1_reset(self):
+    self.adev.regBIF_BX0_BIOS_SCRATCH_3.write(0x20000000)
+    self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_Mode1Reset, 0, poll=True)
+    self.adev.regBIF_BX0_BIOS_SCRATCH_3.write(0x0)
+    assert self.adev.regBIF_BX0_BIOS_SCRATCH_7.read() == 0x200
 
   # def smu_start_smc_engine(self):
   #   pass
@@ -72,8 +76,9 @@ class SMU_IP:
     hi = [0x00000C94, 0x000204E1, 0x000105DC, 0x00050B76, 0x00070B76, 0x00040898, 0x00060898, 0x000308FD]
     # hi = [0x000009B2, 0x000204E1, 0x000105DC, 0x00050B76, 0x00070B76, 0x00040898, 0x00060898, 0x000308FD]
     for clck in hi:
-      self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_SetSoftMinByFreq, clck, poll=False)
-      # self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_SetSoftMaxByFreq, clck, poll=False)
+      self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_SetSoftMinByFreq, clck, poll=True)
+      self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_SetSoftMaxByFreq, clck, poll=True)
+    self.smu_cmn_send_smc_msg_with_param(amdgpu_smu_v13_0_0.PPSMC_MSG_SetMGpuFanBoostLimitRpm, 0, poll=True)
 
   def init(self):
     # print("SMU init")

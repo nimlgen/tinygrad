@@ -472,10 +472,13 @@ class AMDDevice(HCQCompiled):
     # else: flags |= (kfd.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR if host else kfd.KFD_IOC_ALLOC_MEM_FLAGS_VRAM)
 
     if cpu_access or True: flags |= kfd.KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+    size = round_up(size, 0x1000)
 
-    if host: buf = addr = libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0)
-    else: buf, addr = 0, libc.mmap(0, size, 0, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
+    if host: buf = addr = libc.mmap(0, size + size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, -1, 0)
+    else: buf, addr = 0, libc.mmap(0, size + size, 0, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
     assert addr != 0xffffffffffffffff
+
+    addr = round_up(addr, size)
 
     try: mem = kfd.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU(self.kfd, va_addr=addr, size=size, base=addr, length=size, gpu_id=self.gpu_id,
                                                   flags=flags, mmap_offset=buf, cpu_addr=addr)
@@ -537,8 +540,8 @@ class AMDDevice(HCQCompiled):
       visible_devices = [int(x) for x in (getenv('VISIBLE_DEVICES', getenv('HIP_VISIBLE_DEVICES', ''))).split(',') if x.strip()]
       AMDDevice.gpus = [AMDDevice.gpus[x] for x in visible_devices] if visible_devices else AMDDevice.gpus
 
-    self.device_id += 1
-    if self.device_id >= len(AMDDevice.gpus): raise RuntimeError(f"No device found for {device}. Requesting more devices than the system has?")
+    self.device_id += 0
+    if self.device_id >= len(AMDDevice.gpus): raise RuntimeError(f"No device found for {self.device_id}. Requesting more devices than the system has?")
 
     libpciaccess.pci_device_probe(ctypes.byref(AMDDevice.gpus[self.device_id]))
     self.adev = AMDev(AMDDevice.gpus[self.device_id])

@@ -39,7 +39,26 @@ def parse_amdgpu_logs(log_content, register_names=None):
     # Replace register numbers with names
     processed_log = re.sub(pattern, replace_register_2, processed_log)
 
-    return processed_log
+    lines = processed_log.split('\n')
+    
+    # Remove trace sections
+    in_trace = False
+    cleaned_lines = []
+    
+    for line in lines:
+        if "cut here" in line:
+            in_trace = True
+            continue
+        if "end trace" in line:
+            in_trace = False
+            continue
+        if not in_trace:
+            # Remove timestamp and amdgpu prefix
+            cleaned_line = re.sub(r'^\[\d+\.\d+\]\s*(?:amdgpu\s+[^:]+:\s*amdgpu:\s*)?', '', line)
+            if cleaned_line.strip():  # Only add non-empty lines
+                cleaned_lines.append(cleaned_line)
+
+    return '\n'.join(cleaned_lines)
 
 def main():
     def check(x): assert x == 0
@@ -83,11 +102,11 @@ def main():
 
     _prepare_registers([("MP0", amdgpu_mp_13_0_0), ("NBIO", amdgpu_nbio_4_3_0), ("MMHUB", amdgpu_mmhub_3_0_0), ("GC", amdgpu_gc_11_0_0), ("OSSSYS", amdgpu_osssys_6_0_0)])
 
-    # with open('/home/nimlgen/tinygrad/z.z', 'r') as f:
-    #     log_content = f.read()
-
-    with open('/home/nimlgen/amdgpu_ubuntu_22_04/logs.txt', 'r') as f:
+    with open('/home/nimlgen/tinygrad/z.z', 'r') as f:
         log_content = f.read()
+
+    # with open('/home/nimlgen/amdgpu_ubuntu_22_04/logs.txt', 'r') as f:
+    #     log_content = f.read()
 
     # Process the log content
     processed_log = parse_amdgpu_logs(log_content)
@@ -96,7 +115,7 @@ def main():
     # print(processed_log)
 
     # Optionally, write to a file
-    with open('/home/nimlgen/amdgpu_ubuntu_22_04/z4.logs', 'w') as f:
+    with open('/home/nimlgen/amdgpu_ubuntu_22_04/x5.logs', 'w') as f:
         f.write(processed_log)
 
 if __name__ == '__main__':

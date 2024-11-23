@@ -7,7 +7,7 @@ class PSP_IP:
   def __init__(self, adev):
     self.adev = adev
 
-    self.msg1_pm = self.adev.mm.valloc(0x100000, align=0x100000)
+    self.msg1_pm = self.adev.mm.valloc(0x100000, align=0x100000, uncached=True)
     self.fence_pm = self.adev.mm.palloc(0x1000)
     self.cmd_pm = self.adev.mm.palloc(0x1000)
     self.ring_pm = self.adev.mm.palloc(0x10000)

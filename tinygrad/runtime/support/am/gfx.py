@@ -138,7 +138,7 @@ class GFX_IP:
     self.soc21_grbm_select(0, 0, 0, 0)
 
   def kcq_init(self):
-    self.kcq_ring = AMRing(self.adev, size=0x100000, me=1, pipe=0, queue=1, vmid=0, doorbell_index=((self.AMDGPU_NAVI10_DOORBELL_MEC_RING0) << 1))
+    self.kcq_ring = AMRing(self.adev, size=0x100000, me=1, pipe=0, queue=1, vmid=8, doorbell_index=((self.AMDGPU_NAVI10_DOORBELL_MEC_RING0) << 1))
     self.hqd_load(self.kcq_ring)
 
     # self.adev.mes.kiq_set_resources(0xffffffffffffffff) # full mask

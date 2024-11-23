@@ -55,7 +55,7 @@ class AMDev:
     self.gmc.init(self.mm.root_pt)
     # self.ih.init()
 
-    # self.regRLC_SPM_MC_CNTL.write(0xf)
+    self.regRLC_SPM_MC_CNTL.write(0xf)
 
     self.psp.init()
     self.smu.init()
