@@ -6,7 +6,7 @@ from tinygrad.runtime.autogen.am import am, mp_11_0, mp_13_0_0, nbio_4_3_0, mmhu
 from tinygrad.runtime.support.am.mm import TLSFAllocator
 from tinygrad.runtime.support.am.firmware import Firmware
 from tinygrad.runtime.support.am.ip import AM_SOC21, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
-from tinygrad.runtime.support.hcq import BumpAllocator
+# from tinygrad.runtime.support.hcq import BumpAllocator
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
 
@@ -35,24 +35,20 @@ class AMRegister:
   def read(self, **kwargs): return self.adev.rreg(self.reg_off) & self._parse_kwargs(**kwargs)[0]
 
 class AMPhysicalMemoryBlock:
-  def __init__(self, adev:AMDev, paddr:int, size:int): self.adev, self.paddr, self.size = adev, paddr, size
+  def __init__(self, adev:AMDev, paddr:int, size:int): self.adev, self.paddr, self.size, self.cpu_addr = adev, paddr, size,mv_address(adev.vram)+paddr
   def mc_addr(self): return self.adev.gmc.mc_base + self.paddr
-  def cpu_addr(self): return mv_address(self.adev.vram) + self.paddr
-  def cpu_view(self): return to_mv(self.cpu_addr(), self.size)
 
 class AMVirtualMapping:
   def __init__(self, va_addr:int, size:int, cpu_addr:Optional[int], paddr:Optional[int]):
     self.va_addr, self.size, self.cpu_addr, self.paddr = va_addr, size, cpu_addr, paddr
 
 class AMPageTableEntry:
-  def __init__(self, pm, lv): self.pm, self.view, self.lv = pm, pm.cpu_view().cast('Q'), lv
+  def __init__(self, pm:AMPhysicalMemoryBlock, lv:int): self.pm, self.view, self.lv = pm, to_mv(pm.cpu_addr, pm.size).cast('Q'), lv
 
   def set_table(self, entry_id, pte:AMPageTableEntry, valid=True):
-    # if self.pm.paddr == 0x1700000 and entry_id == 0: input("hmm tbl")
     self.view[entry_id] = (pte.pm.paddr & 0x0000FFFFFFFFF000) | (am.AMDGPU_PTE_VALID if valid else 0)
 
   def set_page(self, entry_id, paddr, uncached=False, system=False, snooped=False, frag=0, valid=True):
-    # if self.pm.paddr == 0x1700000 and entry_id == 0: input("hmm pg")
     f = (am.AMDGPU_PTE_VALID if valid else 0) | am.AMDGPU_PTE_WRITEABLE | am.AMDGPU_PTE_READABLE | am.AMDGPU_PTE_EXECUTABLE \
       | am.AMDGPU_PTE_FRAG(frag) | (am.AMDGPU_PDE_PTE if self.lv != am.AMDGPU_VM_PTB else 0) \
       | ((am.AMDGPU_PTE_SYSTEM) if system else 0) | ((am.AMDGPU_PTE_SNOOPED) if snooped else 0) \
@@ -73,8 +69,6 @@ class AMMemoryManager:
     pte_covers = 1 << ((9 * (3-page_table.lv)) + 12)
     assert size // pte_covers < 512, "Size must be less than 512 ptes"
 
-    # print("Walker", page_table, hex(vaddr), hex(size))
-
     def _move_cursor(sz):
       nonlocal vaddr, offset, size
       vaddr, offset, size = vaddr + sz, offset + sz, size - sz
@@ -92,7 +86,7 @@ class AMMemoryManager:
 
       if free_pt and all(child_page_table.get_entry(i) & am.AMDGPU_PTE_VALID == 0 for i in range(512)):
         self.pfree(child_page_table.pm)
-        page_table.set_page(pte_idx, paddr=0, valid=False)
+        page_table.set_page(pte_idx, paddr=0x0, valid=False)
 
     # First pte is not full covered
     if vaddr % pte_covers != 0:
@@ -122,50 +116,43 @@ class AMMemoryManager:
         pte_st_idx, n_ptes, inner_off = pte_st_idx + update_ptes, n_ptes - update_ptes, inner_off + pte_covers * update_ptes
 
   def map_range(self, vaddr, size, paddr=None, uncached=False, system=False, snooped=False):
-    if AM_DEBUG >= 2: print(f"Mapping {vaddr=:#x} -> {paddr} ({size=:#x})")
+    if AM_DEBUG >= 3: print(f"Mapping {vaddr=:#x} -> {paddr} ({size=:#x})")
 
     vaddr = vaddr - AMMemoryManager.va_allocator.base
-    for va, off, pte_st_idx, n_ptes, pte_covers, page_table, frags_cnt in self.frags_walker(self.root_page_table, vaddr, size):
-      if paddr is None: lpaddr, off = self.pa_allocator.alloc(n_ptes * pte_covers), 0
-      else: lpaddr = paddr
+    for va, off, pte_st_idx, n_ptes, pte_covers, pt, frags_cnt in self.frags_walker(self.root_page_table, vaddr, size):
+      lpaddr, off = (self.pa_allocator.alloc(n_ptes * pte_covers), 0) if paddr is None else (paddr, off)
 
-      # print("here with", pte_st_idx, n_ptes)
       for pte_idx in range(n_ptes):
-        assert page_table.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == 0, "Entry already set"
-        page_table.set_page(pte_st_idx + pte_idx, paddr=lpaddr + off, uncached=uncached, system=system, snooped=snooped, frag=frags_cnt, valid=True)
+        assert pt.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == 0, f"Entry already valid: {pte_st_idx + pte_idx}"
+        pt.set_page(pte_st_idx + pte_idx, paddr=lpaddr + off, uncached=uncached, system=system, snooped=snooped, frag=frags_cnt, valid=True)
         off += pte_covers
 
-      if AM_DEBUG >= 3: print(f"\tnptes={n_ptes:#x} incr={pte_covers:#x} upd_flags={page_table.get_entry(pte_st_idx):#x} frags={frags_cnt:#x}")
+      if AM_DEBUG >= 4: print(f"\tnptes={n_ptes:#x} incr={pte_covers:#x} upd_flags={pt.get_entry(pte_st_idx):#x} frags={frags_cnt:#x}")
 
     self.adev.gmc.flush_tlb(ip="GC", vmid=0)
     self.adev.gmc.flush_tlb(ip="MM", vmid=0)
 
   def unmap_range(self, vaddr:int, size:int, free_paddrs=True):
-    if AM_DEBUG >= 2: print(f"Unmapping {vaddr=:#x} ({size=:#x})")
-    # print(f"Unmapping {vaddr=:#x} ({size=:#x})")
+    if AM_DEBUG >= 3: print(f"Unmapping {vaddr=:#x} ({size=:#x})")
 
     vaddr = vaddr - AMMemoryManager.va_allocator.base
-    for va, off, pte_st_idx, n_ptes, pte_covers, page_table, _ in self.frags_walker(self.root_page_table, vaddr, size, from_entry=True, free_pt=True):
-      entry = page_table.get_entry(pte_st_idx)
+    for va, off, pte_st_idx, n_ptes, pte_covers, pt, _ in self.frags_walker(self.root_page_table, vaddr, size, from_entry=True, free_pt=True):
+      entry = pt.get_entry(pte_st_idx)
       if not(entry & am.AMDGPU_PTE_SYSTEM) and free_paddrs: self.pa_allocator.free(entry & 0x0000FFFFFFFFF000)
 
       for pte_idx in range(n_ptes):
-        assert page_table.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == am.AMDGPU_PTE_VALID, "Entry must be set"
-        page_table.set_page(pte_st_idx + pte_idx, paddr=0x0, valid=False)
+        assert pt.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == am.AMDGPU_PTE_VALID, "Entry must be set"
+        pt.set_page(pte_st_idx + pte_idx, paddr=0x0, valid=False)
 
   def map_from(self, vaddr:int, size:int, from_adev):
-    if AM_DEBUG >= 2: print(f"Mapping from {vaddr=:#x} {size=:#x} from {from_adev.pcidev}")
+    if AM_DEBUG >= 3: print(f"Mapping from {vaddr=:#x} {size=:#x} from {from_adev.pcidev}")
 
     vaddr = vaddr - AMMemoryManager.va_allocator.base
-    for va, off, pte_st_idx, n_ptes, pte_covers, page_table, _ in self.frags_walker(from_adev.mm.root_page_table, vaddr, size, from_entry=True, creat_pt=False):
-      # print("hm", hex(va + AMMemoryManager.va_allocator.base), hex(off), hex(n_ptes * pte_covers))
-      entry = page_table.get_entry(pte_st_idx)
-      uncached = entry & am.AMDGPU_PTE_MTYPE_NV10(0, am.MTYPE_UC) == am.AMDGPU_PTE_MTYPE_NV10(0, am.MTYPE_UC)
-      snooped = entry & am.AMDGPU_PTE_SNOOPED == am.AMDGPU_PTE_SNOOPED
+    for va, _, pte_st_idx, n_ptes, pte_covers, pt, _ in self.frags_walker(from_adev.mm.root_page_table, vaddr, size, from_entry=True, creat_pt=False):
+      entry = pt.get_entry(pte_st_idx)
       paddr = (entry & 0x0000FFFFFFFFF000) if entry & am.AMDGPU_PTE_SYSTEM else (entry & 0x0000FFFFFFFFF000) + from_adev.pcidev.regions[0].base_addr
-      self.map_range(va + AMMemoryManager.va_allocator.base, n_ptes * pte_covers, paddr=paddr, uncached=uncached, system=True, snooped=snooped)
-
-    # print(f"Mapping done from {from_adev.pcidev} {vaddr=:#x} {size=:#x}")
+      self.map_range(va + AMMemoryManager.va_allocator.base, n_ptes * pte_covers, paddr=paddr, system=True,
+                     uncached=bool(entry & am.AMDGPU_PTE_MTYPE_NV10(0, am.MTYPE_UC)), snooped=bool(entry & am.AMDGPU_PTE_SNOOPED))
 
   @staticmethod
   def alloc_vaddr(size:int, align=0x1000) -> int: return AMMemoryManager.va_allocator.alloc(size, max((1 << (size.bit_length() - 1)), align))
@@ -173,7 +160,7 @@ class AMMemoryManager:
   def valloc(self, size:int, align=0x1000, uncached=False, contigous=False) -> AMVirtualMapping:
     pm = self.palloc(round_up(size, 0x1000), zero=True) if contigous else None
     self.map_range(va:=self.alloc_vaddr(size, align), size, paddr=pm.paddr if pm else None, uncached=uncached)
-    return AMVirtualMapping(va, size, pm.cpu_addr() if pm is not None else None, pm.paddr if pm is not None else None)
+    return AMVirtualMapping(va, size, pm.cpu_addr if pm is not None else None, pm.paddr if pm is not None else None)
 
   def vfree(self, vm:AMVirtualMapping):
     self.unmap_range(vm.va_addr, vm.size, free_paddrs=(vm.paddr is None))
@@ -182,7 +169,7 @@ class AMMemoryManager:
 
   def palloc(self, size, align=0x1000, zero=True) -> AMPhysicalMemoryBlock:
     pm = AMPhysicalMemoryBlock(self.adev, self.pa_allocator.alloc(round_up(size, 0x1000), align), size)
-    if zero: ctypes.memset(pm.cpu_addr(), 0, pm.size)
+    if zero: ctypes.memset(pm.cpu_addr, 0, pm.size)
     return pm
 
   def pfree(self, pm:AMPhysicalMemoryBlock): self.pa_allocator.free(pm.paddr)
@@ -213,13 +200,8 @@ class AMDev:
       self.smu.mode1_reset()
       time.sleep(0.5)
 
-    self.soc21.init()
-    self.gmc.init()
-    self.ih.init()
-    self.psp.init()
-    self.smu.init()
-    self.gfx.init()
-    self.sdma.init()
+    # Initialize all blocks
+    for ip in [self.soc21, self.gmc, self.ih, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
 
   def ip_base(self, ip:str, inst:int, seg:int) -> int: return self.regs_offset[am.__dict__.get(f"{ip}_HWIP")][inst][seg]
  
@@ -264,7 +246,7 @@ class AMDev:
     self.vram_size = self.rreg(mmRCC_CONFIG_MEMSIZE) << 20
     self.discovery_pm = AMPhysicalMemoryBlock(self, self.vram_size - (64 << 10), 10 << 10)
 
-    bhdr = am.struct_binary_header.from_address(self.discovery_pm.cpu_addr())
+    bhdr = am.struct_binary_header.from_address(self.discovery_pm.cpu_addr)
     ihdr = am.struct_ip_discovery_header.from_address(ctypes.addressof(bhdr) + bhdr.table_list[am.IP_DISCOVERY].offset)
     assert ihdr.signature == am.DISCOVERY_TABLE_SIGNATURE and not ihdr.base_addr_64_bit
 

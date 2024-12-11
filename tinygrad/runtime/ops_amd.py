@@ -90,7 +90,7 @@ class AMDComputeQueue(HWQueue):
       user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000] if prg.enable_private_segment_sgpr else []
     else: user_regs = []
     if prg.enable_dispatch_ptr:
-      dp = hsa.hsa_kernel_dispatch_packet_t.from_address(dp_addr:=args_state.ptr + prg.kernargs_segment_size)
+      dp = hsa.hsa_kernel_dispatch_packet_t.from_address(dp_addr:=args_state.gpu_ptr + prg.kernargs_segment_size)
 
       self.bind_sints(*local_size, struct=dp, start_field='workgroup_size_x', fmt='H')
       self.bind_sints(*[g*l for g,l in zip(global_size, local_size)], struct=dp, start_field='grid_size_x', fmt='I')
@@ -469,7 +469,7 @@ class VFIOIface:
 
   def free(self, mem):
     if mem.meta[2] is not None:
-      for dev in mem.meta[1][1:]: dev.dev_iface.mm.unmap_range(mem.va_addr, mem.size, free_paddrs=False)
+      for dev in mem.meta[1][1:]: dev.dev_iface.adev.mm.unmap_range(mem.va_addr, mem.size, free_paddrs=False)
       self.adev.mm.vfree(mem.meta[2])
 
   def map(self, mem):

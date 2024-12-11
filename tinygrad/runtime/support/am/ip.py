@@ -3,7 +3,7 @@ import ctypes, time
 from typing import Literal
 from tinygrad.runtime.support.pci import pci_set_master
 from tinygrad.runtime.autogen.am import am, gc_11_0_0, smu_v13_0_0
-from tinygrad.helpers import to_mv, lo32, hi32
+from tinygrad.helpers import to_mv, data64
 
 class AM_IP:
   def __init__(self, adev): self.adev = adev
@@ -208,13 +208,13 @@ class AM_IH(AM_IP):
   def __init__(self, adev):
     super().__init__(adev)
 
-    self.rings = [(self.adev.mm.valloc(262144, uncached=True), self.adev.mm.valloc(0x1000, uncached=True), suf, i) for i,suf in enumerate(["", "_RING1"])]
+    self.ring_vm = self.adev.mm.valloc(256 << 10, uncached=True)
+    self.rwptr_vm = self.adev.mm.valloc(0x1000, uncached=True)
     self.rptr = 0
 
   def interrupt_handler(self):
-    addr_vm, rwptr_vm, suf, ring_id = self.rings[0]
-    ring_view = to_mv(addr_vm.cpu_addr(), 262144).cast('I')
-    wptr = to_mv(rwptr_vm.cpu_addr(), 8).cast('Q')[0]
+    ring_view = to_mv(self.ring_vm.cpu_addr, 262144).cast('I')
+    wptr = to_mv(self.rwptr_vm.cpu_addr, 8).cast('Q')[0]
 
     while self.rptr < wptr:
       ring_index = (self.rptr >> 2)
@@ -229,20 +229,13 @@ class AM_IH(AM_IP):
     self.adev.regIH_RB_RPTR.write(self.rptr)
     # to_mv(self.adev.doorbell_cpu_addr, 0x2000).cast('I')[self.AMDGPU_NAVI10_DOORBELL_IH * 2] = self.rptr
 
-  def enable_ring(self, addr_vm, rwptr_vm, suf, ring_id):
-    self.adev.wreg_pair("regIH_RB_BASE", suf, f"_HI{suf}", addr_vm.va_addr >> 8)
-
-    self.adev.reg(f"regIH_RB_CNTL{suf}").write(0xC0310120 if ring_id == 0 else 0xC0100320)
-
-    if ring_id == 0: self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", rwptr_vm.va_addr)
-
-    self.adev.reg(f"regIH_RB_WPTR{suf}").write(0)
-    self.adev.reg(f"regIH_RB_RPTR{suf}").write(0)
-
-    self.adev.reg(f"regIH_DOORBELL_RPTR{suf}").write(((self.AMDGPU_NAVI10_DOORBELL_IH + ring_id) * 2), enable=1)
-
   def init(self):
-    for ring in self.rings: self.enable_ring(*ring)
+    self.adev.wreg_pair("regIH_RB_BASE", "", f"_HI", self.ring_vm.va_addr >> 8)
+    self.adev.reg(f"regIH_RB_CNTL").write(0xC0310120)
+    self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.rwptr_vm.va_addr)
+    self.adev.reg(f"regIH_RB_WPTR").write(0)
+    self.adev.reg(f"regIH_RB_RPTR").write(0)
+    self.adev.reg(f"regIH_DOORBELL_RPTR").write((self.AMDGPU_NAVI10_DOORBELL_IH * 2), enable=1)
 
     self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
     self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
@@ -251,8 +244,7 @@ class AM_IH(AM_IP):
     pci_set_master(self.adev.pcidev)
 
     # toggle interrupts
-    for addr_vm, rwptr_vm, suf, ring_id in self.rings:
-      self.adev.reg(f"regIH_RB_CNTL{suf}").update(rb_enable=1, **({'enable_intr': 1} if ring_id == 0 else {}))
+    self.adev.reg(f"regIH_RB_CNTL").update(rb_enable=1, enable_intr=1)
 
 class AM_SDMA(AM_IP):
   def load_mqd(self, mqd:am.struct_v11_sdma_mqd, pipe:int, queue:int):
@@ -297,15 +289,10 @@ class AM_PSP(AM_IP):
   def is_sos_alive(self): return self.adev.regMP0_SMN_C2PMSG_81.read() != 0x0
   def init(self):
     sos_components_load_order = [
-      (am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE),
-      (am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_TOS_SPL_TABLE),
-      (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV),
-      (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
-      (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV),
-      (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
-      (am.PSP_FW_TYPE_PSP_RAS_DRV, am.PSP_BL__LOAD_RASDRV),
-      (am.PSP_FW_TYPE_PSP_SOS, am.PSP_BL__LOAD_SOSDRV),
-    ]
+      (am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_TOS_SPL_TABLE),
+      (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
+      (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV), (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
+      (am.PSP_FW_TYPE_PSP_RAS_DRV, am.PSP_BL__LOAD_RASDRV), (am.PSP_FW_TYPE_PSP_SOS, am.PSP_BL__LOAD_SOSDRV)]
     for fw, compid in sos_components_load_order: self._bootloader_load_component(fw, compid)
     while not self.is_sos_alive(): time.sleep(0.01)
 
@@ -322,8 +309,8 @@ class AM_PSP(AM_IP):
   def _wait_for_bootloader(self): self.adev.wait_reg(self.adev.regMP0_SMN_C2PMSG_35, mask=0xFFFFFFFF, value=0x80000000)
 
   def _prep_msg1(self, data):
-    ctypes.memset(self.msg1_pm.cpu_addr(), 0, self.msg1_pm.size)
-    self.msg1_pm.cpu_view()[:len(data)] = data
+    ctypes.memset(self.msg1_pm.cpu_addr, 0, self.msg1_pm.size)
+    to_mv(self.msg1_pm.cpu_addr, self.msg1_pm.size)[:len(data)] = data
     self.adev.gmc.flush_hdp()
 
   def _bootloader_load_component(self, fw, compid):
@@ -359,30 +346,28 @@ class AM_PSP(AM_IP):
   
   def _ring_submit(self):
     prev_wptr = self.adev.regMP0_SMN_C2PMSG_67.read()
-    ring_entry_addr = self.ring_pm.cpu_addr() + prev_wptr * 4
+    ring_entry_addr = self.ring_pm.cpu_addr + prev_wptr * 4
 
     ctypes.memset(ring_entry_addr, 0, ctypes.sizeof(am.struct_psp_gfx_rb_frame))
     write_loc = am.struct_psp_gfx_rb_frame.from_address(ring_entry_addr)
-    write_loc.cmd_buf_addr_hi = hi32(self.cmd_pm.mc_addr())
-    write_loc.cmd_buf_addr_lo = lo32(self.cmd_pm.mc_addr())
-    write_loc.fence_addr_hi = hi32(self.fence_pm.mc_addr())
-    write_loc.fence_addr_lo = lo32(self.fence_pm.mc_addr())
+    write_loc.cmd_buf_addr_hi, write_loc.cmd_buf_addr_lo = data64(self.cmd_pm.mc_addr())
+    write_loc.fence_addr_hi, write_loc.fence_addr_lo = data64(self.fence_pm.mc_addr())
     write_loc.fence_value = prev_wptr
 
     # Move the wptr
     self.adev.regMP0_SMN_C2PMSG_67.write(prev_wptr + ctypes.sizeof(am.struct_psp_gfx_rb_frame) // 4)
 
-    while self.fence_pm.cpu_view().cast('I')[0] != prev_wptr: pass #self.adev.wreg(self.adev.reg_off("HDP", 0, 0x00d1, 0x0), 1)
+    while to_mv(self.fence_pm.cpu_addr, 4).cast('I')[0] != prev_wptr: pass
     time.sleep(0.05)
 
-    resp = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr())
+    resp = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr)
     if resp.resp.status != 0: raise RuntimeError(f"PSP command failed {resp.cmd_id} {resp.resp.status}")
 
     return resp
 
   def _prep_ring_cmd(self, hdr): 
-    ctypes.memset(self.cmd_pm.cpu_addr(), 0, 0x1000)
-    cmd = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr())
+    ctypes.memset(self.cmd_pm.cpu_addr, 0, 0x1000)
+    cmd = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr)
     cmd.cmd_id = hdr
     return cmd
 
@@ -391,26 +376,22 @@ class AM_PSP(AM_IP):
 
     self._prep_msg1(fw_bytes)
     cmd = self._prep_ring_cmd(am.GFX_CMD_ID_LOAD_IP_FW)
-    cmd.cmd.cmd_load_ip_fw.fw_phy_addr_lo = lo32(self.msg1_pm.mc_addr())
-    cmd.cmd.cmd_load_ip_fw.fw_phy_addr_hi = hi32(self.msg1_pm.mc_addr())
+    cmd.cmd.cmd_load_ip_fw.fw_phy_addr_hi, cmd.cmd.cmd_load_ip_fw.fw_phy_addr_lo = data64(self.msg1_pm.mc_addr())
     cmd.cmd.cmd_load_ip_fw.fw_size = len(fw_bytes)
     cmd.cmd.cmd_load_ip_fw.fw_type = fw_type
     return self._ring_submit()
 
   def _tmr_load_cmd(self):
     cmd = self._prep_ring_cmd(am.GFX_CMD_ID_SETUP_TMR)
-    cmd.cmd.cmd_setup_tmr.buf_phy_addr_lo = lo32(self.tmr_pm.mc_addr())
-    cmd.cmd.cmd_setup_tmr.buf_phy_addr_hi = hi32(self.tmr_pm.mc_addr())
-    cmd.cmd.cmd_setup_tmr.system_phy_addr_lo = lo32(self.tmr_pm.paddr)
-    cmd.cmd.cmd_setup_tmr.system_phy_addr_hi = hi32(self.tmr_pm.paddr)
+    cmd.cmd.cmd_setup_tmr.buf_phy_addr_hi, cmd.cmd.cmd_setup_tmr.buf_phy_addr_lo = data64(self.tmr_pm.mc_addr())
+    cmd.cmd.cmd_setup_tmr.system_phy_addr_hi, cmd.cmd.cmd_setup_tmr.system_phy_addr_lo = data64(self.tmr_pm.paddr)
     cmd.cmd.cmd_setup_tmr.bitfield.virt_phy_addr = 1
     cmd.cmd.cmd_setup_tmr.buf_size = self.tmr_pm.size
     return self._ring_submit()
 
   def _load_toc_cmd(self, toc_size):
     cmd = self._prep_ring_cmd(am.GFX_CMD_ID_LOAD_TOC)
-    cmd.cmd.cmd_load_toc.toc_phy_addr_lo = lo32(self.msg1_pm.mc_addr())
-    cmd.cmd.cmd_load_toc.toc_phy_addr_hi = hi32(self.msg1_pm.mc_addr())
+    cmd.cmd.cmd_load_toc.toc_phy_addr_hi, cmd.cmd.cmd_load_toc.toc_phy_addr_lo = data64(self.msg1_pm.mc_addr())
     cmd.cmd.cmd_load_toc.toc_size = toc_size
     return self._ring_submit()
 
