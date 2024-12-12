@@ -504,7 +504,7 @@ class AMDDevice(HCQCompiled):
   def __init__(self, device:str=""):
     AMDDevice.driverless = not os.path.isdir('/sys/module/amdgpu/') or bool(getenv("AMD_DRIVERLESS", 0))
 
-    self.device_id = int(device.split(":")[1]) if ":" in device else 3
+    self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.dev_iface = VFIOIface(self, self.device_id) if AMDDevice.driverless else KFDIface(self.device_id)
 
     self.target = int(self.dev_iface.properties['gfx_target_version'])
