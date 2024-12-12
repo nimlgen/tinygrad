@@ -18,11 +18,10 @@ from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, GlobalCounters, flatten, ge
 from tinygrad.codegen.kernel import Kernel, verify_ast
 from tinygrad.engine.schedule import BUF_LIMIT, ScheduleContext, ScheduleItem, create_schedule, view_right, view_left, do_realize
 from tinygrad.engine.realize import CompiledRunner, get_runner, run_schedule
-from tinygrad.engine.lazy import LazyBuffer
 from extra.models.llama import precompute_freqs_cis
 
 class KernelCountException(Exception): pass
-def check_schedule(t:Union[Tensor, List[Tensor], LazyBuffer], allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_sink=True):
+def check_schedule(t:Union[Tensor, List[Tensor], UOp], allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_sink=True):
   if isinstance(t, Tensor): outs = t.lazydata.lbs
   elif isinstance(t, List): outs = flatten([r.lazydata.lbs for r in t])
   else: outs = [t]
@@ -583,11 +582,12 @@ class TestSchedule(unittest.TestCase):
     np.testing.assert_allclose(out.numpy(), a.numpy().sum(axis=1)[:16] + b.numpy().sum(axis=1)[:16] + c.numpy(), atol=1e-4, rtol=1e-4)
 
   # broken due to const folding and two contiguous are different kernels
+  # NOTE: passes after delete_lazy
   def test_const_no_recompute(self):
     x = Tensor(2) + Tensor(2)
     y = Tensor(2) + Tensor(2)
     out = x.contiguous() + y.contiguous()
-    with self.assertRaises(KernelCountException): check_schedule(out, 2, filter_sink=False)
+    check_schedule(out, 2, filter_sink=False)
 
   # multireduce spec
   def test_reduce_same_size(self):
@@ -1295,14 +1295,14 @@ class TestSchedule(unittest.TestCase):
 
   @unittest.skipIf(Device.DEFAULT not in view_supported_devices, "subbuffer not supported")
   def test_bitcast_subbufer(self):
-    x = cast(LazyBuffer, Tensor.empty(1, dtype=dtypes.float32).realize().lazydata)
+    x = cast(UOp, Tensor.empty(1, dtype=dtypes.float32).realize().lazydata)
     a = x.alu(Ops.EXP2).cast(dtypes.int32, True, allow_buffer_view=True)
     b = x.cast(dtypes.int32, True, allow_buffer_view=True)
     b = a.alu(Ops.ADD, b)
     check_schedule(b, 2) # this should fuse when it makes sense
 
   def test_bitcast_disable_subbufer(self):
-    x = cast(LazyBuffer, Tensor.empty(1, dtype=dtypes.float32).realize().lazydata)
+    x = cast(UOp, Tensor.empty(1, dtype=dtypes.float32).realize().lazydata)
     a = x.alu(Ops.EXP2).cast(dtypes.int32, True, allow_buffer_view=False)
     b = x.cast(dtypes.int32, True, allow_buffer_view=False)
     b = a.alu(Ops.ADD, b)
@@ -1938,28 +1938,28 @@ class TestView(unittest.TestCase):
     np.testing.assert_allclose(b.numpy(), np.pad(a.numpy(), ((0, 5), (0, 0)))[5:])
 
 @track_rewrites(named=True)
-def big_graph_rewrite(big_graph:UOp, realizes={}) -> UOp: return graph_rewrite(big_graph, do_realize, ScheduleContext(realizes=realizes))
+def big_graph_rewrite(big_graph:UOp, ctx) -> UOp: return graph_rewrite(big_graph, do_realize, ctx)
 class TestBigGraph(unittest.TestCase):
   def test_sink_childless_const(self):
     x = UOp.const(dtypes.int, 0)
-    big_graph = big_graph_rewrite(x.sink(), realizes:={})
+    big_graph = big_graph_rewrite(x.sink(), ctx:=ScheduleContext())
     self.assertIs(big_graph, UOp(Ops.NOOP))
-    self.assertEqual(len(realizes), 0)
+    self.assertEqual(len(ctx.realizes), 0)
 
   def test_sink_childless_const_alt(self):
     x = UOp.const(dtypes.int, 0)
     y = UOp(Ops.VIEW, dtypes.int, (UOp(Ops.BUFFER, dtypes.int.ptr(), (), 0), UOp.const(dtypes.int, 0)), ShapeTracker.from_shape(()))
-    big_graph = big_graph_rewrite(UOp.sink(x, y), realizes:={})
+    big_graph = big_graph_rewrite(UOp.sink(x, y), ctx:=ScheduleContext())
     self.assertIs(big_graph, UOp(Ops.NOOP))
-    self.assertEqual(len(realizes), 0)
+    self.assertEqual(len(ctx.realizes), 0)
 
   def test_sink_childless_const_alt_expanded(self):
     # this is a real STORE of CONST (post expand)
     y = UOp(Ops.VIEW, dtypes.int, (UOp.new_buffer(Device.DEFAULT, 1, dtypes.int), UOp.const(dtypes.int, 0)), ShapeTracker.from_shape(()))
     out = UOp(Ops.VIEW, dtypes.int, (UOp.new_buffer(Device.DEFAULT, 2, dtypes.int), y.reshape((1,)).expand((2,)).contiguous(),), ShapeTracker.from_shape((2,)))
-    big_graph = big_graph_rewrite(out.sink(), realizes:={})
+    big_graph = big_graph_rewrite(out.sink(), ctx:=ScheduleContext())
     self.assertIs(big_graph, out.sink())
-    self.assertEqual(len(realizes), 1)
+    self.assertEqual(len(ctx.realizes), 1)
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)
