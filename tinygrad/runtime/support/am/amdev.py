@@ -45,7 +45,7 @@ class AMFirmware:
       fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
       ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
       self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
-    
+
     # Load other fw
     self.ucode_start: Dict[str, int] = {}
     self.descs: List[Tuple[int, memoryview]] = []
@@ -187,15 +187,18 @@ class AMMemoryManager:
     for va, off, pte_st_idx, n_ptes, pte_covers, pt, frags_cnt in self.frags_walker(self.root_page_table, vaddr, size):
       lpaddr, off = (self.pa_allocator.alloc(n_ptes * pte_covers), 0) if paddr is None else (paddr, off)
 
+      # print("AMM", hex(pt.pm.paddr))
       for pte_idx in range(n_ptes):
-        assert pt.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == 0, f"Entry already valid: {pte_st_idx + pte_idx}"
+        assert pt.get_entry(pte_st_idx + pte_idx) & am.AMDGPU_PTE_VALID == 0, f"Entry already valid: {pte_st_idx + pte_idx} {pt.get_entry(pte_st_idx + pte_idx):#x}"
         pt.set_page(pte_st_idx + pte_idx, paddr=lpaddr + off, uncached=uncached, system=system, snooped=snooped, frag=frags_cnt, valid=True)
         off += pte_covers
 
       if AM_DEBUG >= 4: print(f"\tnptes={n_ptes:#x} incr={pte_covers:#x} upd_flags={pt.get_entry(pte_st_idx):#x} frags={frags_cnt:#x}")
 
     self.adev.gmc.flush_tlb(ip="GC", vmid=0)
+    self.adev.gmc.flush_tlb(ip="GC", vmid=0, flush_type=2)
     self.adev.gmc.flush_tlb(ip="MM", vmid=0)
+    self.adev.gmc.flush_tlb(ip="MM", vmid=0, flush_type=2)
 
   def unmap_range(self, vaddr:int, size:int, free_paddrs=True):
     if AM_DEBUG >= 3: print(f"Unmapping {vaddr=:#x} ({size=:#x})")
@@ -243,6 +246,8 @@ class AMDev:
   def __init__(self, pcidev, vram_bar:memoryview, doorbell_bar:memoryview, mmio_bar:memoryview):
     self.pcidev = pcidev
     self.vram, self.doorbell64, self.mmio = vram_bar, doorbell_bar, mmio_bar
+    # self.doorbell_cpu_addr = mv_address(self.doorbell64)
+    # print("vram cpu addr", hex(mv_address(self.vram)))
 
     self._run_discovery()
     self._build_regs()
@@ -260,18 +265,16 @@ class AMDev:
     self.gfx = AM_GFX(self)
     self.sdma = AM_SDMA(self)
 
-    if self.psp.is_sos_alive():
-      if AM_DEBUG >= 2: print("sOS is alive, issue mode1 reset...")
-      self.smu.mode1_reset()
-      time.sleep(0.5)
+    if self.psp.is_sos_alive(): self.smu.mode1_reset()
 
     # Initialize all blocks
     for ip in [self.soc21, self.gmc, self.ih, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
+    # for ip in [self.soc21, self.gmc, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
 
   def ip_base(self, ip:str, inst:int, seg:int) -> int: return self.regs_offset[am.__dict__.get(f"{ip}_HWIP")][inst][seg]
- 
+
   def reg(self, reg:str) -> AMRegister: return self.__dict__[reg]
-  
+
   def rreg(self, reg:int) -> int:
     val = self.indirect_rreg(reg * 4) if reg > len(self.mmio) else self.mmio[reg]
     if AM_DEBUG >= 4 and getattr(self, '_prev_rreg', None) != (reg, val): print(f"Reading register {reg:#x} with value {val:#x}")

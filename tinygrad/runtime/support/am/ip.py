@@ -111,7 +111,9 @@ class AM_SMU(AM_IP):
       self._smu_cmn_send_smc_msg_with_param(smu_v13_0_0.PPSMC_MSG_SetSoftMinByFreq, clck, poll=True)
       self._smu_cmn_send_smc_msg_with_param(smu_v13_0_0.PPSMC_MSG_SetSoftMaxByFreq, clck, poll=True)
 
-  def mode1_reset(self): self._smu_cmn_send_smc_msg_with_param(smu_v13_0_0.PPSMC_MSG_Mode1Reset, 0, poll=True)
+  def mode1_reset(self):
+    self._smu_cmn_send_smc_msg_with_param(smu_v13_0_0.PPSMC_MSG_Mode1Reset, 0, poll=True)
+    time.sleep(0.5)
 
   def _smu_cmn_poll_stat(self): self.adev.wait_reg(self.adev.mmMP1_SMN_C2PMSG_90, mask=0xFFFFFFFF, value=1)
   def _smu_cmn_send_msg(self, msg, param=0):
@@ -215,48 +217,79 @@ class AM_IH(AM_IP):
   def __init__(self, adev):
     super().__init__(adev)
 
-    self.ring_vm = self.adev.mm.valloc(256 << 10, uncached=True)
-    self.rwptr_vm = self.adev.mm.valloc(0x1000, uncached=True)
     self.rptr = 0
 
+  def enable_ring(self, addr_vm, rwptr_vm, suf, ring_id):
+    self.adev.wreg_pair("regIH_RB_BASE", suf, f"_HI{suf}", addr_vm.va_addr >> 8)
+
+    self.adev.reg(f"regIH_RB_CNTL{suf}").write(mc_space=4, wptr_overflow_clear=1, rb_size=(addr_vm.size//4).bit_length(),
+      mc_snoop=1, mc_ro=0, mc_vmid=0, **({'wptr_overflow_enable': 1, 'rptr_rearm': 1} if ring_id == 0 else {'rb_full_drain_enable': 1}))
+
+    if ring_id == 0: self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", rwptr_vm.va_addr)
+
+    self.adev.reg(f"regIH_RB_WPTR{suf}").write(0)
+    self.adev.reg(f"regIH_RB_RPTR{suf}").write(0)
+
+    self.adev.reg(f"regIH_DOORBELL_RPTR{suf}").write(((am.AMDGPU_NAVI10_DOORBELL_IH + ring_id) * 2), enable=1)
+
   def interrupt_handler(self):
-    ring_view = to_mv(self.ring_vm.cpu_addr, 262144).cast('I')
-    wptr = to_mv(self.rwptr_vm.cpu_addr, 8).cast('Q')[0]
+    pass
+    # # addr_vm, rwptr_vm, suf, ring_id = self.rings[0]
+    # for addr_vm, rwptr_vm, suf, ring_id in self.rings[:1]:
+    #   ring_view = to_mv(addr_vm.cpu_addr, addr_vm.size).cast('I')
+    #   wptr = to_mv(rwptr_vm.cpu_addr, 8).cast('Q')[0]
+    #   # wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read()
 
-    while (self.rptr % self.ring_vm.size) < (wptr % self.ring_vm.size):
-      ring_index = (self.rptr % self.ring_vm.size) // 4
-      iv_entry = am.struct_amdgpu_iv_entry(client_id=ring_view[ring_index + 0] & 0xff, src_id=(ring_view[ring_index + 0] >> 8) & 0xff,
-        ring_id=(ring_view[ring_index + 0] >> 16) & 0xff, vmid=(ring_view[ring_index + 0] >> 24) & 0xf, vmid_src=(ring_view[ring_index + 0] >> 31),
-        timestamp=ring_view[ring_index + 1] | ((ring_view[ring_index + 2] & 0xffff) << 32), timestamp_src=(ring_view[ring_index + 2] >> 31),
-        pasid=ring_view[ring_index + 3] & 0xffff, node_id=(ring_view[ring_index + 3] >> 16) & 0xff)
+    #   # while (self.rptr % self.ring_vm.size) < (wptr % self.ring_vm.size):
+    #   #   ring_index = (self.rptr % self.ring_vm.size) // 4
+    #   #   iv_entry = am.struct_amdgpu_iv_entry(client_id=ring_view[ring_index + 0] & 0xff, src_id=(ring_view[ring_index + 0] >> 8) & 0xff,
+    #   #     ring_id=(ring_view[ring_index + 0] >> 16) & 0xff, vmid=(ring_view[ring_index + 0] >> 24) & 0xf, vmid_src=(ring_view[ring_index + 0] >> 31),
+    #   #     timestamp=ring_view[ring_index + 1] | ((ring_view[ring_index + 2] & 0xffff) << 32), timestamp_src=(ring_view[ring_index + 2] >> 31),
+    #   #     pasid=ring_view[ring_index + 3] & 0xffff, node_id=(ring_view[ring_index + 3] >> 16) & 0xff)
 
-      # print(iv_entry.client_id, iv_entry.timestamp, am.soc21_ih_clientid__enumvalues.get(iv_entry.client_id, "UNK CLIENT"))
-      self.rptr += 32
+    #   #   print(iv_entry.client_id, iv_entry.timestamp, am.soc21_ih_clientid__enumvalues.get(iv_entry.client_id, "UNK CLIENT"))
+    #   #   self.rptr += 32
 
-    self.adev.regIH_RB_CNTL.update(wptr_overflow_clear=1)
-    self.adev.regIH_RB_CNTL.update(wptr_overflow_clear=0)
-    self.adev.regIH_RB_RPTR.write(self.rptr % self.ring_vm.size)
-    to_mv(self.adev.doorbell_cpu_addr, 0x2000).cast('I')[am.AMDGPU_NAVI10_DOORBELL_IH * 2] = self.rptr
+    #   print(ring_id, self.rptr, wptr)
+    #   self.rptr = wptr
+    #   if self.adev.reg(f"regIH_RB_WPTR{suf}").read(rb_overflow=1):
+    #     print("hmm")
+    #     self.adev.reg(f"regIH_RB_WPTR{suf}").update(rb_overflow=0)
+    #     self.adev.reg(f"regIH_RB_CNTL{suf}").update(wptr_overflow_clear=1)
+    #     self.adev.reg(f"regIH_RB_CNTL{suf}").update(wptr_overflow_clear=0)
+    #   self.adev.reg(f"regIH_RB_RPTR{suf}").write(self.rptr % addr_vm.size)
+    #   # self.adev.doorbell64[am.AMDGPU_NAVI10_DOORBELL_IH + ring_id] = self.rptr
+    # # to_mv(self.adev.doorbell_cpu_addr, 0x2000).cast('I')[am.AMDGPU_NAVI10_DOORBELL_IH * 2] = self.rptr
 
   def init(self):
-    self.adev.wreg_pair("regIH_RB_BASE", "", f"_HI", self.ring_vm.va_addr >> 8)
-    self.adev.regIH_RB_CNTL.write(mc_space=4, wptr_overflow_clear=1, wptr_overflow_enable=1, rb_size=(self.ring_vm.size//4).bit_length(),
-                                  wptr_writeback_enable=1, mc_snoop=1, mc_ro=0, mc_vmid=0)
-    self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.rwptr_vm.va_addr)
-    self.adev.regIH_RB_RPTR.write(0)
-    self.adev.regIH_RB_RPTR.write(0)
-    self.adev.regIH_DOORBELL_RPTR.write((am.AMDGPU_NAVI10_DOORBELL_IH * 2), enable=1)
+    self.rings = [(self.adev.mm.valloc(4 << 20, uncached=True, contigous=True), self.adev.mm.valloc(0x1000, uncached=True, contigous=True), suf, i) for i,suf in enumerate(["", "_RING1"])]
+    for ring in self.rings: self.enable_ring(*ring)
+
+    # self.ring_vm = self.adev.mm.valloc(256 << 10, uncached=True, contigous=True)
+    # self.rwptr_vm = self.adev.mm.valloc(0x1000, uncached=True, contigous=True)
+
+    # self.adev.wreg_pair("regIH_RB_BASE", "", f"_HI", self.ring_vm.va_addr >> 8)
+    # self.adev.regIH_RB_CNTL.write(mc_space=4, wptr_overflow_clear=1, wptr_overflow_enable=1, rb_size=(self.ring_vm.size//4).bit_length(),
+    #                               wptr_writeback_enable=1, mc_snoop=1, mc_ro=0, mc_vmid=0)
+    # self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.rwptr_vm.va_addr)
+    # self.adev.regIH_RB_RPTR.write(0)
+    # self.adev.regIH_RB_WPTR.write(0)
+    # self.adev.regIH_DOORBELL_RPTR.write((am.AMDGPU_NAVI10_DOORBELL_IH * 2), enable=1)
 
     self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
     self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
     self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+    self.adev.regIH_RING1_CLIENT_CFG_INDEX.update(index=0)
+    self.adev.regIH_RING1_CLIENT_CFG_DATA.update(client_id=0xa, source_id=0x0, source_id_match_enable=1)
 
     # TODO: parse from linux/include/uapi/linux/pci_regs.h
     libpciaccess.pci_device_cfg_read_u16(self.adev.pcidev, ctypes.byref(val:=ctypes.c_uint16()), 0x4)
     libpciaccess.pci_device_cfg_write_u16(self.adev.pcidev, val.value | 0x4, 0x4)
 
     # toggle interrupts
-    self.adev.reg(f"regIH_RB_CNTL").update(rb_enable=1, enable_intr=1)
+    for addr_vm, rwptr_vm, suf, ring_id in self.rings:
+      self.adev.reg(f"regIH_RB_CNTL{suf}").update(rb_enable=1, **({'enable_intr': 1} if ring_id == 0 else {}))
+    # self.adev.reg(f"regIH_RB_CNTL").update(rb_enable=1, enable_intr=1)
 
 class AM_SDMA(AM_IP):
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, doorbell:int, pipe:int, queue:int):
@@ -275,6 +308,7 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_RB_CNTL").write(rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=1,
       f32_wptr_poll_enable=1, rb_size=(ring_size//4).bit_length()-1, rb_enable=1)
     self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_IB_CNTL").update(ib_enable=1)
+    self.adev.reg(f"regSDMA{pipe}_CNTL").update(ctxempty_int_enable=1)
 
   def init(self):
     self.adev.regSDMA0_WATCHDOG_CNTL.update(queue_hang_count=100) # 10s, 100ms per unit
@@ -349,7 +383,7 @@ class AM_PSP(AM_IP):
     time.sleep(100 / 1000)
 
     self.adev.wait_reg(self.adev.regMP0_SMN_C2PMSG_64, mask=0x8000FFFF, value=0x80000000)
-  
+
   def _ring_submit(self):
     prev_wptr = self.adev.regMP0_SMN_C2PMSG_67.read()
     ring_entry_addr = self.ring_pm.cpu_addr + prev_wptr * 4
@@ -371,7 +405,7 @@ class AM_PSP(AM_IP):
 
     return resp
 
-  def _prep_ring_cmd(self, hdr): 
+  def _prep_ring_cmd(self, hdr):
     ctypes.memset(self.cmd_pm.cpu_addr, 0, 0x1000)
     cmd = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr)
     cmd.cmd_id = hdr
