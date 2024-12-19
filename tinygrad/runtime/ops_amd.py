@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List, Any, Optional, cast
-import os, ctypes, ctypes.util, functools, pathlib, mmap, errno, array, contextlib, sys, subprocess, select, struct
+import os, ctypes, ctypes.util, functools, pathlib, mmap, errno, array, contextlib, sys, subprocess, select, struct, time
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram
@@ -26,23 +26,65 @@ COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN = (1 << 0), (1 << 2), (1 << 15)
 def gfxreg(reg): return reg + 0x00001260 - amd_gpu.PACKET3_SET_SH_REG_START
 def nbioreg(reg): return reg + 0x00000d20 # NBIO_BASE__INST0_SEG2
 
+# def read_physical_memory(vaddr):
+#   # Define the page size and calculate the page index
+#   page_size = 4096
+#   page_index = vaddr // page_size
+#   offset = page_index * 8
+
+#   # Open /proc/self/pagemap to read the physical address mapping
+#   with open(f"/proc/self/pagemap", "rb") as f:
+#     f.seek(offset)
+#     # Read the entry for the page and extract the physical address
+#     paddr = struct.unpack("Q", f.read(8))[0] & ((1 << 54) - 1)
+#     paddr = paddr * page_size + (vaddr % page_size)
+
+#   # Open /dev/mem and use mmap to read from the physical address
+#   with open("/dev/mem", "r") as f:
+#     # Memory map the physical address to the process's address space
+#     mapped_addr = libc.mmap(0,
+#             8,
+#             mmap.PROT_READ,
+#             mmap.MAP_SHARED,
+#             f.fileno(),
+#             paddr)
+    
+#     # print(mapped_addr)
+
+#     # Read the 8-byte data from the mapped memory (you can change the number of bytes if needed)
+#     value = struct.unpack("Q", ctypes.string_at(mapped_addr, 8))[0]
+    
+#     # Close the memory map after reading
+#     # mem_map.close()
+    
+#     return value
+
 class AMDSignal(HCQSignal):
-  def __init__(self, base_addr:Optional[int]=None, **kwargs):
-    super().__init__(AMDDevice.signals_pool.pop() if base_addr is None else base_addr, **kwargs, timestamp_divider=100)
+  def __init__(self, dev, base_addr:Optional[int]=None, **kwargs):
+    self.dev = dev
+    super().__init__(dev.signals_pool.pop() if base_addr is None else base_addr, **kwargs, timestamp_divider=100)
 
   def __del__(self):
-    if isinstance(self.base_addr, int): AMDDevice.signals_pool.append(self.base_addr)
+    if isinstance(self.base_addr, int): self.dev.signals_pool.append(self.base_addr)
 
   def _sleep(self, time_spent_waiting_ms:int):
     # Resonable to sleep for long workloads (which take more than 2s) and only timeline signals.
-    if time_spent_waiting_ms > 2000 and self.timeline_for_device is not None: self.timeline_for_device.dev_iface.sleep(timeout=200)
+    pass
+    # self.timeline_for_device.dev_iface.adev.gmc.flush_hdp()
+    # self.timeline_for_device.dev_iface.adev.gmc.flush_tlb(ip="GC", vmid=0, flush_type=2)
+    # self.timeline_for_device.dev_iface.adev.gmc.flush_tlb(ip="MM", vmid=0, flush_type=2)
+    # if time_spent_waiting_ms > 5000: print("HMM", self.value)
+
+    # if time_spent_waiting_ms > 2000 and self.timeline_for_device is not None: self.timeline_for_device.dev_iface.sleep(timeout=200)
 
 class AMDComputeQueue(HWQueue):
   def __del__(self):
     if self.binded_device is not None:
       self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True, uncached=True))
 
-  def pkt3(self, cmd, *vals): self.q(amd_gpu.PACKET3(cmd, len(vals) - 1), *vals)
+  def pkt3(self, cmd, *vals):
+    self.q(amd_gpu.PACKET3(cmd, len(vals) - 1), *vals)
+    # self._h = array.array('I', self._q)
 
   def wait_reg_mem(self, value, mask=0xffffffff, mem=None, reg_req=None, reg_done=None):
     wrm_info_dw = amd_gpu.WAIT_REG_MEM_MEM_SPACE(int(mem is not None)) | amd_gpu.WAIT_REG_MEM_OPERATION(int(mem is None)) \
@@ -97,6 +139,7 @@ class AMDComputeQueue(HWQueue):
 
     user_regs += [*data64_le(args_state.ptr)]
 
+    assert prg.prog_addr > 0, f"Program address is not set {prg.prog_addr}"
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_LO), *data64_le(prg.prog_addr >> 8))
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_RSRC1), prg.rsrc1, prg.rsrc2)
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_RSRC3), 0)
@@ -130,9 +173,9 @@ class AMDComputeQueue(HWQueue):
     self.release_mem(signal.value_addr, value, amd_gpu.data_sel__mec_release_mem__send_32_bit_low,
                      amd_gpu.int_sel__mec_release_mem__send_interrupt_after_write_confirm, cache_flush=True)
 
-    if not AMDDevice.driverless and (dev:=signal.timeline_for_device) is not None:
-      self.release_mem(dev.queue_event_mailbox_ptr, dev.queue_event.event_id, amd_gpu.data_sel__mec_release_mem__send_32_bit_low,
-                       amd_gpu.int_sel__mec_release_mem__send_interrupt_after_write_confirm, ctxid=dev.queue_event.event_id)
+    # if not AMDDevice.driverless and (dev:=signal.timeline_for_device) is not None:
+    #   self.release_mem(dev.queue_event_mailbox_ptr, dev.queue_event.event_id, amd_gpu.data_sel__mec_release_mem__send_32_bit_low,
+    #                    amd_gpu.int_sel__mec_release_mem__send_interrupt_after_write_confirm, ctxid=dev.queue_event.event_id)
     return self
 
   def bind(self, dev:AMDDevice):
@@ -179,10 +222,11 @@ class AMDCopyQueue(HWQueue):
 
   def signal(self, signal:AMDSignal, value:sint=0):
     self.q(amd_gpu.SDMA_OP_FENCE | amd_gpu.SDMA_PKT_FENCE_HEADER_MTYPE(3), *data64_le(signal.value_addr), value)
+    # self.q(amd_gpu.SDMA_OP_GCR_REQ, 0, amd_gpu.SDMA_GCR_GLK_WB | amd_gpu.SDMA_GCR_GL2_WB, 0, 0)
 
-    if not AMDDevice.driverless and (dev:=signal.timeline_for_device) is not None:
-      self.q(amd_gpu.SDMA_OP_FENCE | amd_gpu.SDMA_PKT_FENCE_HEADER_MTYPE(3), *data64_le(dev.queue_event_mailbox_ptr), dev.queue_event.event_id)
-      self.q(amd_gpu.SDMA_OP_TRAP, amd_gpu.SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(dev.queue_event.event_id))
+    # if not AMDDevice.driverless and (dev:=signal.timeline_for_device) is not None:
+    #   self.q(amd_gpu.SDMA_OP_FENCE | amd_gpu.SDMA_PKT_FENCE_HEADER_MTYPE(3), *data64_le(dev.queue_event_mailbox_ptr), dev.queue_event.event_id)
+    #   self.q(amd_gpu.SDMA_OP_TRAP, amd_gpu.SDMA_PKT_TRAP_INT_CONTEXT_INT_CONTEXT(dev.queue_event.event_id))
 
     return self
 
@@ -515,10 +559,16 @@ class AMDDevice(HCQCompiled):
     if self.target < 100300 or self.target >= 120000: raise RuntimeError(f"Unsupported arch: {self.arch}")
 
     # TODO: think of moving this out.
-    if AMDDevice.signals_page is None:
-      AMDDevice.signals_page = self.dev_iface.alloc(16 * 65536, host=True, uncached=True, cpu_access=True)
-      AMDDevice.signals_pool = [self.signals_page.va_addr + off for off in range(0, AMDDevice.signals_page.size, 16)]
-    else: self.dev_iface.map(AMDDevice.signals_page)
+    self.signals_page = self.dev_iface.alloc(65536, uncached=True, cpu_access=True)
+    self.signals_pool = [self.signals_page.va_addr + off for off in range(0, self.signals_page.size, 16)]
+    for dev in self.devices: 
+      self.dev_iface.map(dev.signals_page)
+      dev.dev_iface.map(self.signals_page)
+
+    # if AMDDevice.signals_page is None:
+    #   AMDDevice.signals_page = self.dev_iface.alloc(16 * 65536, host=True, uncached=True, cpu_access=True)
+    #   AMDDevice.signals_pool = [self.signals_page.va_addr + off for off in range(0, AMDDevice.signals_page.size, 16)]
+    # else: self.dev_iface.map(AMDDevice.signals_page)
 
     # Scratch setup
     max_cu_id = self.dev_iface.properties['simd_count'] // self.dev_iface.properties['simd_per_cu'] - 1
@@ -548,7 +598,9 @@ class AMDDevice(HCQCompiled):
     self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
 
     super().__init__(device, AMDDriverAllocator(self), AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
-                     AMDSignal, AMDComputeQueue, AMDCopyQueue)
+                     functools.partial(AMDSignal, self), AMDComputeQueue, AMDCopyQueue)
+
+    # print(read_physical_memory(self.timeline_signal.value_addr))
 
   def create_queue(self, queue_type, ring_size, ctx_save_restore_size=0, eop_buffer_size=0, ctl_stack_size=0, debug_memory_size=0):
     ring = self.dev_iface.alloc(ring_size, uncached=True, cpu_access=True)

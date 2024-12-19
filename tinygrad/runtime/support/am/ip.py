@@ -262,7 +262,7 @@ class AM_IH(AM_IP):
     # # to_mv(self.adev.doorbell_cpu_addr, 0x2000).cast('I')[am.AMDGPU_NAVI10_DOORBELL_IH * 2] = self.rptr
 
   def init(self):
-    self.rings = [(self.adev.mm.valloc(4 << 20, uncached=True, contigous=True), self.adev.mm.valloc(0x1000, uncached=True, contigous=True), suf, i) for i,suf in enumerate(["", "_RING1"])]
+    self.rings = [(self.adev.mm.valloc(512 << 10, uncached=True, contigous=True), self.adev.mm.valloc(0x1000, uncached=True, contigous=True), suf, i) for i,suf in enumerate(["", "_RING1"])]
     for ring in self.rings: self.enable_ring(*ring)
 
     # self.ring_vm = self.adev.mm.valloc(256 << 10, uncached=True, contigous=True)
@@ -298,6 +298,7 @@ class AM_SDMA(AM_IP):
     while not self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_CONTEXT_STATUS").read(idle=1): pass
 
     # Setup the ring
+    self.adev.reg(f"regSDMA{pipe}_SEM_WAIT_FAIL_TIMER_CNTL").write(0)
     self.adev.wreg_pair(f"regSDMA{pipe}_QUEUE{queue}_RB_RPTR", "", "_HI", 0)
     self.adev.wreg_pair(f"regSDMA{pipe}_QUEUE{queue}_RB_WPTR", "", "_HI", 0)
     self.adev.wreg_pair(f"regSDMA{pipe}_QUEUE{queue}_RB_BASE", "", "_HI", ring_addr >> 8)
@@ -305,8 +306,8 @@ class AM_SDMA(AM_IP):
     self.adev.wreg_pair(f"regSDMA{pipe}_QUEUE{queue}_RB_WPTR_POLL_ADDR", "_LO", "_HI", wptr_addr)
     self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_DOORBELL_OFFSET").update(offset=doorbell * 2)
     self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_DOORBELL").update(enable=1)
-    self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_RB_CNTL").write(rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=1,
-      f32_wptr_poll_enable=1, rb_size=(ring_size//4).bit_length()-1, rb_enable=1)
+    self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_RB_CNTL").write(rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4,
+      f32_wptr_poll_enable=1, rb_size=(ring_size//4).bit_length()-1, rb_priv=1, rb_enable=1)
     self.adev.reg(f"regSDMA{pipe}_QUEUE{queue}_IB_CNTL").update(ib_enable=1)
     self.adev.reg(f"regSDMA{pipe}_CNTL").update(ctxempty_int_enable=1)
 
@@ -315,7 +316,6 @@ class AM_SDMA(AM_IP):
     self.adev.regSDMA0_UTCL1_CNTL.update(resp_mode=3, redo_delay=9)
     self.adev.regSDMA0_UTCL1_PAGE.write(0x10cec20)
     self.adev.regSDMA0_F32_CNTL.update(halt=0, th1_reset=0)
-    self.adev.regS2A_DOORBELL_ENTRY_2_CTRL.write(0x3051001d)
 
 class AM_PSP(AM_IP):
   def __init__(self, adev):
@@ -380,7 +380,7 @@ class AM_PSP(AM_IP):
     self.adev.regMP0_SMN_C2PMSG_64.write(am.PSP_RING_TYPE__KM << 16)
 
     # There might be handshake issue with hardware which needs delay
-    time.sleep(100 / 1000)
+    time.sleep(0.1)
 
     self.adev.wait_reg(self.adev.regMP0_SMN_C2PMSG_64, mask=0x8000FFFF, value=0x80000000)
 
