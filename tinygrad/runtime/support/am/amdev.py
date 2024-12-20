@@ -5,7 +5,6 @@ from tinygrad.helpers import to_mv, mv_address, getenv, round_up
 from tinygrad.runtime.autogen.am import am, mp_11_0, mp_13_0_0, nbio_4_3_0, mmhub_3_0_0, gc_11_0_0, osssys_6_0_0
 from tinygrad.runtime.support.am.mm import TLSFAllocator
 from tinygrad.runtime.support.am.ip import AM_SOC21, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
-# from tinygrad.runtime.support.hcq import BumpAllocator
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
 
@@ -311,7 +310,15 @@ class AMDev:
     # NOTE: Fixed register to query memory size without known ip bases to find the discovery table.
     #       The table is located at the end of VRAM - 64KB and is 10KB in size.
     mmRCC_CONFIG_MEMSIZE = 0xde3
+    
+    print(self.rreg(0x16061))
+
     self.vram_size = self.rreg(mmRCC_CONFIG_MEMSIZE) << 20
+
+    print(self.vram_size)
+    print("DONE")
+    exit(0)
+
     self.discovery_pm = AMPhysicalMemoryBlock(self, self.vram_size - (64 << 10), 10 << 10)
 
     bhdr = am.struct_binary_header.from_address(self.discovery_pm.cpu_addr)
