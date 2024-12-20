@@ -13,6 +13,7 @@ from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.compiler_hip import AMDCompiler
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev
+from tinygrad.runtime.support.am.asm2x6x import Asm236x
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 if getenv("MOCKGPU"): import extra.mockgpu.mockgpu # noqa: F401 # pylint: disable=unused-import
 
@@ -541,6 +542,17 @@ class VFIOIface:
     if getenv("VFIO", 1):
       x = self.irq_poller.poll(timeout)
       if len(x): os.read(self.irq_fd, 1024)
+
+class USBIface(VFIOIface):
+  iommu_set:bool = False
+  gpus:List[Any] = []
+
+  def __init__(self, dev, dev_id):
+    self.dev = dev
+    self.usb = Asm236x("/dev/sg0")
+
+    # setup pci
+    
 
 class AMDDevice(HCQCompiled):
   driverless:bool = False
