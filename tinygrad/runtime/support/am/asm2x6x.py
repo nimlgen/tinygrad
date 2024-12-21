@@ -85,10 +85,14 @@ class Asm236x(Asm2x6x):
         return bytes(data)
 
     def write(self, start_addr, data):
+        st = time.perf_counter_ns()
         for offset, value in enumerate(data):
             cdb = struct.pack('>BBBHB', 0xe5, value, 0x00, start_addr + offset, 0x00)
             ret = sgio.execute(self._file, cdb, None, None)
             assert ret == 0
+        en = time.perf_counter_ns()
+        print(f"write done in {(en-st)/len(data)*1e-6:.2}ms")
+        return en
 
     def reload(self):
         cdb = bytes.fromhex("e8 00 00 00 00 00 00 00 00 00 00 00")
@@ -163,7 +167,9 @@ class Asm236x(Asm2x6x):
 
         return self.pcie_gen_req(fmt_type, address, value, size)
 
-    def pcie_gen_req(self, fmt_type, address, value=None, size=4):
+    def pcie_gen_req(self, fmt_type, address, value=None, size=4, cnt=10):
+        xw = 0
+        st = time.perf_counter_ns()
         assert fmt_type >> 8 == 0
         assert size > 0 and size <= 4
 
@@ -177,43 +183,45 @@ class Asm236x(Asm2x6x):
         if value is not None:
             assert value >> (8 * size) == 0, f"{value}"
             shifted_value = value << (8 * offset)
-            self.write(0xB220, struct.pack('>I', shifted_value))
+            xw += self.write(0xB220, struct.pack('>I', shifted_value))
 
-        self.write(0xB210, struct.pack('>III',
+        print("hm")
+        xw += self.write(0xB210, struct.pack('>III',
             0x00000001 | (fmt_type << 24),
             byte_enable,
             masked_address,
         ))
 
         # Clear timeout bit.
-        self.write(0xB296, bytes([0x01]))
+        xw += self.write(0xB296, bytes([0x01]))
 
         # Unknown
-        self.write(0xB254, bytes([0x0f]))
+        xw += self.write(0xB254, bytes([0x0f]))
 
         # Wait for PCIe to become ready.
         while self.read(0xB296, 1)[0] & 4 == 0:
             continue
 
         # Write to CSR bit 2 to send the TLP.
-        self.write(0xB296, bytes([0x04]))
+        xw += self.write(0xB296, bytes([0x04]))
 
+        prep_st = time.perf_counter_ns()
+        
         if ((fmt_type & 0b11011111) == 0b01000000) or ((fmt_type & 0b10111000) == 0b00110000):
+            print(f"Prep waiting {(prep_st-st)*1e-6:.2}ms, xw {xw*1e-6:.2}ms")
             # This is a posted transaction, so there's no completion and we can return early.
             return
-
+        
         # Wait for completion.
-        # print(self.read(0xB296, 1)[0])
-        # print(self.read(0xB212, 1)[0])
-        # print(self.read(0xB213, 1)[0])
-        # print(self.read(0xB23e, 1)[0])
         while self.read(0xB296, 1)[0] & 2 == 0:
             # print(self.read(0xB296, 1)[0])
             if self.read(0xB296, 1)[0] & 1:
                 # Clear timeout bit.
                 self.write(0xB296, bytes([0x01]))
 
-                raise Exception("PCIe timeout!")
+                print("pci redo")
+                if cnt > 0: self.pcie_gen_req(fmt_type, address, value, size, cnt=cnt-1)
+                else: raise Exception("PCIe timeout!")
 
         # Clear done bit.
         self.write(0xB296, bytes([0x02]))
@@ -240,6 +248,9 @@ class Asm236x(Asm2x6x):
         if status or ((fmt_type & 0xbe == 0x04) and (((value is None) and (not b284_bit_0)) or ((value is not None) and b284_bit_0))):
             raise Exception("Completion status: {}, 0xB284 bit 0: {}".format(
                 status_map.get(status, "Reserved (0b{:03b})".format(status)), b284_bit_0))
+
+        en = time.perf_counter_ns()
+        print(f"Prep waiting {(prep_st-st)*1e-6:.2}ms, wt {(en-prep_st)*1e-6:.2}ms")
 
         if value is None:
             full_value = struct.unpack('>I', self.read(0xB220, 4))[0]
