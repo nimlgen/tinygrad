@@ -262,8 +262,17 @@ generate_vfio() {
 
 generate_am() {
   clang2py -k cdefstum \
-    extra/amdpci/headers/pci.h \
-    -o $BASE/pci.py
+    /usr/include/scsi/sg.h \
+    -o $BASE/scsi.py
+
+  clang2py -k cdefstum \
+    /usr/include/usb.h \
+    -l /lib/x86_64-linux-gnu/libusb-0.1.so.4.4.4 \
+    -o $BASE/libusb.py
+  
+  # clang2py -k cdefstum \
+  #   extra/amdpci/headers/pci.h \
+  #   -o $BASE/pci.py
 
   # clang2py -k cdefstum \
   #   extra/amdpci/headers/v11_structs.h \
