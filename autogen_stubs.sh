@@ -261,13 +261,13 @@ generate_vfio() {
 }
 
 generate_am() {
-  clang2py -k cdefstum \
-    /usr/include/scsi/sg.h \
-    -o $BASE/scsi.py
+  # clang2py -k cdefstum \
+  #   /usr/include/scsi/sg.h \
+  #   -o $BASE/scsi.py
 
   clang2py -k cdefstum \
-    /usr/include/usb.h \
-    -l /lib/x86_64-linux-gnu/libusb-0.1.so.4.4.4 \
+    /usr/include/libusb-1.0/libusb.h \
+    -l /usr/lib/x86_64-linux-gnu/libusb-1.0.so \
     -o $BASE/libusb.py
   
   # clang2py -k cdefstum \
