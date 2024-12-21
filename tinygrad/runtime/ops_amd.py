@@ -8,11 +8,12 @@ from tinygrad.ops import sint
 from tinygrad.device import BufferSpec
 from tinygrad.helpers import getenv, to_mv, round_up, data64_le, mv_address, from_mv, lo32, hi32
 from tinygrad.renderer.cstyle import AMDRenderer
-from tinygrad.runtime.autogen import kfd, hsa, amd_gpu, libc, libpciaccess, vfio
+from tinygrad.runtime.autogen import kfd, hsa, amd_gpu, libc, libpciaccess, vfio, pci
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.compiler_hip import AMDCompiler
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev
+from tinygrad.runtime.support.am.asm2x6x import Asm236x
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 if getenv("MOCKGPU"): import extra.mockgpu.mockgpu # noqa: F401 # pylint: disable=unused-import
 
@@ -542,6 +543,164 @@ class VFIOIface:
       x = self.irq_poller.poll(timeout)
       if len(x): os.read(self.irq_fd, 1024)
 
+class USBTrackedMemoryView:
+  def __init__(self, bar_info, usb, elsz=1):
+    (self.addr, self.size), self.usb = bar_info, usb
+    self.elsz = elsz
+    assert self.elsz <= 4 or self.elsz % 4 == 0
+
+  def _read(self, index):
+    val = 0
+    for off in range(max(1, self.elsz // 4)):
+      part = self.usb.pcie_mem_req(self.addr + index * self.elsz + off * 4, None, min(4, self.elsz))
+      val += part << (32 * off)
+    return val
+
+  def _write(self, index, value):
+    for off in range(max(1, self.elsz // 4)):
+      self.usb.pcie_mem_req(self.addr + index * self.elsz + off * 4, (value >> (32 * off)) & 0xFFFFFFFF, min(4, self.elsz))
+
+  def __getitem__(self, index): return self._read(index)
+  def __setitem__(self, index, value): return self._write(index, value)
+  def cast(self, new_type, **kwargs): return self
+  def offset(self, offset=0, elsz=None): return USBTrackedMemoryView((self.addr + offset, self.size - offset), self.usb, elsz or self.elsz)
+
+  def copyin(self, mv):
+    print("copyin", len(mv))
+    x = mv.cast({1:'B', 2:'H', 4:'I', 8:'Q'}[self.elsz])
+    for i in range(len(x)): self._write(i, x[i])
+
+  def copyout(self, mv):
+    x = mv.cast({1:'B', 2:'H', 4:'I', 8:'Q'}[self.elsz])
+    for i in range(len(x)): x[i] = self._read(i)
+
+  @property
+  def nbytes(self): return self.size
+  def __len__(self): return self.size // self.elsz
+  def __repr__(self): return "USBTrackedMemoryView"
+
+class USBIface(VFIOIface):
+  iommu_set:bool = False
+  gpus:List[Any] = []
+
+  def __init__(self, dev, dev_id):
+    self.dev = dev
+    self.usb = Asm236x("/dev/sg0")
+
+    # setup pci switch
+    self.usb.pcie_cfg_req(pci.PCI_SUBORDINATE_BUS, bus=0, dev=0, fn=0, value=3, size=1)
+    self.usb.pcie_cfg_req(pci.PCI_SECONDARY_BUS, bus=0, dev=0, fn=0, value=1, size=1)
+    self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=0, dev=0, fn=0, value=0, size=1)
+
+    self.usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=0, dev=0, fn=0, value=0x1000, size=2)
+    self.usb.pcie_cfg_req(pci.PCI_MEMORY_LIMIT, bus=0, dev=0, fn=0, value=0x2000, size=2)
+
+    self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_BASE, bus=0, dev=0, fn=0, value=0x4000, size=2)
+    self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_LIMIT, bus=0, dev=0, fn=0, value=0xffff, size=2)
+
+    for bus in [1, 2]:
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, dev=0, fn=0, value=0x1000, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_MEMORY_LIMIT, bus=bus, dev=0, fn=0, value=0x2000, size=2)
+
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_BASE, bus=bus, dev=0, fn=0, value=0x4000, size=2)
+      self.usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_LIMIT, bus=bus, dev=0, fn=0, value=0xffff, size=2)
+
+      self.usb.pcie_cfg_req(pci.PCI_SUBORDINATE_BUS, bus=bus, dev=0, fn=0, value=3, size=1)
+      self.usb.pcie_cfg_req(pci.PCI_SECONDARY_BUS, bus=bus, dev=0, fn=0, value=bus+1, size=1)
+      self.usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=bus-1, size=1)
+
+      self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bus, dev=0, fn=0, value=pci.PCI_BRIDGE_CTL_BUS_RESET, size=1)
+      time.sleep(1)
+      self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bus, dev=0, fn=0, value=pci.PCI_BRIDGE_CTL_PARITY|pci.PCI_BRIDGE_CTL_SERR, size=1)      
+      self.usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+
+    bar_next_addr, bar_off, self.bars = [0x10000000, 0x40000000], 0, {}
+    for bar_id in range(4):
+      bar_cfg = self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=3, dev=0, fn=0, size=4)
+      if bar_cfg & pci.PCI_BASE_ADDRESS_SPACE == pci.PCI_BASE_ADDRESS_SPACE_MEMORY:
+        self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=3, dev=0, fn=0, value=0xffffffff, size=4)
+        bar_size = 0xffffffff - (self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=3, dev=0, fn=0, size=4) & 0xFFFFFFF0) + 1
+        if bar_id in {0, 1, 3}:
+          is_pref = int(bool(bar_cfg & pci.PCI_BASE_ADDRESS_MEM_PREFETCH))
+          self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=3, dev=0, fn=0, value=bar_next_addr[is_pref], size=4)
+          self.bars[bar_id] = (bar_next_addr[is_pref], bar_size)
+          bar_next_addr[is_pref] += round_up(bar_size, 2 << 20)
+          print(bar_id, hex(self.usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=3, dev=0, fn=0, size=4)))
+      print(bar_id, hex(bar_cfg))
+      bar_off += 8 if bar_cfg & pci.PCI_BASE_ADDRESS_MEM_TYPE_64 else 4
+
+    cap_ptr = self.usb.pcie_cfg_req(0x34, bus=3, dev=0, fn=0, value=None, size=1)
+    caps = {}
+    while True:
+        cap_0 = self.usb.pcie_cfg_req(cap_ptr, bus=3, dev=0, fn=0, value=None, size=1)
+        cap_nxt = self.usb.pcie_cfg_req(cap_ptr+1, bus=3, dev=0, fn=0, value=None, size=1)
+        cap_len = self.usb.pcie_cfg_req(cap_ptr+2, bus=3, dev=0, fn=0, value=None, size=1)
+        # print(cap_0, cap_nxt, cap_len)
+        caps[cap_0] = cap_ptr
+        if cap_nxt == 0: break
+        cap_ptr = cap_nxt
+
+    print(caps)
+
+    pm_state = self.usb.pcie_cfg_req(caps[0x1]+4, bus=3, dev=0, fn=0, value=None, size=1)
+    self.usb.pcie_cfg_req(caps[0x1]+4, bus=3, dev=0, fn=0, value=0x0, size=1)
+    # print("PM cap now", pm_state)
+
+    self.usb.pcie_cfg_req(pci.PCI_COMMAND, bus=3, dev=0, fn=0, value=pci.PCI_COMMAND_MEMORY, size=1)
+
+    # print(caps)
+
+    # print(self.bars)
+
+    aa, size = self.bars[3]
+    # print(hex(aa))
+    # print(self.usb.pcie_mem_req(aa, None, size=4))
+    # exit(0)
+
+    # print(self.bars)
+    self.vram_bar = USBTrackedMemoryView(self.bars[0], self.usb, elsz=1)
+    self.doorbell_bar = USBTrackedMemoryView(self.bars[1], self.usb, elsz=8)
+    self.mmio_bar = USBTrackedMemoryView(self.bars[3], self.usb, elsz=4)
+    self.adev = AMDev(None, self.vram_bar, self.doorbell_bar, self.mmio_bar)
+    # print(bars)
+
+    self.properties = {'simd_count': 192, 'simd_per_cu': 2, 'max_waves_per_simd': 16, 'gfx_target_version': 110000, 'max_slots_scratch_cu': 32,
+                       'array_count': 12, 'simd_arrays_per_engine': 2, 'lds_size_in_kb': 64}
+
+  # def _tracked_view(self, va):
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, zero=False):
+    # if host:
+    #   vaddr = self.adev.mm.alloc_vaddr(size, align=mmap.PAGESIZE)
+    #   va = libc.mmap(vaddr, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | MAP_LOCKED | MAP_FIXED, -1, 0)
+
+    #   # Read pagemap to get the physical address of each page. The pages are locked.
+    #   with open("/proc/self/pagemap", "rb") as f:
+    #     for off in range(0, size, mmap.PAGESIZE):
+    #       f.seek(((va + off) // mmap.PAGESIZE) * 8)
+    #       pt_entry = struct.unpack("Q", f.read(8))[0] & ((1 << 55) - 1)
+    #       self.adev.mm.map_range(vaddr=vaddr + off, size=mmap.PAGESIZE, paddr=pt_entry * mmap.PAGESIZE, system=True, snooped=True, uncached=True)
+    #   return HCQBuffer(vaddr, size, meta=(self.dev, [self.dev], None))
+
+    vm = self.adev.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contigous=True, zero=zero)
+    tracked_mv = self.vram_bar.offset(vm.paddr, elsz=1)
+    # assert tracked_mv.size >= 0, f"{vm.paddr} {tracked_mv.size}, {tracked_mv.}"
+    return HCQBuffer(vm.va_addr, size, meta=(self.dev, [self.dev], vm, tracked_mv))
+
+  def create_queue(self, queue_type, ring, gart, eop_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0, debug_memory_size=0):
+    # print(ring.va_addr)
+
+    if queue_type == kfd.KFD_IOC_QUEUE_TYPE_SDMA:
+      doorbell_index = 0
+      pass
+      # self.adev.sdma.setup_ring(ring_addr=ring.va_addr, ring_size=ring.size, rptr_addr=gart.va_addr, wptr_addr=gart.va_addr+0x10,
+      #                           doorbell=(doorbell_index:=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0), pipe=0, queue=0)
+    else:
+      self.adev.gfx.setup_ring(ring_addr=ring.va_addr, ring_size=ring.size, rptr_addr=gart.va_addr, wptr_addr=gart.va_addr+0x10,
+        eop_addr=eop_buffer.va_addr, eop_size=eop_buffer.size, doorbell=(doorbell_index:=am.AMDGPU_NAVI10_DOORBELL_MEC_RING0), pipe=0, queue=0)
+
+    return AMDQueueDesc(ring=ring.meta[3].offset(elsz=4), doorbell=self.doorbell_bar.offset(doorbell_index * 8, elsz=8),
+                        read_ptr=gart.meta[3].offset(elsz=8), write_ptr=gart.meta[3].offset(offset=0x10, elsz=8))
+
 class AMDDevice(HCQCompiled):
   driverless:bool = False
   event_page:Any = None  # TODO: fix types in kfd, Optional[kfd.struct_kfd_ioctl_alloc_memory_of_gpu_args]
@@ -552,14 +711,15 @@ class AMDDevice(HCQCompiled):
     AMDDevice.driverless = not os.path.isdir('/sys/module/amdgpu/') or bool(getenv("AMD_DRIVERLESS", 0))
 
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
-    self.dev_iface = VFIOIface(self, self.device_id) if AMDDevice.driverless else KFDIface(self, self.device_id)
+    # self.dev_iface = VFIOIface(self, self.device_id) if AMDDevice.driverless else KFDIface(self, self.device_id)
+    self.dev_iface = USBIface(self, self.device_id)
 
     self.target = int(self.dev_iface.properties['gfx_target_version'])
     self.arch = "gfx%d%x%x" % (self.target // 10000, (self.target // 100) % 100, self.target % 100)
     if self.target < 100300 or self.target >= 120000: raise RuntimeError(f"Unsupported arch: {self.arch}")
 
     # TODO: think of moving this out.
-    self.signals_page = self.dev_iface.alloc(65536, uncached=True, cpu_access=True)
+    self.signals_page = self.dev_iface.alloc(0x1000, uncached=True, cpu_access=True, zero=True)
     self.signals_pool = [self.signals_page.va_addr + off for off in range(0, self.signals_page.size, 16)]
     for dev in self.devices: 
       self.dev_iface.map(dev.signals_page)
@@ -577,7 +737,8 @@ class AMDDevice(HCQCompiled):
     # <gfx103 requires alignment of 1024, >=gfx11 requires 256
     wave_scratch_len = round_up(((max_wave_id + 1) * self.max_private_segment_size), 256 if self.target >= 110000 else 1024)
     self.scratch_len = (max_cu_id + 1) * self.dev_iface.properties['max_slots_scratch_cu'] * wave_scratch_len
-    self.scratch = self.dev_iface.alloc(self.scratch_len)
+    self.scratch = self.dev_iface.alloc(0x1000)
+    # self.scratch = self.dev_iface.alloc(self.scratch_len)
     self.has_scratch_base_registers = self.target >= 110000
     engines = self.dev_iface.properties['array_count'] // self.dev_iface.properties['simd_arrays_per_engine']
     waves = wave_scratch_len // (256 if self.target >= 110000 else 1024)
@@ -592,20 +753,34 @@ class AMDDevice(HCQCompiled):
     ctl_stack_size = round_up(12 * (max_cu_id + 1) * (max_wave_id + 1) + 8 + 40, mmap.PAGESIZE)
     debug_memory_size = round_up((max_cu_id + 1) * (max_wave_id + 1) * 32, 64)
 
-    self.compute_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, 0x800000, ctx_save_restore_size=wg_data_size + ctl_stack_size,
+    self.compute_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, 16 << 10, ctx_save_restore_size=wg_data_size + ctl_stack_size,
                                            eop_buffer_size=0x1000, ctl_stack_size=ctl_stack_size, debug_memory_size=debug_memory_size)
 
-    self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
+    # self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
 
     super().__init__(device, AMDDriverAllocator(self), AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
                      functools.partial(AMDSignal, self), AMDComputeQueue, AMDCopyQueue)
 
+    AMDComputeQueue().signal(self.timeline_signal, self.timeline_value).submit(self)
+    self.timeline_value += 1
+
+    time.sleep(1)
+
+    sig_view = self.signals_page.meta[3].offset(self.timeline_signal.value_addr - self.signals_page.va_addr, elsz=4)
+    print(sig_view[0])
+    print(self.compute_queue.write_ptr[0], self.compute_queue.read_ptr[0])
+
+    print("OK")
+    exit(0)
+
+    # self.synchronize()
+    
     # print(read_physical_memory(self.timeline_signal.value_addr))
 
   def create_queue(self, queue_type, ring_size, ctx_save_restore_size=0, eop_buffer_size=0, ctl_stack_size=0, debug_memory_size=0):
-    ring = self.dev_iface.alloc(ring_size, uncached=True, cpu_access=True)
-    gart = self.dev_iface.alloc(0x1000, uncached=True, cpu_access=True)
-    eop_buffer = self.dev_iface.alloc(eop_buffer_size) if eop_buffer_size else None
+    ring = self.dev_iface.alloc(ring_size, uncached=True, cpu_access=True, zero=True)
+    gart = self.dev_iface.alloc(0x1000, uncached=True, cpu_access=True, zero=True)
+    eop_buffer = self.dev_iface.alloc(eop_buffer_size, zero=True) if eop_buffer_size else None
     return self.dev_iface.create_queue(queue_type, ring, gart, eop_buffer=eop_buffer, debug_memory_size=debug_memory_size,
                                        ctx_save_restore_size=ctx_save_restore_size, ctl_stack_size=ctl_stack_size)
 

@@ -179,7 +179,8 @@ class AM_GFX(AM_IP):
       cp_hqd_eop_control=self.adev.regCP_HQD_EOP_CONTROL.build(eop_size=(eop_size//4).bit_length()-2))
 
     # Copy mqd into memory
-    ctypes.memmove(mqd.cpu_addr, ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct))
+    mqd.cpu_view.copyin(to_mv(ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct)))
+    # ctypes.memmove(mqd.cpu_addr, ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct))
     self.adev.gmc.flush_hdp()
 
     self._grbm_select(me=1, pipe=pipe, queue=queue)
@@ -321,10 +322,10 @@ class AM_PSP(AM_IP):
   def __init__(self, adev):
     super().__init__(adev)
 
-    self.msg1_pm = self.adev.mm.palloc(am.PSP_1_MEG, align=am.PSP_1_MEG)
+    self.msg1_pm = self.adev.mm.palloc(am.PSP_1_MEG, align=am.PSP_1_MEG, zero=False)
     self.cmd_pm = self.adev.mm.palloc(am.PSP_CMD_BUFFER_SIZE)
     self.fence_pm = self.adev.mm.palloc(am.PSP_FENCE_BUFFER_SIZE)
-    self.ring_pm = self.adev.mm.palloc(0x10000)
+    self.ring_pm = self.adev.mm.palloc(0x10000, zero=False)
 
   def is_sos_alive(self): return self.adev.regMP0_SMN_C2PMSG_81.read() != 0x0
   def init(self):
@@ -349,8 +350,10 @@ class AM_PSP(AM_IP):
   def _wait_for_bootloader(self): self.adev.wait_reg(self.adev.regMP0_SMN_C2PMSG_35, mask=0xFFFFFFFF, value=0x80000000)
 
   def _prep_msg1(self, data):
-    ctypes.memset(self.msg1_pm.cpu_addr, 0, self.msg1_pm.size)
-    to_mv(self.msg1_pm.cpu_addr, self.msg1_pm.size)[:len(data)] = data
+    # ctypes.memset(self.msg1_pm.cpu_addr, 0, self.msg1_pm.size)
+    # to_mv(self.msg1_pm.cpu_addr, self.msg1_pm.size)[:len(data)] = data
+    x = self.msg1_pm.cpu_view.offset(elsz=4)
+    x.copyin(data)
     self.adev.gmc.flush_hdp()
 
   def _bootloader_load_component(self, fw, compid):
@@ -362,6 +365,8 @@ class AM_PSP(AM_IP):
     self.adev.regMP0_SMN_C2PMSG_36.write(self.msg1_pm.mc_addr() >> 20)
     self.adev.regMP0_SMN_C2PMSG_35.write(compid)
 
+    print("ok load", compid)
+
     return self._wait_for_bootloader()
 
   def _tmr_init(self):
@@ -369,7 +374,7 @@ class AM_PSP(AM_IP):
     self._prep_msg1(fwm:=self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_TOC])
     resp = self._load_toc_cmd(len(fwm))
 
-    self.tmr_pm = self.adev.mm.palloc(resp.resp.tmr_size, align=am.PSP_TMR_ALIGNMENT)
+    self.tmr_pm = self.adev.mm.palloc(resp.resp.tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False)
 
   def _ring_create(self):
     # Wait until the sOS is ready
@@ -384,30 +389,43 @@ class AM_PSP(AM_IP):
 
     self.adev.wait_reg(self.adev.regMP0_SMN_C2PMSG_64, mask=0x8000FFFF, value=0x80000000)
 
-  def _ring_submit(self):
+  def _ring_submit(self, cmd):
     prev_wptr = self.adev.regMP0_SMN_C2PMSG_67.read()
-    ring_entry_addr = self.ring_pm.cpu_addr + prev_wptr * 4
+    cmd_view = self.cmd_pm.cpu_view.offset(elsz=4)
+    ring_entry_view = self.ring_pm.cpu_view.offset(offset=prev_wptr * 4)
+    fence_view = self.fence_pm.cpu_view.offset(elsz=4)
 
-    ctypes.memset(ring_entry_addr, 0, ctypes.sizeof(am.struct_psp_gfx_rb_frame))
-    write_loc = am.struct_psp_gfx_rb_frame.from_address(ring_entry_addr)
+    cmd_view.copyin(to_mv(ctypes.addressof(cmd), ctypes.sizeof(cmd)))
+
+    prev_wptr = self.adev.regMP0_SMN_C2PMSG_67.read()
+
+    # ring_entry_addr = self.ring_pm.cpu_addr + prev_wptr * 4
+
+    # ctypes.memset(ring_entry_addr, 0, ctypes.sizeof(am.struct_psp_gfx_rb_frame))
+    write_loc = am.struct_psp_gfx_rb_frame()
     write_loc.cmd_buf_addr_hi, write_loc.cmd_buf_addr_lo = data64(self.cmd_pm.mc_addr())
     write_loc.fence_addr_hi, write_loc.fence_addr_lo = data64(self.fence_pm.mc_addr())
     write_loc.fence_value = prev_wptr
+    ring_entry_view.copyin(to_mv(ctypes.addressof(write_loc), ctypes.sizeof(write_loc)))
 
     # Move the wptr
     self.adev.regMP0_SMN_C2PMSG_67.write(prev_wptr + ctypes.sizeof(am.struct_psp_gfx_rb_frame) // 4)
 
-    while to_mv(self.fence_pm.cpu_addr, 4).cast('I')[0] != prev_wptr: pass
+    while fence_view[0] != prev_wptr: pass
     time.sleep(0.05)
 
-    resp = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr)
+    cmd_view.copyout(to_mv(ctypes.addressof(cmd), ctypes.sizeof(cmd)))
+
+    print("ok fence", prev_wptr)
+
+    resp = cmd
     if resp.resp.status != 0: raise RuntimeError(f"PSP command failed {resp.cmd_id} {resp.resp.status}")
 
     return resp
 
   def _prep_ring_cmd(self, hdr):
-    ctypes.memset(self.cmd_pm.cpu_addr, 0, 0x1000)
-    cmd = am.struct_psp_gfx_cmd_resp.from_address(self.cmd_pm.cpu_addr)
+    # ctypes.memset(self.cmd_pm.cpu_addr, 0, 0x1000)
+    cmd = am.struct_psp_gfx_cmd_resp()
     cmd.cmd_id = hdr
     return cmd
 
@@ -419,7 +437,7 @@ class AM_PSP(AM_IP):
     cmd.cmd.cmd_load_ip_fw.fw_phy_addr_hi, cmd.cmd.cmd_load_ip_fw.fw_phy_addr_lo = data64(self.msg1_pm.mc_addr())
     cmd.cmd.cmd_load_ip_fw.fw_size = len(fw_bytes)
     cmd.cmd.cmd_load_ip_fw.fw_type = fw_type
-    return self._ring_submit()
+    return self._ring_submit(cmd)
 
   def _tmr_load_cmd(self):
     cmd = self._prep_ring_cmd(am.GFX_CMD_ID_SETUP_TMR)
@@ -427,14 +445,14 @@ class AM_PSP(AM_IP):
     cmd.cmd.cmd_setup_tmr.system_phy_addr_hi, cmd.cmd.cmd_setup_tmr.system_phy_addr_lo = data64(self.tmr_pm.paddr)
     cmd.cmd.cmd_setup_tmr.bitfield.virt_phy_addr = 1
     cmd.cmd.cmd_setup_tmr.buf_size = self.tmr_pm.size
-    return self._ring_submit()
+    return self._ring_submit(cmd)
 
   def _load_toc_cmd(self, toc_size):
     cmd = self._prep_ring_cmd(am.GFX_CMD_ID_LOAD_TOC)
     cmd.cmd.cmd_load_toc.toc_phy_addr_hi, cmd.cmd.cmd_load_toc.toc_phy_addr_lo = data64(self.msg1_pm.mc_addr())
     cmd.cmd.cmd_load_toc.toc_size = toc_size
-    return self._ring_submit()
+    return self._ring_submit(cmd)
 
   def _rlc_autoload_cmd(self):
-    self._prep_ring_cmd(am.GFX_CMD_ID_AUTOLOAD_RLC)
-    return self._ring_submit()
+    cmd = self._prep_ring_cmd(am.GFX_CMD_ID_AUTOLOAD_RLC)
+    return self._ring_submit(cmd)

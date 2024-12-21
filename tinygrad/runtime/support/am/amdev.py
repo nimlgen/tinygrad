@@ -1,13 +1,16 @@
 from __future__ import annotations
-import os, ctypes, collections, time
+import os, ctypes, collections, time, pathlib
 from typing import Tuple, Dict, Set, Optional, Generator, List
-from tinygrad.helpers import to_mv, mv_address, getenv, round_up
+from tinygrad.helpers import to_mv, mv_address, getenv, round_up, fetch, Profiling
 from tinygrad.runtime.autogen.am import am, mp_11_0, mp_13_0_0, nbio_4_3_0, mmhub_3_0_0, gc_11_0_0, osssys_6_0_0
 from tinygrad.runtime.support.am.mm import TLSFAllocator
 from tinygrad.runtime.support.am.ip import AM_SOC21, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
-# from tinygrad.runtime.support.hcq import BumpAllocator
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
+
+# class PCIBar:
+#   def __init__(self):
+#     pass
 
 class AMRegister:
   def __init__(self, adev, reg_off:int, reg_fields:Dict[str, Tuple[int, int]]):
@@ -38,7 +41,7 @@ class AMFirmware:
     # Load SOS firmware
     self.sos_fw = {}
 
-    blob, sos_hdr = self.load_fw("/lib/firmware/amdgpu/psp_13_0_0_sos.bin", am.struct_psp_firmware_header_v2_0)
+    blob, sos_hdr = self.load_fw("psp_13_0_0_sos.bin", am.struct_psp_firmware_header_v2_0)
     fw_bin = sos_hdr.psp_fw_bin
 
     for fw_i in range(sos_hdr.psp_fw_bin_count):
@@ -50,17 +53,17 @@ class AMFirmware:
     self.ucode_start: Dict[str, int] = {}
     self.descs: List[Tuple[int, memoryview]] = []
 
-    blob, hdr = self.load_fw("/lib/firmware/amdgpu/smu_13_0_0.bin", am.struct_smc_firmware_header_v1_0)
+    blob, hdr = self.load_fw("smu_13_0_0.bin", am.struct_smc_firmware_header_v1_0)
     self.smu_psp_desc = self.desc(am.GFX_FW_TYPE_SMU, blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes)
 
     # SDMA firmware
-    blob, hdr = self.load_fw("/lib/firmware/amdgpu/sdma_6_0_0.bin", am.struct_sdma_firmware_header_v2_0)
+    blob, hdr = self.load_fw("sdma_6_0_0.bin", am.struct_sdma_firmware_header_v2_0)
     self.descs += [self.desc(am.GFX_FW_TYPE_SDMA_UCODE_TH0, blob, hdr.header.ucode_array_offset_bytes, hdr.ctx_ucode_size_bytes)]
     self.descs += [self.desc(am.GFX_FW_TYPE_SDMA_UCODE_TH1, blob, hdr.ctl_ucode_offset, hdr.ctl_ucode_size_bytes)]
 
     # PFP, ME, MEC firmware
     for (fw_name, fw_cnt) in [('PFP', 2), ('ME', 2), ('MEC', 4)]:
-      blob, hdr = self.load_fw(f"/lib/firmware/amdgpu/gc_11_0_0_{fw_name.lower()}.bin", am.struct_gfx_firmware_header_v2_0)
+      blob, hdr = self.load_fw(f"gc_11_0_0_{fw_name.lower()}.bin", am.struct_gfx_firmware_header_v2_0)
 
       # Code part
       self.descs += [self.desc(getattr(am, f'GFX_FW_TYPE_RS64_{fw_name}'), blob, hdr.header.ucode_array_offset_bytes, hdr.ucode_size_bytes)]
@@ -71,12 +74,12 @@ class AMFirmware:
       self.ucode_start[fw_name] = hdr.ucode_start_addr_lo | (hdr.ucode_start_addr_hi << 32)
 
     # IMU firmware
-    blob, hdr = self.load_fw("/lib/firmware/amdgpu/gc_11_0_0_imu.bin", am.struct_imu_firmware_header_v1_0)
+    blob, hdr = self.load_fw("gc_11_0_0_imu.bin", am.struct_imu_firmware_header_v1_0)
     imu_i_off, imu_i_sz, imu_d_sz = hdr.header.ucode_array_offset_bytes, hdr.imu_iram_ucode_size_bytes, hdr.imu_dram_ucode_size_bytes
     self.descs += [self.desc(am.GFX_FW_TYPE_IMU_I, blob, imu_i_off, imu_i_sz), self.desc(am.GFX_FW_TYPE_IMU_D, blob, imu_i_off + imu_i_sz, imu_d_sz)]
 
     # RLC firmware
-    blob, hdr0, hdr1, hdr2, hdr3 = self.load_fw("/lib/firmware/amdgpu/gc_11_0_0_rlc.bin", am.struct_rlc_firmware_header_v2_0,
+    blob, hdr0, hdr1, hdr2, hdr3 = self.load_fw("gc_11_0_0_rlc.bin", am.struct_rlc_firmware_header_v2_0,
       am.struct_rlc_firmware_header_v2_1, am.struct_rlc_firmware_header_v2_2, am.struct_rlc_firmware_header_v2_3)
 
     for mem in ['GPM', 'SRM']:
@@ -93,22 +96,25 @@ class AMFirmware:
 
     self.descs += [self.desc(am.GFX_FW_TYPE_RLC_G, blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes)]
 
-  def load_fw(self, path:str, *headers):
-    with open(path, "rb") as f: blob = memoryview(bytearray(f.read()))
+  def load_fw(self, fname:str, *headers):
+    if not (path:=pathlib.Path(f"/lib/firmware/amdgpu/{fname}")).exists():
+      path = fetch(f"https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/amdgpu/{fname}")
+
+    blob = memoryview(bytearray(path.read_bytes()))
     return tuple([blob] + [hdr.from_address(mv_address(blob)) for hdr in headers])
 
   def desc(self, typ:int, blob:memoryview, offset:int, size:int) -> Tuple[int, memoryview]: return (typ, blob[offset:offset+size])
 
 class AMPhysicalMemoryBlock:
-  def __init__(self, adev:AMDev, paddr:int, size:int): self.adev, self.paddr, self.size, self.cpu_addr = adev, paddr, size,mv_address(adev.vram)+paddr
+  def __init__(self, adev:AMDev, paddr:int, size:int): self.adev, self.paddr, self.size, self.cpu_view = adev, paddr, size, adev.vram.offset(offset=paddr)
   def mc_addr(self): return self.adev.gmc.mc_base + self.paddr
 
 class AMVirtualMapping:
-  def __init__(self, va_addr:int, size:int, cpu_addr:Optional[int], paddr:Optional[int]):
-    self.va_addr, self.size, self.cpu_addr, self.paddr = va_addr, size, cpu_addr, paddr
+  def __init__(self, va_addr:int, size:int, cpu_view:Optional[int], paddr:Optional[int]):
+    self.va_addr, self.size, self.cpu_view, self.paddr = va_addr, size, cpu_view, paddr
 
 class AMPageTableEntry:
-  def __init__(self, pm:AMPhysicalMemoryBlock, lv:int): self.pm, self.view, self.lv = pm, to_mv(pm.cpu_addr, pm.size).cast('Q'), lv
+  def __init__(self, pm:AMPhysicalMemoryBlock, lv:int): self.pm, self.view, self.lv = pm, pm.cpu_view.offset(elsz=8), lv
 
   def set_table(self, entry_id, pte:AMPageTableEntry, valid=True):
     self.view[entry_id] = (pte.pm.paddr & 0x0000FFFFFFFFF000) | (am.AMDGPU_PTE_VALID if valid else 0)
@@ -225,10 +231,10 @@ class AMMemoryManager:
   @staticmethod
   def alloc_vaddr(size:int, align=0x1000) -> int: return AMMemoryManager.va_allocator.alloc(size, max((1 << (size.bit_length() - 1)), align))
 
-  def valloc(self, size:int, align=0x1000, uncached=False, contigous=False) -> AMVirtualMapping:
-    pm = self.palloc(round_up(size, 0x1000), zero=True) if contigous else None
+  def valloc(self, size:int, align=0x1000, uncached=False, contigous=False, zero=False) -> AMVirtualMapping:
+    pm = self.palloc(round_up(size, 0x1000), zero=zero) if contigous else None
     self.map_range(va:=self.alloc_vaddr(size, align), size, paddr=pm.paddr if pm else None, uncached=uncached)
-    return AMVirtualMapping(va, size, pm.cpu_addr if pm is not None else None, pm.paddr if pm is not None else None)
+    return AMVirtualMapping(va, size, pm.cpu_view if pm is not None else None, pm.paddr if pm is not None else None)
 
   def vfree(self, vm:AMVirtualMapping):
     self.unmap_range(vm.va_addr, vm.size, free_paddrs=(vm.paddr is None))
@@ -237,7 +243,12 @@ class AMMemoryManager:
 
   def palloc(self, size, align=0x1000, zero=True) -> AMPhysicalMemoryBlock:
     pm = AMPhysicalMemoryBlock(self.adev, self.pa_allocator.alloc(round_up(size, 0x1000), align), size)
-    if zero: ctypes.memset(pm.cpu_addr, 0, pm.size)
+    if zero: 
+      x = pm.cpu_view.offset(elsz=4)
+      # print(pm.size)
+      for i in range(pm.size // 4): x[i] = 0
+      print("done")
+      # ctypes.memset(pm.cpu_view, 0, pm.size)
     return pm
 
   def pfree(self, pm:AMPhysicalMemoryBlock): self.pa_allocator.free(pm.paddr)
@@ -268,8 +279,12 @@ class AMDev:
     if self.psp.is_sos_alive(): self.smu.mode1_reset()
 
     # Initialize all blocks
-    for ip in [self.soc21, self.gmc, self.ih, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
-    # for ip in [self.soc21, self.gmc, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
+    # for ip in [self.soc21, self.gmc, self.ih, self.psp, self.smu, self.gfx, self.sdma]: ip.init()
+
+    # this is done :)
+    for ip in [self.soc21, self.gmc, self.psp, self.smu, self.gfx]: ip.init()
+    # for ip in [self.gfx]: ip.init()
+
 
   def ip_base(self, ip:str, inst:int, seg:int) -> int: return self.regs_offset[am.__dict__.get(f"{ip}_HWIP")][inst][seg]
 
@@ -312,27 +327,31 @@ class AMDev:
     #       The table is located at the end of VRAM - 64KB and is 10KB in size.
     mmRCC_CONFIG_MEMSIZE = 0xde3
     self.vram_size = self.rreg(mmRCC_CONFIG_MEMSIZE) << 20
-    self.discovery_pm = AMPhysicalMemoryBlock(self, self.vram_size - (64 << 10), 10 << 10)
 
-    bhdr = am.struct_binary_header.from_address(self.discovery_pm.cpu_addr)
-    ihdr = am.struct_ip_discovery_header.from_address(ctypes.addressof(bhdr) + bhdr.table_list[am.IP_DISCOVERY].offset)
-    assert ihdr.signature == am.DISCOVERY_TABLE_SIGNATURE and not ihdr.base_addr_64_bit
+    # TODO: think of this
+    self.regs_offset = {13: {0: [3072, 37784576]}, 28: {0: [93184, 37754880], 1: [201327616, 201461760], 2: [209716224, 209850368], 3: [218104832, 218238976], 4: [226493440, 226627584], 5: [234882048, 235016192], 6: [243270656, 243404800]}, 21: {0: [28672, 12582912, 37795840, 130023424, 306184192], 1: [201326592, 201463808, 201465856, 204210176, 204472320], 2: [209715200, 209852416, 209854464, 212598784, 212860928], 3: [218103808, 218241024, 218243072, 220987392, 221249536], 4: [226492416, 226629632, 226631680, 229376000, 229638144], 5: [234881024, 235018240, 235020288, 237764608, 238026752], 6: [243269632, 243406848, 243408896, 246153216, 246415360]}, 22: {0: [18, 192, 13504, 36864, 37764096]}, 1: {0: [4704, 40960, 114688, 37760000]}, 2: {0: [3872, 37790720]}, 11: {0: [70656, 38103040]}, 12: {0: [106496, 37783552]}, 15: {0: [90112, 14417920, 14680064, 14942208, 38009856]}, 16: {0: [90112, 14417920, 14680064, 14942208, 38009856]}, 14: {0: [0, 20, 3360, 66560, 37859328, 67371008]}, 26: {0: [0, 20, 3360, 66560, 37859328, 67371008]}, 23: {0: [4256, 37789696]}, 33: {0: [0, 20, 3360, 66560, 37859328, 67371008]}, 25: {0: []}, 3: {0: [4704, 40960, 114688, 37760000]}, 4: {0: [4704, 40960, 114688, 37760000]}, 24: {0: [92160, 92672, 37752832, 54788096]}, 27: {0: [91648, 37751808], 1: [201339904, 201458176], 2: [209728512, 209846784], 3: [218117120, 218235392], 4: [226505728, 226624000], 5: [234894336, 235012608], 6: [243282944, 243401216]}, 29: {0: [201342976, 201344000, 205520896, 205537280], 1: [209731584, 209732608, 213909504, 213925888], 2: [218120192, 218121216, 222298112, 222314496], 3: [226508800, 226509824, 230686720, 230703104], 4: [234897408, 234898432, 239075328, 239091712], 5: [243286016, 243287040, 247463936, 247480320]}, 17: {0: [30720, 32256], 1: [31488, 73728]}}
 
-    # Mapping of HW IP to Discovery HW IP
-    hw_id_map = {am.__dict__[x]: int(y) for x,y in am.hw_id_map}
-    self.regs_offset = collections.defaultdict(dict)
+    # self.discovery_pm = AMPhysicalMemoryBlock(self, self.vram_size - (64 << 10), 10 << 10)
 
-    for num_die in range(ihdr.num_dies):
-      dhdr = am.struct_die_header.from_address(ctypes.addressof(bhdr) + ihdr.die_info[num_die].die_offset)
+    # bhdr = am.struct_binary_header.from_address(self.discovery_pm.cpu_addr)
+    # ihdr = am.struct_ip_discovery_header.from_address(ctypes.addressof(bhdr) + bhdr.table_list[am.IP_DISCOVERY].offset)
+    # assert ihdr.signature == am.DISCOVERY_TABLE_SIGNATURE and not ihdr.base_addr_64_bit
 
-      ip_offset = ctypes.addressof(bhdr) + ctypes.sizeof(dhdr) + ihdr.die_info[num_die].die_offset
-      for num_ip in range(dhdr.num_ips):
-        ip = am.struct_ip_v4.from_address(ip_offset)
-        ba = (ctypes.c_uint32 * ip.num_base_address).from_address(ip_offset + 8)
-        for hw_ip in range(1, am.MAX_HWIP):
-          if hw_ip in hw_id_map and hw_id_map[hw_ip] == ip.hw_id: self.regs_offset[hw_ip][ip.instance_number] = [x for x in ba]
+    # # Mapping of HW IP to Discovery HW IP
+    # hw_id_map = {am.__dict__[x]: int(y) for x,y in am.hw_id_map}
+    # self.regs_offset = collections.defaultdict(dict)
 
-        ip_offset += 8 + (8 if ihdr.base_addr_64_bit else 4) * ip.num_base_address
+    # for num_die in range(ihdr.num_dies):
+    #   dhdr = am.struct_die_header.from_address(ctypes.addressof(bhdr) + ihdr.die_info[num_die].die_offset)
+
+    #   ip_offset = ctypes.addressof(bhdr) + ctypes.sizeof(dhdr) + ihdr.die_info[num_die].die_offset
+    #   for num_ip in range(dhdr.num_ips):
+    #     ip = am.struct_ip_v4.from_address(ip_offset)
+    #     ba = (ctypes.c_uint32 * ip.num_base_address).from_address(ip_offset + 8)
+    #     for hw_ip in range(1, am.MAX_HWIP):
+    #       if hw_ip in hw_id_map and hw_id_map[hw_ip] == ip.hw_id: self.regs_offset[hw_ip][ip.instance_number] = [x for x in ba]
+
+    #     ip_offset += 8 + (8 if ihdr.base_addr_64_bit else 4) * ip.num_base_address
 
   def _build_regs(self):
     mods = [("MP0", mp_13_0_0), ("MP1", mp_11_0, "mmMP1"), ("NBIO", nbio_4_3_0), ("MMHUB", mmhub_3_0_0), ("GC", gc_11_0_0), ("OSSSYS", osssys_6_0_0)]

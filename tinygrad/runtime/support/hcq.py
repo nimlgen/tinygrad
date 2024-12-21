@@ -346,8 +346,8 @@ class HCQCompiled(Compiled, Generic[SignalType]):
     self.device_id:int = int(device.split(":")[1]) if ":" in device else 0
     self.signal_t, self.hw_compute_queue_t, self.hw_copy_queue_t = signal_t, comp_queue_t, copy_queue_t
     self.timeline_value:int = 1
-    self.timeline_signal:SignalType = self.signal_t(value=0, timeline_for_device=self)
-    self._shadow_timeline_signal:SignalType = self.signal_t(value=0, timeline_for_device=self)
+    self.timeline_signal:SignalType = self.signal_t(value=None, timeline_for_device=self)
+    self._shadow_timeline_signal:SignalType = self.signal_t(value=None, timeline_for_device=self)
     self.sig_prof_records:List[Tuple[HCQSignal, HCQSignal, str, bool]] = []
     self.raw_prof_records:List[Tuple[decimal.Decimal, decimal.Decimal, str, bool, Optional[Dict]]] = []
     self.dep_prof_records:List[Tuple[decimal.Decimal, decimal.Decimal, HCQCompiled, bool, decimal.Decimal, decimal.Decimal, HCQCompiled, bool]] = []

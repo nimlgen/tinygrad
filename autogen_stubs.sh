@@ -261,18 +261,31 @@ generate_vfio() {
 }
 
 generate_am() {
+  # clang2py -k cdefstum \
+  #   /usr/include/scsi/sg.h \
+  #   -o $BASE/scsi.py
+
   clang2py -k cdefstum \
-    extra/amdpci/headers/v11_structs.h \
-    extra/amdpci/headers/amdgpu_vm.h \
-    extra/amdpci/headers/discovery.h \
-    extra/amdpci/headers/amdgpu_ucode.h \
-    extra/amdpci/headers/soc21_enum.h \
-    extra/amdpci/headers/psp_gfx_if.h \
-    extra/amdpci/headers/amdgpu_psp.h \
-    extra/amdpci/headers/amdgpu_irq.h \
-    extra/amdpci/headers/amdgpu_doorbell.h \
-    extra/amdpci/headers/soc15_ih_clientid.h \
-    -o $BASE/am/am.py
+    /usr/include/libusb-1.0/libusb.h \
+    -l /usr/lib/x86_64-linux-gnu/libusb-1.0.so \
+    -o $BASE/libusb.py
+  
+  # clang2py -k cdefstum \
+  #   extra/amdpci/headers/pci.h \
+  #   -o $BASE/pci.py
+
+  # clang2py -k cdefstum \
+  #   extra/amdpci/headers/v11_structs.h \
+  #   extra/amdpci/headers/amdgpu_vm.h \
+  #   extra/amdpci/headers/discovery.h \
+  #   extra/amdpci/headers/amdgpu_ucode.h \
+  #   extra/amdpci/headers/soc21_enum.h \
+  #   extra/amdpci/headers/psp_gfx_if.h \
+  #   extra/amdpci/headers/amdgpu_psp.h \
+  #   extra/amdpci/headers/amdgpu_irq.h \
+  #   extra/amdpci/headers/amdgpu_doorbell.h \
+  #   extra/amdpci/headers/soc15_ih_clientid.h \
+  #   -o $BASE/am/am.py
 
   # clang2py -k cdefstum \
   #   extra/amdpci/headers/mp_13_0_0_offset.h \
