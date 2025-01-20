@@ -128,12 +128,16 @@ class GraphRunner(Runner):
 class MultiGraphRunner(GraphRunner): pass
 
 def update_depends(depends:set[Buffer|None], jit_cache:list[ExecItem]):
+  def base(b): return b if b is None else b.base
+
   for ei in jit_cache:
-    if any(b in depends for b in ei.bufs):
+    if any(base(b) in depends for b in ei.bufs):
       if isinstance(ei.prg, CompiledRunner):
         depends.update(cast(Buffer, ei.bufs[out]) for out in ei.prg.p.outs if out not in ei.prg.p.ins)
+        depends.update(cast(Buffer, base(ei.bufs[out])) for out in ei.prg.p.outs if out not in ei.prg.p.ins)
       if isinstance(ei.prg, (BufferCopy, BufferXfer)):
         depends.add(cast(Buffer, ei.bufs[0]))
+        depends.add(cast(Buffer, base(ei.bufs[0])))
 
 ReturnType = TypeVar('ReturnType')
 @dataclass
@@ -160,11 +164,33 @@ class CapturedJit(Generic[ReturnType]):
     for (j,i) in self._input_replace.keys(): self._jit_cache[j].bufs[i] = None
 
   def free_intermediates(self):
+    was_in_output = set()
+    b_deps_1 = set()
+    b_deps_2 = set()
+    
+    # for ei in self.jit_cache:
+    #   for b in ei.bufs:
+    #     if b is not None and b.base in was_in_output:
+    #       if b.base.is_allocated():
+    #         b.base.deallocate()
+    #         b_deps_1.add(b.base)
+    #         # print("WILL DEALLOCATE")
+    #   if isinstance(ei.prg, CompiledRunner): was_in_output.update(ei.prg.p.outs)
+    #   elif isinstance(ei.prg, (BufferCopy, BufferXfer)): was_in_output.add(ei.bufs[0])
+
     depends: set[Buffer|None] = set([None])
     update_depends(depends, self.jit_cache)
+    # print("DID DEALLOCATE")
+    self.b_deps = []
     for b in depends:
-      if b is not None: b.deallocate()
-    self.__post_init__()   # reset the graph state
+      if b is not None:
+        self.b_deps.append((b, b._buf.va_addr))
+        b_deps_2.add(b.base)
+        b.deallocate()
+        # if b.is_allocated(): b.deallocate()
+
+    # assert len(b_deps_2) == len(b_deps_1), f"hmm, why??? {len(b_deps_2)} == {len(b_deps_1)}"
+    self.__post_init__() # reset the graph state
 
   # jit exec
   def __call__(self, input_buffers:list[Buffer], var_vals:dict[Variable, int]) -> ReturnType:
@@ -179,8 +205,29 @@ class CapturedJit(Generic[ReturnType]):
       for ji in self.jit_cache:
         for b in ji.bufs:
           if b is not None: b.ensure_allocated()
+
+      old_addrs = set()
+      if hasattr(self, 'b_deps'):
+        for b,old_addr in self.b_deps:
+          if b is not None:
+            assert b.is_allocated()
+            b.ensure_allocated()
+            old_addrs.add(old_addr)
+            # print('buf', hex(old_addr), hex(b.base._buf.va_addr), hex(b._buf.va_addr))
+
       # create graph if needed
       if JIT < 2:
+        print("WILL INIT GRAPH", len(self.jit_cache), len(old_addrs))
+        # print(self.jit_cache)
+
+        for ji in self.jit_cache:
+          for b in ji.bufs:
+            if b is not None and hasattr(b._buf, 'va_addr'):
+              # print(b._buf.va_addr)
+              if b._buf.va_addr in old_addrs:
+                print("Broken", hex(b._buf.va_addr), hex(b.base._buf.va_addr))
+              # assert b._buf.va_addr not in old_addrs
+
         self._jit_cache = apply_graph_to_jit(self.jit_cache, input_buffers, var_vals, max_batch_size=getenv("JIT_BATCH_SIZE", 32))
         self._input_replace = get_input_replace(self._jit_cache, input_buffers)
       self._first_run = False
