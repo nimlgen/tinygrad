@@ -22,7 +22,7 @@ import argparse
 import os
 import struct
 import sys
-import time
+import time, fcntl, ctypes, mmap
 from pathlib import Path
 
 try:
@@ -31,10 +31,35 @@ except ModuleNotFoundError:
     sys.stderr.write("Error: Failed to import \"sgio\". Please install \"cython-sgio\", then try running this script again.\n")
     sys.exit(1)
 
+from tinygrad.runtime.autogen import scsi, io_uring, libc
+from tinygrad.helpers import mv_address
+
+
+MAP_LOCKED, MAP_POPULATE = 0x2000, getattr(mmap, "MAP_POPULATE", 0x008000)
 
 class Asm2x6x:
     def __init__(self, dev_path):
         self._file = os.fdopen(os.open(dev_path, os.O_RDWR | os.O_NONBLOCK))
+
+        # fd = libc.syscall(io_uring.NR_io_uring_setup, 4096, ctypes.byref(p:=io_uring.struct_io_uring_params()))
+        # if fd < 0: return
+
+        # sq_ptr = libc.mmap(0, p.sq_off.array + p.sq_entries * 4, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_POPULATE, fd, 0)
+        # cq_ptr = libc.mmap(0, p.cq_off.cqes + p.cq_entries * ctypes.sizeof(io_uring.struct_io_uring_cqe),
+        #                     mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_POPULATE, fd, io_uring.IORING_OFF_CQ_RING)
+        # sqes = libc.mmap(0, p.sq_entries * ctypes.sizeof(io_uring.struct_io_uring_sqe),
+        #                 mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_POPULATE, fd, io_uring.IORING_OFF_SQES)
+
+        # def u32ptr(val): return ctypes.cast(val, ctypes.POINTER(ctypes.c_uint32))
+        # sqdesc = io_uring.struct_io_uring_sq(khead=u32ptr(sq_ptr+p.sq_off.head), ktail=u32ptr(sq_ptr+p.sq_off.tail),
+        #                                     array=u32ptr(sq_ptr+p.sq_off.array),
+        #     kring_mask=u32ptr(sq_ptr+p.sq_off.ring_mask), sqes=ctypes.cast(sqes, ctypes.POINTER(io_uring.struct_io_uring_sqe)))
+
+        # cqdesc = io_uring.struct_io_uring_cq(khead=u32ptr(cq_ptr+p.cq_off.head), ktail=u32ptr(cq_ptr+p.cq_off.tail),
+        #     kring_mask=u32ptr(sq_ptr+p.cq_off.ring_mask), cqes=ctypes.cast(cq_ptr+p.cq_off.cqes, ctypes.POINTER(io_uring.struct_io_uring_cqe)))
+
+        # self.io_uring = io_uring.struct_io_uring(ring_fd=fd, sq=sqdesc, cq=cqdesc) # type: ignore
+
 
     def get_fw_version_data(self):
         return self.read(0x07f0, 6)
@@ -85,6 +110,84 @@ class Asm236x(Asm2x6x):
         return bytes(data)
 
     def write(self, start_addr, data):
+        # Prepare the sg device I/O header structure.
+        # x = struct.pack('>BBBHB', 0xe5, value, 0x00, start_addr + offset, 0x00)
+        st = time.perf_counter_ns()
+        cdb = memoryview(bytearray(struct.pack('>BBBHB', 0xe5, 0x0, 0x00, 0x0, 0x00)))
+        sense = memoryview(bytearray(32))
+        io_hdr = scsi.struct_sg_io_hdr(interface_id=ord('S'), cmd_len=6, timeout=1800000, mx_sb_len=32,
+                                       dxfer_direction=scsi.SG_DXFER_NONE,
+            sbp=ctypes.cast(mv_address(sense), ctypes.POINTER(ctypes.c_ubyte)), cmdp=ctypes.cast(mv_address(cdb), ctypes.POINTER(ctypes.c_ubyte)))
+
+        for offset, value in enumerate(data):
+            cdb[1] = value
+            cdb[3] = (start_addr + offset) >> 8
+            cdb[4] = (start_addr + offset) & 0xff
+
+            # self._file.write(cdb)
+            # os.write(self._file.fileno(), cdb)
+
+            fcntl.ioctl(self._file.fileno(), scsi.SG_IO, io_hdr)
+            # cdb = struct.pack('>BBBHB', 0xe5, value, 0x00, start_addr + offset, 0x00)
+            # ret = sgio.execute(self._file, cdb, None, None)
+            # assert ret == 0
+        en = time.perf_counter_ns()
+        print(f"write done in {(en-st)/len(data)*1e-6:.2}ms")
+
+        # fcntl.ioctl(self._file, scsi.SG_IO, ctypes.byref(io_hdr))
+
+        # ioctl(fid.fileno(), SG_IO, &io_hdr)
+
+        # io_hdr.interface_id = b'S'
+        # io_hdr.cmd_len = len(cdb)
+        # io_hdr.iovec_count = 0
+        # io_hdr.cmdp = cdb
+        # io_hdr.sbp = sense
+        # io_hdr.timeout = 1800000
+        # io_hdr.flags = 0
+        # io_hdr.mx_sb_len = max_sense_data_length
+
+        # if data_out is not None:
+        #     data_out_len = len(data_out)
+        # else:
+        #     data_out_len = 0
+
+        # if data_in is not None:
+        #     data_in_len = len(data_in)
+        # else:
+        #     data_in_len = 0
+
+        # if data_out_len and data_in_len:
+        #     raise NotImplemented('Indirect IO is not supported.')
+        # elif data_out_len:
+        #     io_hdr.dxfer_direction = SG_DXFER_TO_DEV
+        #     io_hdr.dxfer_len = data_out_len
+        #     io_hdr.dxferp = data_out
+        # elif data_in_len:
+        #     io_hdr.dxfer_direction = SG_DXFER_FROM_DEV
+        #     io_hdr.dxfer_len = data_in_len
+        #     io_hdr.dxferp = &input_view[0]
+        # else:
+        #     io_hdr.dxfer_len = 0
+        #     io_hdr.dxferp = NULL
+        #     io_hdr.dxfer_direction = SG_DXFER_NONE
+
+        # result = ioctl(fid.fileno(), SG_IO, &io_hdr)
+        # if result < 0:
+        #     raise OSError(errno, 'ioctl failed')
+
+        # if io_hdr.info & SG_INFO_OK_MASK != SG_INFO_OK:
+        #     if io_hdr.sb_len_wr > 0:
+        #         raise CheckConditionError(bytes(sense[:io_hdr.sb_len_wr]))
+        #     else:
+        #         raise UnspecifiedError()
+
+        # # Return the actual transfer written and any sense we got.
+        # if return_sense_buffer:
+        #     return io_hdr.resid, bytes(sense[:io_hdr.sb_len_wr])
+        # else:
+        #     return io_hdr.resid
+        
         st = time.perf_counter_ns()
         for offset, value in enumerate(data):
             cdb = struct.pack('>BBBHB', 0xe5, value, 0x00, start_addr + offset, 0x00)

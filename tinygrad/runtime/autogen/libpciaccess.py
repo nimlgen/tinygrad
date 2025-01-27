@@ -117,7 +117,7 @@ class Union(ctypes.Union, AsDictMixin):
 
 
 _libraries = {}
-_libraries['libpciaccess.so'] = ctypes.CDLL('/usr/lib/x86_64-linux-gnu/libpciaccess.so')
+_libraries['libpciaccess.so'] = None #ctypes.CDLL('/usr/lib/x86_64-linux-gnu/libpciaccess.so')
 c_int128 = ctypes.c_ubyte*16
 c_uint128 = c_int128
 void = None

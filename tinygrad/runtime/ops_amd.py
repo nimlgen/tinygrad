@@ -13,7 +13,7 @@ from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.compiler_hip import AMDCompiler
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev
-from tinygrad.runtime.support.am.asm2x6x import Asm236x
+from tinygrad.runtime.support.am.usb import Asm236x
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 if getenv("MOCKGPU"): import extra.mockgpu.mockgpu # noqa: F401 # pylint: disable=unused-import
 
@@ -196,6 +196,7 @@ class AMDComputeQueue(HWQueue):
     for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
 
     dev.compute_queue.put_value += len(cmds)
+    print("will send")
     dev.compute_queue.write_ptr[0] = dev.compute_queue.put_value
     dev.compute_queue.doorbell[0] = dev.compute_queue.put_value
 
