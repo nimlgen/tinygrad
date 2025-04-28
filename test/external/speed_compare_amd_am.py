@@ -79,7 +79,7 @@ if __name__ == "__main__":
       amdlin = hand_coded_optimizations(amdlin)
       has_bf16 = any(b.dtype == dtypes.bfloat16 for b in amdlin.membufs)
 
-      amd_prg = CompiledRunner(amdlin.to_program())
+      amd_prg = CompiledRunner(prg:=amdlin.to_program())
       amdbufs = bufs_from_lin(amdlin)
       test_amdbufs = get_fuzz_rawbufs(amdlin) if not has_bf16 else amdbufs
       if not has_bf16: contents = [buf.as_buffer() for buf in test_amdbufs]
@@ -110,8 +110,8 @@ if __name__ == "__main__":
     tm_amd, tm_am, failed = [], [], False
     with run_amd():
       try:
-        amd_prg(test_amdbufs, {}, wait=True)
-        for i in range(CNT): tm_amd.append(amd_prg(amdbufs, {}, wait=True))
+        amd_prg([test_amdbufs[i] for i in prg.globals], {}, wait=True)
+        for i in range(CNT): tm_amd.append(amd_prg([amdbufs[i] for i in prg.globals], {}, wait=True))
       except RuntimeError:
         print("AMD FAILED")
         tm_amd = [1e9]
@@ -119,16 +119,16 @@ if __name__ == "__main__":
 
     with run_am():
       try:
-        am_prg(test_ambufs, {}, wait=True)
-        for i in range(CNT): tm_am.append(am_prg(ambufs, {}, wait=True))
+        am_prg([test_ambufs[i] for i in prg.globals], {}, wait=True)
+        for i in range(CNT): tm_am.append(am_prg([ambufs[i] for i in prg.globals], {}, wait=True))
       except RuntimeError:
         print("AM FAILED")
         tm_am = [1e9]
         failed = True
 
     if CHECK_CPU:
-      cpu_prg(test_cpubufs, {}, wait=True)
-      for i in range(1): cpu_prg(cpubufs, {}, wait=True)
+      cpu_prg([test_cpubufs[i] for i in prg.globals], {}, wait=True)
+      for i in range(1): cpu_prg([cpubufs[i] for i in prg.globals], {}, wait=True)
 
     if not failed and not has_bf16:
       with run_amd():
