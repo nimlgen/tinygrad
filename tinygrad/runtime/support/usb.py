@@ -1,7 +1,7 @@
 import ctypes, struct, dataclasses, array, itertools
 from typing import Sequence
 from tinygrad.runtime.autogen import libusb
-from tinygrad.helpers import DEBUG
+from tinygrad.helpers import DEBUG, Timing
 from tinygrad.runtime.support.hcq import MMIOInterface
 
 class USB3:
@@ -12,7 +12,7 @@ class USB3:
     self.ctx = ctypes.POINTER(libusb.struct_libusb_context)()
 
     if libusb.libusb_init(ctypes.byref(self.ctx)): raise RuntimeError("libusb_init failed")
-    if DEBUG >= 6: libusb.libusb_set_option(self.ctx, libusb.LIBUSB_OPTION_LOG_LEVEL, 4)
+    libusb.libusb_set_option(self.ctx, libusb.LIBUSB_OPTION_LOG_LEVEL, 4)
 
     self.handle = libusb.libusb_open_device_with_vid_pid(self.ctx, self.vendor, self.dev)
     if not self.handle: raise RuntimeError(f"device {self.vendor:04x}:{self.dev:04x} not found. sudo required?")
@@ -55,15 +55,17 @@ class USB3:
     return tr
 
   def _submit_and_wait(self, cmds):
-    for tr in cmds: libusb.libusb_submit_transfer(tr)
+    with Timing("submit"):
+      for tr in cmds: libusb.libusb_submit_transfer(tr)
 
-    running = len(cmds)
-    while running:
-      libusb.libusb_handle_events(self.ctx)
+    with Timing("wait"):
       running = len(cmds)
-      for tr in cmds:
-        if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
-        elif tr.contents.status != 0xFF: raise RuntimeError(f"EP 0x{tr.contents.endpoint:02X} error: {tr.contents.status}")
+      while running:
+        libusb.libusb_handle_events(self.ctx)
+        running = len(cmds)
+        for tr in cmds:
+          if tr.contents.status == libusb.LIBUSB_TRANSFER_COMPLETED: running -= 1
+          elif tr.contents.status != 0xFF: raise RuntimeError(f"EP 0x{tr.contents.endpoint:02X} error: {tr.contents.status}")
 
   def send_batch(self, cdbs:list[bytes], idata:list[int]|None=None, odata:list[bytes|None]|None=None) -> list[bytes|None]:
     idata, odata = idata or [0] * len(cdbs), odata or [None] * len(cdbs)
