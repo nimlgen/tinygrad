@@ -86,16 +86,16 @@ class NVDev(PCIDevImplBase):
     # 4           PDE0 (dual 64k/4k PDE, or 2M PTE)   28:21
     # 5           PTE_64K / PTE_4K                    20:16 / 20:12
     bits, shifts = (56, [12, 21, 29, 38, 47, 56]) if self.mmu_ver == 3 else (48, [12, 21, 29, 38, 47])
-    self.mm = NVMemoryManager(self, self.vram_size, boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts, va_base=0,
+    self.mm = NVMemoryManager(self, self.vram_size, boot_size=(128 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts, va_base=0,
       palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]])
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp:NV_GSP = NV_GSP(self)
 
-    # Turn the booting early, gsp client is loaded from the clean.
-    self.is_booting = False
-
     for ip in [self.flcn, self.gsp]: ip.init_sw()
     for ip in [self.flcn, self.gsp]: ip.init_hw()
+
+    # Boot is done
+    self.is_booting = False
 
   def fini(self):
     for ip in [self.gsp, self.flcn]: ip.fini_hw()

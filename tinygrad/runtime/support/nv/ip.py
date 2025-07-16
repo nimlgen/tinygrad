@@ -430,12 +430,12 @@ class NV_GSP(NV_IP):
 
     bufs_p = nv_gpu.struct_NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS(pageSize=res_sz, numLevelsToCopy=3,
       virtAddrLo=res_va, virtAddrHi=res_va + res_sz - 1)
-    for i,pt in enumerate(self.nvdev.mm.page_tables(res_va, size=res_sz)):
+    for i,pt in enumerate(self.nvdev.mm.page_tables(res_va, size=res_sz, boot=True)):
       bufs_p.levels[i] = nv_gpu.struct_NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS_0(physAddress=pt.paddr,
         size=self.nvdev.mm.pte_cnt[0] * 8 if i == 0 else 0x1000, pageShift=self.nvdev.mm.pte_covers[i].bit_length() - 1, aperture=1)
     self.rpc_rm_control(hObject=vaspace, cmd=nv_gpu.NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES, params=bufs_p)
 
-    gpfifo_area = self.nvdev.mm.valloc(4 << 10, contiguous=True)
+    gpfifo_area = self.nvdev.mm.valloc(4 << 10, contiguous=True, boot=True)
     userd = nv_gpu.NV_MEMORY_DESC_PARAMS(base=gpfifo_area.paddrs[0][0] + 0x20 * 8, size=0x20, addressSpace=2, cacheAttrib=0)
     gg_params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=gpfifo_area.va_addr, gpFifoEntries=32, engineType=0x1, cid=3,
       hVASpace=vaspace, userdOffset=(ctypes.c_uint64*8)(0x20 * 8), userdMem=userd, internalFlags=0x1a, flags=0x200320)
@@ -469,7 +469,11 @@ class NV_GSP(NV_IP):
     self.priv_root = 0xc1e00004
     self.init_golden_image()
 
-  def fini_hw(self): self.rpc_unloading_guest_driver()
+  def fini_hw(self):
+    last_handle = next(self.handle_gen) - 1
+    for h in range(last_handle, 0xcf000000 - 1, -1): self.rpc_free(hRoot=0xc1000000, hObjectParent=0x0, hObject=h)
+    self.rpc_free(hRoot=0xc1000000, hObjectParent=0x0, hObject=0xc1000000)
+    if getenv("NV_UNLOAD"): self.rpc_unloading_guest_driver()
 
   ### RPCs
 
@@ -543,6 +547,12 @@ class NV_GSP(NV_IP):
 
     header = nv.PACKED_REGISTRY_TABLE(size=hdr_size + len(entries_bytes) + len(data_bytes), numEntries=len(table))
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_SET_REGISTRY, bytes(header) + entries_bytes + data_bytes)
+
+  def rpc_free(self, hRoot, hObjectParent, hObject):
+    data = nv.rpc_free_v(params=nv.struct_NVOS00_PARAMETERS_v03_00(hRoot=hRoot, hObjectParent=hObjectParent, hObjectOld=hObject))
+    print(bytes(data))
+    self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_FREE, bytes(data))
+    self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_FREE)
 
   def run_cpu_seq(self, seq_buf):
     hdr = nv.rpc_run_cpu_sequencer_v17_00.from_address(mv_address(seq_buf))
