@@ -335,11 +335,13 @@ class AMDComputeQueue(HWQueue):
 class AMDComputeAQLQueue(AMDComputeQueue):
   def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
     self.bind_args_state(args_state)
+    print(prg.group_segment_size, prg.private_segment_size, hex(prg.aql_prog_addr))
     self._q.append(pkt:=hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
       setup=3<<hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=prg.private_segment_size,
       group_segment_size=prg.group_segment_size, kernel_object=prg.aql_prog_addr, kernarg_address=args_state.buf.va_addr))
     self.bind_sints_to_mem(*local_size, mem=(pkt_view:=MMIOInterface(addr=ctypes.addressof(pkt), nbytes=ctypes.sizeof(pkt))), fmt='H', offset=4)
     self.bind_sints_to_mem(*[l * g for l,g in zip(local_size, global_size)], mem=pkt_view, fmt='I', offset=12)
+    print(global_size, local_size)
 
   def bind(self, dev:AMDDevice): pass # not supported
   def _submit(self, dev:AMDDevice):
@@ -464,7 +466,8 @@ class AMDProgram(HCQProgram):
     # TODO; this API needs the type signature of the function and global_size/local_size
     self.dev, self.name, self.lib = dev, name, lib
 
-    image, sections, _ = elf_loader(self.lib)
+    image, sections, relocs = elf_loader(self.lib)
+    print(relocs)
 
     rodata_entry = next((sh.header.sh_addr for sh in sections if sh.name == ".rodata"), -1)
     text_entry = next((sh.header.sh_addr for sh in sections if sh.name == ".text"), -1)
@@ -485,6 +488,7 @@ class AMDProgram(HCQProgram):
 
     # Ensure scratch size
     self.dev._ensure_has_local_memory(self.private_segment_size)
+    print(hex(self.private_segment_size))
 
     # NOTE: this is wrong, it's not this object. pad it, since it might be smaller than the struct
     code = hsa.amd_kernel_code_t.from_buffer_copy(bytes(image[rodata_entry:rodata_entry+256]) + b'\x00'*256)
@@ -496,6 +500,7 @@ class AMDProgram(HCQProgram):
     self.rsrc3: int = image[rodata_entry+44:rodata_entry+48].cast("I")[0] # NOTE: kernel descriptor, not in amd_kernel_code_t struct
     self.aql_prog_addr: int = self.lib_gpu.va_addr + rodata_entry
     self.prog_addr: int = self.lib_gpu.va_addr + rodata_entry + code.kernel_code_entry_byte_offset
+    print(hex(code.kernel_code_entry_byte_offset))
     # Some programs use hsa_kernel_dispatch_packet_t to read workgroup sizes during execution.
     # The packet is represented as a pointer and set up in SGPRs. Space for the packet is allocated as part of the kernel arguments.
     self.enable_dispatch_ptr: int = code.kernel_code_properties & hsa.AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_PTR
@@ -773,7 +778,7 @@ class AMDDevice(HCQCompiled):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = self._select_iface(KFDIface, PCIIface, USBIface)
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
-    self.arch = "gfx%d%x%x" % self.target
+    self.arch = "gfx942"# % self.target
     if self.target < (9,4,2) or self.target >= (13,0,0): raise RuntimeError(f"Unsupported arch: {self.arch}")
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 

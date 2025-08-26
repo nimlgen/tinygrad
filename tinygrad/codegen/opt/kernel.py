@@ -508,6 +508,8 @@ class Kernel:
           return local_buffer.view(st).load(local_buffer.view(st).store(grouped_reduce))
 
       return ret
+
+    print(self.name, self.ast, self.applied_opts)
     self.finalized = True
     fixed_ast = fixup_ast(self.ast)
     del fixup_ast
