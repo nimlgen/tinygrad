@@ -851,11 +851,19 @@ class AMDDevice(HCQCompiled):
       self.max_private_segment_size = required
 
       if hasattr(self, 'aql_desc'):
+        print(self.soc.SQ_SEL_X)
+        
+        if self.target >= (11,0,0): rsrc_word3 = {'format': 0x14, 'add_tid_enable':1, 'oob_select':2}
+        elif self.target >= (10,0,0): rsrc_word3 = {'format': 0x14, 'add_tid_enable':1, 'oob_select':2, 'resource_level':1}
+        else: rsrc_word3 = {'num_format': self.soc.BUF_NUM_FORMAT_UINT, 'data_format': self.soc.BUF_DATA_FORMAT_32, 'index_stride':3,  'add_tid_enable':1}
+
         self.aql_desc.scratch_backing_memory_location = self.scratch.va_addr
         self.aql_desc.scratch_backing_memory_byte_size = self.scratch.size
         self.aql_desc.scratch_wave64_lane_byte_size = self.max_private_segment_size * (self.aql_desc.max_wave_id + 1) // 64
         self.aql_desc.scratch_resource_descriptor[:] = [lo32(self.scratch.va_addr), hi32(self.scratch.va_addr) | (1 << 30), lo32(self.scratch.size),
-          0x20814fac] # FORMAT=BUF_FORMAT_32_UINT,OOB_SELECT=2,ADD_TID_ENABLE=1,TYPE=SQ_RSRC_BUF,SQ_SELs
+          self.gc.regSQ_BUF_RSRC_WORD3.encode(type=self.soc.SQ_RSRC_BUF, dst_sel_x=self.soc.SQ_SEL_X, dst_sel_y=self.soc.SQ_SEL_Y,
+                                              dst_sel_z=self.soc.SQ_SEL_Z, dst_sel_w=self.soc.SQ_SEL_W, **rsrc_word3)]
+        print(hex(self.aql_desc.scratch_resource_descriptor[3]))
         self.aql_desc.compute_tmpring_size = self.tmpring_size
 
   def invalidate_caches(self):
