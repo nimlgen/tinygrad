@@ -71,7 +71,10 @@ class QCOMComputeQueue(HWQueue):
       self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     else:
       # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
-      raise RuntimeError('CP_EVENT_WRITE7 is not supported')
+      # raise RuntimeError('CP_EVENT_WRITE7 is not supported')
+      self.cmd(adreno.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=adreno.CACHE_FLUSH_TS, write_src=adreno.EV_WRITE_USER_32B, write_dst=adreno.EV_DST_RAM, write_enabled=1),
+               *data64_le(signal.timestamp_addr if ts else signal.value_addr), qreg.cp_event_write_3(value & 0xFFFFFFFF))
+      self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     return self
 
   def timestamp(self, signal:QCOMSignal): return self.signal(signal, 0, ts=True)
@@ -339,7 +342,7 @@ class QCOMDevice(HCQCompiled):
     info = kgsl.struct_kgsl_devinfo()
     kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
     QCOMDevice.gpu_id = ((info.chip_id >> 24) & 0xFF) * 100 + ((info.chip_id >> 16) & 0xFF) * 10 + ((info.chip_id >>  8) & 0xFF)
-    if QCOMDevice.gpu_id >= 700: raise RuntimeError(f"Unsupported GPU: {QCOMDevice.gpu_id}")
+    if QCOMDevice.gpu_id >= 800: raise RuntimeError(f"Unsupported GPU: {QCOMDevice.gpu_id}")
 
     compilers = [(QCOMRenderer, functools.partial(QCOMCompiler, device))]
     super().__init__(device, QCOMAllocator(self), compilers, functools.partial(QCOMProgram, self), QCOMSignal, QCOMComputeQueue, None)
