@@ -72,7 +72,7 @@ class QCOMComputeQueue(HWQueue):
     else:
       # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
       # raise RuntimeError('CP_EVENT_WRITE7 is not supported')
-      self.cmd(adreno.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=adreno.CACHE_FLUSH_TS, write_src=adreno.EV_WRITE_USER_32B, write_dst=adreno.EV_DST_RAM, write_enabled=1),
+      self.cmd(adreno.CP_EVENT_WRITE7, qreg.cp_event_write7_0(event=adreno.CACHE_FLUSH_TS, write_src=adreno.EV_WRITE_USER_32B, write_dst=adreno.EV_DST_RAM) | adreno.CP_EVENT_WRITE7_0_WRITE_ENABLED,
                *data64_le(signal.timestamp_addr if ts else signal.value_addr), qreg.cp_event_write_3(value & 0xFFFFFFFF))
       self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
     return self
