@@ -172,7 +172,8 @@ def ioctl(fd, request, argp):
     s = get_struct(argp, stype)
     if IOCTL > 0: print(f"{ret:2d} = {name:40s}", ' '.join(format_struct(s)))
     if name == "IOCTL_KGSL_GPUOBJ_INFO": pass
-      # mmaped[s.gpuaddr] = mmap.mmap(fd, s.size, offset=s.id*0x1000)
+      mmaped[s.gpuaddr] = mmap.mmap(fd, s.size, offset=s.id*0x1000)
+      print(mmaped[s.gpuaddr])
     if name == "IOCTL_KGSL_GPU_COMMAND":
       for i in range(s.numcmds):
         cmd = get_struct(s.cmdlist+ctypes.sizeof(msm_kgsl.struct_kgsl_command_object)*i, msm_kgsl.struct_kgsl_command_object)
