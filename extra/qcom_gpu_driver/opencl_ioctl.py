@@ -97,7 +97,7 @@ def parse_cmd_buf(dat):
 
         if state_block == SB6_CS_SHADER:
           from extra.disassemblers.adreno import disasm_raw
-          if state_type == ST6_SHADER and IOCTL > 2:
+          if state_type == ST6_SHADER and IOCTL > 3:
             disasm_raw(get_mem(((vals[2] << 32) | vals[1]), num_unit * 128))
           if state_type == ST6_CONSTANTS:
             x = get_mem(((vals[2] << 32) | vals[1]), num_unit*4)

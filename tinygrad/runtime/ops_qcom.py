@@ -111,12 +111,13 @@ class QCOMComputeQueue(HWQueue):
     def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
+    self.cmd(adreno.CP_THREAD_CONTROL, 0x8000001)
     self.cmd(adreno.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=adreno.RM6_COMPUTE))
     if QCOMDevice.gpu_id < 700:
       self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
       self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, 0x0)
     else:
-      self.reg(adreno.REG_A7XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
+      self.reg(adreno.REG_A7XX_HLSQ_INVALIDATE_CMD, 0x260)
       # self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, 0x0)
     self.reg(adreno.REG_A6XX_SP_CS_TEX_COUNT, qreg.a6xx_sp_cs_tex_count(0x80))
     self.reg(adreno.REG_A6XX_SP_CS_IBO_COUNT, qreg.a6xx_sp_cs_ibo_count(0x40))
@@ -152,7 +153,7 @@ class QCOMComputeQueue(HWQueue):
 
     self.reg(adreno.REG_A7XX_HLSQ_CONTROL_2_REG, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a7xx_hlsq_cs_cntl(constlen=1024 // 4, enabled=True))
 
-    self.reg(adreno.REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_hw_stack_offset(prg.hw_stack_offset))
+    self.reg(adreno.REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, 0)
     self.reg(adreno.REG_A6XX_SP_CS_INSTRLEN, qreg.a6xx_sp_cs_instrlen(prg.image_size // 4))
 
     if args_state.prg.samp_cnt > 0:
