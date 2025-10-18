@@ -111,7 +111,7 @@ class QCOMComputeQueue(HWQueue):
     def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
-    # self.cmd(adreno.CP_THREAD_CONTROL, 0x8000001)
+    self.cmd(adreno.CP_THREAD_CONTROL, 0x8000001)
     self.cmd(adreno.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=adreno.RM6_COMPUTE))
     if QCOMDevice.gpu_id < 700:
       self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
