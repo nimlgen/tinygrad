@@ -112,18 +112,19 @@ def parse_cmd_buf(dat):
               print('texture ibos')
               hexdump(ibos_bytes)
         elif state_block == SB6_CS_TEX:
-          if state_type == ST6_SHADER:
-            samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
-            CAPTURED_STATE['samplers'] = samplers_bytes[:]
-            if IOCTL > 1:
-              print('texture samplers')
-              hexdump(samplers_bytes)
-          if state_type == ST6_CONSTANTS:
-            descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
-            CAPTURED_STATE['descriptors'] = descriptors_bytes[:]
-            if IOCTL > 1:
-              print('texture descriptors')
-              hexdump(descriptors_bytes)
+          print("SKIP TEXTURE STATE BLOCK")
+          # if state_type == ST6_SHADER:
+          #   samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
+          #   CAPTURED_STATE['samplers'] = samplers_bytes[:]
+          #   if IOCTL > 1:
+          #     print('texture samplers')
+          #     hexdump(samplers_bytes)
+          # if state_type == ST6_CONSTANTS:
+          #   descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
+          #   CAPTURED_STATE['descriptors'] = descriptors_bytes[:]
+          #   if IOCTL > 1:
+          #     print('texture descriptors')
+          #     hexdump(descriptors_bytes)
         print("EXIT")
       elif ops[opcode] == "CP_REG_TO_MEM":
         reg, cnt, b64, accum = vals[0] & 0x3FFFF, (vals[0] >> 18) & 0xFFF, (vals[0] >> 30) & 0x1, (vals[0] >> 31) & 0x1
