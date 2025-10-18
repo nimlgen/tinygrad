@@ -127,19 +127,20 @@ def parse_cmd_buf(dat):
               print('texture ibos')
               hexdump(ibos_bytes)
         elif state_block == SB6_CS_TEX:
-          print("SKIP TEXTURE STATE BLOCK")
-          # if state_type == ST6_SHADER:
-          #   samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
-          #   CAPTURED_STATE['samplers'] = samplers_bytes[:]
-          #   if IOCTL > 1:
-          #     print('texture samplers')
-          #     hexdump(samplers_bytes)
-          # if state_type == ST6_CONSTANTS:
-          #   descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
-          #   CAPTURED_STATE['descriptors'] = descriptors_bytes[:]
-          #   if IOCTL > 1:
-          #     print('texture descriptors')
-          #     hexdump(descriptors_bytes)
+          # print("SKIP TEXTURE STATE BLOCK")
+          if state_type == ST6_SHADER:
+            # CAPTURED_STATE['bindless_base']
+            samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
+            CAPTURED_STATE['samplers'] = samplers_bytes[:]
+            if IOCTL > 1:
+              print('texture samplers')
+              hexdump(samplers_bytes)
+          if state_type == ST6_CONSTANTS:
+            descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
+            CAPTURED_STATE['descriptors'] = descriptors_bytes[:]
+            if IOCTL > 1:
+              print('texture descriptors')
+              hexdump(descriptors_bytes)
         print("EXIT")
       elif ops[opcode] == "CP_REG_TO_MEM":
         reg, cnt, b64, accum = vals[0] & 0x3FFFF, (vals[0] >> 18) & 0xFFF, (vals[0] >> 30) & 0x1, (vals[0] >> 31) & 0x1
@@ -168,6 +169,10 @@ def parse_cmd_buf(dat):
         if IOCTL > 0:
           print(f'THREADSIZE-{(vals[0] >> 20)&0x1}\nEARLYPREAMBLE-{(vals[0] >> 23) & 0x1}\nMERGEDREGS-{(vals[0] >> 3) & 0x1}\nTHREADMODE-{vals[0] & 0x1}\nHALFREGFOOTPRINT-{(vals[0] >> 1) & 0x3f}\nFULLREGFOOTPRINT-{(vals[0] >> 7) & 0x3f}\nBRANCHSTACK-{(vals[0] >> 14) & 0x3f}\n')
           print(f'SP_CS_UNKNOWN_A9B1-{vals[1]}\nSP_CS_BRANCH_COND-{vals[2]}\nSP_CS_OBJ_FIRST_EXEC_OFFSET-{vals[3]}\nSP_CS_OBJ_START-{vals[4] | (vals[5] << 32)}\nSP_CS_PVT_MEM_PARAM-{vals[6]}\nSP_CS_PVT_MEM_ADDR-{vals[7] | (vals[8] << 32)}\nSP_CS_PVT_MEM_SIZE-{vals[9]}')
+      if offset == 0xa9e8:
+        CAPTURED_STATE['bindless_base'] = (vals[0] | (vals[1] << 32)) & ~0b11
+        print(hex(CAPTURED_STATE['bindless_base']))
+        hexdump(get_mem(CAPTURED_STATE['bindless_base'], 0x200))
       if offset == 0xb180:
         if IOCTL > 0:
           print('border color offset', hex(vals[1] << 32 | vals[0]))
