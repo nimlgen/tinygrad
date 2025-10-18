@@ -101,6 +101,13 @@ def parse_cmd_buf(dat):
             disasm_raw(get_mem(((vals[2] << 32) | vals[1]), num_unit * 128))
           if state_type == ST6_CONSTANTS:
             x = get_mem(((vals[2] << 32) | vals[1]), num_unit*4)
+
+            ptr = x.cast('Q')[0x140//8]
+            print('CNST', hex(ptr))
+            constants = get_mem(ptr, 0x10)
+            print('Indirect PTR?')
+            hexdump(x)
+
             CAPTURED_STATE['constants'] = x[:]
             if IOCTL > 2:
               print('constants')
