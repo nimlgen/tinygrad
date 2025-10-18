@@ -171,7 +171,7 @@ def ioctl(fd, request, argp):
     name, stype = nrs[nr]
     s = get_struct(argp, stype)
     if IOCTL > 0: print(f"{ret:2d} = {name:40s}", ' '.join(format_struct(s)))
-    if name == "IOCTL_KGSL_GPUOBJ_INFO": pass
+    if name == "IOCTL_KGSL_GPUOBJ_INFO":
       mmaped[s.gpuaddr] = mmap.mmap(fd, s.size, offset=s.id*0x1000)
       print(mmaped[s.gpuaddr])
     if name == "IOCTL_KGSL_GPU_COMMAND":
