@@ -102,11 +102,11 @@ def parse_cmd_buf(dat):
           if state_type == ST6_CONSTANTS:
             x = get_mem(((vals[2] << 32) | vals[1]), num_unit*4)
 
-            ptr = x.cast('Q')[0x140//8]
+            ptr = memoryview(bytearray(x)).cast('Q')[0x140//8]
             print('CNST', hex(ptr))
             constants = get_mem(ptr, 0x10)
             print('Indirect PTR?')
-            hexdump(x)
+            hexdump(constants)
 
             CAPTURED_STATE['constants'] = x[:]
             if IOCTL > 2:
