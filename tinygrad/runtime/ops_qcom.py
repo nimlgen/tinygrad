@@ -127,16 +127,21 @@ class QCOMComputeQueue(HWQueue):
     self.cmd(adreno.CP_WAIT_FOR_IDLE)
 
     # REG_A7XX_HLSQ_CS_NDRANGE_0
-    self.reg(adreno.REG_A7XX_HLSQ_CS_NDRANGE_0,
-             qreg.a7xx_hlsq_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
-             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a7xx_hlsq_cs_cntl_1(threadsize=adreno.THREAD64),
-             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+    # self.reg(adreno.REG_A7XX_HLSQ_CS_NDRANGE_0,
+    #          qreg.a7xx_hlsq_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+    #          global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a7xx_hlsq_cs_cntl_1(threadsize=adreno.THREAD64),
+    #          cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+
+    self.reg(adreno.REG_A7XX_HLSQ_CS_NDRANGE_0, 11,3,0,1,0,1,0,0x2fc,1,1,1,8)
 
     self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
-             qreg.a6xx_sp_cs_ctrl_reg0(threadsize=adreno.THREAD64, halfregfootprint=prg.hregs, fullregfootprint=prg.fregs, branchstack=prg.brnchstck),
-             qreg.a6xx_sp_cs_unknown_a9b1(unk6=True, shared_size=prg.shared_size), 0, prg.prg_offset, *data64_le(prg.lib_gpu.va_addr),
-             qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=prg.pvtmem_size_per_item), *data64_le(prg.dev._stack.va_addr),
-             qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=prg.pvtmem_size_total))
+             0x80104100,0x4000040,0,0,0xe80000,0x40,0,0x39000,0x40,0x80000201)
+
+    # self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
+    #          qreg.a6xx_sp_cs_ctrl_reg0(threadsize=adreno.THREAD64, halfregfootprint=prg.hregs, fullregfootprint=prg.fregs, branchstack=prg.brnchstck),
+    #          qreg.a6xx_sp_cs_unknown_a9b1(unk6=True, shared_size=prg.shared_size), 0, prg.prg_offset, *data64_le(prg.lib_gpu.va_addr),
+    #          qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=prg.pvtmem_size_per_item), *data64_le(prg.dev._stack.va_addr),
+    #          qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=prg.pvtmem_size_total))
 
     self.cmd(adreno.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=adreno.ST_CONSTANTS, state_src=adreno.SS6_INDIRECT,
                                                                state_block=adreno.SB6_CS_SHADER, num_unit=1024 // 4),
