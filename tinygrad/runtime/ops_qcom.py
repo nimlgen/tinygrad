@@ -112,8 +112,12 @@ class QCOMComputeQueue(HWQueue):
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
     self.cmd(adreno.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=adreno.RM6_COMPUTE))
-    self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
-    self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, 0x0)
+    if QCOMDevice.gpu_id < 700:
+      self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
+      self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, 0x0)
+    else:
+      self.reg(adreno.REG_A7XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
+      # self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, 0x0)
     self.reg(adreno.REG_A6XX_SP_CS_TEX_COUNT, qreg.a6xx_sp_cs_tex_count(0x80))
     self.reg(adreno.REG_A6XX_SP_CS_IBO_COUNT, qreg.a6xx_sp_cs_ibo_count(0x40))
     self.reg(adreno.REG_A6XX_SP_MODE_CONTROL, qreg.a6xx_sp_mode_control(isammode=adreno.ISAMMODE_CL))
@@ -122,9 +126,10 @@ class QCOMComputeQueue(HWQueue):
     self.reg(adreno.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
     self.cmd(adreno.CP_WAIT_FOR_IDLE)
 
-    self.reg(adreno.REG_A6XX_HLSQ_CS_NDRANGE_0,
-             qreg.a6xx_hlsq_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
-             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_hlsq_cs_cntl_1(threadsize=adreno.THREAD64),
+    # REG_A7XX_HLSQ_CS_NDRANGE_0
+    self.reg(adreno.REG_A7XX_HLSQ_CS_NDRANGE_0,
+             qreg.a7xx_hlsq_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a7xx_hlsq_cs_cntl_1(threadsize=adreno.THREAD64),
              cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
 
     self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
@@ -140,7 +145,7 @@ class QCOMComputeQueue(HWQueue):
                                                                state_block=adreno.SB6_CS_SHADER, num_unit=round_up(prg.image_size, 128) // 128),
              *data64_le(prg.lib_gpu.va_addr))
 
-    self.reg(adreno.REG_A6XX_HLSQ_CONTROL_2_REG, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_hlsq_cs_cntl(constlen=1024 // 4, enabled=True))
+    self.reg(adreno.REG_A7XX_HLSQ_CONTROL_2_REG, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a7xx_hlsq_cs_cntl(constlen=1024 // 4, enabled=True))
 
     self.reg(adreno.REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_hw_stack_offset(prg.hw_stack_offset))
     self.reg(adreno.REG_A6XX_SP_CS_INSTRLEN, qreg.a6xx_sp_cs_instrlen(prg.image_size // 4))
