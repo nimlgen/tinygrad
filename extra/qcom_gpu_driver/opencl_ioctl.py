@@ -121,7 +121,9 @@ def parse_cmd_buf(dat):
               print('constants')
               hexdump(x)
           if state_type == ST6_IBO:
-            ibos_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 16 * 4)
+            if state_src == 0x1:
+              ibos_bytes = get_mem(CAPTURED_STATE['bindless_base'] + ((vals[2] << 32) | vals[1]) * 4, num_unit * 64)
+            else: ibos_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 16 * 4)
             CAPTURED_STATE['ibos'] = ibos_bytes[:]
             if IOCTL > 1:
               print('texture ibos')
@@ -130,7 +132,9 @@ def parse_cmd_buf(dat):
           # print("SKIP TEXTURE STATE BLOCK")
           if state_type == ST6_SHADER:
             # CAPTURED_STATE['bindless_base']
-            samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
+            if state_src == 0x1:
+              samplers_bytes = get_mem(CAPTURED_STATE['bindless_base'] + ((vals[2] << 32) | vals[1]) * 4, num_unit * 64)
+            else: samplers_bytes = get_mem((vals[2] << 32) | vals[1], num_unit * 4 * 4)
             CAPTURED_STATE['samplers'] = samplers_bytes[:]
             if IOCTL > 1:
               print('texture samplers')
@@ -171,8 +175,8 @@ def parse_cmd_buf(dat):
           print(f'SP_CS_UNKNOWN_A9B1-{vals[1]}\nSP_CS_BRANCH_COND-{vals[2]}\nSP_CS_OBJ_FIRST_EXEC_OFFSET-{vals[3]}\nSP_CS_OBJ_START-{vals[4] | (vals[5] << 32)}\nSP_CS_PVT_MEM_PARAM-{vals[6]}\nSP_CS_PVT_MEM_ADDR-{vals[7] | (vals[8] << 32)}\nSP_CS_PVT_MEM_SIZE-{vals[9]}')
       if offset == 0xa9e8:
         CAPTURED_STATE['bindless_base'] = (vals[0] | (vals[1] << 32)) & ~0b11
-        print(hex(CAPTURED_STATE['bindless_base']))
-        hexdump(get_mem(CAPTURED_STATE['bindless_base'], 0x200))
+        # print(hex(CAPTURED_STATE['bindless_base']))
+        # hexdump(get_mem(CAPTURED_STATE['bindless_base'], 0x200))
       if offset == 0xb180:
         if IOCTL > 0:
           print('border color offset', hex(vals[1] << 32 | vals[0]))
