@@ -104,7 +104,7 @@ def parse_cmd_buf(dat):
 
             ptr = memoryview(bytearray(x)).cast('Q')[0x140//8]
             print('CNST', hex(ptr))
-            constants = get_mem(ptr, 0x10)
+            constants = get_mem(ptr, 0x100)
             print('Indirect PTR?')
             hexdump(constants)
 
