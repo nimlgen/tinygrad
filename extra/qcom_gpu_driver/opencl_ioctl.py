@@ -124,7 +124,7 @@ def parse_cmd_buf(dat):
             if IOCTL > 1:
               print('texture descriptors')
               hexdump(descriptors_bytes)
-
+        print("EXIT")
       elif ops[opcode] == "CP_REG_TO_MEM":
         reg, cnt, b64, accum = vals[0] & 0x3FFFF, (vals[0] >> 18) & 0xFFF, (vals[0] >> 30) & 0x1, (vals[0] >> 31) & 0x1
         dest = vals[1] | (vals[2] << 32)
