@@ -111,7 +111,7 @@ class QCOMComputeQueue(HWQueue):
     def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
-    self.cmd(adreno.CP_THREAD_CONTROL, 0x8000001)
+    # self.cmd(adreno.CP_THREAD_CONTROL, 0x8000001)
     self.cmd(adreno.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=adreno.RM6_COMPUTE))
     if QCOMDevice.gpu_id < 700:
       self.reg(adreno.REG_A6XX_HLSQ_INVALIDATE_CMD, qreg.a6xx_hlsq_invalidate_cmd(cs_state=True, cs_ibo=True))
@@ -135,8 +135,11 @@ class QCOMComputeQueue(HWQueue):
 
     self.reg(adreno.REG_A7XX_HLSQ_CS_NDRANGE_0, 11,3,0,1,0,1,0,0x2fc,1,1,1,8)
 
+    # self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
+    #          0x80104100,0x4000040,0,0,0xe80000,0x40,0,0x39000,0x40,0x80000201)
+
     self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
-             0x80104100,0x4000040,0,0,0xe80000,0x40,0,0x39000,0x40,0x80000201)
+             0x80104100, 0x4000040, 0, 0, *data64_le(prg.lib_gpu.va_addr), 0x40, *data64_le(prg.dev._stack.va_addr), 0x80000201)
 
     # self.reg(adreno.REG_A6XX_SP_CS_CTRL_REG0,
     #          qreg.a6xx_sp_cs_ctrl_reg0(threadsize=adreno.THREAD64, halfregfootprint=prg.hregs, fullregfootprint=prg.fregs, branchstack=prg.brnchstck),
