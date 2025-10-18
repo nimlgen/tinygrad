@@ -140,7 +140,9 @@ def parse_cmd_buf(dat):
               print('texture samplers')
               hexdump(samplers_bytes)
           if state_type == ST6_CONSTANTS:
-            descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
+            if state_src == 0x1:
+              descriptors_bytes = get_mem(CAPTURED_STATE['bindless_base'] + ((vals[2] << 32) | vals[1]) * 4, num_unit * 64)
+            else: descriptors_bytes = get_mem((vals[2] << 32) | vals[1], 1600)
             CAPTURED_STATE['descriptors'] = descriptors_bytes[:]
             if IOCTL > 1:
               print('texture descriptors')
