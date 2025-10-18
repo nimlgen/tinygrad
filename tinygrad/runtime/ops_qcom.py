@@ -257,6 +257,7 @@ class QCOMProgram(HCQProgram):
     bdoff = round_up(image_desc_off + 0x158 + len(self.name), 4) + 8 * samp_cnt_in_file
     while bdoff + 32 <= len(self.lib):
       length, _, _, offset_words, _, _, _, typ = struct.unpack("IIIIIIII", self.lib[bdoff:bdoff+32])
+      print('args info', length, offset_words, typ)
       if length == 0: break
       self.buf_info.append(SimpleNamespace(offset=offset_words * 4, type=typ))
       bdoff += length

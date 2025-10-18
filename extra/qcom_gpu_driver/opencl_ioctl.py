@@ -103,10 +103,17 @@ def parse_cmd_buf(dat):
             x = get_mem(((vals[2] << 32) | vals[1]), num_unit*4)
 
             ptr = memoryview(bytearray(x)).cast('Q')[0x140//8]
-            print('CNST', hex(ptr))
-            constants = get_mem(ptr, 0x100)
-            print('Indirect PTR?')
-            hexdump(constants)
+            ptr_in = memoryview(bytearray(x)).cast('Q')[0xb0//8]
+            print('CNST', hex(ptr), hex(ptr_in))
+            if ptr_in != 0:
+              constants = get_mem(ptr_in, 0x20)
+              print('Indirect PTR IN')
+              hexdump(constants)
+
+            if ptr != 0:
+              constants = get_mem(ptr, 0x100)
+              print('Indirect PTR?')
+              hexdump(constants)
 
             CAPTURED_STATE['constants'] = x[:]
             if IOCTL > 2:
