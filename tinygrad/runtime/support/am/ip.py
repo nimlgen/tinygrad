@@ -281,6 +281,17 @@ class AM_GFX(AM_IP):
         if self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1: self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2, inst=xcc) # 1 - DRAIN_PIPE; 2 - RESET_WAVES
         self._grbm_select(inst=xcc)
 
+  def stop_compute_queue(self, idx:int, aql:bool):
+    """Stop the compute queue using DEQUEUE_REQUEST with RESET_WAVES."""
+    pipe, queue = idx // 4, idx % 4
+    for xcc in range(self.xccs if aql else 1):
+      self._grbm_select(me=1, pipe=pipe, queue=queue, inst=xcc)
+      if self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1:
+        self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2, inst=xcc)  # 2 - RESET_WAVES
+        # Wait for queue to become inactive
+        wait_cond(lambda: self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1, value=0, msg="Compute queue dequeue timeout")
+      self._grbm_select(inst=xcc)
+
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool) -> tuple[int, int]:
     pipe, queue, doorbell = idx // 4, idx % 4, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0
     self._grbm_select(me=1, pipe=pipe, queue=queue, inst=0)

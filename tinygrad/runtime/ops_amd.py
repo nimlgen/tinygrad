@@ -1002,6 +1002,10 @@ class AMDDevice(HCQCompiled):
     cwsr_buffer = self.iface.alloc(cwsr_buffer_size) if ctx_save_restore_size else None
     eop_buffer = self.iface.alloc(eop_buffer_size) if eop_buffer_size else None
 
+    # Store queue parameters for compute queues (for potential queue reset)
+    if queue_type in (kfd.KFD_IOC_QUEUE_TYPE_COMPUTE, kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL):
+      self._compute_queue_ring, self._compute_queue_gart, self._compute_queue_eop_buffer = ring, gart, eop_buffer
+
     return (self.iface.create_queue(queue_type, ring, gart, rptr=getattr(hsa.amd_queue_t, 'read_dispatch_id').offset,
             wptr=getattr(hsa.amd_queue_t, 'write_dispatch_id').offset, eop_buffer=eop_buffer, cwsr_buffer=cwsr_buffer,
             ctx_save_restore_size=ctx_save_restore_size, ctl_stack_size=ctl_stack_size, idx=idx))
@@ -1047,6 +1051,38 @@ class AMDDevice(HCQCompiled):
   def invalidate_caches(self):
     self.hw_compute_queue_t().memory_barrier().signal(self.timeline_signal, self.next_timeline()).submit(self)
     self.synchronize()
+
+  def synchronize_timeout(self, timeout_ms:int) -> bool:
+    """Synchronize with a timeout. Returns True if synchronized successfully, False if timed out."""
+    try:
+      self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout_ms)
+      return True
+    except RuntimeError:
+      return False
+
+  def reset_compute_queue(self):
+    """Stop and recreate the compute queue. Only supported for AM devices."""
+    if not self.is_am(): raise RuntimeError("reset_compute_queue is only supported for AM devices")
+    
+    # Stop the compute queue
+    self.iface.dev_impl.gfx.stop_compute_queue(idx=int(self.is_aql), aql=self.is_aql)
+
+    # Get stored queue parameters and recreate queue
+    ring, gart, eop_buffer = self._compute_queue_ring, self._compute_queue_gart, self._compute_queue_eop_buffer
+    rptr, wptr = getattr(hsa.amd_queue_t, 'read_dispatch_id').offset, getattr(hsa.amd_queue_t, 'write_dispatch_id').offset
+
+    # Recreate the queue with the same addresses
+    pv, doorbell_index = self.iface.dev_impl.gfx.setup_ring(ring_addr=ring.va_addr, ring_size=ring.size, rptr_addr=gart.va_addr+rptr,
+      wptr_addr=gart.va_addr+wptr, eop_addr=eop_buffer.va_addr, eop_size=eop_buffer.size, idx=int(self.is_aql), aql=self.is_aql)
+
+    # Update the queue descriptor with fresh state
+    self.compute_queue.put_value = pv
+    for write_ptr in self.compute_queue.write_ptrs: write_ptr[0] = pv
+    for read_ptr in self.compute_queue.read_ptrs: read_ptr[0] = pv
+
+    self.timeline_signal.value = self.timeline_value - 1
+
+    if hasattr(self, 'pm4_ib_alloc'): self.pm4_ib_alloc = BumpAllocator(self.pm4_ibs.size, wrap=True)
 
   def on_device_hang(self): self.iface.on_device_hang()
 

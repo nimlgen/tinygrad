@@ -36,7 +36,8 @@ def get_test_global_size(global_size, max_global_size, var_vals):
   return test_global_size, input_size / prod(test_global_size)
 
 def _time_program(p:ProgramSpec, lib:bytes, var_vals:dict[str, int], rawbufs:list[Buffer], early_stop:float|None=None,
-                  allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, name="test") -> list[float]:
+                  allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, name="test",
+                  timeout_ms:int|None=None) -> list[float]:
   factor = 1
   if allow_test_size and max_global_size is not None:
     global_size, factor = get_test_global_size(p.global_size, max_global_size, var_vals)
@@ -45,12 +46,25 @@ def _time_program(p:ProgramSpec, lib:bytes, var_vals:dict[str, int], rawbufs:lis
   except AssertionError: return [math.inf] * cnt
   tms = []
   input_bufs = [rawbufs[i] for i in car.p.globals]
+  dev = Device[p.device]
   for _ in range(cnt):
     if clear_l2:
-      if hasattr(dev:=Device[p.device], 'invalidate_caches'): dev.invalidate_caches()
+      if hasattr(dev, 'invalidate_caches'): dev.invalidate_caches()
       else:
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024,1024).contiguous().realize(do_update_stats=False)
-    tms.append(unwrap(car(input_bufs, var_vals, wait=True))*factor)
+    # Use timeout-based synchronization if timeout_ms is specified
+    if timeout_ms is not None:
+      st = time.perf_counter()
+      car(input_bufs, var_vals, wait=False)
+      if not dev.synchronize(timeout_ms=timeout_ms):
+        # Timeout occurred, reset queue if supported
+        if hasattr(dev, 'reset_compute_queue'):
+          if DEBUG >= 2: print(f"*** BEAM KERNEL TIMEOUT after {timeout_ms}ms, resetting queue")
+          dev.reset_compute_queue()
+        return [math.inf] * cnt
+      tms.append((time.perf_counter() - st) * factor)
+    else:
+      tms.append(unwrap(car(input_bufs, var_vals, wait=True))*factor)
     if early_stop is not None and early_stop < min(tms): break
   return tms
 
@@ -160,8 +174,13 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
           if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
           continue
         seen_libs.add(lib)
+        # Calculate timeout: use best time * 2, converted to milliseconds (minimum 100ms, skip if no valid time yet)
+        timeout_ms = int(beam[0][1] * 4 * 1000) if beam[0][1] != float("inf") and beam[0][1] > 0 else None
+        # timeout_ms = min(timeout_ms, min([x for y, x in timed]) * 2 * 1000) if len(timed) > 0 and timeout_ms is not None else timeout_ms
+        if timeout_ms is not None: timeout_ms = max(timeout_ms, 100)  # minimum 100ms timeout
         try: tms = _time_program(p, lib, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
-                                 allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'))
+                                 allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
+                                 timeout_ms=timeout_ms)
         except Exception as e:
           if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
           if isinstance(e, RuntimeError): continue

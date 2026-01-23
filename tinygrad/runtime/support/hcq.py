@@ -385,15 +385,25 @@ class HCQCompiled(Compiled, Generic[SignalType]):
 
     if self._is_cpu(): HCQCompiled.cpu_devices.append(self)
 
-  def synchronize(self):
+  def synchronize(self, timeout_ms:int|None=None) -> bool:
+    """
+    Synchronize with the device, waiting for all pending operations to complete.
+
+    Args:
+      timeout_ms: Optional timeout in milliseconds. If provided and timeout occurs, returns False without raising.
+
+    Returns:
+      True if synchronized successfully, False if timeout occurred (only when timeout_ms is provided).
+    """
     if self.error_state is not None: raise self.error_state
 
     # If we have any work on CPU devices, need to synchronize them. This is just an optimization to release GIL allowing to finish faster.
     if not self._is_cpu():
       for dev in HCQCompiled.cpu_devices: dev.synchronize()
 
-    try: self.timeline_signal.wait(self.timeline_value - 1)
+    try: self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout_ms if timeout_ms is not None else getenv("HCQDEV_WAIT_TIMEOUT_MS", 30000))
     except RuntimeError as e:
+      if timeout_ms is not None: return False  # Timeout with explicit timeout_ms returns False instead of raising
       self.error_state = e
       if hasattr(self, 'on_device_hang'): self.on_device_hang()
       else: raise e
@@ -402,6 +412,7 @@ class HCQCompiled(Compiled, Generic[SignalType]):
     if PROFILE:
       Compiled.profile_events += [ProfileRangeEvent(self.device, name, st.timestamp, en.timestamp, cp) for st,en,name,cp in self.sig_prof_records]
       self.sig_prof_records = []
+    return True
 
   def next_timeline(self):
     self.timeline_value += 1
