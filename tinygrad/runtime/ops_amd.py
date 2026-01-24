@@ -1061,28 +1061,8 @@ class AMDDevice(HCQCompiled):
       return False
 
   def reset_compute_queue(self):
-    """Stop and recreate the compute queue. Only supported for AM devices."""
     if not self.is_am(): raise RuntimeError("reset_compute_queue is only supported for AM devices")
-    
-    # Stop the compute queue
-    self.iface.dev_impl.gfx.stop_compute_queue(idx=int(self.is_aql), aql=self.is_aql)
-
-    # Get stored queue parameters and recreate queue
-    ring, gart, eop_buffer = self._compute_queue_ring, self._compute_queue_gart, self._compute_queue_eop_buffer
-    rptr, wptr = getattr(hsa.amd_queue_t, 'read_dispatch_id').offset, getattr(hsa.amd_queue_t, 'write_dispatch_id').offset
-
-    # Recreate the queue with the same addresses
-    pv, doorbell_index = self.iface.dev_impl.gfx.setup_ring(ring_addr=ring.va_addr, ring_size=ring.size, rptr_addr=gart.va_addr+rptr,
-      wptr_addr=gart.va_addr+wptr, eop_addr=eop_buffer.va_addr, eop_size=eop_buffer.size, idx=int(self.is_aql), aql=self.is_aql)
-
-    # Update the queue descriptor with fresh state
-    self.compute_queue.put_value = pv
-    for write_ptr in self.compute_queue.write_ptrs: write_ptr[0] = pv
-    for read_ptr in self.compute_queue.read_ptrs: read_ptr[0] = pv
-
-    self.timeline_signal.value = self.timeline_value - 1
-
-    if hasattr(self, 'pm4_ib_alloc'): self.pm4_ib_alloc = BumpAllocator(self.pm4_ibs.size, wrap=True)
+    self.iface.dev_impl.gfx.kill_sq_cmd()
 
   def on_device_hang(self): self.iface.on_device_hang()
 

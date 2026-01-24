@@ -281,16 +281,13 @@ class AM_GFX(AM_IP):
         if self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1: self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2, inst=xcc) # 1 - DRAIN_PIPE; 2 - RESET_WAVES
         self._grbm_select(inst=xcc)
 
-  def stop_compute_queue(self, idx:int, aql:bool):
-    """Stop the compute queue using DEQUEUE_REQUEST with RESET_WAVES."""
-    pipe, queue = idx // 4, idx % 4
-    for xcc in range(self.xccs if aql else 1):
-      self._grbm_select(me=1, pipe=pipe, queue=queue, inst=xcc)
-      if self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1:
-        self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2, inst=xcc)  # 2 - RESET_WAVES
-        # Wait for queue to become inactive
-        wait_cond(lambda: self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1, value=0, msg="Compute queue dequeue timeout")
-      self._grbm_select(inst=xcc)
+  def kill_sq_cmd(self):
+    for xcc in range(self.xccs):
+      # self.adev.regGRBM_GFX_INDEX.write(instance_broadcast_writes=1, sa_broadcast_writes=1, se_broadcast_writes=1, inst=xcc)
+      self.adev.regRLC_SAFE_MODE.write(message=1, cmd=1, inst=xcc)
+      wait_cond(lambda: self.adev.regRLC_SAFE_MODE.read(inst=xcc) & 0x1, value=0, msg="RLC safe mode timeout")
+      self.adev.regSQ_CMD.write(cmd=3, mode=1, check_vmid=1, vm_id=0, inst=xcc) # 3 - KILL_ALL_WAVES
+      self.adev.regRLC_SAFE_MODE.write(message=0, cmd=1, inst=xcc)
 
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool) -> tuple[int, int]:
     pipe, queue, doorbell = idx // 4, idx % 4, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0

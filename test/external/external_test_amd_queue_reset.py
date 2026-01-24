@@ -47,14 +47,15 @@ class TestAMDQueueReset(unittest.TestCase):
       if DEBUG >= 2: print(f"Reset iteration {i+1}")
 
       # Run kernel
-      a = Tensor.ones(100, 100).realize()
-      b = Tensor.ones(100, 100).realize()
+      a = Tensor.randn(20000, 20000).realize()
+      b = Tensor.randn(20000, 20000).realize()
       c = (a @ b).realize()
-      self.dev.synchronize()
 
       # Reset queue
       with Timing("Resetting compute queue iteration"):
         self.dev.reset_compute_queue()
+
+      self.dev.synchronize()
 
       # Verify compute still works after reset
       d = Tensor([i, i+1, i+2]).realize()
