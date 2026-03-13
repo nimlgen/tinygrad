@@ -259,26 +259,29 @@ class LNXPCIIfaceBase:
 
 # *** Remote PCI Devices
 
-class RemoteCmd(enum.IntEnum): MAP_BAR, MAP_SYSMEM_FD, CFG_READ, CFG_WRITE, RESET, MMIO_READ, MMIO_WRITE = 1, 2, 3, 4, 5, 6, 7
+class RemoteCmd(enum.IntEnum):
+  MAP_BAR, MAP_SYSMEM_FD, CFG_READ, CFG_WRITE, RESET, MMIO_READ, MMIO_WRITE, MAP_SYSMEM, SYSMEM_READ, SYSMEM_WRITE = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 
 class RemoteMMIOInterface(MMIOInterface):
-  def __init__(self, dev:RemotePCIDevice, residx:int, nbytes:int, fmt='B', off=0):
+  def __init__(self, dev:RemotePCIDevice, residx:int, nbytes:int, fmt='B', off=0,
+               rd_cmd=RemoteCmd.MMIO_READ, wr_cmd=RemoteCmd.MMIO_WRITE):
     self.dev, self.residx, self.nbytes, self.fmt, self.off, self.el_sz = dev, residx, nbytes, fmt, off, struct.calcsize(fmt)
+    self.rd_cmd, self.wr_cmd = rd_cmd, wr_cmd
 
   def __getitem__(self, index):
     sl = index if isinstance(index, slice) else slice(index, index + 1)
     start, stop = (sl.start or 0) * self.el_sz, (sl.stop or len(self)) * self.el_sz
-    data = self.dev._bulk_read(RemoteCmd.MMIO_READ, self.residx, self.off + start, stop - start)
+    data = self.dev._bulk_read(self.rd_cmd, self.residx, self.off + start, stop - start)
     result = data if self.fmt == 'B' else list(struct.unpack(f'<{(stop - start) // self.el_sz}{self.fmt}', data))
     return result if isinstance(index, slice) else result[0]
 
   def __setitem__(self, index, val):
     start = (index.start or 0) * self.el_sz if isinstance(index, slice) else index * self.el_sz
     data = (val if self.fmt == 'B' else struct.pack(f'<{len(val)}{self.fmt}', *val)) if isinstance(index, slice) else struct.pack(f'<{self.fmt}', val)
-    self.dev._bulk_write(RemoteCmd.MMIO_WRITE, self.residx, self.off + start, data)
+    self.dev._bulk_write(self.wr_cmd, self.residx, self.off + start, data)
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
-    return RemoteMMIOInterface(self.dev, self.residx, size or (self.nbytes - offset), fmt or self.fmt, self.off + offset)
+    return RemoteMMIOInterface(self.dev, self.residx, size or (self.nbytes - offset), fmt or self.fmt, self.off + offset, self.rd_cmd, self.wr_cmd)
 
 class RemotePCIDevice(PCIDevice):
   def __init__(self, devpref:str, pcibus:str, bars:list[int], sock:socket.socket):
@@ -288,8 +291,7 @@ class RemotePCIDevice(PCIDevice):
     self.bar_info = {b: PCIBarInfo(0, self._rpc(RemoteCmd.MAP_BAR, b)[0]) for b in bars}
 
   def _recvall(self, n:int) -> bytes:
-    data = b''
-    while len(data) < n and (chunk:=self.sock.recv(n - len(data))): data += chunk
+    data = self.sock.recv(n, socket.MSG_WAITALL)
     if len(data) < n: raise RuntimeError("Connection closed")
     return data
 
@@ -305,7 +307,7 @@ class RemotePCIDevice(PCIDevice):
     return (resp[1], resp[2]) + ((self._recvall(readout_size) if readout_size > 0 else None),) + (fd,)
 
   def _bulk_read(self, cmd:int, idx:int, offset:int, size:int) -> bytes: return unwrap(self._rpc(cmd, idx, offset, size, readout_size=size)[2])
-  def _bulk_write(self, cmd:int, idx:int, offset:int, data:bytes): self.sock.sendall(struct.pack('<BBQQQ', cmd, idx, offset, len(data), 0) + data)
+  def _bulk_write(self, cmd:int, idx:int, offset:int, data:bytes|memoryview): self.sock.sendmsg([struct.pack('<BBQQQ', cmd, idx, offset, len(data), 0), data])
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     mapped_size, _, _, fd = self._rpc(RemoteCmd.MAP_SYSMEM_FD, 0, 0, size, has_fd=True)
@@ -340,14 +342,31 @@ class APLRemotePCIDevice(RemotePCIDevice):
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
     super().__init__(devpref, pcibus, bars, sock)
 
-class APLRemoteIfaceBase(LNXPCIIfaceBase):
+class LNXRemotePCIDevice(RemotePCIDevice):
+  def __init__(self, devpref:str, pcibus:str, bars:list[int], resize_bars:list[int]|None=None):
+    host_port = getenv("REMOTE", "").split(":")
+    host, port = host_port[0], int(host_port[1]) if len(host_port) > 1 else 6667
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect((host, port))
+    super().__init__(devpref, pcibus, bars, sock)
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    paddrs_len, handle, _, _ = self._rpc(RemoteCmd.MAP_SYSMEM, 0, 0, size)
+    paddrs = list(struct.unpack(f'<{paddrs_len // 8}Q', self._recvall(paddrs_len)))
+    return RemoteMMIOInterface(self, handle, size, fmt='B', rd_cmd=RemoteCmd.SYSMEM_READ, wr_cmd=RemoteCmd.SYSMEM_WRITE), paddrs
+
+class RemoteIfaceBase(LNXPCIIfaceBase):
   def __init__(self, dev, dev_id, vendor, devices:list[tuple[int, list[int]]], bars, vram_bar, va_start, va_size, base_class:int|None=None):
     if not (cls:=type(self)).gpus:
-      cls.gpus = System.pci_scan_bus(vendor, devices, base_class)
-      if not cls.gpus: raise RuntimeError("No supported GPUs found")
-      if not os.path.exists(APLRemotePCIDevice.APP_PATH): APLRemotePCIDevice.install_tinygpu()
+      if OSX:
+        cls.gpus = System.pci_scan_bus(vendor, devices, base_class)
+        if not cls.gpus: raise RuntimeError("No supported GPUs found")
+        if not os.path.exists(APLRemotePCIDevice.APP_PATH): APLRemotePCIDevice.install_tinygpu()
+      else:
+        cls.gpus = ['remote:0']
     if dev_id >= len(cls.gpus): raise RuntimeError(f"No device found for {dev_id}. Requesting more devices than the system has ({cls.gpus})?")
-    self.pci_dev = APLRemotePCIDevice(dev.__class__.__name__[:2], f'remote:{dev_id}', bars)
+    self.pci_dev = (APLRemotePCIDevice if OSX else LNXRemotePCIDevice)(dev.__class__.__name__[:2], f'remote:{dev_id}', bars)
     self.dev, self.vram_bar = dev, vram_bar
 
   def free(self, b:HCQBuffer):
@@ -355,4 +374,4 @@ class APLRemoteIfaceBase(LNXPCIIfaceBase):
 
   def map(self, b:HCQBuffer): raise RuntimeError(f"P2P mapping not supported for remote devices: {b.owner} -> {self.dev}")
 
-PCIIfaceBase:type = APLRemoteIfaceBase if OSX else LNXPCIIfaceBase
+PCIIfaceBase:type = RemoteIfaceBase if (OSX or getenv("REMOTE", "")) else LNXPCIIfaceBase
