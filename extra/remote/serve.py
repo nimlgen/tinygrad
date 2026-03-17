@@ -39,13 +39,16 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
   elif cmd == RemoteCmd.CFG_WRITE:
     pci_dev.write_config(arg0, arg2, arg1)
     conn.sendall(resp())
+  elif cmd == RemoteCmd.RESIZE_BAR:
+    pci_dev.resize_bar(bar)
+    conn.sendall(resp())
   elif cmd == RemoteCmd.RESET:
     pci_dev.reset()
     conn.sendall(resp())
   elif cmd == RemoteCmd.MMIO_READ:
-    conn.sendmsg([resp(arg1), mapped_bars[(dev_id, bar)].mv[arg0:arg0+arg1]])
+    conn.sendmsg([resp(arg1), mapped_bars[(dev_id, bar)][arg0:arg0+arg1]])
   elif cmd == RemoteCmd.MMIO_WRITE:
-    mapped_bars[(dev_id, bar)].mv[arg0:arg0+arg1] = conn.recv(arg1, socket.MSG_WAITALL)
+    mapped_bars[(dev_id, bar)][arg0:arg0+arg1] = conn.recv(arg1, socket.MSG_WAITALL)
   elif cmd == RemoteCmd.MAP_SYSMEM:
     memview, paddrs = pci_dev.alloc_sysmem(arg0)
     hdl = len(sysmem_allocs)
@@ -53,9 +56,9 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     paddrs_bytes = struct.pack(f'<{len(paddrs)}Q', *paddrs)
     conn.sendall(resp(len(paddrs_bytes), hdl) + paddrs_bytes)
   elif cmd == RemoteCmd.SYSMEM_READ:
-    conn.sendmsg([resp(arg1), sysmem_allocs[bar][0].mv[arg0:arg0+arg1]])
+    conn.sendmsg([resp(arg1), sysmem_allocs[bar][0][arg0:arg0+arg1]])
   elif cmd == RemoteCmd.SYSMEM_WRITE:
-    sysmem_allocs[bar][0].mv[arg0:arg0+arg1] = conn.recv(arg1, socket.MSG_WAITALL)
+    sysmem_allocs[bar][0][arg0:arg0+arg1] = conn.recv(arg1, socket.MSG_WAITALL)
   else: raise RuntimeError(f"unknown command {cmd}")
 
 def serve(conn:socket.socket):
