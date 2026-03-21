@@ -60,7 +60,9 @@ class MLXDev:
 
     self.eq = self._create_eq()
     self.cq = self._create_cq()
-    print(f"mlx5: MAC={':'.join(f'{b:02x}' for b in self.mac)} UAR={self.uar} PD=0x{self.pd:x} TD=0x{self.td:x} EQ={self.eq} CQ=0x{self.cq:x}")
+    self.mkey = self._create_mkey()
+    print(f"mlx5: MAC={':'.join(f'{b:02x}' for b in self.mac)} UAR={self.uar} PD=0x{self.pd:x} TD=0x{self.td:x}")
+    print(f"mlx5: EQ={self.eq} CQ=0x{self.cq:x} MKEY=0x{self.mkey:x}")
     print("mlx5: ready for QP creation")
 
   # --- Big-endian MMIO (init segment at BAR0) ---
@@ -421,6 +423,29 @@ class MLXDev:
     cqn = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # cqn[24] at DW2
     if MLX_DEBUG >= 1: print(f"mlx5: created CQ 0x{cqn:x}, {cq_size} entries")
     return cqn
+
+  def _create_mkey(self):
+    """CREATE_MKEY in PA (physical address) mode covering all memory. Returns full mkey value."""
+    # create_mkey_in from DW2: rsvd[4B] + flags[4B] + mkc[64B] + rsvd[16B] + translations_sz[4B] + rsvd[172B]
+    inp = bytearray(264)
+
+    # MKey context (mkc) at inp[8:72]
+    mkc = memoryview(inp)[8:72]
+    ifc_set(mkc, 0x03, 3, 0)           # access_mode_4_2 = 0 (PA mode)
+    ifc_set(mkc, 0x16, 2, 0)           # access_mode_1_0 = 0 (PA mode)
+    ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
+    ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
+    ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
+    ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
+    ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = 0xFFFFFF (any QP)
+    ifc_set(mkc, 0x28, 8, 0x42)        # mkey_7_0 (low 8 bits of key)
+    ifc_set(mkc, 0x68, 24, self.pd)    # pd
+
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
+    mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # mkey_index[24] at DW2
+    mkey = (mkey_index << 8) | 0x42  # full mkey = index << 8 | mkey_7_0
+    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full memory)")
+    return mkey
 
 if __name__ == "__main__":
   pci_bdf = os.getenv("MLX_PCI", "0000:41:00.0")
