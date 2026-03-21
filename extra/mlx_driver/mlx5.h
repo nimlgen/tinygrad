@@ -67,9 +67,11 @@ struct mlx5_init_seg {
 #define MLX5_CMD_OP_RST2INIT_QP              0x502
 #define MLX5_CMD_OP_INIT2RTR_QP              0x503
 #define MLX5_CMD_OP_RTR2RTS_QP              0x504
-#define MLX5_CMD_OP_ACCESS_REG               0x805
-#define MLX5_CMD_OP_ALLOC_UAR                0x802
+#define MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT  0x754
+#define MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT 0x755
 #define MLX5_CMD_OP_ALLOC_PD                 0x800
+#define MLX5_CMD_OP_ALLOC_UAR                0x802
+#define MLX5_CMD_OP_ACCESS_REG               0x805
 #define MLX5_CMD_OP_ALLOC_TRANSPORT_DOMAIN   0x816
 
 // --- Command status (device.h) ---

@@ -46,6 +46,23 @@ class MLXDev:
     self._init_hca()                                                # mlx5_cmd_init_hca
     print("mlx5: INIT_HCA OK")
 
+    # Post-INIT_HCA: re-query caps, allocate resources (mlx5_init_once + mlx5_load)
+    self._query_hca_caps_post_init()
+    self.uar = self._alloc_uar()
+    self.pd = self._alloc_pd()
+    self.td = self._alloc_td()
+    self.resd_lkey, self.null_mkey = self._query_special_contexts()
+    self.mac = self._query_nic_vport_mac()
+
+    # Allocate doorbell record page (for CQ/QP doorbells)
+    self.dbr_mem, self.dbr_paddrs = self.pci_dev.alloc_sysmem(0x1000)
+    self.dbr_offset = 0  # next free offset in dbr page
+
+    self.eq = self._create_eq()
+    self.cq = self._create_cq()
+    print(f"mlx5: MAC={':'.join(f'{b:02x}' for b in self.mac)} UAR={self.uar} PD=0x{self.pd:x} TD=0x{self.td:x} EQ={self.eq} CQ=0x{self.cq:x}")
+    print("mlx5: ready for QP creation")
+
   # --- Big-endian MMIO (init segment at BAR0) ---
   def rreg(self, off): return swap32(self.bar[off // 4])
   def wreg(self, off, val): self.bar[off // 4] = swap32(val)
@@ -290,6 +307,120 @@ class MLXDev:
     if ifc_get(self.gen_caps, 0x61E, 1):  # sw_owner_id capability
       for i in range(4): struct.pack_into('>I', inp, 8 + i * 4, random.getrandbits(32))
     self.cmd_exec(mlx5.MLX5_CMD_OP_INIT_HCA, inp=inp)
+
+  # --- Post-INIT_HCA resource allocation ---
+  def _query_hca_caps_post_init(self):
+    """Re-query all HCA caps after INIT_HCA (mlx5_query_hca_caps). Saves current general caps."""
+    self.gen_caps = self._query_cap(mlx5.MLX5_CAP_GENERAL, 1)
+    # Query additional cap types based on general caps (only current mode needed post-init)
+    if ifc_get(self.gen_caps, 0x21E, 1): self._query_cap(mlx5.MLX5_CAP_ATOMIC, 1)    # atomic
+    if ifc_get(self.gen_caps, 0x227, 1): self._query_cap(mlx5.MLX5_CAP_ODP, 1)       # odp
+    if ifc_get(self.gen_caps, 0x21D, 1): self._query_cap(mlx5.MLX5_CAP_ROCE, 1)      # roce
+
+  def _alloc_uar(self):
+    """ALLOC_UAR -> returns UAR number. Also maps the UAR MMIO page."""
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_ALLOC_UAR)
+    uar = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # uar[24] at DW2
+    # Map UAR MMIO page within BAR0 for doorbells
+    page_sz = os.sysconf('SC_PAGE_SIZE')
+    uar_offset = uar * page_sz  # byte offset in BAR0
+    self.uar_page = self.pci_dev.map_bar(0, off=uar_offset, size=page_sz, fmt='I')
+    return uar
+
+  def _alloc_pd(self):
+    """ALLOC_PD -> returns 24-bit PD number."""
+    return struct.unpack_from('>I', self.cmd_exec(mlx5.MLX5_CMD_OP_ALLOC_PD), 0)[0] & 0xFFFFFF
+
+  def _alloc_td(self):
+    """ALLOC_TRANSPORT_DOMAIN -> returns 24-bit TD number."""
+    return struct.unpack_from('>I', self.cmd_exec(mlx5.MLX5_CMD_OP_ALLOC_TRANSPORT_DOMAIN), 0)[0] & 0xFFFFFF
+
+  def _query_special_contexts(self):
+    """QUERY_SPECIAL_CONTEXTS -> returns (resd_lkey, null_mkey)."""
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_QUERY_SPECIAL_CONTEXTS, out_sz=16)
+    return struct.unpack_from('>I', out, 4)[0], struct.unpack_from('>I', out, 8)[0]  # resd_lkey at DW3, null_mkey in mbox
+
+  def _query_nic_vport_mac(self):
+    """QUERY_NIC_VPORT_CONTEXT -> returns 6-byte MAC address."""
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT, out_sz=256)
+    # nic_vport_context starts at out[8]. permanent_address at context bit 0x7A0 = byte 0xF4
+    # mac_address_layout: rsvd[2] mac_47_32[2] mac_31_0[4] at context byte 0xF4
+    off = 8 + 0xF4  # offset in out_data
+    return bytes(out[off + 2:off + 8])  # skip 2-byte reserved, take 6 bytes MAC
+
+  def _alloc_dbr(self):
+    """Allocate an 8-byte doorbell record from the DBR page. Returns physical address."""
+    assert self.dbr_offset + 8 <= 0x1000, "DBR page full"
+    phys = self.dbr_paddrs[0] + self.dbr_offset
+    self.dbr_offset += 8
+    return phys
+
+  def _create_eq(self, log_eq_size=7):
+    """CREATE_EQ for completion events. Returns EQ number."""
+    eq_size = 1 << log_eq_size  # number of EQEs
+    eq_buf_sz = eq_size * 64    # each EQE is 64 bytes
+    n_pages = (eq_buf_sz + 0xFFF) // 0x1000
+
+    # Allocate EQ buffer (DMA memory, zero-initialized)
+    self.eq_mem, eq_paddrs = self.pci_dev.alloc_sysmem(n_pages * 0x1000)
+    # Set ownership bit on all EQEs: byte 31 bit 0 (owner) = 1 (HW owns initially)
+    for i in range(eq_size): self.eq_mem.mv[i * 64 + 31] = 0x01
+
+    # Build CREATE_EQ input
+    # Layout from DW2: rsvd[8B] + eqc[64B] + rsvd[8B] + event_bitmask[32B] + rsvd[152B] + pas[]
+    inp = bytearray(264 + n_pages * 8)
+
+    # Fill EQ context (eqc) at inp[8:72]
+    eqc = memoryview(inp)[8:72]
+    ifc_set(eqc, 0x63, 5, log_eq_size)       # log_eq_size
+    ifc_set(eqc, 0x68, 24, self.uar)          # uar_page
+    ifc_set(eqc, 0xC3, 5, 0)                  # log_page_size = 0 (4K)
+
+    # Event bitmask at inp[80:112] - leave all zeros for completion EQ
+    # (completions are routed via CQ's c_eqn field, not the event bitmask)
+
+    # Page addresses at inp[264:]
+    for i in range(n_pages): struct.pack_into('>Q', inp, 264 + i * 8, eq_paddrs[i])
+
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_EQ, inp=inp)
+    eq_num = struct.unpack_from('>I', out, 0)[0] & 0xFF  # eq_number[8] in low byte of DW2
+    if MLX_DEBUG >= 1: print(f"mlx5: created EQ {eq_num}, {eq_size} entries")
+    return eq_num
+
+  def _create_cq(self, log_cq_size=7):
+    """CREATE_CQ with doorbell record. Returns CQN."""
+    cq_size = 1 << log_cq_size
+    cq_buf_sz = cq_size * 64  # each CQE is 64 bytes
+    n_pages = (cq_buf_sz + 0xFFF) // 0x1000
+
+    # Allocate CQ buffer
+    self.cq_mem, cq_paddrs = self.pci_dev.alloc_sysmem(n_pages * 0x1000)
+    # Set ownership on all CQEs: byte 63 bit 0 (owner) = 1 (HW owns)
+    for i in range(cq_size): self.cq_mem.mv[i * 64 + 63] = 0x01
+
+    # Allocate doorbell record for this CQ
+    self.cq_dbr_phys = self._alloc_dbr()
+
+    # Build CREATE_CQ input
+    # Layout from DW2: rsvd[8B] + cqc[64B] + rsvd[12B] + cq_umem_valid(1bit) + rsvd[~180B] + pas[]
+    inp = bytearray(264 + n_pages * 8)
+
+    # Fill CQ context (cqc) at inp[8:72]
+    cqc = memoryview(inp)[8:72]
+    ifc_set(cqc, 0x63, 5, log_cq_size)        # log_cq_size
+    ifc_set(cqc, 0x68, 24, self.uar)           # uar_page
+    ifc_set(cqc, 0xA0, 32, self.eq)            # c_eqn (EQ number for completion events)
+    ifc_set(cqc, 0xC3, 5, 0)                   # log_page_size = 0 (4K)
+    # dbr_addr at cqc bit 0x1C0 (64 bits)
+    ifc_set(cqc, 0x1C0, 64, self.cq_dbr_phys)  # doorbell record address
+
+    # Page addresses at inp[264:]
+    for i in range(n_pages): struct.pack_into('>Q', inp, 264 + i * 8, cq_paddrs[i])
+
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_CQ, inp=inp)
+    cqn = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # cqn[24] at DW2
+    if MLX_DEBUG >= 1: print(f"mlx5: created CQ 0x{cqn:x}, {cq_size} entries")
+    return cqn
 
 if __name__ == "__main__":
   pci_bdf = os.getenv("MLX_PCI", "0000:41:00.0")
