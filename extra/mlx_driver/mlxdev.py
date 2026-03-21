@@ -61,9 +61,10 @@ class MLXDev:
     self.eq = self._create_eq()
     self.cq = self._create_cq()
     self.mkey = self._create_mkey()
+    self.qpn = self._create_qp()
     print(f"mlx5: MAC={':'.join(f'{b:02x}' for b in self.mac)} UAR={self.uar} PD=0x{self.pd:x} TD=0x{self.td:x}")
-    print(f"mlx5: EQ={self.eq} CQ=0x{self.cq:x} MKEY=0x{self.mkey:x}")
-    print("mlx5: ready for QP creation")
+    print(f"mlx5: EQ={self.eq} CQ=0x{self.cq:x} MKEY=0x{self.mkey:x} QPN=0x{self.qpn:x}")
+    print("mlx5: QP in INIT state, ready for connection")
 
   # --- Big-endian MMIO (init segment at BAR0) ---
   def rreg(self, off): return swap32(self.bar[off // 4])
@@ -446,6 +447,72 @@ class MLXDev:
     mkey = (mkey_index << 8) | 0x42  # full mkey = index << 8 | mkey_7_0
     if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full memory)")
     return mkey
+
+  def _create_qp(self, log_sq_size=4, log_rq_size=4):
+    """CREATE_QP (RC) + RST2INIT_QP. Returns QPN.
+
+    WQ layout: [RQ at offset 0 | SQ at offset rq_size]
+    - RQ: 2^log_rq_size WQEs, each 16 bytes (1 data segment = 1 SGE)
+    - SQ: 2^log_sq_size WQEBBs, each 64 bytes (basic block)
+    - Doorbell record: 8 bytes [RCV_DBR(be32) | SND_DBR(be32)]
+    """
+    # WQ sizing (matches kernel set_rq_size + calc_sq_size)
+    log_rq_stride = 0  # stride = 16 << log_rq_stride = 16 bytes (1 SGE per RQ WQE)
+    rq_sz = (1 << log_rq_size) << (log_rq_stride + 4)  # wqe_cnt * stride
+    sq_sz = (1 << log_sq_size) * 64                      # wqe_cnt * WQEBB(64)
+    n_pages = ((rq_sz + sq_sz) + 0xFFF) // 0x1000
+
+    self.qp_buf, qp_paddrs = self.pci_dev.alloc_sysmem(n_pages * 0x1000)
+    self.qp_dbr_phys = self._alloc_dbr()
+    self.sq_offset = rq_sz  # SQ starts after RQ in the buffer
+
+    # ---- CREATE_QP ----
+    # create_qp_in from DW2: input_qpn(4) rsvd(4) opt_param_mask(4) ece(4) qpc(232) umem_off(8) umem_id(4) umem_valid(4) pas[]
+    inp = bytearray(264 + n_pages * 8)
+
+    # QPC at inp[16:248] — WQ configuration for the QP (kernel create_kernel_qp)
+    qpc = memoryview(inp)[16:248]
+    ifc_set(qpc, 0x08, 8, 0)                        # st = RC
+    ifc_set(qpc, 0x13, 2, 3)                        # pm_state = MIGRATED
+    ifc_set(qpc, 0x28, 24, self.pd)                  # pd
+    ifc_set(qpc, 0x43, 5, 30)                        # log_msg_max = 30 (max 1GB messages)
+    ifc_set(qpc, 0x49, 4, log_rq_size)               # log_rq_size
+    ifc_set(qpc, 0x4D, 3, log_rq_stride)             # log_rq_stride (stride = 16 << val)
+    ifc_set(qpc, 0x51, 4, log_sq_size)               # log_sq_size (in WQEBBs)
+    ifc_set(qpc, 0x5B, 1, 1)                         # rlky (use reserved lkey)
+    ifc_set(qpc, 0x68, 24, self.uar)                  # uar_page
+    ifc_set(qpc, 0xA3, 5, 0)                         # log_page_size = 0 (4K)
+    ifc_set(qpc, 0x3E8, 24, self.cq)                 # cqn_snd
+    ifc_set(qpc, 0x4E8, 24, self.cq)                 # cqn_rcv (same CQ for both)
+    ifc_set(qpc, 0x500, 64, self.qp_dbr_phys)        # dbr_addr
+
+    # Page addresses at inp[264:]
+    for i in range(n_pages): struct.pack_into('>Q', inp, 264 + i * 8, qp_paddrs[i])
+
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_QP, inp=inp)
+    qpn = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # qpn[24] at DW2
+    if MLX_DEBUG >= 1: print(f"mlx5: created QP 0x{qpn:x} (RC, sq={1<<log_sq_size} rq={1<<log_rq_size})")
+
+    # ---- RST2INIT_QP ----
+    # rst2init_qp_in from DW2: qpn(4) rsvd(4) opt_param_mask(4) ece(4) qpc(232) rsvd(16)
+    inp2 = bytearray(264)
+    struct.pack_into('>I', inp2, 0, qpn)  # DW2: rsvd[8] | qpn[24]
+
+    # QPC at inp2[16:248] — connection parameters for INIT state
+    qpc2 = memoryview(inp2)[16:248]
+    ifc_set(qpc2, 0x08, 8, 0)                        # st = RC
+    ifc_set(qpc2, 0x13, 2, 3)                        # pm_state = MIGRATED
+    ifc_set(qpc2, 0x28, 24, self.pd)                  # pd
+    ifc_set(qpc2, 0x3E8, 24, self.cq)                # cqn_snd
+    ifc_set(qpc2, 0x4E8, 24, self.cq)                # cqn_rcv
+    ifc_set(qpc2, 0x380, 4, 8)                       # log_ack_req_freq = 8
+    # Primary address path: pkey_index + port
+    ifc_set(qpc2, 0xC0 + 0x10, 16, 0)                # pkey_index = 0
+    ifc_set(qpc2, 0xC0 + 0x128, 8, 1)                # vhca_port_num = 1
+
+    self.cmd_exec(mlx5.MLX5_CMD_OP_RST2INIT_QP, inp=inp2)
+    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{qpn:x} RST -> INIT")
+    return qpn
 
 if __name__ == "__main__":
   pci_bdf = os.getenv("MLX_PCI", "0000:41:00.0")
