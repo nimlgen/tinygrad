@@ -160,4 +160,8 @@ def __getattr__(nm):
     case "corefoundation": return load("corefoundation", "'CoreFoundation'",
                                        [f"{macossdk}/System/Library/Frameworks/CoreFoundation.framework/Headers/CF{s}.h" for s in ["String", "Data"]],
                                        args=["-isysroot", macossdk])
+    case "mlx5": return load("mlx5", None, [root/"extra/mlx_driver/mlx5.h", "/home/nimlgen/linux/include/linux/mlx5/mlx5_ifc.h"],
+                             args=["-Du8=unsigned char", "-Du16=unsigned short", "-Du32=unsigned int", "-Du64=unsigned long long",
+                                   "-D__be16=unsigned short", "-D__be32=unsigned int", "-D__be64=unsigned long long",
+                                   "-I/home/nimlgen/linux/include"])
     case _: raise AttributeError(f"no such autogen: {nm}")
