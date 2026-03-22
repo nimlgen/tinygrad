@@ -19,7 +19,7 @@ subprocess.run(["rsync", "-az", "--exclude=.git", "--exclude=__pycache__", "--ex
 print("=== booting remote ===")
 remote = subprocess.Popen(
   SSH + [f"cd ~/tinygrad && sudo PYTHONPATH=. MLX_DEBUG=1 MLX_PCI={REMOTE_PCI} python3 extra/mlx_driver/mlxdev.py --server --ip {REMOTE_IP}"],
-  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
 
 # Read remote output until we get the JSON connection info line
 remote_info = None
@@ -58,5 +58,31 @@ print("=== both QPs in RTS - connection established ===")
 print(f"  local:  QPN=0x{local_info['qpn']:x}  IP={LOCAL_IP}  MAC={local_info['mac']}")
 print(f"  remote: QPN=0x{remote_info['qpn']:x} IP={REMOTE_IP} MAC={remote_info['mac']}")
 
+# 6. Wait for remote to post receive WQE
+for line in iter(remote.stdout.readline, ''):
+  print(f"  [remote] {line}", end='')
+  if "recv_posted" in line: break
+
+# 7. SEND test data to remote
+local_dev.cq_ci = 0
+local_dev.sq_head = 0
+local_dev.rq_head = 0
+test_msg = b"Hello from tinygrad MLX5 driver! SEND works!"
+src_mem, src_paddrs = local_dev.pci_dev.alloc_sysmem(0x1000)
+for i, b in enumerate(test_msg): src_mem[i] = b
+
+print(f"=== SEND {len(test_msg)}B to remote ===")
+local_dev.send(src_paddrs[0], local_dev.resd_lkey, len(test_msg))
+
+# 8. Tell remote to poll CQ and read received data
+remote.stdin.write("done\n")
+remote.stdin.flush()
+
+# 9. Read remote's verification output
+for line in iter(remote.stdout.readline, ''):
+  print(f"  [remote] {line}", end='')
+  if "AS TEXT" in line: break
+
 remote.stdin.close()
 remote.wait()
+print("=== SEND/RECV test complete ===")

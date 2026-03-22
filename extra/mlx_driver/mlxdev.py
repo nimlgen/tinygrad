@@ -447,14 +447,15 @@ class MLXDev:
 
     # MKey context (mkc) at inp[8:72]
     mkc = memoryview(inp)[8:72]
-    ifc_set(mkc, 0x03, 3, 0)           # access_mode_4_2 = 0 (PA mode)
-    ifc_set(mkc, 0x16, 2, 0)           # access_mode_1_0 = 0 (PA mode)
+    ifc_set(mkc, 0x03, 3, 0)           # access_mode_4_2 = 0 → PA mode (0x0)
+    ifc_set(mkc, 0x16, 2, 0)           # access_mode_1_0 = 0 → PA mode (0x0)
     ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
     ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
     ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
     ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
     ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = 0xFFFFFF (any QP)
     ifc_set(mkc, 0x28, 8, 0x42)        # mkey_7_0 (low 8 bits of key)
+    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full 64-bit address space)
     ifc_set(mkc, 0x68, 24, self.pd)    # pd
 
     out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
@@ -634,11 +635,78 @@ class MLXDev:
     self.cmd_exec(mlx5.MLX5_CMD_OP_RTR2RTS_QP, inp=inp)
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} RTR -> RTS")
 
+  # --- Data Operations ---
+  def _ring_sq_doorbell(self, wqe):
+    """Ring SQ doorbell: update DBR[1] then MMIO write ctrl to UAR."""
+    dbr_off = self.qp_dbr_phys - self.dbr_paddrs[0]
+    struct.pack_into('>I', self.dbr_mem.mv, dbr_off + 4, self.sq_head)  # DBR[1] = SND_DBR
+    bf_off = 0x800 // 4
+    self.uar_page[bf_off] = swap32(struct.unpack_from('>I', wqe, 0)[0])
+    self.uar_page[bf_off + 1] = swap32(struct.unpack_from('>I', wqe, 4)[0])
+
+  def post_recv(self, addr, lkey, length):
+    """Post a receive WQE. RQ WQEs are just data_seg entries (16B each)."""
+    rq_idx = self.rq_head & ((1 << 4) - 1)  # log_rq_size=4 → 16 WQEs
+    wqe_off = rq_idx * 16  # RQ at offset 0, stride=16 (1 SGE)
+    wqe = memoryview(self.qp_buf.mv)[wqe_off:wqe_off + 16]
+    struct.pack_into('>I', wqe, 0, length)   # byte_count
+    struct.pack_into('>I', wqe, 4, lkey)     # lkey
+    struct.pack_into('>Q', wqe, 8, addr)     # addr
+    self.rq_head += 1
+    # RQ doorbell: just update DBR[0] (no MMIO write needed)
+    dbr_off = self.qp_dbr_phys - self.dbr_paddrs[0]
+    struct.pack_into('>I', self.dbr_mem.mv, dbr_off, self.rq_head & 0xFFFF)  # DBR[0] = RCV_DBR
+
+  def send(self, addr, lkey, length):
+    """Post a SEND WQE and wait for completion. WQE = ctrl_seg(16B) + data_seg(16B) = 2 DS."""
+    wqe_idx = self.sq_head & ((1 << 4) - 1)
+    wqe_off = self.sq_offset + wqe_idx * 64
+    wqe = memoryview(self.qp_buf.mv)[wqe_off:wqe_off + 64]
+    wqe[:64] = bytes(64)
+    struct.pack_into('>I', wqe, 0, (self.sq_head << 8) | 0x0a)  # wqe_index | SEND opcode
+    struct.pack_into('>I', wqe, 4, (self.qpn << 8) | 2)          # qpn | ds_count=2
+    wqe[11] = 0x08  # fm_ce_se = CQ_UPDATE (signaled)
+    struct.pack_into('>I', wqe, 16, length)   # data_seg: byte_count
+    struct.pack_into('>I', wqe, 20, lkey)     # data_seg: lkey
+    struct.pack_into('>Q', wqe, 24, addr)     # data_seg: addr
+    self.sq_head += 1
+    self._ring_sq_doorbell(wqe)
+    self._poll_cq()
+    if MLX_DEBUG >= 1: print(f"mlx5: SEND {length}B complete")
+
+  def _poll_cq(self, timeout=5.0):
+    """Poll CQ until a completion is found."""
+    t = time.monotonic()
+    cq_size = 1 << 7  # log_cq_size=7 → 128 entries
+    while True:
+      idx = self.cq_ci & (cq_size - 1)
+      cqe = bytes(self.cq_mem.mv[idx * 64:(idx + 1) * 64])
+      op_own = cqe[63]
+      opcode = op_own >> 4
+      owner = op_own & 1
+      # SW owns when owner bit matches expected: !(ci & cq_size) for initial cycle
+      expected_owner = 0 if (self.cq_ci & cq_size) == 0 else 1
+      if opcode != 0x0F and owner == expected_owner:  # valid CQE, SW owns it
+        self.cq_ci += 1
+        # Update CQ DBR[0] (consumer index)
+        cq_dbr_off = self.cq_dbr_phys - self.dbr_paddrs[0]
+        struct.pack_into('>I', self.dbr_mem.mv, cq_dbr_off, self.cq_ci & 0xFFFFFF)
+        if opcode in (13, 14):  # REQ_ERR or RESP_ERR
+          syndrome = cqe[55]
+          vendor = cqe[54]
+          raise RuntimeError(f"CQE error: opcode={opcode} syndrome=0x{syndrome:02x} vendor=0x{vendor:02x}")
+        return opcode
+      if time.monotonic() - t > timeout: raise TimeoutError("CQ poll timeout")
+      time.sleep(0.0001)
+
 if __name__ == "__main__":
   pci_bdf = os.getenv("MLX_PCI", "0000:41:00.0")
   ip = sys.argv[sys.argv.index("--ip") + 1] if "--ip" in sys.argv else None
 
   dev = MLXDev(PCIDevice("mlx5", pci_bdf))
+  dev.cq_ci = 0   # CQ consumer index
+  dev.sq_head = 0  # SQ producer index
+  dev.rq_head = 0  # RQ producer index
 
   if "--server" in sys.argv:
     # Server mode: set RoCE addr, print info, wait for remote info, connect
@@ -648,3 +716,14 @@ if __name__ == "__main__":
     dev.init2rtr(remote["qpn"], remote["mac"], remote["gid"])
     dev.rtr2rts()
     print("connected", flush=True)
+    # Post receive WQE to receive SEND data
+    recv_mem, recv_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
+    dev.post_recv(recv_paddrs[0], dev.resd_lkey, 256)
+    print("recv_posted", flush=True)
+    # Wait for sender to finish
+    input()
+    # Poll CQ for receive completion
+    opcode = dev._poll_cq(timeout=10.0)
+    data = bytes(recv_mem[i] for i in range(64))
+    print(f"RECEIVED: {data.hex(' ')}", flush=True)
+    print(f"AS TEXT: {data.rstrip(b'\\x00').decode('ascii', errors='replace')}", flush=True)
