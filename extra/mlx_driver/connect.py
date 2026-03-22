@@ -74,9 +74,9 @@ test_msg = b"Hello from tinygrad MLX5 driver! RDMA WRITE works!"
 src_mem, src_paddrs = local_dev.pci_dev.alloc_sysmem(0x1000)
 for i, b in enumerate(test_msg): src_mem[i] = b
 
-print(f"=== RDMA WRITE {len(test_msg)}B to remote (rkey=0x{remote_target['rkey']:x}) ===")
-# MTT MKey on remote: start_addr=0, so rdma_addr=0 maps to the target buffer's physical page
-local_dev.rdma_write(0, remote_target["rkey"], src_paddrs[0], local_dev.resd_lkey, len(test_msg))
+print(f"=== RDMA WRITE {len(test_msg)}B to remote phys 0x{remote_target['target_addr']:x} ===")
+# PA MKey: use physical addresses directly, same mkey for local and remote
+local_dev.rdma_write(remote_target["target_addr"], remote_target["rkey"], src_paddrs[0], local_dev.mkey, len(test_msg))
 
 # 8. Tell remote to read the target buffer
 remote.stdin.write("done\n")

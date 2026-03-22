@@ -441,20 +441,22 @@ class MLXDev:
     return cqn
 
   def _create_mkey(self):
-    """CREATE_MKEY in PA mode for local access (resd_lkey also works via rlky=1 in QPC)."""
+    """CREATE_MKEY in PA mode covering all physical memory with full local+remote access."""
     inp = bytearray(264)
     mkc = memoryview(inp)[8:72]
     ifc_set(mkc, 0x16, 2, 0)           # access_mode = PA (0x0)
-    ifc_set(mkc, 0x14, 1, 1)           # lw
-    ifc_set(mkc, 0x15, 1, 1)           # lr
+    ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
+    ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
+    ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
+    ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
     ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = any
     ifc_set(mkc, 0x38, 8, 0x42)        # mkey_7_0
-    ifc_set(mkc, 0x60, 1, 1)           # length64
+    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full address space)
     ifc_set(mkc, 0x68, 24, self.pd)    # pd
     out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
     mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF
     mkey = (mkey_index << 8) | 0x42
-    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode)")
+    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full access)")
     return mkey
 
   def create_mkey_for_buf(self, va, paddrs, buf_size):
@@ -759,10 +761,9 @@ if __name__ == "__main__":
     dev.init2rtr(remote["qpn"], remote["mac"], remote["gid"])
     dev.rtr2rts()
     print("connected", flush=True)
-    # Allocate target buffer + per-buffer MTT MKey for remote RDMA write
+    # Allocate target buffer — PA MKey covers all physical memory
     target_mem, target_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
-    target_rkey = dev.create_mkey_for_buf(0, target_paddrs[:1], 0x1000)
-    print(json.dumps({"rkey": target_rkey}), flush=True)
+    print(json.dumps({"target_addr": target_paddrs[0], "rkey": dev.mkey}), flush=True)
     # Wait for RDMA WRITE to complete
     input()
     data = bytes(target_mem[i] for i in range(64))
