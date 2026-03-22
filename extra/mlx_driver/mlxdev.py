@@ -251,49 +251,41 @@ class MLXDev:
     self.cmd_exec(mlx5.MLX5_CMD_OP_SET_ROCE_ADDRESS, inp=inp)
     self.local_gid = MLXQP._ipv4_to_gid(ip)
 
-# *** MLX5 queue pair: EQ, CQ, QP creation + data ops (send, recv, rdma_write) ***
 class MLXQP:
   def __init__(self, dev:MLXDev, log_sq_size=4, log_rq_size=4, log_eq_size=7, log_cq_size=7):
-    self.dev = dev
+    self.dev, self.cq_size = dev, 1 << log_cq_size
 
-    # EQ: completion event queue
-    self.eq_mem, eq_paddrs = dev.pci_dev.alloc_sysmem((n_eq:=((1 << log_eq_size) * 64 + 0xFFF) // 0x1000) * 0x1000)
-    for i in range(1 << log_eq_size): self.eq_mem.mv[i * 64 + 31] = 0x01
-    inp = bytearray(264 + n_eq * 8)
-    fill_ifc(memoryview(inp)[8:72], mlx5.struct_mlx5_ifc_eqc_bits, log_eq_size=log_eq_size, uar_page=dev.uar, log_page_size=0)
-    pack_pas(inp, 264, eq_paddrs)
-    self.eqn = struct.unpack_from('>I', dev.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_EQ, inp=inp), 0)[0] & 0xFF
+    def _create_hw_q(log_size, entry_sz, owner_off, opcode, ctx_struct, ctx_off, mask, **ctx_kw):
+      mem, paddrs = dev.pci_dev.alloc_sysmem((n:=((1 << log_size) * entry_sz + 0xFFF) // 0x1000) * 0x1000)
+      for i in range(1 << log_size): mem.mv[i * entry_sz + owner_off] = 0x01
+      inp = bytearray(264 + n * 8)
+      fill_ifc(memoryview(inp)[ctx_off:ctx_off + 64], ctx_struct, **ctx_kw)
+      pack_pas(inp, 264, paddrs)
+      return mem, struct.unpack_from('>I', dev.cmd_exec(opcode, inp=inp), 0)[0] & mask
 
-    # CQ: completion queue with doorbell record
-    self.cq_mem, cq_paddrs = dev.pci_dev.alloc_sysmem((n_cq:=((1 << log_cq_size) * 64 + 0xFFF) // 0x1000) * 0x1000)
-    for i in range(1 << log_cq_size): self.cq_mem.mv[i * 64 + 63] = 0x01
-    self.cq_dbr_phys, self.cq_size = dev._alloc_dbr(), 1 << log_cq_size
-    inp = bytearray(264 + n_cq * 8)
-    fill_ifc(memoryview(inp)[8:72], mlx5.struct_mlx5_ifc_cqc_bits,
-             log_cq_size=log_cq_size, uar_page=dev.uar, c_eqn_or_apu_element=self.eqn, log_page_size=0, dbr_addr=self.cq_dbr_phys)
-    pack_pas(inp, 264, cq_paddrs)
-    self.cqn = struct.unpack_from('>I', dev.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_CQ, inp=inp), 0)[0] & 0xFFFFFF
-
-    # QP: work queues (RQ at offset 0, SQ after) + doorbell record
+    self.eq_mem, self.eqn = _create_hw_q(log_eq_size, 64, 31, mlx5.MLX5_CMD_OP_CREATE_EQ, mlx5.struct_mlx5_ifc_eqc_bits, 8, 0xFF,
+                                          log_eq_size=log_eq_size, uar_page=dev.uar, log_page_size=0)
+    self.cq_dbr_phys = dev._alloc_dbr()
+    self.cq_mem, self.cqn = _create_hw_q(log_cq_size, 64, 63, mlx5.MLX5_CMD_OP_CREATE_CQ, mlx5.struct_mlx5_ifc_cqc_bits, 8, 0xFFFFFF,
+                                          log_cq_size=log_cq_size, uar_page=dev.uar, c_eqn_or_apu_element=self.eqn, log_page_size=0,
+                                          dbr_addr=self.cq_dbr_phys)
     rq_sz = (1 << log_rq_size) << 4
     self.qp_buf, qp_paddrs = dev.pci_dev.alloc_sysmem((n_qp:=((rq_sz + (1 << log_sq_size) * 64 + 0xFFF) // 0x1000)) * 0x1000)
-    self.qp_dbr_phys, self.sq_offset = dev._alloc_dbr(), rq_sz
+    self.qp_dbr_phys, self.sq_offset, self.dbr_off = dev._alloc_dbr(), rq_sz, 0
     inp = bytearray(264 + n_qp * 8)
     fill_ifc(memoryview(inp)[16:248], mlx5.struct_mlx5_ifc_qpc_bits, st=0, pm_state=3, pd=dev.pd, cqn_snd=self.cqn, cqn_rcv=self.cqn,
              log_msg_max=30, log_rq_size=log_rq_size, log_rq_stride=0, log_sq_size=log_sq_size,
              rlky=1, uar_page=dev.uar, log_page_size=0, dbr_addr=self.qp_dbr_phys)
     pack_pas(inp, 264, qp_paddrs)
     self.qpn = struct.unpack_from('>I', dev.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_QP, inp=inp), 0)[0] & 0xFFFFFF
-
-    # RST -> INIT
     self._qp_transition(mlx5.MLX5_CMD_OP_RST2INIT_QP, qpc_kw=dict(log_ack_req_freq=8), ads_kw=dict(pkey_index=0, vhca_port_num=1))
     self.cq_ci = self.sq_head = self.rq_head = 0
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} (EQ={self.eqn} CQ=0x{self.cqn:x})")
 
-  def _qp_transition(self, opcode, qpc_kw=None, ads_kw=None, opt_param_mask=0):
-    inp = bytearray(264)
-    struct.pack_into('>I', inp, 0, self.qpn)
-    if opt_param_mask: struct.pack_into('>I', inp, 8, opt_param_mask)
+  def _dbr_write(self, phys, val): struct.pack_into('>I', self.dev.dbr_mem.mv, phys - self.dev.dbr_paddrs[0], val)
+
+  def _qp_transition(self, opcode, qpc_kw=None, ads_kw=None):
+    inp = bytearray(264); struct.pack_into('>I', inp, 0, self.qpn)
     qpc = memoryview(inp)[16:248]
     fill_ifc(qpc, mlx5.struct_mlx5_ifc_qpc_bits, st=0, pm_state=3, pd=self.dev.pd, cqn_snd=self.cqn, cqn_rcv=self.cqn, **(qpc_kw or {}))
     if ads_kw: fill_ifc(qpc, mlx5.struct_mlx5_ifc_ads_bits, base=0xC0, **ads_kw)
@@ -301,7 +293,6 @@ class MLXQP:
 
   @staticmethod
   def _ipv4_to_gid(ip): return bytes(10) + b'\xff\xff' + socket.inet_aton(ip)
-
   @staticmethod
   def _calc_udp_sport(lqpn, rqpn):
     v = (lqpn * rqpn ^ ((lqpn * rqpn) >> 20) ^ ((lqpn * rqpn) >> 40)) & 0xFFFFF
@@ -310,10 +301,7 @@ class MLXQP:
   def connect(self, remote_qpn, remote_mac, remote_gid):
     if isinstance(remote_mac, str): remote_mac = bytes.fromhex(remote_mac)
     if isinstance(remote_gid, str): remote_gid = bytes.fromhex(remote_gid)
-    # INIT -> RTR
-    inp = bytearray(264)
-    struct.pack_into('>II', inp, 0, self.qpn, 0)
-    struct.pack_into('>I', inp, 8, 0x1A)  # opt_param_mask: RRE|RWE|PKEY_INDEX
+    inp = bytearray(264); struct.pack_into('>I', inp, 0, self.qpn); struct.pack_into('>I', inp, 8, 0x1A)
     qpc = memoryview(inp)[16:248]
     fill_ifc(qpc, mlx5.struct_mlx5_ifc_qpc_bits, st=0, pm_state=3, pd=self.dev.pd, cqn_snd=self.cqn, cqn_rcv=self.cqn,
              mtu=3, log_msg_max=read_ifc(self.dev.gen_caps, mlx5.struct_mlx5_ifc_cmd_hca_cap_bits, 'log_max_msg'),
@@ -321,14 +309,12 @@ class MLXQP:
     fill_ifc(qpc, mlx5.struct_mlx5_ifc_ads_bits, base=0xC0, pkey_index=0, src_addr_index=0, hop_limit=64,
              udp_sport=self._calc_udp_sport(self.qpn, remote_qpn), vhca_port_num=1,
              rmac_47_32=int.from_bytes(remote_mac[0:2], 'big'), rmac_31_0=int.from_bytes(remote_mac[2:6], 'big'))
-    qpc[(0xC0 + 0x80) // 8:(0xC0 + 0x80) // 8 + 16] = remote_gid
+    qpc[40:56] = remote_gid  # rgid_rip at ADS offset 0x80 = QPC byte (0xC0+0x80)//8 = 40
     self.dev.cmd_exec(mlx5.MLX5_CMD_OP_INIT2RTR_QP, inp=inp)
-    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} INIT -> RTR (remote=0x{remote_qpn:x})")
-    # RTR -> RTS
     self._qp_transition(mlx5.MLX5_CMD_OP_RTR2RTS_QP,
       qpc_kw=dict(log_ack_req_freq=8, next_send_psn=0, log_sra_max=3, retry_count=7, rnr_retry=7),
       ads_kw=dict(ack_timeout=14, vhca_port_num=1))
-    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} RTR -> RTS")
+    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} connected (remote=0x{remote_qpn:x})")
 
   def _post_sq(self, opcode, ds_count, segs):
     wqe = memoryview(self.qp_buf.mv)[(wo:=self.sq_offset + (self.sq_head & 0xF) * 64):wo + 64]
@@ -337,30 +323,28 @@ class MLXQP:
     wqe[11] = 0x08
     for off, data in segs: wqe[off:off + len(data)] = data
     self.sq_head += 1
-    struct.pack_into('>I', self.dev.dbr_mem.mv, self.qp_dbr_phys - self.dev.dbr_paddrs[0] + 4, self.sq_head)
+    self._dbr_write(self.qp_dbr_phys + 4, self.sq_head)
     self.dev.uar_page[0x200] = swap32(struct.unpack_from('>I', wqe, 0)[0])
     self.dev.uar_page[0x201] = swap32(struct.unpack_from('>I', wqe, 4)[0])
     self.poll_cq()
 
   def rdma_write(self, remote_addr, rkey, local_addr, lkey, length):
     self._post_sq(0x08, 3, [(16, struct.pack('>QI4x', remote_addr, rkey)), (32, struct.pack('>IIQ', length, lkey, local_addr))])
-
   def send(self, addr, lkey, length): self._post_sq(0x0a, 2, [(16, struct.pack('>IIQ', length, lkey, addr))])
 
   def post_recv(self, addr, lkey, length):
     struct.pack_into('>IIQ', self.qp_buf.mv, (self.rq_head & 0xF) * 16, length, lkey, addr)
     self.rq_head += 1
-    struct.pack_into('>I', self.dev.dbr_mem.mv, self.qp_dbr_phys - self.dev.dbr_paddrs[0], self.rq_head & 0xFFFF)
+    self._dbr_write(self.qp_dbr_phys, self.rq_head & 0xFFFF)
 
   def poll_cq(self, timeout=5.0):
     t = time.monotonic()
     while True:
-      idx = self.cq_ci & (self.cq_size - 1)
-      cqe = bytes(self.cq_mem.mv[idx * 64:(idx + 1) * 64])
+      cqe = bytes(self.cq_mem.mv[(idx:=self.cq_ci & (self.cq_size - 1)) * 64:(idx + 1) * 64])
       opcode, owner = cqe[63] >> 4, cqe[63] & 1
       if opcode != 0x0F and owner == (1 if (self.cq_ci & self.cq_size) else 0):
         self.cq_ci += 1
-        struct.pack_into('>I', self.dev.dbr_mem.mv, self.cq_dbr_phys - self.dev.dbr_paddrs[0], self.cq_ci & 0xFFFFFF)
+        self._dbr_write(self.cq_dbr_phys, self.cq_ci & 0xFFFFFF)
         if opcode in (13, 14): raise RuntimeError(f"CQE error: opcode={opcode} syndrome=0x{cqe[55]:02x} vendor=0x{cqe[54]:02x}")
         return opcode
       if time.monotonic() - t > timeout: raise TimeoutError("CQ poll timeout")
