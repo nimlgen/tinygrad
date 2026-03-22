@@ -110,6 +110,11 @@ class MLXDev:
 
   # --- Command interface (polling mode) ---
   def _setup_cmd(self):
+    # Enable PCI bus mastering (required for DMA — kernel does this in mlx5_pci_init)
+    from tinygrad.runtime.autogen import pci
+    cmd_reg = self.pci_dev.read_config(pci.PCI_COMMAND, 2)
+    self.pci_dev.write_config(pci.PCI_COMMAND, cmd_reg | pci.PCI_COMMAND_MASTER, 2)
+
     cmd_l = self.rreg(0x14) & 0xFF  # cmdq_addr_l_sz low byte: log_sz(4) | log_stride(4)
     self.log_sz, self.log_stride = (cmd_l >> 4) & 0xF, cmd_l & 0xF
     self.max_reg_cmds = (1 << self.log_sz) - 1
