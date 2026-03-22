@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Connect two MLX5 devices over RoCE v2. Run on the local machine."""
 import subprocess, json, sys, os
 
 REMOTE_HOST = os.getenv("REMOTE_HOST", "192.168.52.154")
@@ -10,18 +9,15 @@ REMOTE_IP   = os.getenv("REMOTE_IP", "10.0.0.2")
 SSH         = ["ssh", "-o", "StrictHostKeyChecking=no", REMOTE_HOST]
 TINYGRAD    = os.path.dirname(os.path.abspath(__file__)) + "/../.."
 
-# 1. Sync code to remote
 print("syncing code to remote")
 subprocess.run(["rsync", "-az", "--exclude=.git", "--exclude=__pycache__", "--exclude=*.pyc",
                 TINYGRAD + "/", f"{REMOTE_HOST}:~/tinygrad/"], check=True)
 
-# 2. Start remote in server mode
 print("booting remote")
 remote = subprocess.Popen(
   SSH + [f"cd ~/tinygrad && sudo PYTHONPATH=. MLX_DEBUG=1 MLX_PCI={REMOTE_PCI} python3 extra/mlx_driver/mlxdev.py --server --ip {REMOTE_IP}"],
   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
 
-# Read remote output until we get the JSON connection info line
 remote_info = None
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
@@ -30,7 +26,6 @@ for line in iter(remote.stdout.readline, ''):
 assert remote_info, "failed to get remote connection info"
 print(f"remote info: QPN=0x{remote_info['qpn']:x} MAC={remote_info['mac']}")
 
-# 3. Boot local device
 print("booting local")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 from extra.mlx_driver.mlxdev import MLXDev
@@ -41,21 +36,16 @@ local_dev.set_roce_address(0, LOCAL_IP)
 local_info = local_dev.connection_info()
 print(f"local info: QPN=0x{local_info['qpn']:x} MAC={local_info['mac']}")
 
-# 4. Send local info to remote -> it does INIT2RTR + RTR2RTS
 remote.stdin.write(json.dumps(local_info) + "\n")
 remote.stdin.flush()
-
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
   if "connected" in line: break
 
-# 5. Local INIT2RTR + RTR2RTS
 local_dev.init2rtr(remote_info["qpn"], remote_info["mac"], remote_info["gid"])
 local_dev.rtr2rts()
+print("both QPs in RTS - connection established")
 
-print(f"both QPs in RTS - connection established")
-
-# 6. Get remote target buffer
 remote_target = None
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
@@ -63,10 +53,6 @@ for line in iter(remote.stdout.readline, ''):
   except json.JSONDecodeError: pass
 assert remote_target, "failed to get remote target info"
 
-# 7. RDMA WRITE test data directly into remote memory
-local_dev.cq_ci = 0
-local_dev.sq_head = 0
-local_dev.rq_head = 0
 test_msg = b"Test message, rdma works!"
 src_mem, src_paddrs = local_dev.pci_dev.alloc_sysmem(0x1000)
 for i, b in enumerate(test_msg): src_mem[i] = b
@@ -74,11 +60,8 @@ for i, b in enumerate(test_msg): src_mem[i] = b
 print(f"RDMA WRITE {len(test_msg)}B to remote phys 0x{remote_target['target_addr']:x}")
 local_dev.rdma_write(remote_target["target_addr"], remote_target["rkey"], src_paddrs[0], local_dev.mkey, len(test_msg))
 
-# 8. Tell remote to read the target buffer
 remote.stdin.write("done\n")
 remote.stdin.flush()
-
-# 9. Read remote's verification output
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
   if "AS TEXT" in line: break
