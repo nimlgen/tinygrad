@@ -71,6 +71,7 @@ MLX5_CMD_OP_INIT2RTR_QP = 0x503 # type: ignore
 MLX5_CMD_OP_RTR2RTS_QP = 0x504 # type: ignore
 MLX5_CMD_OP_QUERY_NIC_VPORT_CONTEXT = 0x754 # type: ignore
 MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT = 0x755 # type: ignore
+MLX5_CMD_OP_SET_ROCE_ADDRESS = 0x761 # type: ignore
 MLX5_CMD_OP_ALLOC_PD = 0x800 # type: ignore
 MLX5_CMD_OP_ALLOC_UAR = 0x802 # type: ignore
 MLX5_CMD_OP_ACCESS_REG = 0x805 # type: ignore

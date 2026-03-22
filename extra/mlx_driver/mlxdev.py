@@ -1,4 +1,4 @@
-import os, struct, time, random
+import os, struct, time, random, json, sys, socket
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.autogen import mlx5
 
@@ -53,6 +53,7 @@ class MLXDev:
     self.td = self._alloc_td()
     self.resd_lkey, self.null_mkey = self._query_special_contexts()
     self.mac = self._query_nic_vport_mac()
+    self._enable_roce()
 
     # Allocate doorbell record page (for CQ/QP doorbells)
     self.dbr_mem, self.dbr_paddrs = self.pci_dev.alloc_sysmem(0x1000)
@@ -133,7 +134,7 @@ class MLXDev:
     """Execute a FW command. inp=data after opcode/op_mod header. Returns output data after status/syndrome."""
     self.token = (self.token % 255) + 1
     tok, slot = self.token, self.max_reg_cmds if page_queue else 0
-    inlen, outlen = 16 + len(inp), 16 + out_sz
+    inlen, outlen = max(16, 8 + len(inp)), 16 + out_sz
 
     # Build 16-byte header: DW0(opcode|uid) DW1(rsvd|op_mod) DW2-DW3(first 8 bytes of inp)
     hdr = bytearray(16)
@@ -324,6 +325,15 @@ class MLXDev:
     if ifc_get(self.gen_caps, 0x21E, 1): self._query_cap(mlx5.MLX5_CAP_ATOMIC, 1)    # atomic
     if ifc_get(self.gen_caps, 0x227, 1): self._query_cap(mlx5.MLX5_CAP_ODP, 1)       # odp
     if ifc_get(self.gen_caps, 0x21D, 1): self._query_cap(mlx5.MLX5_CAP_ROCE, 1)      # roce
+
+  def _enable_roce(self):
+    """Enable RoCE on the NIC vport via MODIFY_NIC_VPORT_CONTEXT."""
+    # modify_nic_vport_context_in from DW2: other_vport(4B) field_select(4B) rsvd(240B) nic_vport_context(256B)
+    inp = bytearray(504)
+    ifc_set(inp, 4 * 8 + 0x1E, 1, 1)  # field_select.roce_en = 1
+    ifc_set(inp, 248 * 8 + 0x1F, 1, 1)  # nic_vport_context.roce_en = 1
+    self.cmd_exec(mlx5.MLX5_CMD_OP_MODIFY_NIC_VPORT_CONTEXT, inp=inp)
+    if MLX_DEBUG >= 1: print("mlx5: RoCE enabled on vport")
 
   def _alloc_uar(self):
     """ALLOC_UAR -> returns UAR number. Also maps the UAR MMIO page."""
@@ -519,6 +529,122 @@ class MLXDev:
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{qpn:x} RST -> INIT")
     return qpn
 
+  # --- RoCE Connection ---
+  @staticmethod
+  def _ipv4_to_gid(ip):
+    """Convert IPv4 string to RoCE v2 GID (IPv4-mapped IPv6): ::ffff:A.B.C.D"""
+    return bytes(10) + b'\xff\xff' + socket.inet_aton(ip)
+
+  @staticmethod
+  def _calc_udp_sport(lqpn, rqpn):
+    """Compute RoCE v2 UDP source port from QPN pair (kernel rdma_calc_flow_label + rdma_flow_label_to_udp_sport)."""
+    v = lqpn * rqpn
+    v = (v ^ (v >> 20) ^ (v >> 40)) & 0xFFFFF  # flow_label
+    fl_low = v & 0x3FFF
+    fl_low ^= (v & 0xFC000) >> 14
+    return fl_low | 0xC000
+
+  def set_roce_address(self, gid_index, ip):
+    """SET_ROCE_ADDRESS: program GID table entry with our IP/MAC for RoCE v2."""
+    # set_roce_address_in from DW2: roce_address_index[16] | rsvd[12] | vhca_port_num[4] | rsvd[32] | roce_addr_layout[256]
+    inp = bytearray(40)
+    struct.pack_into('>H', inp, 0, gid_index)                     # roce_address_index
+    inp[3] = 1                                                      # vhca_port_num = 1 (low nibble of byte 3)
+    # roce_addr_layout at inp[8:40]
+    ra = memoryview(inp)[8:]
+    ra[0:16] = self._ipv4_to_gid(ip)                               # source_l3_address (GID)
+    ra[18:20] = self.mac[0:2]                                       # source_mac_47_32
+    ra[20:24] = self.mac[2:6]                                       # source_mac_31_0
+    ifc_set(ra, 0xD4, 4, 0)                                         # roce_l3_type = 0 (IPv4)
+    ifc_set(ra, 0xD8, 8, 2)                                         # roce_version = 2 (RoCE v2)
+    self.cmd_exec(mlx5.MLX5_CMD_OP_SET_ROCE_ADDRESS, inp=inp)
+    self.local_gid = self._ipv4_to_gid(ip)
+    if MLX_DEBUG >= 1: print(f"mlx5: SET_ROCE_ADDRESS[{gid_index}] ip={ip}")
+
+  def connection_info(self):
+    """Return connection info dict for QP pairing."""
+    return {"qpn": self.qpn, "mac": self.mac.hex(), "gid": self.local_gid.hex()}
+
+  def init2rtr(self, remote_qpn, remote_mac, remote_gid):
+    """INIT2RTR_QP: configure QP to receive from remote."""
+    if isinstance(remote_mac, str): remote_mac = bytes.fromhex(remote_mac)
+    if isinstance(remote_gid, str): remote_gid = bytes.fromhex(remote_gid)
+
+    # init2rtr_qp_in from DW2: qpn(4) rsvd(4) opt_param_mask(4) ece(4) qpc(232) rsvd(16)
+    inp = bytearray(264)
+    struct.pack_into('>I', inp, 0, self.qpn)
+    # opt_param_mask: RRE(0x2)|RAE(0x4)|RWE(0x8)|PKEY_INDEX(0x10) = 0x1E
+    struct.pack_into('>I', inp, 8, 0x1E)
+
+    qpc = memoryview(inp)[16:248]
+    ifc_set(qpc, 0x08, 8, 0)                         # st = RC
+    ifc_set(qpc, 0x13, 2, 3)                         # pm_state = MIGRATED
+    ifc_set(qpc, 0x28, 24, self.pd)                   # pd
+    ifc_set(qpc, 0x40, 3, 3)                          # mtu = 1K (safe default)
+    ifc_set(qpc, 0x43, 5, ifc_get(self.gen_caps, 0x1C3, 5))  # log_msg_max from caps
+    ifc_set(qpc, 0xA8, 24, remote_qpn)               # remote_qpn
+    ifc_set(qpc, 0x3E8, 24, self.cq)                 # cqn_snd
+    ifc_set(qpc, 0x4E8, 24, self.cq)                 # cqn_rcv
+    ifc_set(qpc, 0x380, 4, 8)                         # log_ack_req_freq
+    ifc_set(qpc, 0x488, 3, 3)                         # log_rra_max = 3 (8 outstanding RDMA reads)
+    ifc_set(qpc, 0x490, 1, 1)                         # rre (remote read enable)
+    ifc_set(qpc, 0x491, 1, 1)                         # rwe (remote write enable)
+    ifc_set(qpc, 0x4A3, 5, 12)                        # min_rnr_nak
+    ifc_set(qpc, 0x4A8, 24, 0)                        # next_rcv_psn = 0
+
+    # Primary address path (ADS at QPC offset 0xC0)
+    P = 0xC0  # primary path base in QPC
+    ifc_set(qpc, P + 0x10, 16, 0)                    # pkey_index = 0
+    # Note: grh bit is NOT set for RoCE (only for IB)
+    ifc_set(qpc, P + 0x48, 8, 0)                     # src_addr_index = 0 (GID table index)
+    ifc_set(qpc, P + 0x58, 8, 64)                    # hop_limit = 64
+    # rgid_rip: remote GID (16 bytes)
+    rgid_byte_off = (P + 0x80) // 8
+    qpc[rgid_byte_off:rgid_byte_off + 16] = remote_gid
+    ifc_set(qpc, P + 0x110, 16, self._calc_udp_sport(self.qpn, remote_qpn))  # udp_sport
+    ifc_set(qpc, P + 0x128, 8, 1)                    # vhca_port_num = 1
+    # rmac (remote MAC, 6 bytes)
+    rmac_byte_off = (P + 0x130) // 8
+    qpc[rmac_byte_off:rmac_byte_off + 2] = remote_mac[0:2]      # rmac_47_32
+    qpc[rmac_byte_off + 2:rmac_byte_off + 6] = remote_mac[2:6]  # rmac_31_0
+
+    self.cmd_exec(mlx5.MLX5_CMD_OP_INIT2RTR_QP, inp=inp)
+    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} INIT -> RTR (remote_qpn=0x{remote_qpn:x})")
+
+  def rtr2rts(self):
+    """RTR2RTS_QP: enable sending."""
+    inp = bytearray(264)
+    struct.pack_into('>I', inp, 0, self.qpn)
+
+    qpc = memoryview(inp)[16:248]
+    ifc_set(qpc, 0x08, 8, 0)                          # st = RC
+    ifc_set(qpc, 0x13, 2, 3)                          # pm_state = MIGRATED
+    ifc_set(qpc, 0x28, 24, self.pd)                    # pd
+    ifc_set(qpc, 0x3E8, 24, self.cq)                  # cqn_snd
+    ifc_set(qpc, 0x4E8, 24, self.cq)                  # cqn_rcv
+    ifc_set(qpc, 0x380, 4, 8)                          # log_ack_req_freq
+    ifc_set(qpc, 0x3C8, 24, 0)                         # next_send_psn = 0
+    ifc_set(qpc, 0x388, 3, 3)                          # log_sra_max = 3
+    ifc_set(qpc, 0x38D, 3, 7)                          # retry_count = 7
+    ifc_set(qpc, 0x390, 3, 7)                          # rnr_retry = 7
+    # ack_timeout in primary address path
+    ifc_set(qpc, 0xC0 + 0x40, 5, 14)                  # ack_timeout = 14 (~1 sec)
+    ifc_set(qpc, 0xC0 + 0x128, 8, 1)                  # vhca_port_num = 1
+
+    self.cmd_exec(mlx5.MLX5_CMD_OP_RTR2RTS_QP, inp=inp)
+    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} RTR -> RTS")
+
 if __name__ == "__main__":
   pci_bdf = os.getenv("MLX_PCI", "0000:41:00.0")
+  ip = sys.argv[sys.argv.index("--ip") + 1] if "--ip" in sys.argv else None
+
   dev = MLXDev(PCIDevice("mlx5", pci_bdf))
+
+  if "--server" in sys.argv:
+    # Server mode: set RoCE addr, print info, wait for remote info, connect
+    dev.set_roce_address(0, ip)
+    print(json.dumps(dev.connection_info()), flush=True)
+    remote = json.loads(input())
+    dev.init2rtr(remote["qpn"], remote["mac"], remote["gid"])
+    dev.rtr2rts()
+    print("connected", flush=True)
