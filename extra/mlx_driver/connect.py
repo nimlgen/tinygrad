@@ -24,17 +24,16 @@ for line in iter(remote.stdout.readline, ''):
   try: remote_info = json.loads(line.strip()); break
   except json.JSONDecodeError: pass
 assert remote_info, "failed to get remote connection info"
-print(f"remote info: QPN=0x{remote_info['qpn']:x} MAC={remote_info['mac']}")
 
 print("booting local")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
-from extra.mlx_driver.mlxdev import MLXDev
+from extra.mlx_driver.mlxdev import MLXDev, MLXQP
 from tinygrad.runtime.support.system import PCIDevice
 
 local_dev = MLXDev(PCIDevice("mlx5", LOCAL_PCI))
+local_qp = MLXQP(local_dev)
 local_dev.set_roce_address(0, LOCAL_IP)
-local_info = local_dev.connection_info()
-print(f"local info: QPN=0x{local_info['qpn']:x} MAC={local_info['mac']}")
+local_info = {"qpn": local_qp.qpn, "mac": local_dev.mac.hex(), "gid": local_dev.local_gid.hex()}
 
 remote.stdin.write(json.dumps(local_info) + "\n")
 remote.stdin.flush()
@@ -42,23 +41,22 @@ for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
   if "connected" in line: break
 
-local_dev.init2rtr(remote_info["qpn"], remote_info["mac"], remote_info["gid"])
-local_dev.rtr2rts()
-print("both QPs in RTS - connection established")
+local_qp.connect(remote_info["qpn"], remote_info["mac"], remote_info["gid"])
+print("both QPs in RTS")
 
 remote_target = None
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
   try: remote_target = json.loads(line.strip()); break
   except json.JSONDecodeError: pass
-assert remote_target, "failed to get remote target info"
+assert remote_target
 
 test_msg = b"Test message, rdma works!"
 src_mem, src_paddrs = local_dev.pci_dev.alloc_sysmem(0x1000)
 for i, b in enumerate(test_msg): src_mem[i] = b
 
 print(f"RDMA WRITE {len(test_msg)}B to remote phys 0x{remote_target['target_addr']:x}")
-local_dev.rdma_write(remote_target["target_addr"], remote_target["rkey"], src_paddrs[0], local_dev.mkey, len(test_msg))
+local_qp.rdma_write(remote_target["target_addr"], remote_target["rkey"], src_paddrs[0], local_dev.mkey, len(test_msg))
 
 remote.stdin.write("done\n")
 remote.stdin.flush()
