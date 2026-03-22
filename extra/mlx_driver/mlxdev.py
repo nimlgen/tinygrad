@@ -441,47 +441,43 @@ class MLXDev:
     return cqn
 
   def _create_mkey(self):
-    """CREATE_MKEY in PA mode with full permissions (local + remote RDMA access)."""
+    """CREATE_MKEY in PA mode for local access (resd_lkey also works via rlky=1 in QPC)."""
     inp = bytearray(264)
     mkc = memoryview(inp)[8:72]
     ifc_set(mkc, 0x16, 2, 0)           # access_mode = PA (0x0)
-    ifc_set(mkc, 0x11, 1, 1)           # a (access enable)
-    ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
-    ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
-    ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
-    ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
-    ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = 0xFFFFFF (any QP)
-    ifc_set(mkc, 0x28, 8, 0x42)        # mkey_7_0
-    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full address space)
+    ifc_set(mkc, 0x14, 1, 1)           # lw
+    ifc_set(mkc, 0x15, 1, 1)           # lr
+    ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = any
+    ifc_set(mkc, 0x38, 8, 0x42)        # mkey_7_0
+    ifc_set(mkc, 0x60, 1, 1)           # length64
     ifc_set(mkc, 0x68, 24, self.pd)    # pd
     out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
     mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF
     mkey = (mkey_index << 8) | 0x42
-    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full access)")
+    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode)")
     return mkey
 
-  def create_mkey_for_buf(self, paddrs, buf_size):
-    """CREATE_MKEY with MTT (page translation) for remote RDMA access. Returns full mkey value."""
+  def create_mkey_for_buf(self, va, paddrs, buf_size):
+    """CREATE_MKEY with MTT for remote RDMA access. va=virtual address of buffer. Returns full mkey value."""
     n_pages = len(paddrs)
     key_tag = random.randint(0, 255)
     # create_mkey_in: flags[8B] + mkc[64B] + rsvd[16B] + translations_actual_sz[4B] + rsvd[172B] + pas[]
     pas_bytes = ((n_pages * 8 + 15) // 16) * 16  # round up to octword (16B) alignment
     inp = bytearray(264 + pas_bytes)
     mkc = memoryview(inp)[8:72]
-    ifc_set(mkc, 0x01, 1, 0)              # free = 0 (valid)
+    ifc_set(mkc, 0x10, 1, 1)             # umr_en = 1 (kernel always sets this)
     ifc_set(mkc, 0x16, 2, 1)             # access_mode = MTT (0x1)
-    ifc_set(mkc, 0x11, 1, 1)             # a (access enable)
     ifc_set(mkc, 0x12, 1, 1)             # rw (remote write)
     ifc_set(mkc, 0x13, 1, 1)             # rr (remote read)
     ifc_set(mkc, 0x14, 1, 1)             # lw (local write)
     ifc_set(mkc, 0x15, 1, 1)             # lr (local read)
     ifc_set(mkc, 0x20, 24, 0xFFFFFF)     # qpn = any QP can use this MKey
-    ifc_set(mkc, 0x28, 8, key_tag)       # mkey_7_0
+    ifc_set(mkc, 0x38, 8, key_tag)       # mkey_7_0
     ifc_set(mkc, 0x68, 24, self.pd)      # pd
-    ifc_set(mkc, 0x80, 64, 0)            # start_addr = 0
+    ifc_set(mkc, 0x80, 64, va)           # start_addr
     ifc_set(mkc, 0xC0, 64, buf_size)     # len
     ifc_set(mkc, 0x1A0, 32, (n_pages * 8 + 15) // 16)  # translations_octword_size
-    ifc_set(mkc, 0x1DA, 6, 12)            # log_page_size = 12 (log2(4096))
+    ifc_set(mkc, 0x1DA, 6, 12)            # log_page_size = 12 (4K pages)
     # translations_octword_actual_size at inp[88:92]
     struct.pack_into('>I', inp, 88, (n_pages * 8 + 15) // 16)
     # Page addresses at inp[264:]
@@ -602,8 +598,8 @@ class MLXDev:
     # init2rtr_qp_in from DW2: qpn(4) rsvd(4) opt_param_mask(4) ece(4) qpc(232) rsvd(16)
     inp = bytearray(264)
     struct.pack_into('>I', inp, 0, self.qpn)
-    # opt_param_mask: RRE(0x2)|RAE(0x4)|RWE(0x8)|PKEY_INDEX(0x10) = 0x1E
-    struct.pack_into('>I', inp, 8, 0x1E)
+    # opt_param_mask: RRE(0x2)|RWE(0x8)|PKEY_INDEX(0x10) = 0x1A (no RAE — avoids atomic_mode conflict)
+    struct.pack_into('>I', inp, 8, 0x1A)
 
     qpc = memoryview(inp)[16:248]
     ifc_set(qpc, 0x08, 8, 0)                         # st = RC
@@ -763,9 +759,10 @@ if __name__ == "__main__":
     dev.init2rtr(remote["qpn"], remote["mac"], remote["gid"])
     dev.rtr2rts()
     print("connected", flush=True)
-    # Allocate target buffer — PA MKey (with rr/rw/a) covers all phys memory
+    # Allocate target buffer + per-buffer MTT MKey for remote RDMA write
     target_mem, target_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
-    print(json.dumps({"target_addr": target_paddrs[0], "rkey": dev.mkey}), flush=True)
+    target_rkey = dev.create_mkey_for_buf(0, target_paddrs[:1], 0x1000)
+    print(json.dumps({"rkey": target_rkey}), flush=True)
     # Wait for RDMA WRITE to complete
     input()
     data = bytes(target_mem[i] for i in range(64))
