@@ -441,27 +441,55 @@ class MLXDev:
     return cqn
 
   def _create_mkey(self):
-    """CREATE_MKEY in PA (physical address) mode covering all memory. Returns full mkey value."""
-    # create_mkey_in from DW2: rsvd[4B] + flags[4B] + mkc[64B] + rsvd[16B] + translations_sz[4B] + rsvd[172B]
+    """CREATE_MKEY in PA mode with full permissions (local + remote RDMA access)."""
     inp = bytearray(264)
-
-    # MKey context (mkc) at inp[8:72]
     mkc = memoryview(inp)[8:72]
-    ifc_set(mkc, 0x03, 3, 0)           # access_mode_4_2 = 0 → PA mode (0x0)
-    ifc_set(mkc, 0x16, 2, 0)           # access_mode_1_0 = 0 → PA mode (0x0)
+    ifc_set(mkc, 0x16, 2, 0)           # access_mode = PA (0x0)
+    ifc_set(mkc, 0x11, 1, 1)           # a (access enable)
     ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
     ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
     ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
     ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
     ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = 0xFFFFFF (any QP)
-    ifc_set(mkc, 0x28, 8, 0x42)        # mkey_7_0 (low 8 bits of key)
-    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full 64-bit address space)
+    ifc_set(mkc, 0x28, 8, 0x42)        # mkey_7_0
+    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full address space)
     ifc_set(mkc, 0x68, 24, self.pd)    # pd
-
     out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
-    mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF  # mkey_index[24] at DW2
-    mkey = (mkey_index << 8) | 0x42  # full mkey = index << 8 | mkey_7_0
-    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full memory)")
+    mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF
+    mkey = (mkey_index << 8) | 0x42
+    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full access)")
+    return mkey
+
+  def create_mkey_for_buf(self, paddrs, buf_size):
+    """CREATE_MKEY with MTT (page translation) for remote RDMA access. Returns full mkey value."""
+    n_pages = len(paddrs)
+    key_tag = random.randint(0, 255)
+    # create_mkey_in: flags[8B] + mkc[64B] + rsvd[16B] + translations_actual_sz[4B] + rsvd[172B] + pas[]
+    pas_bytes = ((n_pages * 8 + 15) // 16) * 16  # round up to octword (16B) alignment
+    inp = bytearray(264 + pas_bytes)
+    mkc = memoryview(inp)[8:72]
+    ifc_set(mkc, 0x01, 1, 0)              # free = 0 (valid)
+    ifc_set(mkc, 0x16, 2, 1)             # access_mode = MTT (0x1)
+    ifc_set(mkc, 0x11, 1, 1)             # a (access enable)
+    ifc_set(mkc, 0x12, 1, 1)             # rw (remote write)
+    ifc_set(mkc, 0x13, 1, 1)             # rr (remote read)
+    ifc_set(mkc, 0x14, 1, 1)             # lw (local write)
+    ifc_set(mkc, 0x15, 1, 1)             # lr (local read)
+    ifc_set(mkc, 0x20, 24, 0xFFFFFF)     # qpn = any QP can use this MKey
+    ifc_set(mkc, 0x28, 8, key_tag)       # mkey_7_0
+    ifc_set(mkc, 0x68, 24, self.pd)      # pd
+    ifc_set(mkc, 0x80, 64, 0)            # start_addr = 0
+    ifc_set(mkc, 0xC0, 64, buf_size)     # len
+    ifc_set(mkc, 0x1A0, 32, (n_pages * 8 + 15) // 16)  # translations_octword_size
+    ifc_set(mkc, 0x1DA, 6, 12)            # log_page_size = 12 (log2(4096))
+    # translations_octword_actual_size at inp[88:92]
+    struct.pack_into('>I', inp, 88, (n_pages * 8 + 15) // 16)
+    # Page addresses at inp[264:]
+    for i in range(n_pages): struct.pack_into('>Q', inp, 264 + i * 8, paddrs[i])
+    out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
+    mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF
+    mkey = (mkey_index << 8) | key_tag
+    if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (MTT, {n_pages} pages, {buf_size}B)")
     return mkey
 
   def _create_qp(self, log_sq_size=4, log_rq_size=4):
@@ -636,6 +664,25 @@ class MLXDev:
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} RTR -> RTS")
 
   # --- Data Operations ---
+  def rdma_write(self, remote_addr, rkey, local_addr, lkey, length):
+    """Post RDMA WRITE WQE: ctrl(16) + raddr(16) + data(16) = 3 DS."""
+    wqe_idx = self.sq_head & ((1 << 4) - 1)
+    wqe_off = self.sq_offset + wqe_idx * 64
+    wqe = memoryview(self.qp_buf.mv)[wqe_off:wqe_off + 64]
+    wqe[:64] = bytes(64)
+    struct.pack_into('>I', wqe, 0, (self.sq_head << 8) | 0x08)  # RDMA_WRITE
+    struct.pack_into('>I', wqe, 4, (self.qpn << 8) | 3)
+    wqe[11] = 0x08  # CQ_UPDATE (signaled)
+    struct.pack_into('>Q', wqe, 16, remote_addr)                 # raddr
+    struct.pack_into('>I', wqe, 24, rkey)                         # rkey
+    struct.pack_into('>I', wqe, 32, length)                       # data: byte_count
+    struct.pack_into('>I', wqe, 36, lkey)                         # data: lkey
+    struct.pack_into('>Q', wqe, 40, local_addr)                   # data: addr
+    self.sq_head += 1
+    self._ring_sq_doorbell(wqe)
+    self._poll_cq()
+    if MLX_DEBUG >= 1: print(f"mlx5: RDMA WRITE {length}B complete")
+
   def _ring_sq_doorbell(self, wqe):
     """Ring SQ doorbell: update DBR[1] then MMIO write ctrl to UAR."""
     dbr_off = self.qp_dbr_phys - self.dbr_paddrs[0]
@@ -716,14 +763,11 @@ if __name__ == "__main__":
     dev.init2rtr(remote["qpn"], remote["mac"], remote["gid"])
     dev.rtr2rts()
     print("connected", flush=True)
-    # Post receive WQE to receive SEND data
-    recv_mem, recv_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
-    dev.post_recv(recv_paddrs[0], dev.resd_lkey, 256)
-    print("recv_posted", flush=True)
-    # Wait for sender to finish
+    # Allocate target buffer — PA MKey (with rr/rw/a) covers all phys memory
+    target_mem, target_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
+    print(json.dumps({"target_addr": target_paddrs[0], "rkey": dev.mkey}), flush=True)
+    # Wait for RDMA WRITE to complete
     input()
-    # Poll CQ for receive completion
-    opcode = dev._poll_cq(timeout=10.0)
-    data = bytes(recv_mem[i] for i in range(64))
+    data = bytes(target_mem[i] for i in range(64))
     print(f"RECEIVED: {data.hex(' ')}", flush=True)
     print(f"AS TEXT: {data.rstrip(b'\\x00').decode('ascii', errors='replace')}", flush=True)

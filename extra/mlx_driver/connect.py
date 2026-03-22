@@ -58,23 +58,26 @@ print("=== both QPs in RTS - connection established ===")
 print(f"  local:  QPN=0x{local_info['qpn']:x}  IP={LOCAL_IP}  MAC={local_info['mac']}")
 print(f"  remote: QPN=0x{remote_info['qpn']:x} IP={REMOTE_IP} MAC={remote_info['mac']}")
 
-# 6. Wait for remote to post receive WQE
+# 6. Get remote target buffer + MTT MKey for RDMA WRITE
+remote_target = None
 for line in iter(remote.stdout.readline, ''):
   print(f"  [remote] {line}", end='')
-  if "recv_posted" in line: break
+  try: remote_target = json.loads(line.strip()); break
+  except json.JSONDecodeError: pass
+assert remote_target, "failed to get remote target info"
 
-# 7. SEND test data to remote
+# 7. RDMA WRITE test data directly into remote memory (no recv WQE needed!)
 local_dev.cq_ci = 0
 local_dev.sq_head = 0
 local_dev.rq_head = 0
-test_msg = b"Hello from tinygrad MLX5 driver! SEND works!"
+test_msg = b"Hello from tinygrad MLX5 driver! RDMA WRITE works!"
 src_mem, src_paddrs = local_dev.pci_dev.alloc_sysmem(0x1000)
 for i, b in enumerate(test_msg): src_mem[i] = b
 
-print(f"=== SEND {len(test_msg)}B to remote ===")
-local_dev.send(src_paddrs[0], local_dev.resd_lkey, len(test_msg))
+print(f"=== RDMA WRITE {len(test_msg)}B to remote (rkey=0x{remote_target['rkey']:x}) ===")
+local_dev.rdma_write(remote_target["target_addr"], remote_target["rkey"], src_paddrs[0], local_dev.resd_lkey, len(test_msg))
 
-# 8. Tell remote to poll CQ and read received data
+# 8. Tell remote to read the target buffer
 remote.stdin.write("done\n")
 remote.stdin.flush()
 
@@ -85,4 +88,4 @@ for line in iter(remote.stdout.readline, ''):
 
 remote.stdin.close()
 remote.wait()
-print("=== SEND/RECV test complete ===")
+print("=== RDMA WRITE test complete ===")
