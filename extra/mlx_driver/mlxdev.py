@@ -96,7 +96,7 @@ class MLXDev:
       struct.pack_into('>I', self.dma.mv, off + 568, i)
 
   def _mbox_read(self, size, base):
-    return b''.join(bytes(self.dma.mv[(off:=0x1000 + i * MBOX_STRIDE):off + min(MBOX_SZ, size - i * MBOX_SZ)])
+    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * MBOX_STRIDE):off + min(MBOX_SZ, size - i * MBOX_SZ)])
                     for i in range((size + MBOX_SZ - 1) // MBOX_SZ))
 
   def _setup_cmd(self):
@@ -278,12 +278,12 @@ class MLXDev:
              access_mode_1_0=0, rw=1, rr=1, lw=1, lr=1, qpn=0xFFFFFF, mkey_7_0=0x42, length64=1, pd=self.pd)
     return (struct.unpack_from('>I', self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp), 0)[0] & 0xFFFFFF) << 8 | 0x42
 
-  def _qp_cmd(self, opcode, qpn, qpc_kwargs=None, ads_kwargs=None, extra_inp=None):
-    inp = extra_inp if extra_inp is not None else bytearray(264)
+  def _qp_cmd(self, opcode, qpn, qpc_kw=None, ads_kw=None):
+    inp = bytearray(264)
     struct.pack_into('>I', inp, 0, qpn)
     qpc = memoryview(inp)[16:248]
-    if qpc_kwargs: fill_ifc(qpc, mlx5.struct_mlx5_ifc_qpc_bits, st=0, pm_state=3, pd=self.pd, cqn_snd=self.cq, cqn_rcv=self.cq, **qpc_kwargs)
-    if ads_kwargs: fill_ifc(qpc, mlx5.struct_mlx5_ifc_ads_bits, base=0xC0, **ads_kwargs)
+    fill_ifc(qpc, mlx5.struct_mlx5_ifc_qpc_bits, st=0, pm_state=3, pd=self.pd, cqn_snd=self.cq, cqn_rcv=self.cq, **(qpc_kw or {}))
+    if ads_kw: fill_ifc(qpc, mlx5.struct_mlx5_ifc_ads_bits, base=0xC0, **ads_kw)
     self.cmd_exec(opcode, inp=inp)
 
   def _create_qp(self, log_sq_size=4, log_rq_size=4):
@@ -296,7 +296,7 @@ class MLXDev:
              rlky=1, uar_page=self.uar, log_page_size=0, dbr_addr=self.qp_dbr_phys)
     pack_pas(inp, 264, qp_paddrs)
     qpn = struct.unpack_from('>I', self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_QP, inp=inp), 0)[0] & 0xFFFFFF
-    self._qp_cmd(mlx5.MLX5_CMD_OP_RST2INIT_QP, qpn, qpc_kwargs=dict(log_ack_req_freq=8), ads_kwargs=dict(pkey_index=0, vhca_port_num=1))
+    self._qp_cmd(mlx5.MLX5_CMD_OP_RST2INIT_QP, qpn, qpc_kw=dict(log_ack_req_freq=8), ads_kw=dict(pkey_index=0, vhca_port_num=1))
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{qpn:x} RST -> INIT")
     return qpn
 
@@ -338,8 +338,8 @@ class MLXDev:
 
   def rtr2rts(self):
     self._qp_cmd(mlx5.MLX5_CMD_OP_RTR2RTS_QP, self.qpn,
-      qpc_kwargs=dict(log_ack_req_freq=8, next_send_psn=0, log_sra_max=3, retry_count=7, rnr_retry=7),
-      ads_kwargs=dict(ack_timeout=14, vhca_port_num=1))
+      qpc_kw=dict(log_ack_req_freq=8, next_send_psn=0, log_sra_max=3, retry_count=7, rnr_retry=7),
+      ads_kw=dict(ack_timeout=14, vhca_port_num=1))
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qpn:x} RTR -> RTS")
 
   def _post_sq(self, opcode, ds_count, segs):
