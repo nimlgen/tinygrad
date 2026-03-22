@@ -1,4 +1,4 @@
-import os, struct, time, random, json, sys, socket
+import os, struct, time, random, json, sys, socket, ctypes
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.autogen import mlx5
 
@@ -7,20 +7,27 @@ MLX_DEBUG = int(os.getenv("MLX_DEBUG", "0"))
 def swap32(v): return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF)
 
 def ifc_get(buf, bit_off, width):
-  """Read a field from a big-endian IFC struct (MSB-first bit numbering)."""
   byte_off, bit_in = bit_off // 8, bit_off % 8
   n = (bit_in + width + 7) // 8
-  val = int.from_bytes(buf[byte_off:byte_off + n], 'big')
-  return (val >> (n * 8 - bit_in - width)) & ((1 << width) - 1)
+  return (int.from_bytes(buf[byte_off:byte_off + n], 'big') >> (n * 8 - bit_in - width)) & ((1 << width) - 1)
 
 def ifc_set(buf, bit_off, width, value):
-  """Write a field to a big-endian IFC struct (MSB-first bit numbering)."""
   byte_off, bit_in = bit_off // 8, bit_off % 8
   n = (bit_in + width + 7) // 8
-  val = int.from_bytes(buf[byte_off:byte_off + n], 'big')
   shift = n * 8 - bit_in - width
-  val = (val & ~(((1 << width) - 1) << shift)) | ((value & ((1 << width) - 1)) << shift)
-  buf[byte_off:byte_off + n] = val.to_bytes(n, 'big')
+  val = int.from_bytes(buf[byte_off:byte_off + n], 'big')
+  buf[byte_off:byte_off + n] = ((val & ~(((1 << width) - 1) << shift)) | ((value & ((1 << width) - 1)) << shift)).to_bytes(n, 'big')
+
+def ifc_fields(ifc_struct):
+  return {name: (off, ctypes.sizeof(typ)) for name, typ, off in ifc_struct._real_fields_ if not name.startswith('reserved')}
+
+def fill_ifc(buf, ifc_struct, base=0, **kwargs):
+  fields = ifc_fields(ifc_struct)
+  for name, val in kwargs.items(): ifc_set(buf, base + fields[name][0], fields[name][1], val)
+
+def read_ifc(buf, ifc_struct, field, base=0):
+  f = ifc_fields(ifc_struct)
+  return ifc_get(buf, base + f[field][0], f[field][1])
 
 class MLXDev:
   CMD_IF_REV, MBOX_SZ, MBOX_STRIDE = 5, 512, 1024  # cmd interface rev, data per mailbox block, mailbox alignment
@@ -441,21 +448,11 @@ class MLXDev:
     return cqn
 
   def _create_mkey(self):
-    """CREATE_MKEY in PA mode covering all physical memory with full local+remote access."""
     inp = bytearray(264)
-    mkc = memoryview(inp)[8:72]
-    ifc_set(mkc, 0x16, 2, 0)           # access_mode = PA (0x0)
-    ifc_set(mkc, 0x12, 1, 1)           # rw (remote write)
-    ifc_set(mkc, 0x13, 1, 1)           # rr (remote read)
-    ifc_set(mkc, 0x14, 1, 1)           # lw (local write)
-    ifc_set(mkc, 0x15, 1, 1)           # lr (local read)
-    ifc_set(mkc, 0x20, 24, 0xFFFFFF)   # qpn = any
-    ifc_set(mkc, 0x38, 8, 0x42)        # mkey_7_0
-    ifc_set(mkc, 0x60, 1, 1)           # length64 = 1 (full address space)
-    ifc_set(mkc, 0x68, 24, self.pd)    # pd
+    fill_ifc(memoryview(inp)[8:72], mlx5.struct_mlx5_ifc_mkc_bits,
+             access_mode_1_0=0, rw=1, rr=1, lw=1, lr=1, qpn=0xFFFFFF, mkey_7_0=0x42, length64=1, pd=self.pd)
     out = self.cmd_exec(mlx5.MLX5_CMD_OP_CREATE_MKEY, inp=inp)
-    mkey_index = struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF
-    mkey = (mkey_index << 8) | 0x42
+    mkey = (struct.unpack_from('>I', out, 0)[0] & 0xFFFFFF) << 8 | 0x42
     if MLX_DEBUG >= 1: print(f"mlx5: created MKey 0x{mkey:x} (PA mode, full access)")
     return mkey
 
