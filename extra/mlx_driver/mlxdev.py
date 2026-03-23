@@ -1,5 +1,5 @@
 import struct, time, random, json, sys, socket, ctypes, os, functools
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, wait_cond
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.autogen import mlx5
 
@@ -29,9 +29,9 @@ def pack_pas(buf, offset, paddrs):
 class MLXDev:
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.bar, self.token = pci_dev, pci_dev.map_bar(0, fmt='I'), 0
-    fw_rev, cmdif_sub = self.rreg(0), self.rreg(4)
-    print(f"mlx5: firmware {fw_rev >> 16}.{fw_rev & 0xFFFF}.{cmdif_sub & 0xFFFF}")
-    assert (cmdif_sub >> 16) == 5
+    # fw_rev, cmdif_sub = self.rreg(0), self.rreg(4)
+    # print(f"mlx5: firmware {fw_rev >> 16}.{fw_rev & 0xFFFF}.{cmdif_sub & 0xFFFF}")
+    # assert (cmdif_sub >> 16) == 5
 
     self.wait_fw_init()
     self._setup_cmd()
@@ -59,11 +59,7 @@ class MLXDev:
   def rreg(self, off): return swap32(self.bar[off // 4])
   def wreg(self, off, val): self.bar[off // 4] = swap32(val)
 
-  def wait_fw_init(self, timeout=10.0):
-    t = time.monotonic()
-    while self.rreg(0x1FC) & 0x80000000:
-      if time.monotonic() - t > timeout: raise TimeoutError("FW init timeout")
-      time.sleep(0.001)
+  def wait_fw_init(self): wait_cond(lambda: self.rreg(0x1FC) & 0x80000000, value=0, msg="FW init timeout")
 
   def _dma_phys(self, off): return self.dma_paddrs[off // 0x1000] + (off % 0x1000)
 
