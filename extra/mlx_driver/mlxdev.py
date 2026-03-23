@@ -1,7 +1,7 @@
 import struct, time, random, json, sys, socket, ctypes, os, functools
 from tinygrad.helpers import getenv, wait_cond
 from tinygrad.runtime.support.system import PCIDevice
-from tinygrad.runtime.autogen import mlx5
+from tinygrad.runtime.autogen import mlx5, pci
 
 MLX_DEBUG = getenv("MLX_DEBUG", 0)
 MBOX_SZ, MBOX_STRIDE = 512, 1024
@@ -22,16 +22,17 @@ def ifc_fields(ifc_struct): return {name: (off, ctypes.sizeof(typ)) for name, ty
 def fill_ifc(buf, ifc_struct, base=0, **kw):
   for name, val in kw.items(): ifc_set(buf, base + (f:=ifc_fields(ifc_struct)[name])[0], f[1], val)
 def read_ifc(buf, ifc_struct, field, base=0): return ifc_get(buf, base + (f:=ifc_fields(ifc_struct)[field])[0], f[1])
+def ifc_decode(buf, ifc_struct, base=0): return {name: ifc_get(buf, base + off, w) for name, (off, w) in ifc_fields(ifc_struct).items()}
 def pack_pas(buf, offset, paddrs):
   for i, pa in enumerate(paddrs): struct.pack_into('>Q', buf, offset + i * 8, pa)
 
-# *** MLX5 device: firmware init, command interface, resource allocation ***
 class MLXDev:
   def __init__(self, pci_dev:PCIDevice):
-    self.pci_dev, self.bar, self.token = pci_dev, pci_dev.map_bar(0, fmt='I'), 0
-    # fw_rev, cmdif_sub = self.rreg(0), self.rreg(4)
-    # print(f"mlx5: firmware {fw_rev >> 16}.{fw_rev & 0xFFFF}.{cmdif_sub & 0xFFFF}")
-    # assert (cmdif_sub >> 16) == 5
+    self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    self.bar, self.token = pci_dev.map_bar(0, fmt='I'), 0
+    fw_rev, cmdif_sub = self.rreg(0), self.rreg(4)
+    print(f"mlx5: firmware {fw_rev >> 16}.{fw_rev & 0xFFFF}.{cmdif_sub & 0xFFFF}")
+    assert (cmdif_sub >> 16) == 5
 
     self.wait_fw_init()
     self._setup_cmd()
@@ -86,7 +87,6 @@ class MLXDev:
                     for i in range((size + MBOX_SZ - 1) // MBOX_SZ))
 
   def _setup_cmd(self):
-    from tinygrad.runtime.autogen import pci
     self.pci_dev.write_config(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     cmd_l = self.rreg(0x14) & 0xFF
     self.log_sz, self.log_stride, self.max_reg_cmds = (cmd_l >> 4) & 0xF, cmd_l & 0xF, (1 << ((cmd_l >> 4) & 0xF)) - 1
@@ -143,6 +143,13 @@ class MLXDev:
     assert status == 0, f"cmd 0x{opcode:04x} failed status=0x{status:x} syn=0x{syndrome:08x}"
     return bytearray(struct.pack('>II', out_hdr[2], out_hdr[3])) + (self._mbox_read(out_sz, n_in) if out_sz > 0 else b'')
 
+  def ifc_cmd(self, opcode, in_struct=None, out_struct=None, op_mod=0, page_queue=False, **kw):
+    inp = bytearray(max(0, ctypes.sizeof(in_struct) - 8)) if in_struct else b''
+    if kw: fill_ifc(inp, in_struct, base=-0x40, **kw)
+    out_sz = max(0, ctypes.sizeof(out_struct) - 16) if out_struct else 0
+    raw = self.cmd_exec(opcode, op_mod=op_mod, inp=inp, out_sz=out_sz, page_queue=page_queue)
+    return ifc_decode(raw, out_struct, base=-0x40) if out_struct else raw
+
   def _query_cap(self, cap_type, mode): return bytearray(self.cmd_exec(mlx5.MLX5_CMD_OP_QUERY_HCA_CAP, op_mod=(cap_type << 1) | mode, out_sz=4096)[8:])
   def _set_cap(self, cap_type, data): self.cmd_exec(mlx5.MLX5_CMD_OP_SET_HCA_CAP, op_mod=cap_type << 1, inp=bytearray(8) + data)
   def _alloc_24(self, op): return struct.unpack_from('>I', self.cmd_exec(op), 0)[0] & 0xFFFFFF
@@ -152,8 +159,8 @@ class MLXDev:
     phys = self.dbr_paddrs[0] + self.dbr_offset; self.dbr_offset += 8; return phys
 
   def _set_issi(self):
-    if struct.unpack_from('>I', self.cmd_exec(mlx5.MLX5_CMD_OP_QUERY_ISSI, out_sz=96), 100)[0] & 2:
-      inp = bytearray(8); struct.pack_into('>I', inp, 0, 1); self.cmd_exec(mlx5.MLX5_CMD_OP_SET_ISSI, inp=inp)
+    if self.ifc_cmd(mlx5.MLX5_CMD_OP_QUERY_ISSI, out_struct=mlx5.struct_mlx5_ifc_query_issi_out_bits)['supported_issi_dw0'] & 2:
+      self.ifc_cmd(mlx5.MLX5_CMD_OP_SET_ISSI, in_struct=mlx5.struct_mlx5_ifc_set_issi_in_bits, current_issi=1)
 
   def _satisfy_pages(self, mode):
     npages = struct.unpack_from('>i', self.cmd_exec(mlx5.MLX5_CMD_OP_QUERY_PAGES, op_mod=mode), 4)[0]
