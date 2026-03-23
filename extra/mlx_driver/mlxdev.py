@@ -163,9 +163,7 @@ class MLXDev:
       self.ifc_cmd(mlx5.MLX5_CMD_OP_SET_ISSI, in_struct=mlx5.struct_mlx5_ifc_set_issi_in_bits, current_issi=1)
 
   def _satisfy_pages(self, mode):
-    npages = self.ifc_cmd(mlx5.MLX5_CMD_OP_QUERY_PAGES, out_struct=mlx5.struct_mlx5_ifc_query_pages_out_bits, op_mod=mode)['num_pages']
-    if MLX_DEBUG >= 1: print(f"mlx5: {'boot' if mode == mlx5.MLX5_BOOT_PAGES else 'init'} pages: {npages}")
-    if npages <= 0: return
+    if (npages:=self.ifc_cmd(mlx5.MLX5_CMD_OP_QUERY_PAGES, out_struct=mlx5.struct_mlx5_ifc_query_pages_out_bits, op_mod=mode)['num_pages']) <= 0: return
     mem, paddrs = self.pci_dev.alloc_sysmem(npages * 0x1000)
     self.fw_pages.append((mem, paddrs))
     inp = bytearray(8 + npages * 8)
