@@ -1,10 +1,9 @@
 import struct, time, random, json, sys, socket, ctypes, os, functools
-from tinygrad.helpers import getenv, wait_cond
+from tinygrad.helpers import getenv, wait_cond, next_power2
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.runtime.autogen import mlx5, pci
 
 MLX_DEBUG = getenv("MLX_DEBUG", 0)
-MBOX_SZ, MBOX_STRIDE = 512, 1024
 
 def swap32(v): return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF)
 
@@ -35,11 +34,15 @@ def read_ifc(buf, ifc_struct, field, base=0): return ifc_get(buf, base + (f:=ifc
 def ifc_decode(buf, ifc_struct, base=0): return {name: ifc_get(buf, base + off, w) for name, (off, w) in ifc_fields(ifc_struct).items()}
 
 class MLXCmdQueue:
+  MBOX_SZ, MBOX_STRIDE = mlx5.MLX5_CMD_DATA_BLOCK_SIZE, next_power2(ctypes.sizeof(mlx5.struct_mlx5_cmd_prot_block))
+
   def __init__(self, dev):
     self.dev, self.token = dev, 0
+
     cmd_l = dev.iseg_r('cmdq_addr_l_sz') & 0xFF
     self.log_sz, self.log_stride, self.max_reg_cmds = (cmd_l >> 4) & 0xF, cmd_l & 0xF, (1 << ((cmd_l >> 4) & 0xF)) - 1
-    self.dma, self.dma_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 128 * MBOX_STRIDE)
+
+    self.dma, self.dma_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 128 * MLXCmdQueue.MBOX_STRIDE)
     dev.iseg_w('cmdq_addr_h', self.dma_paddrs[0] >> 32)
     dev.iseg_w('cmdq_addr_l_sz', (self.dma_paddrs[0] & 0xFFFFFFFF) | cmd_l)
 
@@ -48,24 +51,24 @@ class MLXCmdQueue:
   def _setup_mbox(self, n, base, tok):
     if n == 0: return 0
     for i in range(n):
-      off = 0x1000 + (base + i) * MBOX_STRIDE
+      off = 0x1000 + (base + i) * self.MBOX_STRIDE
       self.dma.mv[off:off + 576] = bytes(576)
       struct.pack_into('>I', self.dma.mv, off + 568, i)
       self.dma.mv[off + 573] = tok
-      if i < n - 1: struct.pack_into('>Q', self.dma.mv, off + 560, self._dma_phys(0x1000 + (base + i + 1) * MBOX_STRIDE))
-    return self._dma_phys(0x1000 + base * MBOX_STRIDE)
+      if i < n - 1: struct.pack_into('>Q', self.dma.mv, off + 560, self._dma_phys(0x1000 + (base + i + 1) * self.MBOX_STRIDE))
+    return self._dma_phys(0x1000 + base * self.MBOX_STRIDE)
 
   def _mbox_write(self, data, base, tok):
-    for i in range((len(data) + MBOX_SZ - 1) // MBOX_SZ):
-      off = 0x1000 + (base + i) * MBOX_STRIDE
-      chunk = data[i * MBOX_SZ:(i + 1) * MBOX_SZ]
+    for i in range((len(data) + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE):
+      off = 0x1000 + (base + i) * self.MBOX_STRIDE
+      chunk = data[i * mlx5.MLX5_CMD_DATA_BLOCK_SIZE:(i + 1) * mlx5.MLX5_CMD_DATA_BLOCK_SIZE]
       self.dma.mv[off:off + len(chunk)] = chunk
       self.dma.mv[off + 573] = tok
       struct.pack_into('>I', self.dma.mv, off + 568, i)
 
   def _mbox_read(self, size, base):
-    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * MBOX_STRIDE):off + min(MBOX_SZ, size - i * MBOX_SZ)])
-                    for i in range((size + MBOX_SZ - 1) // MBOX_SZ))
+    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * self.MBOX_STRIDE):off + min(mlx5.MLX5_CMD_DATA_BLOCK_SIZE, size - i * mlx5.MLX5_CMD_DATA_BLOCK_SIZE)])
+                    for i in range((size + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE))
 
   def exec(self, opcode, op_mod=0, inp=b'', out_sz=0, page_queue=False, in_struct=None, out_struct=None, _payload=b'', **kw):
     if in_struct is not None:
@@ -85,8 +88,8 @@ class MLXCmdQueue:
     hdr[8:8 + min(8, len(inp))] = inp[:min(8, len(inp))]
 
     mbox_in = inp[8:] if len(inp) > 8 else b''
-    n_in = (len(mbox_in) + MBOX_SZ - 1) // MBOX_SZ if mbox_in else 0
-    n_out = (out_sz + MBOX_SZ - 1) // MBOX_SZ if out_sz > 0 else 0
+    n_in = (len(mbox_in) + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE if mbox_in else 0
+    n_out = (out_sz + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE if out_sz > 0 else 0
     in_ptr, out_ptr = self._setup_mbox(n_in, 0, tok), self._setup_mbox(n_out, n_in, tok)
     if mbox_in: self._mbox_write(mbox_in, 0, tok)
 
