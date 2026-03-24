@@ -34,35 +34,35 @@ def read_ifc(buf, ifc_struct, field, base=0): return ifc_get(buf, base + (f:=ifc
 def ifc_decode(buf, ifc_struct, base=0): return {name: ifc_get(buf, base + off, w) for name, (off, w) in ifc_fields(ifc_struct).items()}
 
 class MLXCmdQueue:
-  MBOX_SZ, MBOX_STRIDE = mlx5.MLX5_CMD_DATA_BLOCK_SIZE, next_power2(ctypes.sizeof(mlx5.struct_mlx5_cmd_prot_block))
+  _blk = mlx5.struct_mlx5_cmd_prot_block
+  MBOX_SZ, MBOX_BLK_SZ, MBOX_STRIDE = mlx5.MLX5_CMD_DATA_BLOCK_SIZE, ctypes.sizeof(_blk), next_power2(ctypes.sizeof(_blk))
 
   def __init__(self, dev):
     self.dev, self.token = dev, 0
-
     cmd_l = dev.iseg_r('cmdq_addr_l_sz') & 0xFF
     self.log_sz, self.log_stride, self.max_reg_cmds = (cmd_l >> 4) & 0xF, cmd_l & 0xF, (1 << ((cmd_l >> 4) & 0xF)) - 1
+    self.queue, self.queue_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 128 * self.MBOX_STRIDE)
+    dev.iseg_w('cmdq_addr_h', self.queue_paddrs[0] >> 32)
+    dev.iseg_w('cmdq_addr_l_sz', (self.queue_paddrs[0] & 0xFFFFFFFF) | cmd_l)
 
-    self.dma, self.dma_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 128 * MLXCmdQueue.MBOX_STRIDE)
-    dev.iseg_w('cmdq_addr_h', self.dma_paddrs[0] >> 32)
-    dev.iseg_w('cmdq_addr_l_sz', (self.dma_paddrs[0] & 0xFFFFFFFF) | cmd_l)
+  def _dma_phys(self, off): return self.queue_paddrs[off // 0x1000] + (off % 0x1000)
 
-  def _dma_phys(self, off): return self.dma_paddrs[off // 0x1000] + (off % 0x1000)
-
-  def _setup_mbox(self, n, base, tok, data=b''):
+  def _prep_mbox(self, n, base, tok, data=b''):
     if n == 0: return 0
     for i in range(n):
       off = 0x1000 + (base + i) * self.MBOX_STRIDE
-      self.dma.mv[off:off + 576] = bytes(576)
+      self.queue.mv[off:off + self.MBOX_BLK_SZ] = bytes(self.MBOX_BLK_SZ)
       if data:
         chunk = data[i * self.MBOX_SZ:(i + 1) * self.MBOX_SZ]
-        self.dma.mv[off:off + len(chunk)] = chunk
-      struct.pack_into('>I', self.dma.mv, off + 568, i)
-      self.dma.mv[off + 573] = tok
-      if i < n - 1: struct.pack_into('>Q', self.dma.mv, off + 560, self._dma_phys(0x1000 + (base + i + 1) * self.MBOX_STRIDE))
+        self.queue.mv[off:off + len(chunk)] = chunk
+      struct.pack_into('>I', self.queue.mv, off + self._blk.block_num.offset, i)
+      self.queue.mv[off + self._blk.token.offset] = tok
+      if i < n - 1: struct.pack_into('>Q', self.queue.mv, off + self._blk.next.offset,
+                                      self._dma_phys(0x1000 + (base + i + 1) * self.MBOX_STRIDE))
     return self._dma_phys(0x1000 + base * self.MBOX_STRIDE)
 
-  def _mbox_read(self, size, base):
-    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * self.MBOX_STRIDE):off + min(self.MBOX_SZ, size - i * self.MBOX_SZ)])
+  def _read_mbox(self, size, base):
+    return b''.join(bytes(self.queue.mv[(off:=0x1000 + (base + i) * self.MBOX_STRIDE):off + min(self.MBOX_SZ, size - i * self.MBOX_SZ)])
                     for i in range((size + self.MBOX_SZ - 1) // self.MBOX_SZ))
 
   def exec(self, opcode, op_mod=0, inp=b'', out_sz=0, page_queue=False, in_struct=None, out_struct=None, _payload=b'', **kw):
@@ -85,40 +85,40 @@ class MLXCmdQueue:
     mbox_in = inp[8:] if len(inp) > 8 else b''
     n_in = (len(mbox_in) + self.MBOX_SZ - 1) // self.MBOX_SZ if mbox_in else 0
     n_out = (out_sz + self.MBOX_SZ - 1) // self.MBOX_SZ if out_sz > 0 else 0
-    in_ptr = self._setup_mbox(n_in, 0, tok, mbox_in)
-    out_ptr = self._setup_mbox(n_out, n_in, tok)
+    in_ptr = self._prep_mbox(n_in, 0, tok, mbox_in)
+    out_ptr = self._prep_mbox(n_out, n_in, tok)
 
     lay = slot << self.log_stride
-    self.dma.mv[lay:lay + 64] = bytes(64)
-    self.dma.mv[lay] = mlx5.MLX5_PCI_CMD_XPORT
-    struct.pack_into('>I', self.dma.mv, lay + 4, inlen)
-    struct.pack_into('>Q', self.dma.mv, lay + 8, in_ptr)
-    self.dma.mv[lay + 16:lay + 32] = hdr
-    struct.pack_into('>Q', self.dma.mv, lay + 48, out_ptr)
-    struct.pack_into('>I', self.dma.mv, lay + 56, outlen)
-    self.dma.mv[lay + 60], self.dma.mv[lay + 63] = tok, mlx5.CMD_OWNER_HW
+    self.queue.mv[lay:lay + 64] = bytes(64)
+    self.queue.mv[lay] = mlx5.MLX5_PCI_CMD_XPORT
+    struct.pack_into('>I', self.queue.mv, lay + 4, inlen)
+    struct.pack_into('>Q', self.queue.mv, lay + 8, in_ptr)
+    self.queue.mv[lay + 16:lay + 32] = hdr
+    struct.pack_into('>Q', self.queue.mv, lay + 48, out_ptr)
+    struct.pack_into('>I', self.queue.mv, lay + 56, outlen)
+    self.queue.mv[lay + 60], self.queue.mv[lay + 63] = tok, mlx5.CMD_OWNER_HW
     xor_val = 0
-    for i in range(64): xor_val ^= self.dma.mv[lay + i]
-    self.dma.mv[lay + 61] = (~xor_val) & 0xFF
+    for i in range(64): xor_val ^= self.queue.mv[lay + i]
+    self.queue.mv[lay + 61] = (~xor_val) & 0xFF
 
     if MLX_DEBUG >= 2:
-      d = bytes(self.dma.mv[lay:lay + 64])
+      d = bytes(self.queue.mv[lay:lay + 64])
       print(f"  CMD[{slot}] op=0x{opcode:04x} mod=0x{op_mod:04x} inlen={inlen} outlen={outlen} tok={tok}")
       print(f"  LAY: {d[:32].hex(' ')}"); print(f"  LAY: {d[32:].hex(' ')}")
 
     self.dev.iseg_w('cmd_dbell', 1 << slot)
     t = time.monotonic()
-    while self.dma.mv[lay + 63] & mlx5.CMD_OWNER_HW:
+    while self.queue.mv[lay + 63] & mlx5.CMD_OWNER_HW:
       if time.monotonic() - t > 60.0: raise TimeoutError(f"cmd 0x{opcode:04x} timeout")
       time.sleep(0.0001)
 
-    delivery = self.dma.mv[lay + 63] >> 1
-    out_hdr = [struct.unpack_from('>I', self.dma.mv, lay + 32 + i * 4)[0] for i in range(4)]
+    delivery = self.queue.mv[lay + 63] >> 1
+    out_hdr = [struct.unpack_from('>I', self.queue.mv, lay + 32 + i * 4)[0] for i in range(4)]
     status, syndrome = out_hdr[0] >> 24, out_hdr[1]
     if MLX_DEBUG >= 2: print(f"  DONE[{slot}] status=0x{status:02x} syn=0x{syndrome:08x} delivery=0x{delivery:x}")
     assert delivery == 0, f"cmd 0x{opcode:04x} delivery error 0x{delivery:x}"
     assert status == 0, f"cmd 0x{opcode:04x} failed status=0x{status:x} syn=0x{syndrome:08x}"
-    raw = bytearray(struct.pack('>II', out_hdr[2], out_hdr[3])) + (self._mbox_read(out_sz, n_in) if out_sz > 0 else b'')
+    raw = bytearray(struct.pack('>II', out_hdr[2], out_hdr[3])) + (self._read_mbox(out_sz, n_in) if out_sz > 0 else b'')
     return ifc_decode(raw, out_struct, base=-0x40) if out_struct else raw
 
 class MLXDev:
