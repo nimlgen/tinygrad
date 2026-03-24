@@ -47,8 +47,10 @@ class MLXCmdQueue:
 
   def _dma_phys(self, off): return self.queue_paddrs[off // 0x1000] + (off % 0x1000)
 
-  def _prep_mbox(self, n, base, tok, data=b''):
+  def _prep_mbox(self, n, tok, data=b''):
     if n == 0: return 0
+    base = self._mbox_alloc
+    self._mbox_alloc += n
     for i in range(n):
       off = 0x1000 + (base + i) * self.MBOX_STRIDE
       self.queue.mv[off:off + self.MBOX_BLK_SZ] = bytes(self.MBOX_BLK_SZ)
@@ -85,8 +87,10 @@ class MLXCmdQueue:
     mbox_in = inp[8:] if len(inp) > 8 else b''
     n_in = (len(mbox_in) + self.MBOX_SZ - 1) // self.MBOX_SZ if mbox_in else 0
     n_out = (out_sz + self.MBOX_SZ - 1) // self.MBOX_SZ if out_sz > 0 else 0
-    in_ptr = self._prep_mbox(n_in, 0, tok, mbox_in)
-    out_ptr = self._prep_mbox(n_out, n_in, tok)
+    self._mbox_alloc = 0
+    in_ptr = self._prep_mbox(n_in, tok, mbox_in)
+    out_base = self._mbox_alloc
+    out_ptr = self._prep_mbox(n_out, tok)
 
     lay = slot << self.log_stride
     self.queue.mv[lay:lay + 64] = bytes(64)
@@ -118,7 +122,7 @@ class MLXCmdQueue:
     if MLX_DEBUG >= 2: print(f"  DONE[{slot}] status=0x{status:02x} syn=0x{syndrome:08x} delivery=0x{delivery:x}")
     assert delivery == 0, f"cmd 0x{opcode:04x} delivery error 0x{delivery:x}"
     assert status == 0, f"cmd 0x{opcode:04x} failed status=0x{status:x} syn=0x{syndrome:08x}"
-    raw = bytearray(struct.pack('>II', out_hdr[2], out_hdr[3])) + (self._read_mbox(out_sz, n_in) if out_sz > 0 else b'')
+    raw = bytearray(struct.pack('>II', out_hdr[2], out_hdr[3])) + (self._read_mbox(out_sz, out_base) if out_sz > 0 else b'')
     return ifc_decode(raw, out_struct, base=-0x40) if out_struct else raw
 
 class MLXDev:
