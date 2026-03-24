@@ -39,7 +39,7 @@ class MLXDev:
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
     self.bar, self.token = pci_dev.map_bar(0, fmt='I'), 0
-    fw_rev, cmdif_sub = self.rreg(0), self.rreg(4)
+    fw_rev, cmdif_sub = self.iseg_r('fw_rev'), self.iseg_r('cmdif_rev_fw_sub')
     print(f"mlx5: firmware {fw_rev >> 16}.{fw_rev & 0xFFFF}.{cmdif_sub & 0xFFFF}")
     assert (cmdif_sub >> 16) == 5
 
@@ -70,7 +70,10 @@ class MLXDev:
   def rreg(self, off): return swap32(self.bar[off // 4])
   def wreg(self, off, val): self.bar[off // 4] = swap32(val)
 
-  def wait_fw_init(self): wait_cond(lambda: self.rreg(0x1FC) & 0x80000000, value=0, msg="FW init timeout")
+  def iseg_r(self, field): return self.rreg(getattr(mlx5.struct_mlx5_init_seg, field).offset)
+  def iseg_w(self, field, val): self.wreg(getattr(mlx5.struct_mlx5_init_seg, field).offset, val)
+
+  def wait_fw_init(self): wait_cond(lambda: self.iseg_r('initializing') & 0x80000000, value=0, msg="FW init timeout")
 
   def _dma_phys(self, off): return self.dma_paddrs[off // 0x1000] + (off % 0x1000)
 
@@ -98,11 +101,11 @@ class MLXDev:
 
   def _setup_cmd(self):
     self.pci_dev.write_config(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
-    cmd_l = self.rreg(0x14) & 0xFF
+    cmd_l = self.iseg_r('cmdq_addr_l_sz') & 0xFF
     self.log_sz, self.log_stride, self.max_reg_cmds = (cmd_l >> 4) & 0xF, cmd_l & 0xF, (1 << ((cmd_l >> 4) & 0xF)) - 1
     self.dma, self.dma_paddrs = self.pci_dev.alloc_sysmem(0x1000 + 128 * MBOX_STRIDE)
-    self.wreg(0x10, self.dma_paddrs[0] >> 32)
-    self.wreg(0x14, (self.dma_paddrs[0] & 0xFFFFFFFF) | cmd_l)
+    self.iseg_w('cmdq_addr_h', self.dma_paddrs[0] >> 32)
+    self.iseg_w('cmdq_addr_l_sz', (self.dma_paddrs[0] & 0xFFFFFFFF) | cmd_l)
     self.fw_pages = []
 
   def cmd_exec(self, opcode, op_mod=0, inp=b'', out_sz=0, page_queue=False, in_struct=None, out_struct=None, _payload=b'', **kw):
@@ -148,7 +151,7 @@ class MLXDev:
       print(f"  CMD[{slot}] op=0x{opcode:04x} mod=0x{op_mod:04x} inlen={inlen} outlen={outlen} tok={tok}")
       print(f"  LAY: {d[:32].hex(' ')}"); print(f"  LAY: {d[32:].hex(' ')}")
 
-    self.wreg(0x18, 1 << slot)
+    self.iseg_w('cmd_dbell', 1 << slot)
     t = time.monotonic()
     while self.dma.mv[lay + 63] & mlx5.CMD_OWNER_HW:
       if time.monotonic() - t > 60.0: raise TimeoutError(f"cmd 0x{opcode:04x} timeout")
