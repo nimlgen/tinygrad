@@ -48,27 +48,22 @@ class MLXCmdQueue:
 
   def _dma_phys(self, off): return self.dma_paddrs[off // 0x1000] + (off % 0x1000)
 
-  def _setup_mbox(self, n, base, tok):
+  def _setup_mbox(self, n, base, tok, data=b''):
     if n == 0: return 0
     for i in range(n):
       off = 0x1000 + (base + i) * self.MBOX_STRIDE
       self.dma.mv[off:off + 576] = bytes(576)
+      if data:
+        chunk = data[i * self.MBOX_SZ:(i + 1) * self.MBOX_SZ]
+        self.dma.mv[off:off + len(chunk)] = chunk
       struct.pack_into('>I', self.dma.mv, off + 568, i)
       self.dma.mv[off + 573] = tok
       if i < n - 1: struct.pack_into('>Q', self.dma.mv, off + 560, self._dma_phys(0x1000 + (base + i + 1) * self.MBOX_STRIDE))
     return self._dma_phys(0x1000 + base * self.MBOX_STRIDE)
 
-  def _mbox_write(self, data, base, tok):
-    for i in range((len(data) + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE):
-      off = 0x1000 + (base + i) * self.MBOX_STRIDE
-      chunk = data[i * mlx5.MLX5_CMD_DATA_BLOCK_SIZE:(i + 1) * mlx5.MLX5_CMD_DATA_BLOCK_SIZE]
-      self.dma.mv[off:off + len(chunk)] = chunk
-      self.dma.mv[off + 573] = tok
-      struct.pack_into('>I', self.dma.mv, off + 568, i)
-
   def _mbox_read(self, size, base):
-    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * self.MBOX_STRIDE):off + min(mlx5.MLX5_CMD_DATA_BLOCK_SIZE, size - i * mlx5.MLX5_CMD_DATA_BLOCK_SIZE)])
-                    for i in range((size + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE))
+    return b''.join(bytes(self.dma.mv[(off:=0x1000 + (base + i) * self.MBOX_STRIDE):off + min(self.MBOX_SZ, size - i * self.MBOX_SZ)])
+                    for i in range((size + self.MBOX_SZ - 1) // self.MBOX_SZ))
 
   def exec(self, opcode, op_mod=0, inp=b'', out_sz=0, page_queue=False, in_struct=None, out_struct=None, _payload=b'', **kw):
     if in_struct is not None:
@@ -88,10 +83,10 @@ class MLXCmdQueue:
     hdr[8:8 + min(8, len(inp))] = inp[:min(8, len(inp))]
 
     mbox_in = inp[8:] if len(inp) > 8 else b''
-    n_in = (len(mbox_in) + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE if mbox_in else 0
-    n_out = (out_sz + mlx5.MLX5_CMD_DATA_BLOCK_SIZE - 1) // mlx5.MLX5_CMD_DATA_BLOCK_SIZE if out_sz > 0 else 0
-    in_ptr, out_ptr = self._setup_mbox(n_in, 0, tok), self._setup_mbox(n_out, n_in, tok)
-    if mbox_in: self._mbox_write(mbox_in, 0, tok)
+    n_in = (len(mbox_in) + self.MBOX_SZ - 1) // self.MBOX_SZ if mbox_in else 0
+    n_out = (out_sz + self.MBOX_SZ - 1) // self.MBOX_SZ if out_sz > 0 else 0
+    in_ptr = self._setup_mbox(n_in, 0, tok, mbox_in)
+    out_ptr = self._setup_mbox(n_out, n_in, tok)
 
     lay = slot << self.log_stride
     self.dma.mv[lay:lay + 64] = bytes(64)
