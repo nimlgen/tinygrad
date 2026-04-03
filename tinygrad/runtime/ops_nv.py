@@ -355,6 +355,7 @@ class GPFifo:
   put_value: int = 0
 
 class NVKIface:
+  peer_group: str = "nvk"
   root = None
   fd_ctl: FileIOInterface
   fd_uvm: FileIOInterface
