@@ -53,8 +53,8 @@ class MLXCmdQueue:
     self.log_stride, self.max_reg_cmds = cmd_l & 0xF, (1 << ((cmd_l >> 4) & 0xF)) - 1
 
     stride = next_power2(ctypes.sizeof(mlx5.struct_mlx5_cmd_prot_block))
-    self.queue, self.queue_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 128 * stride)
-    self.mboxes = [(off:=0x1000 + i * stride, self.queue_paddrs[1 + (i * stride) // 0x1000] + (off % 0x1000)) for i in range(128)]
+    self.queue, self.queue_paddrs = dev.pci_dev.alloc_sysmem(0x1000 + 1024 * stride)
+    self.mboxes = [(off:=0x1000 + i * stride, self.queue_paddrs[1 + (i * stride) // 0x1000] + (off % 0x1000)) for i in range(1024)]
 
     dev.iseg_w('cmdq_addr_h', hi32(self.queue_paddrs[0]))
     dev.iseg_w('cmdq_addr_l_sz', lo32(self.queue_paddrs[0]) | cmd_l)
@@ -158,10 +158,25 @@ class MLXDev:
     self.cmd.exec(mlx5.MLX5_CMD_OP_SET_ROCE_ADDRESS, roce_address=dict(roce_version=2, source_l3_address=int.from_bytes(self.local_gid, 'big'),
                   roce_l3_type=0, source_mac_47_32=hi32(self.mac), source_mac_31_0=lo32(self.mac)), roce_address_index=0, vhca_port_num=1)
 
+
     if DEBUG >= 2: print(f"mlx5 {self.devfmt}: booted mac={self.mac.to_bytes(6,'big').hex(':')} mkey=0x{self.mkey:x}")
+
+  def register_mem(self, paddrs:list[int], size:int, log_page_size:int=12) -> int:
+    n = len(paddrs)
+    octwords = ceildiv(n, 2)
+    n_padded = ceildiv(n, 2) * 2
+    mtt = struct.pack(f'>{n_padded}Q', *paddrs, *([0] * (n_padded - n)))
+    if MLX_DEBUG >= 1: print(f"mlx5 {self.devfmt}: register_mem pages={n} page_sz={1 << log_page_size} mtt_bytes={len(mtt)}")
+    self.provide_pages(mlx5.MLX5_INIT_PAGES)
+    res = self.cmd.exec(mlx5.MLX5_CMD_OP_CREATE_MKEY,
+      memory_key_mkey_entry=dict(access_mode_1_0=1, lr=1, lw=1, rr=1, rw=1, pd=self.pd, qpn=0xFFFFFF, mkey_7_0=(key_lo:=0x33),
+                                 start_addr=paddrs[0], len=size, log_page_size=log_page_size, translations_octword_size=octwords),
+      translations_octword_actual_size=octwords, payload=mtt)
+    return (res['mkey_index'] << 8) | key_lo
 
   def provide_pages(self, mode):
     if (npages:=self.cmd.exec(mlx5.MLX5_CMD_OP_QUERY_PAGES, op_mod=mode)['num_pages']) <= 0: return
+    if MLX_DEBUG >= 1: print(f"mlx5 {self.devfmt}: provide_pages mode={mode}, {npages} pages")
     mem, paddrs = self.pci_dev.alloc_sysmem(npages * 0x1000)
     self.cmd.exec(mlx5.MLX5_CMD_OP_MANAGE_PAGES, op_mod=mlx5.MLX5_PAGES_GIVE, input_num_entries=npages, payload=struct.pack(f'>{npages}Q', *paddrs))
 

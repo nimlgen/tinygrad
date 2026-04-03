@@ -1,7 +1,7 @@
 from __future__ import annotations
 import mmap, struct, functools
 from typing import cast
-from tinygrad.helpers import round_up, DEBUG
+from tinygrad.helpers import round_up
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQAllocator, HWQueue, HCQBuffer, FileIOInterface
 from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta
 from tinygrad.runtime.support.memory import VirtMapping, AddrSpace
@@ -10,11 +10,22 @@ from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDDevice
 
 class RDMAAllocator(HCQAllocatorBase):
   def __init__(self, dev:RDMADevice): super().__init__(dev, batch_cnt=0)
-  def _map(self, buf): pass
+
+  def _map(self, buf):
+    base = buf._base or buf
+    bar_base = base.owner.iface.pci_dev.bar_info(base.owner.iface.vram_bar)[0]
+    paddrs = base.meta.mapping.paddrs
+    page_sz = (2 << 20) if min(sz for _, sz in paddrs) >= (2 << 20) else (4 << 10)
+    pages = [bar_base + p + off for p, sz in paddrs for off in range(0, sz, page_sz)]
+    mkey = self.dev.iface.mlx_dev.register_mem(pages, len(pages) * page_sz, {(4 << 10): 12, (2 << 20): 21}[page_sz])
+    return HCQBuffer(bar_base + paddrs[0][0], base.size, meta=mkey, owner=self.dev)
+
   def _transfer(self, dest, src, sz, src_dev, dest_dev):
-    src_paddr = src.meta.mapping.paddrs[0][0] + src_dev.iface.pci_dev.bar_info(src_dev.iface.vram_bar)[0]
-    dest_paddr = dest.meta.mapping.paddrs[0][0] + dest_dev.iface.pci_dev.bar_info(dest_dev.iface.vram_bar)[0]
-    RDMACopyQueue(self.dev).copy(dest_paddr, src_paddr, sz, dest_dev, src_dev).submit(self.dev)
+    self.map(src); self.map(dest)
+    src_mb, dest_mb = (src._base or src).mappings[self.dev], (dest._base or dest).mappings[self.dev]
+    RDMACopyQueue(self.dev).copy(src_mb.meta, src_mb.va_addr + (src.va_addr - (src._base or src).va_addr),
+                                 dest_mb.meta, dest_mb.va_addr + (dest.va_addr - (dest._base or dest).va_addr),
+                                 sz, dest_dev, src_dev).submit(self.dev)
 
 class MLXIface(PCIIfaceBase):
   def __init__(self, dev:RDMADevice, dev_id:int):
@@ -44,10 +55,9 @@ class RDMACopyQueue(HWQueue):
     self.dev = dev
     super().__init__()
 
-  def copy(self, dest_paddr, src_paddr, copy_size, dest_dev:AMDDevice, src_dev:AMDDevice):
-    mkey = self.dev.iface.mlx_dev.mkey
-    recv_data = struct.pack('>IIQ', copy_size, mkey, dest_paddr)
-    send_data = struct.pack('>IIQ', copy_size, mkey, src_paddr)
+  def copy(self, src_mkey, src_off, dest_mkey, dest_off, copy_size, dest_dev:AMDDevice, src_dev:AMDDevice):
+    recv_data = struct.pack('>IIQ', copy_size, dest_mkey, dest_off)
+    send_data = struct.pack('>IIQ', copy_size, src_mkey, src_off)
     src_wait = src_dev.timeline_value - 1
     dest_wait = dest_dev.timeline_value - 1
     src_sig = src_dev.next_timeline()
