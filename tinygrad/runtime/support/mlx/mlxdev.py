@@ -1,3 +1,4 @@
+from __future__ import annotations
 import struct, time, random, json, sys, socket, ctypes, os, functools, itertools
 from tinygrad.helpers import getenv, wait_cond, next_power2, ceildiv, DEBUG, hi32, lo32
 from tinygrad.runtime.support.memory import BumpAllocator
@@ -189,7 +190,7 @@ class MLXDev:
 
 class MLXQP:
   def __init__(self, dev:MLXDev, log_sq_size=4, log_rq_size=4, log_eq_size=7, log_cq_size=7):
-    self.dev, self.cq_size, self.log_sq_size = dev, 1 << log_cq_size, log_sq_size
+    self.dev, self.cq_size, self.log_sq_size, self.log_rq_size = dev, 1 << log_cq_size, log_sq_size, log_rq_size
 
     self.cq_dbr, self.qp_dbr = dev.dbr_alloc.alloc(8, alignment=8), dev.dbr_alloc.alloc(8, alignment=8)
 
@@ -210,6 +211,7 @@ class MLXQP:
     self.qp_op(mlx5.MLX5_CMD_OP_RST2INIT_QP, qpc_args=dict(log_ack_req_freq=8), addr_args=dict(pkey_index=0, vhca_port_num=1))
 
     self.cq_ci = self.sq_head = self.rq_head = 0
+    for i in range(self.cq_size): self.cq_mem[i * 64 + 63] = 0x01  # init owner bits so poll_cq waits for real CQEs
     if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qp_info['qpn']:x} (EQ={self.eq_info['eq_number']} CQ=0x{self.cq_info['cqn']:x})")
 
   def create_queue(self, opcode, log_size, entry_sz, owner_off, extra_sz=0, **ctx_kw):
@@ -220,19 +222,19 @@ class MLXQP:
     qpc_args = dict(st=0, pm_state=3, pd=self.dev.pd, cqn_snd=self.cq_info['cqn'], cqn_rcv=self.cq_info['cqn'], **(qpc_args or {}))
     self.dev.cmd.exec(opcode, qpn=self.qp_info['qpn'], qpc=(qpc_args or {}) | {'primary_address_path': addr_args or {}}, **kwargs)
 
-  def connect(self, remote_qpn:int, remote_mac:int, remote_gid:int):
+  def connect(self, remote:MLXQP):
     self.qp_op(mlx5.MLX5_CMD_OP_INIT2RTR_QP, opt_param_mask=0x1A,
-      qpc_args=dict(mtu=3, log_msg_max=self.dev.caps['log_max_msg'], remote_qpn=remote_qpn, log_ack_req_freq=8, log_rra_max=3, rre=1, rwe=1,
+      qpc_args=dict(mtu=3, log_msg_max=self.dev.caps['log_max_msg'], remote_qpn=remote.qp_info['qpn'], log_ack_req_freq=8, log_rra_max=3, rre=1, rwe=1,
                     min_rnr_nak=1, next_rcv_psn=0),
-      addr_args=dict(pkey_index=0, src_addr_index=0, hop_limit=64, udp_sport=udp_sport(self.qp_info['qpn'], remote_qpn), vhca_port_num=1,
-                     rmac_47_32=hi32(remote_mac), rmac_31_0=lo32(remote_mac), rgid_rip=remote_gid))
+      addr_args=dict(pkey_index=0, src_addr_index=0, hop_limit=64, udp_sport=udp_sport(self.qp_info['qpn'], remote.qp_info['qpn']), vhca_port_num=1,
+                     rmac_47_32=hi32(remote.dev.mac), rmac_31_0=lo32(remote.dev.mac), rgid_rip=int.from_bytes(remote.dev.local_gid, 'big')))
     self.qp_op(mlx5.MLX5_CMD_OP_RTR2RTS_QP, qpc_args=dict(log_ack_req_freq=8, next_send_psn=0, log_sra_max=3, retry_count=7, rnr_retry=7),
       addr_args=dict(ack_timeout=14, vhca_port_num=1))
 
-    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qp_info['qpn']:x} connected (remote=0x{remote_qpn:x})")
+    if MLX_DEBUG >= 1: print(f"mlx5: QP 0x{self.qp_info['qpn']:x} connected (remote=0x{remote.qp_info['qpn']:x})")
 
   def _post_sq(self, wqe_op, ds_count, data):
-    wqe = self.qp_buf.view(self.sq_offset + (self.sq_head & 0xF) * 64, 64)
+    wqe = self.qp_buf.view(self.sq_offset + (self.sq_head & ((1 << self.log_sq_size) - 1)) * 64, 64)
     wqe[0:8] = struct.pack('>II', (self.sq_head << 8) | wqe_op, (self.qp_info['qpn'] << 8) | ds_count)
     wqe[11] = 0x08  # CE: signal completion
     wqe[16:16 + len(data)] = data

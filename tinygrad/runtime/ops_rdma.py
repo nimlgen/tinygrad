@@ -1,18 +1,12 @@
 from __future__ import annotations
-import struct
+import mmap, struct, functools
+from typing import cast
 from tinygrad.helpers import round_up, DEBUG
-from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HWQueue
-from tinygrad.runtime.support.system import System, PCIIfaceBase
-from tinygrad.runtime.support.memory import AddrSpace
+from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQAllocator, HWQueue, HCQBuffer, FileIOInterface
+from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta
+from tinygrad.runtime.support.memory import VirtMapping, AddrSpace
 from tinygrad.runtime.support.mlx.mlxdev import MLXDev, MLXQP, to_be
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDDevice, WAIT_REG_MEM_FUNCTION_EQ
-
-def map_phys_to_gpu(gpu, paddrs, size):
-  if isinstance(paddrs, int): paddrs = [paddrs]
-  size = round_up(size, 0x1000)
-  va = gpu.iface.dev_impl.mm.alloc_vaddr(size, align=0x1000)
-  gpu.iface.dev_impl.mm.map_range(va, size, [(p, 0x1000) for p in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
-  return va
+from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDDevice
 
 class RDMAAllocator(HCQAllocatorBase):
   def __init__(self, dev:RDMADevice): super().__init__(dev, batch_cnt=0)
@@ -25,7 +19,25 @@ class RDMAAllocator(HCQAllocatorBase):
 class MLXIface(PCIIfaceBase):
   def __init__(self, dev:RDMADevice, dev_id:int):
     cl, pcibus = System.list_devices(vendor=0x15b3, devices=((0xffff, (0x101b,)),))[dev_id]
+    self.dev = dev
     self.pci_dev = cl("mlx", pcibus)
+    self.mlx_dev = MLXDev(self.pci_dev, ip=f"10.0.0.{dev_id}")
+    self.uar_buf = self._buf([self.mlx_dev.pci_dev.bar_info(0)[0] + self.mlx_dev.uar * 0x1000])
+    self.dbr_buf = self._buf(self.mlx_dev.dbr_paddrs)
+
+  def is_bar_small(self) -> bool: return False
+
+  def _buf(self, paddrs:list[int]) -> HCQBuffer:
+    va = FileIOInterface.anon_mmap(0, size:=len(paddrs) * 0x1000, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, 0)
+    mapping = VirtMapping(va, size, [(p, 0x1000) for p in paddrs], AddrSpace.SYS, uncached=True, snooped=True)
+    return HCQBuffer(va, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=False), owner=self.dev)
+
+  @functools.cache
+  def connect(self, remote_nic:RDMADevice) -> tuple[MLXQP, MLXQP, HCQBuffer]:
+    src_qp, dest_qp = MLXQP(self.mlx_dev, log_sq_size=7, log_rq_size=7), MLXQP(remote_nic.iface.mlx_dev, log_sq_size=7, log_rq_size=7)
+    src_qp.connect(dest_qp)
+    dest_qp.connect(src_qp)
+    return src_qp, dest_qp, remote_nic.iface._buf(dest_qp.cq_paddrs)
 
 class RDMACopyQueue(HWQueue):
   def __init__(self, dev:RDMADevice):
@@ -33,120 +45,63 @@ class RDMACopyQueue(HWQueue):
     super().__init__()
 
   def copy(self, dest_paddr, src_paddr, copy_size, dest_dev:AMDDevice, src_dev:AMDDevice):
-    mkey = self.dev.mlx_dev.mkey
-
+    mkey = self.dev.iface.mlx_dev.mkey
     recv_data = struct.pack('>IIQ', copy_size, mkey, dest_paddr)
     send_data = struct.pack('>IIQ', copy_size, mkey, src_paddr)
-
-    # pre-compute timeline values (capture both waits before any increment to avoid loopback deadlock)
     src_wait = src_dev.timeline_value - 1
     dest_wait = dest_dev.timeline_value - 1
     src_sig = src_dev.next_timeline()
     dest_sig = dest_dev.next_timeline()
-
     self._q.append((src_dev, dest_dev, recv_data, send_data, src_wait, src_sig, dest_wait, dest_sig))
     return self
 
   def _submit(self, dev:RDMADevice):
     for src_dev, dest_dev, recv_data, send_data, src_wait, src_sig, dest_wait, dest_sig in self._q:
-      (src_qp, src_m), (dest_qp, dest_m) = dev.get_qp_pair(src_dev, dest_dev)
+      remote_nic = dest_dev.rdma_dev()
+      src_qp, dest_qp, cq_buf = dev.iface.connect(remote_nic)
 
-      # === CPU: write WQEs to MLX5 queues ===
+      # ensure GPU page tables are set up
+      for buf in [dev.iface.uar_buf, dev.iface.dbr_buf]: cast(HCQAllocator, src_dev.allocator).map(buf)
+      for buf in [remote_nic.iface.dbr_buf, cq_buf]: cast(HCQAllocator, dest_dev.allocator).map(buf)
 
-      # recv WQE on dest QP's RQ (16 bytes scatter entry)
-      rq_mask = (1 << 4) - 1  # log_rq_size=4
-      rq_wqe = dest_qp.qp_buf.view((dest_qp.rq_head & rq_mask) * 16, 16)
+      # recv WQE on dest QP's RQ
+      rq_wqe = dest_qp.qp_buf.view((dest_qp.rq_head & ((1 << dest_qp.log_rq_size) - 1)) * 16, 16)
       rq_wqe[:] = recv_data
       dest_qp.rq_head += 1
 
-      # send WQE on src QP's SQ (64 bytes, opcode 0x0a = SEND, ds_count=2)
-      sq_mask = (1 << src_qp.log_sq_size) - 1
-      wqe = src_qp.qp_buf.view(src_qp.sq_offset + (src_qp.sq_head & sq_mask) * 64, 64)
+      # send WQE on src QP's SQ (opcode 0x0a = SEND, ds_count=2, no CE)
+      wqe = src_qp.qp_buf.view(src_qp.sq_offset + (src_qp.sq_head & ((1 << src_qp.log_sq_size) - 1)) * 64, 64)
       wqe[:] = bytes(64)
       wqe[0:8] = struct.pack('>II', (src_qp.sq_head << 8) | 0x0a, (src_qp.qp_info['qpn'] << 8) | 2)
-      wqe[11] = 0x08  # CE: signal completion
       wqe[16:32] = send_data
       src_qp.sq_head += 1
       doorbell_val = to_be('Q', int.from_bytes(bytes(wqe[0:8]), 'big'))
 
-      # CQ addresses for polling owner bit at cqe byte 63
-      cq0_ci = src_qp.cq_ci
-      cq0_addr = src_m['cq_gpu_va'] + (cq0_ci & (src_qp.cq_size - 1)) * 64 + 60
-      cq0_owner = (1 if (cq0_ci & src_qp.cq_size) else 0) << 24
-      cq1_ci = (dest_qp.cq_ci + 1) if src_dev == dest_dev else dest_qp.cq_ci  # loopback: same CQ, next entry
-      cq1_addr = dest_m['cq_gpu_va'] + (cq1_ci & (dest_qp.cq_size - 1)) * 64 + 60
-      cq1_owner = (1 if (cq1_ci & dest_qp.cq_size) else 0) << 24
+      # recv CQ owner bit poll
+      cq_ci = dest_qp.cq_ci
+      cq_owner = (1 if (cq_ci & dest_qp.cq_size) else 0) << 24
 
-      if src_dev == dest_dev:
-        # loopback: single queue — recv doorbell before send to avoid RNR deadlock
-        q = AMDComputeQueue(src_dev)
-        q.wait(src_dev.timeline_signal, src_wait)
-        q.release_mem(dest_m['dbr_gpu_va'] + dest_qp.qp_dbr, to_be('I', dest_qp.rq_head),
-                      q.pm4.data_sel__mec_release_mem__send_32_bit_low, q.pm4.int_sel__mec_release_mem__none)
-        q.release_mem(src_m['dbr_gpu_va'] + src_qp.qp_dbr + 4, to_be('I', src_qp.sq_head),
-                      q.pm4.data_sel__mec_release_mem__send_32_bit_low, q.pm4.int_sel__mec_release_mem__none)
-        q.release_mem(src_m['uar_gpu_va'] + 0x800, doorbell_val,
-                      q.pm4.data_sel__mec_release_mem__send_64_bit_data, q.pm4.int_sel__mec_release_mem__none)
-        q.wait_reg_mem(cq0_owner, mask=0x01000000, mem=cq0_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
-        q.wait_reg_mem(cq1_owner, mask=0x01000000, mem=cq1_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
-        q.signal(src_dev.timeline_signal, dest_sig)
-        q.submit(src_dev)
-      else:
-        # multi-device: separate queues, each device controls its own
-        src_q = AMDComputeQueue(src_dev)
-        src_q.wait(src_dev.timeline_signal, src_wait)
-        src_q.release_mem(src_m['dbr_gpu_va'] + src_qp.qp_dbr + 4, to_be('I', src_qp.sq_head),
-                          src_q.pm4.data_sel__mec_release_mem__send_32_bit_low, src_q.pm4.int_sel__mec_release_mem__none)
-        src_q.release_mem(src_m['uar_gpu_va'] + 0x800, doorbell_val,
-                          src_q.pm4.data_sel__mec_release_mem__send_64_bit_data, src_q.pm4.int_sel__mec_release_mem__none)
-        src_q.wait_reg_mem(cq0_owner, mask=0x01000000, mem=cq0_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
-        src_q.signal(src_dev.timeline_signal, src_sig)
-        src_q.submit(src_dev)
+      # sender: fire doorbell and signal immediately
+      src_q = AMDComputeQueue(src_dev)
+      src_q.wait(src_dev.timeline_signal, src_wait)
+      src_q.write(dev.iface.dbr_buf.offset(src_qp.qp_dbr + 4), to_be('I', src_qp.sq_head))
+      src_q.write(dev.iface.uar_buf.offset(0x800), doorbell_val, b64=True)
+      src_q.signal(src_dev.timeline_signal, src_sig)
+      src_q.submit(src_dev)
 
-        dest_q = AMDComputeQueue(dest_dev)
-        dest_q.wait(dest_dev.timeline_signal, dest_wait)
-        dest_q.release_mem(dest_m['dbr_gpu_va'] + dest_qp.qp_dbr, to_be('I', dest_qp.rq_head),
-                           dest_q.pm4.data_sel__mec_release_mem__send_32_bit_low, dest_q.pm4.int_sel__mec_release_mem__none)
-        dest_q.wait_reg_mem(cq1_owner, mask=0x01000000, mem=cq1_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
-        dest_q.signal(dest_dev.timeline_signal, dest_sig)
-        dest_q.submit(dest_dev)
+      # receiver: post recv, poll recv CQ
+      dest_q = AMDComputeQueue(dest_dev)
+      dest_q.wait(dest_dev.timeline_signal, dest_wait)
+      dest_q.write(remote_nic.iface.dbr_buf.offset(dest_qp.qp_dbr), to_be('I', dest_qp.rq_head))
+      dest_q.poll(cq_buf.offset((cq_ci & (dest_qp.cq_size - 1)) * 64 + 60), cq_owner, mask=0x01000000)
+      dest_q.write(remote_nic.iface.dbr_buf.offset(dest_qp.cq_dbr), to_be('I', (cq_ci + 1) & 0xFFFFFF))
+      dest_q.signal(dest_dev.timeline_signal, dest_sig)
+      dest_q.submit(dest_dev)
 
-      src_qp.cq_ci += 1
       dest_qp.cq_ci += 1
 
 class RDMADevice(HCQCompiled):
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.iface = MLXIface(self, self.device_id)
-    self.mlx_dev = MLXDev(self.iface.pci_dev, ip=f"10.0.0.{self.device_id}")
-    self.qp_pairs: dict[tuple[int, int], tuple[tuple[MLXQP, dict], tuple[MLXQP, dict]]] = {}
-
     super().__init__(device, RDMAAllocator(self), [], None, signal_t=None)
-
-  def _map_qp_to_gpu(self, qp:MLXQP, gpu_dev:AMDDevice) -> dict:
-    uar_paddr = self.mlx_dev.pci_dev.bar_info(0)[0] + self.mlx_dev.uar * 0x1000
-    uar_gpu_va = map_phys_to_gpu(gpu_dev, uar_paddr, 0x1000)
-    dbr_gpu_va = map_phys_to_gpu(gpu_dev, self.mlx_dev.dbr_paddrs[0], 0x1000)
-    cq_gpu_va = map_phys_to_gpu(gpu_dev, qp.cq_paddrs, round_up(qp.cq_size * 64, 0x1000))
-    for i in range(qp.cq_size): qp.cq_mem[i * 64 + 63] = 0x01
-    return {'uar_gpu_va': uar_gpu_va, 'dbr_gpu_va': dbr_gpu_va, 'cq_gpu_va': cq_gpu_va}
-
-  def get_qp_pair(self, src_dev:AMDDevice, dest_dev:AMDDevice) -> tuple[tuple[MLXQP, dict], tuple[MLXQP, dict]]:
-    key = (src_dev.device_id, dest_dev.device_id)
-    if key not in self.qp_pairs:
-      gid = int.from_bytes(self.mlx_dev.local_gid, 'big')
-      if src_dev.device_id == dest_dev.device_id:
-        qp = MLXQP(self.mlx_dev)
-        qp.connect(qp.qp_info['qpn'], self.mlx_dev.mac, gid)
-        m = self._map_qp_to_gpu(qp, src_dev)
-        self.qp_pairs[key] = ((qp, m), (qp, m))
-        if DEBUG >= 1: print(f"RDMA: loopback QP 0x{qp.qp_info['qpn']:x} for GPU {src_dev.device_id}")
-      else:
-        src_qp, dest_qp = MLXQP(self.mlx_dev), MLXQP(self.mlx_dev)
-        src_qp.connect(dest_qp.qp_info['qpn'], self.mlx_dev.mac, gid)
-        dest_qp.connect(src_qp.qp_info['qpn'], self.mlx_dev.mac, gid)
-        src_m, dest_m = self._map_qp_to_gpu(src_qp, src_dev), self._map_qp_to_gpu(dest_qp, dest_dev)
-        self.qp_pairs[key] = ((src_qp, src_m), (dest_qp, dest_m))
-        if DEBUG >= 1: print(f"RDMA: QP pair 0x{src_qp.qp_info['qpn']:x}<->0x{dest_qp.qp_info['qpn']:x} "
-                             f"for GPU {src_dev.device_id}<->GPU {dest_dev.device_id}")
-    return self.qp_pairs[key]
