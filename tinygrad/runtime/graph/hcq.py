@@ -52,10 +52,20 @@ class HCQGraph(MultiGraphRunner):
     self.copy_queues: dict[tuple[HCQCompiled, int], HWQueue] = {} # lazy allocation, keyed by (device, queue_idx)
     self.num_copy_queues: int = getenv("HCQ_NUM_SDMA", min(len(self.devices), 8) if ALL2ALL >= 1 else 1)
 
+    # Per-peer-group KICK signals: remote GPUs can't access local host memory via GPU page tables.
+    peer_group_rep: dict[str, HCQCompiled] = {}
+    for dev in self.devices:
+      if not dev._is_cpu(): peer_group_rep.setdefault(dev.peer_group, dev)
+    self.kick_signals: dict[str, HCQSignal] = {pg: d.new_signal(value=0) for pg, d in peer_group_rep.items()}
+
     self.signals: dict[Any, HCQSignal] = {**{dev: dev.new_signal(value=0) for dev in self.devices if not dev._is_cpu()},
-      **{"KICK": self.devices[0].new_signal(value=0)}, **{dev: self.devices[0].new_signal(value=0) for dev in self.devices if dev._is_cpu()}}
+      **{"KICK": list(self.kick_signals.values())[0]}, **{dev: self.devices[0].new_signal(value=0) for dev in self.devices if dev._is_cpu()}}
     self.kickoff_value: int = 0
     self.kickoff_var = UOp.variable("kickoff_var", 0, 0xffffffff, dtype=dtypes.uint32)
+    self.multi_peer_group = len(set(d.peer_group for d in self.devices if not d._is_cpu())) > 1
+
+    # RDMA graph state: per-QP-pair (rdma_dev, src_qp, dest_qp, qpn, src_cq_var, dest_cq_var, queue, per_transfer_vars)
+    self.rdma_state: dict[tuple, tuple] = {}
 
     # When profiling allocate 2 signals for each jit item to measure speed. The jth jit item have signals at 2*j and 2*j+1.
     # TODO: This logic might allocate a few extra signals...
@@ -83,15 +93,19 @@ class HCQGraph(MultiGraphRunner):
       self.device_vars[enqueue_dev] = merge_dicts([self.device_vars.get(enqueue_dev, {}), ji.fixedvars])
       if is_exec_prg: self.device_vars[enqueue_dev] = merge_dicts([self.device_vars[enqueue_dev], cast(CompiledRunner, ji.prg).p.runtimevars])
 
-      if is_exec_prg:
+      is_rdma = not is_exec_prg and isinstance(ji.prg, BufferXfer) \
+                and len(set(cast(HCQCompiled, Device[cast(Buffer, b).device]).peer_group for b in ji.bufs)) > 1
+
+      if is_exec_prg or is_rdma:
         enqueue_queue = self.comp_queues[enqueue_dev]
       else:
         assert (enqueue_dev.hw_copy_queue_t is not None), "device must implement a copy queue"
         queue_idx = self.devices.index(cast(HCQCompiled, Device[cast(Buffer, ji.bufs[0]).device])) % self.num_copy_queues
         enqueue_queue = self.copy_queues.setdefault((enqueue_dev, queue_idx),
-                                                    enqueue_dev.hw_copy_queue_t(queue_idx=queue_idx).wait(self.signals['KICK'], self.kickoff_var))
+                                                    enqueue_dev.hw_copy_queue_t(queue_idx=queue_idx).wait(
+                                                      self.kick_signals.get(enqueue_dev.peer_group, self.signals['KICK']), self.kickoff_var))
 
-      out_signal = self.signals.setdefault(enqueue_queue, self.devices[0].new_signal(value=0))
+      out_signal = self.signals.setdefault(enqueue_queue, enqueue_dev.new_signal(value=0))
 
       # Get dependencies based on input and output buffers.
       rdeps = self._access_resources(ji.bufs, ji.prg.p.outs if is_exec_prg else [0], (enqueue_queue, j + 1)) #type:ignore
@@ -110,6 +124,11 @@ class HCQGraph(MultiGraphRunner):
       # Ensure device is ready for use in current context: the graph has initialized the device and it's safe to operate on it within this graph.
       sync_signals = [(self.signals[d], self.kickoff_var) for b in ji.bufs if (d:=Device[cast(Buffer, b).device]) not in dev_access[enqueue_queue]]
       dev_access[enqueue_queue].update(cast(HCQCompiled, Device[cast(Buffer, b).device]) for b in ji.bufs)
+
+      # For multi-peer-group graphs, filter out cross-peer-group deps — RDMA protocol handles cross-peer-group sync.
+      if self.multi_peer_group:
+        sync_signals = [(sig, val) for sig, val in sync_signals if sig.base_buf.owner.peer_group == enqueue_dev.peer_group]
+        opt_deps = [(sig, val) for sig, val in opt_deps if sig.base_buf.owner.peer_group == enqueue_dev.peer_group]
 
       # Remove self-dependency for compute and copy queues.
       # For compute, in case of NV, optimize when only 1 same-queue dependency exists, since NV chains 2+ executions in this case,
@@ -149,8 +168,9 @@ class HCQGraph(MultiGraphRunner):
                                   for dev in self.devices}
 
     for dev in self.devices:
+      kick = self.kick_signals.get(dev.peer_group, self.signals['KICK'])
       self.comp_queues[dev].memory_barrier().wait(self.virt_timeline_signals[dev], self.virt_timeline_vals[dev]) \
-                           .wait(self.signals['KICK'], self.kickoff_var).signal(self.signals[dev], self.kickoff_var)
+                           .wait(kick, self.kickoff_var).signal(self.signals[dev], self.kickoff_var)
 
     for j,ji in enumerate(self.jit_cache):
       enqueue_dev, enqueue_queue, sync_signals, deps, signal, signal_val = self.ji_schedule[j]
@@ -166,6 +186,37 @@ class HCQGraph(MultiGraphRunner):
       # Encode main commands based on ji type.
       if isinstance(ji.prg, CompiledRunner):
         enqueue_queue.exec(ji.prg._prg, self.ji_args[j], tuple(ji.prg.p.global_size or (1,1,1)), tuple(ji.prg.p.local_size or (1,1,1)))
+      elif self.multi_peer_group and isinstance(ji.prg, BufferXfer) \
+           and len(set(cast(HCQCompiled, Device[cast(Buffer, b).device]).peer_group for b in ji.bufs)) > 1:
+        from tinygrad.runtime.ops_rdma import RDMACopyQueue, RDMADevice
+        dest_buf, src_buf = cast(Buffer, ji.bufs[0]), cast(Buffer, ji.bufs[1])
+        src_dev, dest_dev = cast(HCQCompiled, Device[src_buf.device]), cast(HCQCompiled, Device[dest_buf.device])
+
+        assert all(self.input_replace.get((j, bufid)) is None for bufid in range(len(ji.bufs))), \
+          "RDMA graph transfers don't support input_replace buffers"
+
+        rdma_dev: RDMADevice = src_dev.rdma_dev()
+        src_qp, dest_qp, _, _ = rdma_dev.iface.connect(dest_dev.rdma_dev())
+        qp_key = (id(src_qp), id(dest_qp))
+
+        if qp_key not in self.rdma_state:
+          scq_var = UOp.variable(f"rdma_scq_{id(src_qp):x}", 0, 0xFFFFFFFF, dtype=dtypes.uint32)
+          dcq_var = UOp.variable(f"rdma_dcq_{id(dest_qp):x}", 0, 0xFFFFFFFF, dtype=dtypes.uint32)
+          self.rdma_state[qp_key] = (rdma_dev, src_qp, dest_qp, src_qp.qp_info['qpn'], scq_var, dcq_var, RDMACopyQueue(rdma_dev), [])
+
+        rdma_dev, _, _, qpn, scq_var, dcq_var, rdma_q, tvars = self.rdma_state[qp_key]
+        i = len(tvars)
+
+        # per-transfer pre-swapped doorbell sint variables: [sq_dbr, uar_db, src_cq_dbr, rq_dbr, dest_cq_dbr]
+        tv = [UOp.variable(f"rdma_{n}_{qp_key[0]:x}_{i}", 0, 0xFFFFFFFFFFFFFFFF if n == "uar" else 0xFFFFFFFF,
+                            dtype=dtypes.uint64 if n == "uar" else dtypes.uint32)
+              for n in ["sq_dbr", "uar", "scq_dbr", "rq_dbr", "dcq_dbr"]]
+        tvars.append(tv)
+
+        rdma_q.prepare_transfer(self.hcq_bufs[j][0], self.hcq_bufs[j][1], dest_buf.nbytes,
+          src_dev, dest_dev, self.comp_queues[src_dev], self.comp_queues[dest_dev],
+          sq_dbr_val=tv[0], uar_db_val=tv[1], src_cq_dbr_val=tv[2], rq_dbr_val=tv[3], dest_cq_dbr_val=tv[4],
+          src_cq_ci=scq_var + i, dest_cq_ci=dcq_var + i)
       elif isinstance(ji.prg, (BufferXfer, BufferCopy)):
         dest, src = [cast(Buffer, x) for x in ji.bufs[0:2]]
         for bufid, src in enumerate(cast(list[Buffer], ji.bufs)):
@@ -210,6 +261,20 @@ class HCQGraph(MultiGraphRunner):
     for (j,i),input_idx in self.input_replace.items():
       hcq_var_vals[self.input_replace_to_var[(j,i)].expr] = input_buffers[input_idx]._buf.va_addr
 
+    # RDMA: bind pre-swapped doorbell vars, copy WQEs to NIC rings
+    if self.rdma_state: from tinygrad.runtime.support.mlx.mlxdev import to_be  # noqa: E402
+    for rdma_dev, src_qp, dest_qp, qpn, scq_var, dcq_var, rdma_q, tvars in self.rdma_state.values():
+      sq, rq, scq, dcq = src_qp.sq_head, dest_qp.rq_head, src_qp.cq_ci, dest_qp.cq_ci
+      print(f"RDMA graph call: kick={self.kickoff_value} sq={sq} rq={rq} scq={scq} dcq={dcq} ntransfers={len(tvars)}")
+      hcq_var_vals[scq_var.expr], hcq_var_vals[dcq_var.expr] = scq, dcq
+      for i, tv in enumerate(tvars):
+        hcq_var_vals[tv[0].expr] = to_be('I', sq + i + 1)
+        hcq_var_vals[tv[1].expr] = to_be('Q', (((sq + i) << 8) | 0x0a) << 32 | ((qpn << 8) | 2))
+        hcq_var_vals[tv[2].expr] = to_be('I', (scq + i + 1) & 0xFFFFFF)
+        hcq_var_vals[tv[3].expr] = to_be('I', rq + i + 1)
+        hcq_var_vals[tv[4].expr] = to_be('I', (dcq + i + 1) & 0xFFFFFF)
+      rdma_q._submit(rdma_dev)
+
     for dev in self.devices:
       self.comp_queues[dev].submit(dev, hcq_var_vals_local:=hcq_var_vals|self.device_vars.get(dev, {}))
       for copy_queue in self._dev_copy_queues(dev): copy_queue.submit(dev, hcq_var_vals_local)
@@ -217,7 +282,7 @@ class HCQGraph(MultiGraphRunner):
 
     # Launch graph
     for sig in self.queue_signals_to_reset: sig.value = 0
-    self.signals['KICK'].value = self.kickoff_value
+    for kick in self.kick_signals.values(): kick.value = self.kickoff_value
 
     if wait:
       st = time.perf_counter()
@@ -248,8 +313,13 @@ class HCQGraph(MultiGraphRunner):
     # If all of devices are mapped into CPU address space, can use CPU inside the peer group.
     cpu_support = all(type(d.timeline_signal.base_buf.view) is MMIOInterface for d in all_devs)
 
-    # Check if all devices are within the same peer group. If CPU is supported, don't count it as a separate peer group.
-    if len(set(d.peer_group for d in all_devs if not (cpu_support and d._is_cpu()))) > 1: return False
+    # Check if all devices are within the same peer group. Allow multi-peer-group if RDMA is available.
+    peer_groups = set(d.peer_group for d in all_devs if not (cpu_support and d._is_cpu()))
+    if len(peer_groups) > 1:
+      try:
+        for d in all_devs:
+          if not d._is_cpu(): d.rdma_dev()
+      except RuntimeError: return False
 
     if new_call.src[0].op is Ops.COPY:
       # MOCKGPU is not supported, since it can't execute commands in parallel

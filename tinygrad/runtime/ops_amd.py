@@ -109,7 +109,7 @@ class AMDComputeQueue(HWQueue):
     data_sel = self.pm4.data_sel__mec_release_mem__send_64_bit_data if b64 else self.pm4.data_sel__mec_release_mem__send_32_bit_low
     return self.release_mem(b.va_addr, val, data_sel, self.pm4.int_sel__mec_release_mem__none)
 
-  def poll(self, b:HCQBuffer, val:int, mask:int):
+  def poll(self, b:HCQBuffer, val:sint, mask:int):
     return self.wait_reg_mem(val, mask=mask, mem=b.va_addr, op=WAIT_REG_MEM_FUNCTION_EQ)
 
   def release_mem(self, address=0x0, value=0, data_sel=0, int_sel=2, ctxid=0, cache_flush=False):
@@ -879,6 +879,12 @@ class PCIIface(PCIIfaceBase):
         d.iface.dev_impl.gfx.setup_ring(*d.compute_queue.params)
         d.timeline_signal.value = d.timeline_value - 1
         d.error_state = None
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, **kwargs) -> HCQBuffer:
+    # Force use of huge pages for large allocations. NVDev will attempt to use huge pages in any case,
+    # but if the size is not aligned, the tail will be allocated with 4KB pages, increasing TLB pressure.
+    return super().alloc(round_up(size, mmap.PAGESIZE if uncached or host else ((2 << 20) if size >= (8 << 20) else (4 << 10))),
+      host=host, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous, force_devmem=force_devmem, **kwargs)
 
   def sleep(self, timeout):
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
