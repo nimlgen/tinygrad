@@ -490,11 +490,14 @@ class HCQBuffer:
 
   def offset(self, offset:int=0, size:int|None=None) -> HCQBuffer:
     return HCQBuffer(self.va_addr+offset, size or (self.size - offset), owner=self.owner, meta=self.meta,
-      _base=self._base or self, view=(self.view.view(offset=offset, size=size) if self.view is not None else None))
+      _base=self.base, view=(self.view.view(offset=offset, size=size) if self.view is not None else None))
 
   def cpu_view(self) -> MMIOInterface:
     assert self.view is not None, "buffer has no cpu_view"
     return self.view
+
+  @property
+  def base(self) -> HCQBuffer: return self._base or self
 
   @property
   def mappings(self): return self._mappings if self._base is None else self._base._mappings
@@ -527,6 +530,8 @@ class HCQAllocatorBase(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
   @suppress_finalizing
   def _free(self, buf:HCQBuffer, options:BufferSpec|None=None):
     for dev in buf.mapped_devs: dev.synchronize()
+    for dev in buf.mapped_devs[1:]:
+      if hasattr(dev.iface, 'dev_impl'): dev.iface.dev_impl.mm.unmap_range(buf.va_addr, buf.size)
     if hasattr(self, '_do_free'): self._do_free(buf, options)
 
   def _offset(self, buf, size:int, offset:int) -> HCQBuffer: return buf.offset(offset=offset, size=size)

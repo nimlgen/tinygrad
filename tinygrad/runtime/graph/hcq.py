@@ -196,15 +196,16 @@ class HCQGraph(MultiGraphRunner):
           "RDMA graph transfers don't support input_replace buffers"
 
         rdma_dev: RDMADevice = src_dev.rdma_dev()
-        src_qp, dest_qp, _, _ = rdma_dev.iface.connect(dest_dev.rdma_dev())
+        remote_nic: RDMADevice = dest_dev.rdma_dev()
+        src_qp, dest_qp, src_cq_buf, dest_cq_buf = rdma_dev.iface.connect(remote_nic)
         qp_key = (id(src_qp), id(dest_qp))
 
         if qp_key not in self.rdma_state:
           scq_var = UOp.variable(f"rdma_scq_{id(src_qp):x}", 0, 0xFFFFFFFF, dtype=dtypes.uint32)
           dcq_var = UOp.variable(f"rdma_dcq_{id(dest_qp):x}", 0, 0xFFFFFFFF, dtype=dtypes.uint32)
-          self.rdma_state[qp_key] = (rdma_dev, src_qp, dest_qp, src_qp.qp_info['qpn'], scq_var, dcq_var, RDMACopyQueue(rdma_dev), [])
+          self.rdma_state[qp_key] = (rdma_dev, remote_nic, src_qp, dest_qp, src_qp.qp_info['qpn'], scq_var, dcq_var, RDMACopyQueue(rdma_dev), [])
 
-        rdma_dev, _, _, qpn, scq_var, dcq_var, rdma_q, tvars = self.rdma_state[qp_key]
+        rdma_dev, remote_nic, src_qp, dest_qp, qpn, scq_var, dcq_var, rdma_q, tvars = self.rdma_state[qp_key]
         i = len(tvars)
 
         # per-transfer pre-swapped doorbell sint variables: [sq_dbr, uar_db, src_cq_dbr, rq_dbr, dest_cq_dbr]
@@ -213,10 +214,11 @@ class HCQGraph(MultiGraphRunner):
               for n in ["sq_dbr", "uar", "scq_dbr", "rq_dbr", "dcq_dbr"]]
         tvars.append(tv)
 
-        rdma_q.prepare_transfer(self.hcq_bufs[j][0], self.hcq_bufs[j][1], dest_buf.nbytes,
-          src_dev, dest_dev, self.comp_queues[src_dev], self.comp_queues[dest_dev],
-          sq_dbr_val=tv[0], uar_db_val=tv[1], src_cq_dbr_val=tv[2], rq_dbr_val=tv[3], dest_cq_dbr_val=tv[4],
-          src_cq_ci=scq_var + i, dest_cq_ci=dcq_var + i)
+        rdma_q.copy(self.hcq_bufs[j][0], self.hcq_bufs[j][1], dest_buf.nbytes, src_dev, dest_dev)
+        rdma_q.encode_ring(self.comp_queues[src_dev], src_dev, rdma_dev.iface, src_qp, src_cq_buf, src_qp.qp_dbr + 4,
+                           tv[0], tv[2], scq_var + i, uar_db_val=tv[1])
+        rdma_q.encode_ring(self.comp_queues[dest_dev], dest_dev, remote_nic.iface, dest_qp, dest_cq_buf, dest_qp.qp_dbr,
+                           tv[3], tv[4], dcq_var + i)
       elif isinstance(ji.prg, (BufferXfer, BufferCopy)):
         dest, src = [cast(Buffer, x) for x in ji.bufs[0:2]]
         for bufid, src in enumerate(cast(list[Buffer], ji.bufs)):
@@ -263,7 +265,7 @@ class HCQGraph(MultiGraphRunner):
 
     # RDMA: bind pre-swapped doorbell vars, copy WQEs to NIC rings
     if self.rdma_state: from tinygrad.runtime.support.mlx.mlxdev import to_be  # noqa: E402
-    for rdma_dev, src_qp, dest_qp, qpn, scq_var, dcq_var, rdma_q, tvars in self.rdma_state.values():
+    for rdma_dev, remote_nic, src_qp, dest_qp, qpn, scq_var, dcq_var, rdma_q, tvars in self.rdma_state.values():
       sq, rq, scq, dcq = src_qp.sq_head, dest_qp.rq_head, src_qp.cq_ci, dest_qp.cq_ci
       print(f"RDMA graph call: kick={self.kickoff_value} sq={sq} rq={rq} scq={scq} dcq={dcq} ntransfers={len(tvars)}")
       hcq_var_vals[scq_var.expr], hcq_var_vals[dcq_var.expr] = scq, dcq

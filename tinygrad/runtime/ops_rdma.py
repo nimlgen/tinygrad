@@ -6,39 +6,34 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocatorBase, HCQAlloc
 from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta
 from tinygrad.runtime.support.memory import VirtMapping, AddrSpace
 from tinygrad.runtime.support.mlx.mlxdev import MLXDev, MLXQP, to_be
-from tinygrad.runtime.ops_amd import AMDComputeQueue, AMDDevice
+from tinygrad.helpers import unwrap
 
 class RDMAAllocator(HCQAllocatorBase):
   def __init__(self, dev:RDMADevice): super().__init__(dev, batch_cnt=0)
 
-  def _map(self, buf):
-    base = buf._base or buf
-    bar_base = base.owner.iface.pci_dev.bar_info(base.owner.iface.vram_bar)[0]
-    paddrs = base.meta.mapping.paddrs
+  def _map(self, buf:HCQBuffer) -> HCQBuffer:
+    bar, paddrs = buf.base.owner.iface.pci_dev.bar_info(buf.base.owner.iface.vram_bar)[0], buf.base.meta.mapping.paddrs
     page_sz = (2 << 20) if min(sz for _, sz in paddrs) >= (2 << 20) else (4 << 10)
-    pages = [bar_base + p + off for p, sz in paddrs for off in range(0, sz, page_sz)]
-    mkey = self.dev.iface.mlx_dev.register_mem(pages, len(pages) * page_sz, {(4 << 10): 12, (2 << 20): 21}[page_sz])
-    return HCQBuffer(bar_base + paddrs[0][0], base.size, meta=mkey, owner=self.dev)
+    pages = [bar + p + off for p, sz in paddrs for off in range(0, sz, page_sz)]
+    return HCQBuffer(bar + paddrs[0][0], buf.base.size, owner=self.dev,
+                     meta=self.dev.iface.mlx_dev.register_mem(pages, len(pages) * page_sz, page_sz.bit_length() - 1))
 
-  def _transfer(self, dest, src, sz, src_dev, dest_dev):
-    q = RDMACopyQueue(self.dev)
-    src_q, dest_q = AMDComputeQueue(src_dev), AMDComputeQueue(dest_dev)
-    remote_nic = dest_dev.rdma_dev()
-    src_qp, dest_qp, _, _ = self.dev.iface.connect(remote_nic)
-    qpn = src_qp.qp_info['qpn']
+  def _transfer(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev:HCQCompiled, dest_dev:HCQCompiled):
+    # sync device
+    src_q = unwrap(dest_dev.hw_compute_queue_t)().wait(src_dev.timeline_signal, src_dev.timeline_value - 1)
+    dest_q = unwrap(dest_dev.hw_compute_queue_t)().wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1)
 
-    src_q.wait(src_dev.timeline_signal, src_dev.timeline_value - 1)
-    dest_q.wait(dest_dev.timeline_signal, dest_dev.timeline_value - 1)
+    # rdma body + encode doorbell rings
+    src_qp, dest_qp, src_cq_buf, dest_cq_buf = self.dev.iface.connect(remote_nic:=dest_dev.rdma_dev())
+    RDMACopyQueue(self.dev).copy(dest, src, sz, src_dev, dest_dev) \
+                           .encode_ring(src_q, src_dev, self.dev.iface, src_qp, src_cq_buf, src_qp.qp_dbr + 4,
+                                        to_be('I', src_qp.sq_head + 1), to_be('I', (src_qp.cq_ci + 1) & 0xFFFFFF), src_qp.cq_ci,
+                                        uar_db_val=to_be('Q', ((src_qp.sq_head << 8) | 0x0a) << 32 | ((src_qp.qp_info['qpn'] << 8) | 2))) \
+                           .encode_ring(dest_q, dest_dev, remote_nic.iface, dest_qp, dest_cq_buf, dest_qp.qp_dbr,
+                                        to_be('I', dest_qp.rq_head + 1), to_be('I', (dest_qp.cq_ci + 1) & 0xFFFFFF), dest_qp.cq_ci) \
+                           .submit(self.dev)
 
-    q.prepare_transfer(dest, src, sz, src_dev, dest_dev, src_q, dest_q,
-      sq_dbr_val=to_be('I', src_qp.sq_head + 1),
-      uar_db_val=to_be('Q', ((src_qp.sq_head << 8) | 0x0a) << 32 | ((qpn << 8) | 2)),
-      src_cq_dbr_val=to_be('I', (src_qp.cq_ci + 1) & 0xFFFFFF),
-      rq_dbr_val=to_be('I', dest_qp.rq_head + 1),
-      dest_cq_dbr_val=to_be('I', (dest_qp.cq_ci + 1) & 0xFFFFFF),
-      src_cq_ci=src_qp.cq_ci, dest_cq_ci=dest_qp.cq_ci)
-
-    q._submit(self.dev)
+    # signal completion
     src_q.signal(src_dev.timeline_signal, src_dev.next_timeline()).submit(src_dev)
     dest_q.signal(dest_dev.timeline_signal, dest_dev.next_timeline()).submit(dest_dev)
 
@@ -63,80 +58,48 @@ class MLXIface(PCIIfaceBase):
     src_qp, dest_qp = MLXQP(self.mlx_dev, log_sq_size=7, log_rq_size=7), MLXQP(remote_nic.iface.mlx_dev, log_sq_size=7, log_rq_size=7)
     src_qp.connect(dest_qp)
     dest_qp.connect(src_qp)
-    return src_qp, dest_qp, remote_nic.iface._buf(dest_qp.cq_paddrs), self._buf(src_qp.cq_paddrs)
+    return src_qp, dest_qp, self._buf(src_qp.cq_paddrs), remote_nic.iface._buf(dest_qp.cq_paddrs)
 
 class RDMACopyQueue(HWQueue):
   def __init__(self, dev:RDMADevice):
     self.dev = dev
     super().__init__()
 
-  @staticmethod
-  def build_rdma_mec(rdma_dev:RDMADevice, remote_nic:RDMADevice, src_qp:MLXQP, dest_qp:MLXQP,
-                     src_cq_buf:HCQBuffer, cq_buf:HCQBuffer, src_dev:AMDDevice, dest_dev:AMDDevice,
-                     src_q:AMDComputeQueue, dest_q:AMDComputeQueue,
-                     sq_dbr_val:sint, uar_db_val:sint, src_cq_dbr_val:sint, rq_dbr_val:sint, dest_cq_dbr_val:sint,
-                     src_cq_ci:sint, dest_cq_ci:sint):
-    for buf in [rdma_dev.iface.uar_buf, rdma_dev.iface.dbr_buf, src_cq_buf]: cast(HCQAllocator, src_dev.allocator).map(buf)
-    for buf in [remote_nic.iface.dbr_buf, cq_buf]: cast(HCQAllocator, dest_dev.allocator).map(buf)
+  def _wqe_data(self, buf:HCQBuffer, sz:int, nic:RDMADevice) -> bytes:
+    nic.allocator.map(buf)
+    return struct.pack('>IIQ', sz, buf.mappings[nic].meta, buf.mappings[nic].va_addr + (buf.va_addr - buf.base.va_addr))
 
-    # sender: ring SQ doorbell + UAR, poll send CQ completion, advance CQ CI
-    src_q.write(rdma_dev.iface.dbr_buf.offset(src_qp.qp_dbr + 4), sq_dbr_val)
-    src_q.write(rdma_dev.iface.uar_buf.offset(0x800), uar_db_val, b64=True)
-    src_q.poll(HCQBuffer(src_cq_buf.va_addr + ((src_cq_ci & (src_qp.cq_size - 1)) * 64 + 60), 4),
-               (((src_cq_ci >> 7) & 1) << 24), mask=0x01000000)
-    src_q.write(rdma_dev.iface.dbr_buf.offset(src_qp.cq_dbr), src_cq_dbr_val)
+  def copy(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev:HCQCompiled, dest_dev:HCQCompiled):
+    src_qp, dest_qp, _, _ = self.dev.iface.connect(remote_nic:=dest_dev.rdma_dev())
 
-    # receiver: post RQ doorbell, poll recv CQ completion, advance CQ CI
-    dest_q.write(remote_nic.iface.dbr_buf.offset(dest_qp.qp_dbr), rq_dbr_val)
-    dest_q.poll(HCQBuffer(cq_buf.va_addr + ((dest_cq_ci & (dest_qp.cq_size - 1)) * 64 + 60), 4),
-                (((dest_cq_ci >> 7) & 1) << 24), mask=0x01000000)
-    dest_q.write(remote_nic.iface.dbr_buf.offset(dest_qp.cq_dbr), dest_cq_dbr_val)
+    # prebuild send WQE (ctrl dword 0 patched in _submit with current sq_head)
+    sq_wqe = bytearray(64)
+    sq_wqe[4:8] = struct.pack('>I', (src_qp.qp_info['qpn'] << 8) | 2)
+    sq_wqe[11] = 0x08 # CE: signal completion
+    sq_wqe[16:32] = self._wqe_data(src, sz, self.dev)
 
-  def prepare_transfer(self, dest_buf:HCQBuffer, src_buf:HCQBuffer, sz:int,
-                       src_dev:AMDDevice, dest_dev:AMDDevice, src_q:AMDComputeQueue, dest_q:AMDComputeQueue,
-                       sq_dbr_val:sint, uar_db_val:sint, src_cq_dbr_val:sint, rq_dbr_val:sint, dest_cq_dbr_val:sint,
-                       src_cq_ci:sint, dest_cq_ci:sint):
-    rdma_dev = self.dev
-    remote_nic = dest_dev.rdma_dev()
+    self.q(remote_nic, bytes(sq_wqe), self._wqe_data(dest, sz, remote_nic))
+    return self
 
-    # src_buf lkey must be on sender's NIC, dest_buf lkey must be on receiver's NIC
-    rdma_dev.allocator.map(src_buf)
-    remote_nic.allocator.map(dest_buf)
-    src_mb = (src_buf._base or src_buf).mappings[rdma_dev]
-    dest_mb = (dest_buf._base or dest_buf).mappings[remote_nic]
-
-    src_qp, dest_qp, cq_buf, src_cq_buf = rdma_dev.iface.connect(remote_nic)
-
-    src_off = src_mb.va_addr + (src_buf.va_addr - (src_buf._base or src_buf).va_addr)
-    dest_off = dest_mb.va_addr + (dest_buf.va_addr - (dest_buf._base or dest_buf).va_addr)
-    send_data = struct.pack('>IIQ', sz, src_mb.meta, src_off)
-    recv_data = struct.pack('>IIQ', sz, dest_mb.meta, dest_off)
-
-    self._q.append((src_qp, dest_qp, send_data, recv_data))
-
-    RDMACopyQueue.build_rdma_mec(rdma_dev, remote_nic, src_qp, dest_qp, src_cq_buf, cq_buf,
-                                 src_dev, dest_dev, src_q, dest_q,
-                                 sq_dbr_val, uar_db_val, src_cq_dbr_val, rq_dbr_val, dest_cq_dbr_val,
-                                 src_cq_ci, dest_cq_ci)
+  def encode_ring(self, hwq:HWQueue, dev:HCQCompiled, iface:MLXIface, qp:MLXQP, cq_buf:HCQBuffer,
+                  dbr_off:int, dbr_val:sint, cq_dbr_val:sint, cq_ci:int, uar_db_val:sint|None=None):
+    for buf in [iface.dbr_buf, cq_buf] + ([iface.uar_buf] if uar_db_val is not None else []): cast(HCQAllocator, dev.allocator).map(buf)
+    hwq.write(iface.dbr_buf.offset(dbr_off), dbr_val)
+    if uar_db_val is not None: hwq.write(iface.uar_buf.offset(0x800), uar_db_val, b64=True)
+    hwq.poll(HCQBuffer(cq_buf.va_addr + ((cq_ci & (qp.cq_size - 1)) * 64 + 60), 4), (((cq_ci >> 7) & 1) << 24), mask=0x01000000)
+    hwq.write(iface.dbr_buf.offset(qp.cq_dbr), cq_dbr_val)
+    return self
 
   def _submit(self, dev:RDMADevice):
-    for src_qp, dest_qp, send_data, recv_data in self._q:
-      assert src_qp.sq_head + 1 - src_qp.cq_ci <= (1 << src_qp.log_sq_size), "SQ ring full, need bigger ring"
-      assert dest_qp.rq_head + 1 - dest_qp.cq_ci <= (1 << dest_qp.log_rq_size), "RQ ring full, need bigger ring"
-
-      # recv WQE on dest QP's RQ
-      rq_wqe = dest_qp.qp_buf.view((dest_qp.rq_head & ((1 << dest_qp.log_rq_size) - 1)) * 16, 16)
-      rq_wqe[:] = recv_data
+    for remote_nic, sq_wqe, rq_wqe in zip(self._q[0::3], self._q[1::3], self._q[2::3]):
+      src_qp, dest_qp, _, _ = dev.iface.connect(remote_nic)
+      assert src_qp.sq_head + 1 - src_qp.cq_ci <= (1 << src_qp.log_sq_size), "SQ ring full"
+      assert dest_qp.rq_head + 1 - dest_qp.cq_ci <= (1 << dest_qp.log_rq_size), "RQ ring full"
+      dest_qp.qp_buf.view((dest_qp.rq_head & ((1 << dest_qp.log_rq_size) - 1)) * 16, 16)[:] = rq_wqe
       dest_qp.rq_head += 1
-
-      # send WQE on src QP's SQ (opcode 0x0a = SEND, ds_count=2)
-      wqe = src_qp.qp_buf.view(src_qp.sq_offset + (src_qp.sq_head & ((1 << src_qp.log_sq_size) - 1)) * 64, 64)
-      wqe[:] = b'\x00' * 64
-      wqe[0:8] = struct.pack('>II', (src_qp.sq_head << 8) | 0x0a, (src_qp.qp_info['qpn'] << 8) | 2)
-      wqe[11] = 0x08  # CE: signal completion
-      wqe[16:32] = send_data
+      sq_view = src_qp.qp_buf.view(src_qp.sq_offset + (src_qp.sq_head & ((1 << src_qp.log_sq_size) - 1)) * 64, 64)
+      sq_view[:] = struct.pack('>I', (src_qp.sq_head << 8) | 0x0a) + sq_wqe[4:]
       src_qp.sq_head += 1
-
       src_qp.cq_ci += 1
       dest_qp.cq_ci += 1
 
