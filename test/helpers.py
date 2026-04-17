@@ -29,17 +29,8 @@ def derandomize_model(model):
     p.realize()
 
 def assert_jit_cache_len(fxn, expected_len):
-  if not fxn.jit_cache:
-    assert expected_len == 0, expected_len
-    return
-  # until we have a better way of typing the prg in ExecItem
-  if issubclass(type(fxn.jit_cache[0].prg), Runner) and not type(fxn.jit_cache[0].prg).__name__.endswith('Graph'):
-    assert len(fxn.jit_cache) == expected_len, f"expected {expected_len}, got {len(fxn.jit_cache)}"
-  else:
-    assert len(fxn.jit_cache) == 1, len(fxn.jit_cache)
-    # until we have a better way of typing the prg in ExecItem
-    assert type(fxn.jit_cache[0].prg).__name__.endswith('Graph')
-    assert len(fxn.jit_cache[0].prg.jit_cache) == expected_len, f"expected {expected_len}, got {len(fxn.jit_cache[0].prg.jit_cache)}"
+  n = 0 if fxn.captured is None else len(fxn.captured.linear.src)
+  assert n == expected_len, f"expected {expected_len}, got {n}"
 
 def rand_for_dtype(dt:DType, size:int, allow_subnormal=True):
   if dtypes.is_unsigned(dt):

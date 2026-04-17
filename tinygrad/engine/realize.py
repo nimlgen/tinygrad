@@ -115,8 +115,7 @@ class BufferXfer(BufferCopy):
 class EncDec(Runner):
   def __init__(self, cf:UOp, total_sz:int, device:str):
     self.shape, self.pos_var = tuple(s.arg for s in cf.src if s.op is Ops.CONST), cf.variables()[0].expr
-    name = f"enc/dec {total_sz/1e6:7.2f}M, HEVC" if total_sz >= 1e6 else f"enc/dec {total_sz:8d}, HEVC"
-    super().__init__(colored(name, "yellow"), device, Estimates(lds=total_sz, mem=total_sz))
+    super().__init__(colored(f"enc/dec {size_to_str(total_sz)}, HEVC", "yellow"), device, Estimates(lds=total_sz, mem=total_sz))
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False):
     st = time.perf_counter()
     rawbufs[0].allocator._encode_decode(rawbufs[0]._buf, rawbufs[1]._buf, rawbufs[2]._buf,

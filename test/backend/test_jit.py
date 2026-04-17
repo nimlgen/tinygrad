@@ -583,7 +583,7 @@ class TestJitPrune(unittest.TestCase):
       a = Tensor.rand(16).realize()
       out = w2_prune(a)
       np.testing.assert_allclose(out.tolist(), [x*2+y for x,y in zip(weights.tolist(), a.tolist())])
-    assert len(w2_prune.captured.jit_cache) == 1
+    assert len(w2_prune.captured.linear.src) == 1
 
   def test_prune_w_copy_correct(self):
     weights = Tensor.rand(16).realize()
@@ -617,7 +617,7 @@ class TestJitPrune(unittest.TestCase):
       out = w2_prune(a)
       np.testing.assert_allclose(out.tolist(), [x*2+y for x,y in zip(weights.tolist(), a.tolist())])
 
-    assert len(w2_prune.captured.jit_cache) == 1, "prune should have removed the copy"
+    assert len(w2_prune.captured.linear.src) == 1, "prune should have removed the copy"
 
 class TestJitFree(unittest.TestCase):
   def test_free_intermediates(self):
