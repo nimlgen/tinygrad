@@ -6,7 +6,7 @@ from tinygrad.helpers import to_function_name, dedup, prod, Target, DEBUG
 from tinygrad.uop.ops import Ops, UOp, sym_infer, sint, Variable, ssimplify, smin, GroupOp, PatternMatcher, print_uops
 from tinygrad.dtype import AddrSpace, PtrDType
 from tinygrad.codegen.opt.tc import TensorCore
-from tinygrad.codegen.opt import Opt
+from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.device import Compiler
 
 @dataclass(frozen=True)
@@ -127,6 +127,14 @@ class ProgramSpec:
         if special_size is not None: special_size[int(u.arg[-1])] = cast(int, u.src[0].ssimplify())
       if u.op is Ops.DEFINE_VAR and u.arg[0] == 'core_id': global_size[0] = u.arg[2] + 1
 
+    # NOUNILOCAL: kernel is rendered like NOLOCALS (flat idx specials), but the dispatch groups threads into workgroups of the requested local size,
+    # possibly non-uniform on the last workgroup. Supported by renderers with has_nonuniform_workgroups=True.
+    if sink.arg is not None and (nouni:=[o for o in sink.arg.applied_opts if o.op is OptOps.NOUNILOCAL]):
+      assert local_size is None, "NOUNILOCAL requires dont_use_locals"
+      local_size = [1, 1, 1]
+      for o in nouni: local_size[o.axis] = o.arg if o.arg != 0 else global_size[o.axis]
+      global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
+
     return ProgramSpec(sink.arg.name, source.arg, device.arg, sink, uops, lib, list(prg.arg) if prg.arg else [], global_size, local_size,
                        sorted(_vars, key=lambda v: v.arg), sorted(dedup(_globals)), sorted(dedup(outs)), sorted(dedup(ins)))
 
@@ -137,6 +145,7 @@ class Renderer:
   supports_float4: bool = True
   has_local: bool = True
   has_threads: bool = False
+  has_nonuniform_workgroups: bool = False
   has_shared: bool = True
   has_aux: bool = False # additional program info, eg. image shapes
   # NOTE: these two should be in (x,y,z) order to match the max_sizes argument in get_grouped_dims

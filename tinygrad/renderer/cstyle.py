@@ -563,6 +563,7 @@ class HIPCCRenderer(HIPRenderer):
     self.compiler = HIPCCCompiler(target.arch)
 
 class QCOMCLRenderer(OpenCLRenderer):
+  has_nonuniform_workgroups: bool = True
   def __init__(self, target:Target):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_qcom import QCOMCompiler

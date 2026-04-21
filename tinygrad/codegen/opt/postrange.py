@@ -115,7 +115,7 @@ class Scheduler:
 
   def real_axis(self, op:OptOps, axis:int|None) -> int:
     try:
-      if axis is None or op is OptOps.TC: return -1
+      if axis is None or op in {OptOps.TC, OptOps.NOUNILOCAL}: return -1
       if op is OptOps.UNROLL: return self.unrollable_dims[axis]
       if op in {OptOps.GROUP, OptOps.GROUPTOP}: return self.axes_of(AxisType.REDUCE)[axis]
       check(axis < self.shape_len, f"invalid axis on {axis=} {op=} {self.shape_len=}")
@@ -125,6 +125,16 @@ class Scheduler:
   def apply_opt(self, opt:Opt, append_opt:bool=True):
     if opt.op is OptOps.NOLOCALS:
       check(all(x not in {AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE} for x in self.axis_types), "no locals can't have locals")
+      if append_opt: self.applied_opts.append(opt)
+      self.dont_use_locals = True
+      return
+
+    if opt.op is OptOps.NOUNILOCAL:
+      check(self.ren.has_nonuniform_workgroups, "renderer doesn't support nonuniform workgroups")
+      check(all(x not in {AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE} for x in self.axis_types), "nounilocal can't have locals")
+      check(opt.axis is not None and 0 <= opt.axis < 3, "NOUNILOCAL axis must be in [0,3)")
+      check(isinstance(opt.arg, int) and opt.arg >= 0, "NOUNILOCAL arg must be non-negative int")
+      check(not any(o.op is OptOps.NOUNILOCAL and o.axis == opt.axis for o in self.applied_opts), "duplicate NOUNILOCAL axis")
       if append_opt: self.applied_opts.append(opt)
       self.dont_use_locals = True
       return
