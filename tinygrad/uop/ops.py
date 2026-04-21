@@ -960,6 +960,7 @@ class KernelInfo:
   opts_to_apply: tuple|None = None
   estimates: Estimates|None = None
   beam: int = 0
+  nolocals: bool = False
   @property
   def function_name(self): return to_function_name(self.name)
 

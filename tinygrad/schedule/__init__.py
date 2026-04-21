@@ -5,7 +5,7 @@ from dataclasses import replace
 from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass, track_rewrites, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, tensor_spec
 from tinygrad.device import Buffer, MultiBuffer
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, flatten, BEAM, partition
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, flatten, BEAM, NOLOCALS, partition
 from tinygrad.engine.realize import ExecItem
 
 # **** schedule linearizer
@@ -82,6 +82,8 @@ def linear_to_schedule(linear:UOp) -> list[ExecItem]:
       buffers[buf_uops[0]] = base.view(buf_uops[0].arg, ast.dtype, ast.arg[1]*base.dtype.itemsize)
     # set beam on KernelInfo when beam search is enabled
     if ast.op is Ops.SINK and BEAM >= 1 and ast.arg.beam == 0: ast = ast.replace(arg=replace(ast.arg, beam=BEAM.value))
+    # set nolocals on KernelInfo when NOLOCALS is set
+    if ast.op is Ops.SINK and NOLOCALS and not ast.arg.nolocals: ast = ast.replace(arg=replace(ast.arg, nolocals=True))
     ubufs = [b.buffer for b in buf_uops if b.op is not Ops.BIND]
     metadata = si.arg.metadata
     if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph":

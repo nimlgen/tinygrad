@@ -20,7 +20,7 @@ from tinygrad.schedule.rangeify import pm_add_buffers_local, rangeify_codegen, p
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.renderer.amd.elf import do_assemble_amd
 
-def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True, beam:int=0) -> UOp:
+def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True, beam:int=0, nolocals:bool=False) -> UOp:
   if ren is None: ren = Renderer(Target())
 
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Base AST")
@@ -45,7 +45,7 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True, b
     sink = graph_rewrite(sink, pm_flatten_range+pm_simplify_ranges, ctx={}, name="simplify ranges")
 
     # do postrange optimization, BEAM or hand_coded_optimizations
-    sink = apply_opts(sink, ren, beam=beam)
+    sink = apply_opts(sink, ren, beam=beam, nolocals=nolocals)
 
   # ** expander (expand_rewrite) **
   sink = graph_rewrite(sink, sym+pm_move_where_on_load, name="postopt symbolic")
@@ -166,7 +166,7 @@ def get_program(ast:UOp, renderer:Renderer) -> ProgramSpec:
   elif ast.op is Ops.SINK:
     # rewrite to prg
     assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to get_program"
-    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None, beam=ast.arg.beam)
+    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None, beam=ast.arg.beam, nolocals=ast.arg.nolocals)
     prg = UOp(Ops.PROGRAM, src=(full_sink, UOp(Ops.DEVICE, arg=renderer.target.device)))
   else:
     raise RuntimeError(f"can't call get_program on {ast.op}")
