@@ -74,6 +74,9 @@ class Ops(FastEnum):
   # control flow ops
   BARRIER = auto(); RANGE = auto(); IF = auto(); END = auto(); ENDIF = auto()
 
+  # HCQ effect op: wait for a signal (BUFFER) to reach a value (arg=(value, queue_kind))
+  WAIT = auto()
+
   # consts. VCONST is a vectorized const
   VCONST = auto(); CONST = auto()
 

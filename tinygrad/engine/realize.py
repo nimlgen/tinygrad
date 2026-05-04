@@ -31,6 +31,7 @@ def get_call_name(call:UOp, bufs:list[Buffer], var_vals:dict[str, int]|None=None
   if ast.op is Ops.COPY: return colored(f"copy {_uop_sz_to_str(arg_uops[0]):>10}, {bufs[0].device[:7]:>7s} <- {bufs[1].device[:7]:7s}", "yellow")
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec": return colored(f"enc/dec {_uop_sz_to_str(arg_uops[0])}", "yellow")
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return colored(f"batched {len(ast.src[0].src)}", "cyan")
+  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "invoke": return colored("hcq binary", "blue")
   raise NotImplementedError("get_call_name is not implemented")
 
 # **************** Stat ****************
@@ -192,6 +193,11 @@ def exec_graph(ctx:ExecContext, call, ast):
   rt = get_graph_runtime(ast, ctx.input_uops)
   with track_stats(ctx, call, rt.device, [], ctx.var_vals) as t: t[0] = rt(ctx.input_uops, ctx.var_vals, wait=DEBUG>=2) # type: ignore[call-arg]
 
+def exec_invoke(ctx:ExecContext, call, ast):
+  # Generic CUSTOM_FUNCTION dispatch: ast.arg == "invoke" and ast.tag is a callable
+  # (ctx, call, ast) -> None. The callback owns track_stats / submission / everything.
+  ast.tag(ctx, call, ast)
+
 # flatten LINEAR-in-LINEAR: any nested LINEAR child gets inlined into its parent's src
 pm_flatten_linear = PatternMatcher([
   (UPat(Ops.LINEAR, custom_early_reject={Ops.LINEAR}, name="lin"),
@@ -227,13 +233,19 @@ pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="encdec", name="ast"),), name="call", allow_any_len=True), exec_encdec),
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="graph", name="ast"),), name="call", allow_any_len=True), exec_graph),
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
+  (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="invoke", name="ast"),), name="call", allow_any_len=True), exec_invoke),
 ])
 
 def compile_linear(linear:UOp, beam=0, validate=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=(beam or BEAM.value)) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
   linear = graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
-  return graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
+  linear = graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
+
+  # device specific lowering
+  from tinygrad.runtime.support.hcq2 import pm_hcq_schedule
+  linear = graph_rewrite(linear, pm_hcq_schedule+pm_flatten_linear, name="device specific", walk=True)
+  return linear
 
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:tuple[UOp, ...]=(), do_update_stats=True, jit=False):
   if not jit: linear = compile_linear(linear, validate=VALIDATE_WITH_CPU)
