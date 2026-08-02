@@ -256,30 +256,30 @@ pm_encode_cmdbufs = PatternMatcher([
 # *****************
 
 def is_value_known_at_link(val:UOp) -> bool:
-  runtime_reads = [u for u in val.toposort() if u.op in (Ops.LOAD, Ops.INDEX)]
+  # AFTER only orders the patches a buffer depends on, they are not part of the address itself
+  val = val.substitute({a: a.src[0] for a in val.toposort() if a.op is Ops.AFTER})
   addressed_bufs = [b for g in val.toposort() if g.op is Ops.GETADDR for b in unwrap_mstack(g.buf_uop)]
 
   # addr of input params is not known at link time
-  return not val.variables() and not runtime_reads and all(b.op is not Ops.PARAM or b.tag is not None for b in addressed_bufs)
+  return not val.variables() and not [u for u in val.toposort() if u.op in (Ops.LOAD, Ops.INDEX)] \
+     and all(b.op is not Ops.PARAM or b.tag is not None for b in addressed_bufs)
 
-def is_link_patch(p:UOp, jit:bool) -> bool:
-  if p.tag == "link": return True
+def is_link_patch(p:UOp) -> bool:
   store = p.src[0] if (is_binary_patch:=(p.op is Ops.END and p.src[0].op is Ops.STORE)) else p
-  if not jit: return store.buf_uop.tag == "program"
-  return is_binary_patch or (store.op is Ops.STORE and is_value_known_at_link(store.src[1]))
+  return p.tag == "link" or is_binary_patch or (store.op is Ops.STORE and is_value_known_at_link(store.src[1]))
 
-def trim_link_patches(ctx:tuple[bool, list[UOp]], a:UOp) -> UOp|None:
-  links, kept = partition(a.src[1:], lambda p: is_link_patch(p, ctx[0]))
+def trim_link_patches(ctx:list[UOp], a:UOp) -> UOp|None:
+  links, kept = partition(a.src[1:], is_link_patch)
 
   # keep all patches from the link-time patches' subtrees in the C code
   afters = [u for u in UOp.sink(*links).toposort() if u.op is Ops.AFTER]
-  ctx[1].extend(UOp.sink(*links).substitute({p: p.src[0] for p in afters}).src)
+  ctx.extend(UOp.sink(*links).substitute({p: p.src[0] for p in afters}).src)
   return a.src[0].after(*kept, *[d for p in afters for d in p.src[1:]]) if links else None
 pm_trim_link_patches = PatternMatcher([(UPat(Ops.AFTER, src=(UPat((Ops.PARAM, Ops.MSTACK)),), allow_any_len=True, name="a"), trim_link_patches)])
 
-def split_patches(ctx:bool, call:UOp) -> UOp|None:
+def split_patches(call:UOp) -> UOp|None:
   lt_patches:list[UOp] = []
-  body = graph_rewrite(call.src[0], pm_trim_link_patches, ctx=(ctx, lt_patches), name=f"trim link-time patches ({call.arg.aux.name})")
+  body = graph_rewrite(call.src[0], pm_trim_link_patches, ctx=lt_patches, name=f"trim link-time patches ({call.arg.aux.name})")
 
   lt_srcs = collections.defaultdict(list)
   for p in lt_patches: lt_srcs[p.buf_uop].append(p)
@@ -401,7 +401,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None=None, jit=False) -> UOp:
     linear = graph_rewrite(linear, pm_encode_cmdbufs+pm_pack_placeholders, walk=True, name="encode and pack", enter_calls=True)
 
     # patches
-    linear = graph_rewrite(linear, pm_split_patches+pm_early_simplify+symbolic, ctx=jit, bottom_up=False, name="simplify patches", enter_calls=True)
+    linear = graph_rewrite(linear, pm_split_patches+pm_early_simplify+symbolic, bottom_up=False, name="simplify patches", enter_calls=True)
 
     # and compile it
     linear = graph_rewrite(linear, pm_replace_params, bpm=pm_rm_rt_uops, name="replace rt uops and params")
