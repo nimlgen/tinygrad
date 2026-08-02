@@ -32,7 +32,7 @@ class HCQInfo:
   device:tuple[str, ...]
   queue:str
 
-  input_idxs:tuple[int, ...] = () # indexes into input_uops used by this call
+  input_idxs:tuple[tuple[int, int], ...] = () # (index into input_uops, byte offset) per inputs table slot
   inputs:int|None = None
 
 def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for x in to_tuple(d)} <= c
@@ -302,18 +302,59 @@ def make_blob_bufs(call:UOp, blobs:list[UOp]) -> tuple[dict[UOp, UOp], tuple[UOp
   bufs = {b: UOp.placeholder((b.max_numel(),), b.dtype, next(UOp.unique_num), device=call.arg.aux.device).rtag("template") for b in blobs}
   return bufs, tuple(buf.after(make_binary_patch(buf, b.src[0].arg)) for b,buf in bufs.items())
 
-def rm_rt_uops(call:UOp) -> UOp|None:
-  if not (rt_uops:=[u for u in call.src[0].toposort() if u.op is Ops.GETADDR or (u.op is Ops.BITCAST and u.src[0].op is Ops.BINARY)]): return None
-  gaddrs, blobs = partition(rt_uops, lambda u: u.op is Ops.GETADDR)
-  inputs, internals = partition(gaddrs, lambda g: all(x.op is Ops.PARAM and x.tag is None for x in unwrap_mstack(g.buf_uop)))
-  runtimes, systems = partition(internals, lambda g: any(x.tag in {"program", "kernargs", "cmdbuf"} for x in unwrap_mstack(g.buf_uop)))
+def input_addr(a:UOp) -> tuple[int, int]|None:
+  base, off = (a.src[0], a.src[1].val) if a.op is Ops.ADD and a.src[1].op is Ops.CONST else (a, 0)
+  if base.op is not Ops.GETADDR: return None
+  bufs = unwrap_mstack(base.buf_uop)
+  return (bufs[0].arg.slot, off) if all(b.op is Ops.PARAM and b.tag is None for b in bufs) else None
 
-  # exec fills the inputs table with the input addresses every run, so it has no fill patches
-  (reads, _), *tables = [make_addr_table(call, gs, n) for gs,n in ((inputs, "inputs"), (runtimes, "runtime"), (systems, "systems"))] + \
-                        [make_blob_bufs(call, blobs)]
-  reads, fills = reads | {k:v for r,_ in tables for k,v in r.items()}, [f for _,fs in tables for f in fs]
-  return call.replace(src=(call.src[0].substitute(reads), *call.src[1:], *fills),
-                      arg=replace(call.arg, aux=replace(call.arg.aux, input_idxs=tuple(sorted(dedup(g.buf_uop.arg.slot for g in inputs))))))
+def input_word(off:UOp, val:UOp) -> tuple[tuple[int, int], int]|None:
+  # an address only exec knows reaches its patch word as CAST(addr, uint32) for the low half and CAST(addr >> 32, uint32) for the high half
+  if off.op is not Ops.CONST or val.op is not Ops.CAST or val.dtype != dtypes.uint32: return None
+  addr, half = (val.src[0].src[0], 1) if val.src[0].op is Ops.SHR else (val.src[0], 0)
+  return (src, half) if (src:=input_addr(addr)) is not None else None
+
+def make_scatter(dst:UOp, tbl:UOp, blob:UOp, axis:int) -> UOp:
+  r = UOp.range(blob.max_numel(), axis, dtype=dtypes.int, src=(blob, dst))
+  word, slot, half = (entry:=blob.index(r).load()) >> 32, (entry >> 1) & 0x7fffffff, entry & 1
+  return dst.index(word.cast(dtypes.int)).store((tbl.index(slot.cast(dtypes.int)).load() >> half * 32).cast(dtypes.uint32)).end(r)
+
+def make_input_scatter(call:UOp) -> tuple[dict[UOp, UOp], tuple[UOp, ...], tuple[tuple[int, int], ...]]:
+  slots:dict[tuple[int, int], int] = {}
+  plans:dict[UOp, list[int]] = collections.defaultdict(list)
+  rests:dict[UOp, list[tuple[int, UOp]]] = {}
+  for st in call.src[0].toposort():
+    if st.op is not Ops.STORE or st.src[0].op is not Ops.INDEX or st.src[1].op is not Ops.STACK or st.src[0].src[1].op is not Ops.STACK: continue
+    dst, rest = st.src[0].src[0], []
+    for o, v in zip(st.src[0].src[1].src, st.src[1].src):
+      if (w:=input_word(o, v)) is None: rest.append((o.val * dst.dtype.itemsize, v))
+      else: plans[dst].append(o.val << 32 | slots.setdefault(w[0], len(slots)) << 1 | w[1])
+    if len(rest) != len(st.src[1].src): rests[st] = rest
+  if not slots: return {}, (), ()
+
+  devs = call.arg.aux.device
+  tbl = UOp.placeholder((len(slots),), dtypes.uint64, next(UOp.unique_num), device=devs).rtag("inputs")
+  blobs = {dst: UOp.placeholder((len(p),), dtypes.uint64, next(UOp.unique_num), device=devs).rtag("template") for dst,p in plans.items()}
+  scatters = {dst: make_scatter(dst, tbl, blob, axis) for axis, (dst, blob) in enumerate(blobs.items())}
+  subs = {st: UOp.barrier(make_patches(st.src[0].src[0], rest), sc) if rest else sc
+          for st, rest in rests.items() if (sc:=scatters[st.src[0].src[0]]) is not None}
+  return subs, tuple(b.after(make_binary_patch(b, struct.pack(f'<{len(plans[d])}Q', *plans[d]))) for d,b in blobs.items()), tuple(slots)
+
+def rm_rt_uops(call:UOp) -> UOp|None:
+  # exec fills the inputs table with the input addresses every run, one loop per buffer scatters them into their patch words
+  scatter, plans, slots = make_input_scatter(call)
+  body = call.src[0].substitute(scatter)
+  aux = replace(call.arg.aux, input_idxs=slots) if slots else call.arg.aux
+
+  if not (rt_uops:=[u for u in body.toposort() if u.op is Ops.GETADDR or (u.op is Ops.BITCAST and u.src[0].op is Ops.BINARY)]):
+    return call.replace(src=(body, *call.src[1:], *plans), arg=replace(call.arg, aux=aux)) if scatter else None
+  gaddrs, blobs = partition(rt_uops, lambda u: u.op is Ops.GETADDR)
+  assert all(any(b.op is not Ops.PARAM or b.tag is not None for b in unwrap_mstack(g.buf_uop)) for g in gaddrs), "input addr outside a patch word"
+  runtimes, systems = partition(gaddrs, lambda g: any(x.tag in {"program", "kernargs", "cmdbuf"} for x in unwrap_mstack(g.buf_uop)))
+
+  tables = [make_addr_table(call, gs, n) for gs,n in ((runtimes, "runtime"), (systems, "systems"))] + [make_blob_bufs(call, blobs)]
+  reads, fills = {k:v for r,_ in tables for k,v in r.items()}, [f for _,fs in tables for f in fs] + list(plans)
+  return call.replace(src=(body.substitute(reads), *call.src[1:], *fills), arg=replace(call.arg, aux=aux))
 pm_rm_rt_uops = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="hcq"),), name="call", allow_any_len=True), rm_rt_uops)])
 

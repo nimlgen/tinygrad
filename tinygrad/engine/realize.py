@@ -210,10 +210,10 @@ def exec_graph(ctx:ExecContext, call:UOp, ast:UOp) -> float|None:
 
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> float|None:
   if (inputs:=call.arg.aux.inputs) is not None:
-    bufs = [_resolve(ctx.input_uops[i], ctx.input_uops).buffer for i in call.arg.aux.input_idxs]
+    bufs = [(_resolve(ctx.input_uops[i], ctx.input_uops).buffer, off) for i,off in call.arg.aux.input_idxs]
     table = call.src[1+inputs].buffer
     for j,dev in enumerate(call.arg.aux.device):
-      addrs = array.array('Q', [(b.bufs[j] if isinstance(b, MultiBuffer) else b).get_buf(dev).va_addr for b in bufs])
+      addrs = array.array('Q', [(b.bufs[j] if isinstance(b, MultiBuffer) else b).get_buf(dev).va_addr + off for b,off in bufs])
       buf = table.bufs[j] if isinstance(table, MultiBuffer) else table
       buf.ensure_allocated()._buf.cpu_view().view(fmt='Q')[:len(addrs)] = addrs
 
