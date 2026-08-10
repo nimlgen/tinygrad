@@ -169,8 +169,8 @@ class TestAsmKernel(unittest.TestCase):
     if self.arch != "rdna3": self.skipTest("only rdna3")
     a = Tensor.full((16, 16), 1.).contiguous().realize()
     a = Tensor.custom_kernel(a, fxn=custom_add_one)[0]
-    linear = compile_linear(a.schedule_linear())
-    est = estimate_uop(linear.src[-1])
+    linear = a.schedule_linear()
+    est = sum((estimate_uop(call) for call in compile_linear(linear).src), Estimates())
     self.assertEqual(est.ops, a.numel())
     self.assertEqual(est.mem, a.nbytes()*2)
     run_linear(linear)
