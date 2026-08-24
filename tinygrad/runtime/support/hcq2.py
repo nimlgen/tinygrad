@@ -22,7 +22,7 @@ HCQDeviceType = TypeVar('HCQDeviceType', bound='HCQ2Compiled')
 
 HCQ_RUNTIME_DEV = ContextVar("HCQ_RUNTIME_DEV", "CPU")
 
-HCQ_DEVS = frozenset(("AMD", "CPU"))
+HCQ_DEVS = frozenset(("AMD", "CPU", "QCOM"))
 HCQ_CACHE_TAGS = frozenset(("program", "systems"))
 
 @dataclass(frozen=True)

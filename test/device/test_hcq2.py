@@ -21,6 +21,7 @@ class TestHCQ2(unittest.TestCase):
     with patch.object(hcq2, "STAGING_SIZE", 1 << 20), patch.object(hcq2, "STAGING_SLOTS", 4), patch.object(hcq2, "_staging", lambda: buf):
       np.testing.assert_equal(Tensor(data).to(Device.DEFAULT).realize().numpy(), data)
 
+  @unittest.skipIf(Device.DEFAULT.startswith("QCOM"), "one gpu per phone, qcom has no multi device support")
   def test_overlapping_device_tuples(self):
     # an op on a wide device tuple followed by an op on an overlapping smaller tuple used to MMU-fault the smaller one
     d4, d2 = tuple(f"{Device.DEFAULT}:{i}" for i in range(4)), tuple(f"{Device.DEFAULT}:{i}" for i in range(2))
