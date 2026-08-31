@@ -1,6 +1,6 @@
 import ctypes, time, contextlib, functools
 from typing import Any, Iterable, Literal
-from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits, getenv
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.amd import import_soc
 from tinygrad.runtime.support.memory import AddrSpace
@@ -102,11 +102,11 @@ class AM_GMC(AM_IP):
       invalidate_l2_ptes=1, invalidate_l2_pde0=1, invalidate_l2_pde1=1, invalidate_l2_pde2=1, invalidate_l1_ptes=1,
       clear_protection_fault_status_addr=0)
 
-    if ip == "GC" and self.adev.is_vf and (dev:=self.vf_owner) is not None: # the cp runs invalidations once its queues are up
+    if ip == "GC" and self.adev.is_vf and getenv("AM_SKIP_GC_FLUSH"): return
+    if ip == "GC" and self.adev.is_vf and not getenv("AM_MMIO_FLUSH") and (dev:=self.vf_owner) is not None: # the cp runs invalidations once its queues are up
       from tinygrad.runtime.ops_amd import WAIT_REG_MEM_FUNCTION_EQ
       dev.hw_compute_queue_t().wait_reg_mem(req, mask=1 << vmid, reg_done=self.adev.regGCVM_INVALIDATE_ENG17_ACK.addr[0],
-        reg=self.adev.regGCVM_INVALIDATE_ENG17_REQ.addr[0], op=WAIT_REG_MEM_FUNCTION_EQ).signal(dev.timeline_signal, dev.next_timeline()).submit(dev)
-      dev.timeline_signal.wait(dev.timeline_value - 1)
+        reg=self.adev.regGCVM_INVALIDATE_ENG17_REQ.addr[0], op=WAIT_REG_MEM_FUNCTION_EQ).submit(dev)
       return
 
     use_sema = ip == "MM" and not self.adev.is_vf # vf can't use sema
@@ -146,7 +146,7 @@ class AM_GMC(AM_IP):
       self.adev.wreg_pair(f"reg{ip}MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR", "_LSB", "_MSB", self.memscratch_xgmi_paddr >> 12, inst=inst)
       self.adev.wreg_pair(f"reg{ip}VM_L2_PROTECTION_FAULT_DEFAULT_ADDR", "_LO32", "_HI32", self.dummy_page_xgmi_paddr >> 12, inst=inst)
 
-      self.adev.reg(f"reg{ip}VM_L2_PROTECTION_FAULT_CNTL2").update(active_page_migration_pte_read_retry=1, inst=inst)
+      self.adev.reg(f"reg{ip}VM_L2_PROTECTION_FAULT_CNTL2").update(active_page_migration_pte_read_retry=getenv("AM_RETRY", 1), inst=inst)
 
       # Init TLB and cache
       self.adev.reg(f"reg{ip}MC_VM_MX_L1_TLB_CNTL").update(enable_l1_tlb=1, system_access_mode=3, enable_advanced_driver_model=1,
@@ -342,7 +342,7 @@ class AM_GFX(AM_IP):
     pipe, queue = idx // 4, idx % 4
     mqd, doorbell = (2, am.AMDGPU_DOORBELL_KIQ) if me == 2 else (queue, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0)
 
-    for xcc in range(self.xccs if aql else 1):
+    for xcc in range(self.xccs if aql or me == 2 else 1): # the kiq is per xcc, each xcc rlc saves its own scheduler queue
       self._grbm_select(me=me, pipe=pipe, queue=queue, inst=xcc)
 
       struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}{'_compute' if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else ''}_mqd")
