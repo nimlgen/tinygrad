@@ -1,5 +1,6 @@
 import unittest
-from tinygrad.device import CompileError, Device, BufferSpec, TinyELF
+from tinygrad.dtype import dtypes
+from tinygrad.device import CompileError, Device, BufferSpec, TinyELF, Buffer
 from tinygrad.helpers import Target
 if Device.DEFAULT=="METAL":
   from tinygrad.runtime.ops_metal import MetalDevice, MetalCompiler
@@ -8,7 +9,7 @@ class TestMetal(unittest.TestCase):
   def test_alloc_oom(self):
     device = MetalDevice("metal")
     with self.assertRaises(MemoryError):
-      device.allocator.alloc(10000000000000000000)
+      Buffer(device.device, 10000000000000000000, dtypes.uint8).allocate()
 
   def test_compile_error(self):
     compiler = MetalCompiler()
@@ -56,7 +57,7 @@ kernel void r_5(device int* data0, const device int* data1, uint3 gid [[threadgr
     device = Device['METAL']
     before = device.sysdevice.currentAllocatedSize()
 
-    buf = device.allocator.alloc(size, BufferSpec(nolru=True))
+    buf = Buffer(device.device, size, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
     self.assertEqual(curr:=device.sysdevice.currentAllocatedSize(), before+size, msg=f"{curr=} - {before=}")
-    device.allocator.free(buf, buf.size, BufferSpec(nolru=True))
+    buf.deallocate()
     self.assertEqual(curr:=device.sysdevice.currentAllocatedSize(), before, msg=f"{curr=} - {before=}")

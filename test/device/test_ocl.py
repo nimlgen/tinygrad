@@ -4,7 +4,7 @@ from tinygrad import Device
 from tinygrad.device import Buffer, TinyELF
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import Target
-from tinygrad.runtime.ops_cl import CLDevice, CLAllocator, CLCompiler
+from tinygrad.runtime.ops_cl import CLCompiler
 
 @unittest.skipUnless(Device.DEFAULT == "CL", "Runs only on OpenCL")
 class TestCLCompileCache(unittest.TestCase):
@@ -20,11 +20,9 @@ class TestCLCompileCache(unittest.TestCase):
 class TestCLError(unittest.TestCase):
   @unittest.skip("allocates tons of memory")
   def test_oom(self):
-    with self.assertRaises(RuntimeError) as err:
-      allocator = CLAllocator(CLDevice())
-      for i in range(1_000_000):
-        allocator.alloc(1_000_000_000)
-    assert str(err.exception) == "OpenCL Error -6: CL_OUT_OF_HOST_MEMORY"
+    with self.assertRaises(MemoryError) as err:
+      for i in range(1_000_000): Buffer("CL", 1_000_000_000, dtypes.uint8).allocate()
+    assert str(err.exception.__cause__) == "OpenCL Error -6: CL_OUT_OF_HOST_MEMORY"
 
   def test_invalid_kernel_name(self):
     device = Device[Device.DEFAULT]

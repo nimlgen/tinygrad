@@ -4,6 +4,8 @@ Uses run_asm() with memory output, so tests can run on both emulator and real ha
 Set USE_HW=1 to run on both emulator and hardware, comparing results.
 """
 import ctypes, math, os, struct
+from tinygrad.device import Buffer
+from tinygrad.dtype import dtypes
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 
 from test.mockgpu.amd.emu import run_asm
@@ -225,8 +227,8 @@ amdhsa.kernels:
   prg = dev.runtime(TinyELF(lib, "test", Target("AMD", arch=dev.arch), ()))
 
   buf_sz = _out_bytes(n_lanes)
-  out_gpu = dev.allocator.alloc(buf_sz)
-  assert out_gpu.va_addr % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu.va_addr:x}"
+  out_gpu = Buffer(dev.device, buf_sz, dtypes.uint8, preallocate=True)
+  assert out_gpu.gpu % 16 == 0, f"buffer not 16-byte aligned: 0x{out_gpu.gpu:x}"
   prg(out_gpu, global_size=(1, 1, 1), local_size=(n_lanes, 1, 1), wait=True)
 
   out_buf = bytearray(buf_sz)

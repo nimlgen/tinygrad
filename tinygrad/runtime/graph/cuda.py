@@ -20,7 +20,7 @@ class CUDAGraph(MultiGraphRunner):
         global_size, local_size = ast.arg.launch_dims({v: 0 for v in self.vars})
 
         c_deps, new_node = self.new_node([b.base for b in bufs], ast.arg.outs)
-        c_args, vargs = encode_args([b._buf for b in bufs], [device_vars.get(x.expr, 0) for x in ast.arg.vars], runtime.signature)
+        c_args, vargs = encode_args([b.gpu for b in bufs], [device_vars.get(x.expr, 0) for x in ast.arg.vars], runtime.signature)
         kern_params = cuda.CUDA_KERNEL_NODE_PARAMS_v1(runtime.prg, *global_size, *local_size, runtime.smem,
                                                       ctypes.cast(0, ctypes.POINTER(ctypes.c_void_p)), vargs)
         check(cuda.cuGraphAddKernelNode(ctypes.byref(new_node), self.graph, c_deps, len(c_deps or []), ctypes.byref(kern_params)))
@@ -30,8 +30,8 @@ class CUDAGraph(MultiGraphRunner):
         dest, src = bufs[0], bufs[1]
         src_dev = cast(CUDADevice, Device[src.device])
         c_deps, new_node = self.new_node([dest.base, src.base], [0])
-        cp_params = cuda.CUDA_MEMCPY3D_v2(srcMemoryType=cuda.CU_MEMORYTYPE_DEVICE, srcDevice=src._buf, srcPitch=src.nbytes, srcHeight=1,
-                                          dstMemoryType=cuda.CU_MEMORYTYPE_DEVICE, dstDevice=dest._buf, dstPitch=dest.nbytes, dstHeight=1,
+        cp_params = cuda.CUDA_MEMCPY3D_v2(srcMemoryType=cuda.CU_MEMORYTYPE_DEVICE, srcDevice=src.gpu, srcPitch=src.nbytes, srcHeight=1,
+                                          dstMemoryType=cuda.CU_MEMORYTYPE_DEVICE, dstDevice=dest.gpu, dstPitch=dest.nbytes, dstHeight=1,
                                           WidthInBytes=dest.nbytes, Height=1, Depth=1)
         check(cuda.cuGraphAddMemcpyNode(ctypes.byref(new_node), self.graph, c_deps, len(c_deps or []), ctypes.byref(cp_params), src_dev.context))
 
@@ -50,8 +50,8 @@ class CUDAGraph(MultiGraphRunner):
       (_, params, c_args, is_copy), dev_idx = self.nodes[j], self.calls[j][0]
       for pos, iidx in self.uop_replace[j]:
         buf = b.bufs[dev_idx] if isinstance(b:=input_uops[iidx].buffer, MultiBuffer) else b
-        if not is_copy: setattr(c_args, f'f{pos}', buf._buf)
-        else: setattr(params, 'srcDevice' if pos == 1 else 'dstDevice', buf._buf)
+        if not is_copy: setattr(c_args, f'f{pos}', buf.gpu)
+        else: setattr(params, 'srcDevice' if pos == 1 else 'dstDevice', buf.gpu)
 
     # Update var_vals in the c_args struct.
     for j, i, v in self.updated_vars(var_vals): setattr(self.nodes[j][2], f'v{i}', v)

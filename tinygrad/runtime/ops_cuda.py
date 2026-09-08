@@ -1,7 +1,10 @@
 from __future__ import annotations
 import ctypes
+from typing import cast
 from tinygrad.helpers import DEBUG, DEV, getenv, mv_address, suppress_finalizing
-from tinygrad.device import Compiled, BufferSpec, LRUAllocator, Program, TinyELF
+from tinygrad.device import Compiled, Buffer, BufferSpec, LRUAllocator, Program, TinyELF, Device
+from tinygrad.dtype import dtypes
+from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.runtime.autogen import cuda
@@ -55,44 +58,44 @@ class CUDAProgram(Program['CUDADevice']):
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
     check(cuda.cuCtxSetCurrent(self.dev.context))
     if not hasattr(self, "vargs"):
-      self.c_args, self.vargs = encode_args(args, vals, self.signature)
+      self.c_args, self.vargs = encode_args([a.gpu for a in args], vals, self.signature)
 
       # HACK: For MOCKGPU send the args struct itself.
       if MOCKGPU: self.vargs = self.c_args # type: ignore[assignment]
     else:
-      for i in range(len(args)): self.c_args.__setattr__(f'f{i}', args[i])
+      for i in range(len(args)): self.c_args.__setattr__(f'f{i}', args[i].gpu)
       for i in range(len(vals)): self.c_args.__setattr__(f'v{i}', vals[i])
     return cu_time_execution(lambda: check(cuda.cuLaunchKernel(self.prg, *global_size, *local_size, self.smem, None, None, self.vargs)), enable=wait)
 
 class CUDAAllocator(LRUAllocator['CUDADevice']):
-  def _alloc(self, size, options:BufferSpec):
+  def _alloc(self, buf:Buffer, opaque=None):
     check(cuda.cuCtxSetCurrent(self.dev.context))
-    if options.external_ptr: return cuda.CUdeviceptr_v2(options.external_ptr)
-    if options.host: return init_c_var(ctypes.c_void_p, lambda x: check(cuda.cuMemHostAlloc(ctypes.byref(x), size, 0x01)))
-    return init_c_var(cuda.CUdeviceptr, lambda x: check(cuda.cuMemAlloc_v2(ctypes.byref(x), size)))
+    if buf.options.external_ptr: return buf.options.external_ptr, None, None
+    if buf.options.host: # pinned host memory, the device address is the host address
+      ptr = init_c_var(ctypes.c_void_p, lambda x: check(cuda.cuMemHostAlloc(ctypes.byref(x), buf.nbytes, 0x01))).value
+      return ptr, MMIOInterface(ptr, buf.nbytes), None
+    return init_c_var(cuda.CUdeviceptr, lambda x: check(cuda.cuMemAlloc_v2(ctypes.byref(x), buf.nbytes))).value, None, None
   @suppress_finalizing
-  def _free(self, opaque, options:BufferSpec):
-    if options.external_ptr: return
-    if options.host: check(cuda.cuMemFreeHost(opaque))
-    else: check(cuda.cuMemFree_v2(opaque))
-  def _copyin(self, dest, src:memoryview):
+  def _free(self, buf:Buffer):
+    if buf.options.external_ptr: return
+    if buf.options.host: check(cuda.cuMemFreeHost(buf.gpu))
+    else: check(cuda.cuMemFree_v2(buf.gpu))
+  def _copyin(self, buf:Buffer, src:memoryview):
     check(cuda.cuCtxSetCurrent(self.dev.context))
-    host_mem = self.alloc(len(src), BufferSpec(host=True))
-    self.dev.pending_copyin.append((host_mem, len(src), BufferSpec(host=True)))
-    ctypes.memmove(host_mem, mv_address(src), len(src))
-    check(cuda.cuMemcpyHtoDAsync_v2(dest, host_mem, len(src), None))
-  def _copyout(self, dest:memoryview, src):
+    self.dev.pending_copyin.append(host_mem:=Buffer(self.dev.device, len(src), dtypes.uint8, options=BufferSpec(host=True), preallocate=True))
+    host_mem.cpu[:] = src
+    check(cuda.cuMemcpyHtoDAsync_v2(buf.gpu, host_mem.gpu, len(src), None))
+  def _copyout(self, dst:memoryview, buf:Buffer):
     CUDADevice.synchronize_system()
     check(cuda.cuCtxSetCurrent(self.dev.context))
-    check(cuda.cuMemcpyDtoH_v2(mv_address(dest), src, len(dest)))
-  def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
-    check(cuda.cuCtxSetCurrent(src_dev.context))
+    check(cuda.cuMemcpyDtoH_v2(mv_address(dst), buf.gpu, len(dst)))
+  def _transfer(self, dst:Buffer, src:Buffer):
+    check(cuda.cuCtxSetCurrent(cast(CUDADevice, Device[src.device]).context))
     check(cuda.cuEventCreate(ctypes.byref(sync_event := cuda.CUevent()), 0))
-    check(cuda.cuMemcpyDtoDAsync_v2(dest, src, sz, None))
+    check(cuda.cuMemcpyDtoDAsync_v2(dst.gpu, src.gpu, dst.nbytes, None))
     check(cuda.cuEventRecord(sync_event, None))
-    check(cuda.cuCtxSetCurrent(dest_dev.context))
+    check(cuda.cuCtxSetCurrent(self.dev.context))
     check(cuda.cuStreamWaitEvent(None, sync_event, 0)) # sync the default stream on the dest dev
-  def _offset(self, buf, size:int, offset:int): return cuda.CUdeviceptr_v2(buf.value + offset)
 
 class CUDADevice(Compiled):
   devices: list[CUDADevice] = []
@@ -114,7 +117,7 @@ class CUDADevice(Compiled):
       check(cuda.cuCtxEnablePeerAccess(dev.context, 0))
       CUDADevice.peer_access = True
 
-    self.pending_copyin: list[tuple[int, int, BufferSpec|None]] = []
+    self.pending_copyin: list[Buffer] = [] # host staging of the copies in flight, freed at synchronize
     CUDADevice.devices.append(self)
 
     from tinygrad.runtime.graph.cuda import CUDAGraph
@@ -126,7 +129,6 @@ class CUDADevice(Compiled):
   def synchronize(self):
     check(cuda.cuCtxSetCurrent(self.context))
     check(cuda.cuCtxSynchronize())
-    for opaque,sz,options in self.pending_copyin: self.allocator.free(opaque, sz, options)
     self.pending_copyin.clear()
 
   @staticmethod

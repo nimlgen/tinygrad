@@ -5,7 +5,7 @@ from tinygrad.runtime.autogen import opencl as cl
 from tinygrad.runtime.support import c
 from tinygrad.helpers import to_char_p_p, from_mv, OSX, DEBUG, mv_address, suppress_finalizing, unwrap, round_up, is_image_shape
 from tinygrad.renderer.cstyle import OpenCLRenderer
-from tinygrad.device import BufferSpec, LRUAllocator, Compiled, Compiler, CompileError, TinyELF, Program
+from tinygrad.device import Buffer, LRUAllocator, Compiled, Compiler, CompileError, TinyELF, Program
 
 CC_CB = c.CFUNCTYPE[None, [c.POINTER[ctypes.c_char], c.POINTER[None], cl.size_t, c.POINTER[None]]]
 BP_CB = c.CFUNCTYPE[None, [cl.cl_program, c.POINTER[None]]]
@@ -52,10 +52,10 @@ class CLProgram(Program['CLDevice']):
     try: check(cl.clReleaseProgram(self.program))
     except (TypeError, AttributeError): pass
 
-  def __call__(self, *bufs:cl.cl_mem, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(),
+  def __call__(self, *bufs:Buffer, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(),
                wait=False, **kw) -> float|None:
     for i, (_, slot, dt, shape) in enumerate(self.signature):
-      b = bufs[slot] if slot < len(bufs) else getattr(ctypes, f"c_int{dt.bitsize}")(vals[slot-len(bufs)])
+      b = bufs[slot].data if slot < len(bufs) else getattr(ctypes, f"c_int{dt.bitsize}")(vals[slot-len(bufs)])
       if is_image_shape(shape):
         pitch = (round_up(shape[1], 256) if OSX else shape[1]) * 4 * dt.itemsize
         fmt = cl.cl_image_format(cl.CL_RGBA, {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dt.itemsize])
@@ -76,16 +76,16 @@ class CLProgram(Program['CLDevice']):
     return None
 
 class CLAllocator(LRUAllocator['CLDevice']):
-  def _alloc(self, size:int, options:BufferSpec) -> cl.cl_mem:
-    return checked(cl.clCreateBuffer(self.dev.context, cl.CL_MEM_READ_WRITE, size, None, status := ctypes.c_int32()), status)
+  def _alloc(self, buf:Buffer, opaque=None):
+    return None, None, checked(cl.clCreateBuffer(self.dev.context, cl.CL_MEM_READ_WRITE, buf.nbytes, None, status := ctypes.c_int32()), status)
   @suppress_finalizing
-  def _free(self, opaque:cl.cl_mem, options:BufferSpec): check(cl.clReleaseMemObject(opaque))
-  def _copyin(self, dest:cl.cl_mem, src:memoryview):
+  def _free(self, buf:Buffer): check(cl.clReleaseMemObject(buf.data))
+  def _copyin(self, buf:Buffer, src:memoryview):
     if mv_address(src) % 16: src = memoryview(bytearray(src))
-    check(cl.clEnqueueWriteBuffer(self.dev.queue, dest, False, 0, len(src)*src.itemsize, from_mv(src), 0, None, None))
+    check(cl.clEnqueueWriteBuffer(self.dev.queue, buf.data, False, 0, len(src)*src.itemsize, from_mv(src), 0, None, None))
     self.dev.pending_copyin.append(src)    # NOTE: these can't be freed until the GPU actually executes this command
-  def _copyout(self, dest:memoryview, src:cl.cl_mem):
-    check(cl.clEnqueueReadBuffer(self.dev.queue, src, False, 0, len(dest)*dest.itemsize, from_mv(dest), 0, None, None))
+  def _copyout(self, dst:memoryview, buf:Buffer):
+    check(cl.clEnqueueReadBuffer(self.dev.queue, buf.data, False, 0, len(dst)*dst.itemsize, from_mv(dst), 0, None, None))
     self.dev.synchronize()
 
 class CLDevice(Compiled):

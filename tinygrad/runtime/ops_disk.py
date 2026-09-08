@@ -1,7 +1,7 @@
 import os, sys, mmap, io, ctypes, contextlib, pathlib
-from typing import Generator, Callable
-from tinygrad.helpers import OSX, round_up
-from tinygrad.device import Compiled, Allocator
+from tinygrad.helpers import OSX, mv_address
+from tinygrad.device import Compiled, Allocator, Buffer
+from tinygrad.runtime.support.memory import MMIOInterface
 with contextlib.suppress(ImportError):
   import _posixshmem
   from tinygrad.runtime.autogen import io_uring, libc
@@ -68,74 +68,18 @@ class DiskDevice(Compiled):
 
       DiskDevice.io_uring = io_uring.struct_io_uring(ring_fd=fd, sq=sqdesc, cq=cqdesc) # type: ignore
 
-class DiskBuffer:
-  def __init__(self, device:DiskDevice, size:int, offset=0):
-    self.device, self.size, self.offset = device, size, offset
-  def __repr__(self): return f"<DiskBuffer size={self.size} offset={self.offset}>"
-  def _buf(self) -> memoryview:
-    assert hasattr(self.device, "mem"), f"DiskBuffer wasn't opened: {self.device.device}"
-    return memoryview(self.device.mem)[self.offset:self.offset+self.size]
-
 MAP_LOCKED, MAP_POPULATE = 0 if OSX else 0x2000, getattr(mmap, "MAP_POPULATE", 0 if OSX else 0x008000)
 class DiskAllocator(Allocator):
   def __init__(self, dev:DiskDevice): super().__init__(dev)
-  def _alloc(self, size:int, options):
-    self.dev._might_open(size)
-    return DiskBuffer(self.dev, size)
-  def _free(self, opaque, options): self.dev._might_close()
-  def _as_buffer(self, src:DiskBuffer): return src._buf()
-  def _copyin(self, dest:DiskBuffer, src:memoryview): dest._buf()[:] = src
-  def _copyout(self, dest:memoryview, src:DiskBuffer):
+  def _alloc(self, buf:Buffer, opaque=None):
+    self.dev._might_open(buf.nbytes)
+    return None, MMIOInterface(mv_address(memoryview(self.dev.mem)), buf.nbytes), None
+  def _free(self, buf:Buffer): self.dev._might_close()
+  def _copyout(self, dst:memoryview, buf:Buffer):
     if OSX and self.dev.fd is not None:
       # OSX doesn't seem great at mmap, this is faster
       with io.FileIO(self.dev.fd, "a+b", closefd=False) as fo:
-        fo.seek(src.offset)
+        fo.seek(buf.offset)
         bytes_read = 0
-        while (n := fo.readinto(dest[bytes_read:])) is not None and n > 0: bytes_read += n
-    else:
-      dest[:] = src._buf()
-
-  def _copyout_sharded(self, src:DiskBuffer, size:int, _get_free_buf:Callable, seg_len:int,
-                       use_ioring:bool=True) -> Generator[tuple[int, int, int, int], None, None]:
-    fd_offset = src.offset - (minor_offset := src.offset % mmap.PAGESIZE)
-    processed_reqs_cnt, copied_in, next_read_offset, total_copy_size = 0, 0, 0, round_up(size + minor_offset, mmap.PAGESIZE)
-
-    if not hasattr(DiskDevice, 'io_uring') or not use_ioring:
-      local_buf = memoryview(bytearray(seg_len))
-      for off in range(0, total_copy_size, seg_len):
-        while (copy_batch := _get_free_buf()) is None: pass
-        read_size = min(seg_len, total_copy_size - off, src.device.size - fd_offset - off)
-        self._copyout(local_buf[:read_size], DiskBuffer(src.device, read_size, fd_offset + off))
-        copy_batch[0].view(size=read_size)[:] = local_buf[:read_size]
-        real_copy_size = min(read_size - minor_offset, size - copied_in)
-        yield (copy_batch, copied_in, minor_offset, real_copy_size)
-        copied_in, minor_offset = copied_in + real_copy_size, 0
-      return
-
-    reqs: list[tuple[int, int, int, int]] = []
-    while next_read_offset < total_copy_size or len(reqs) != processed_reqs_cnt:
-      if next_read_offset < total_copy_size and (copy_batch := _get_free_buf()) is not None:
-        # Prepare sqe
-        sqe_index = (tail:=DiskDevice.io_uring.sq.ktail[0]) & DiskDevice.io_uring.sq.kring_mask[0]
-        sqe = DiskDevice.io_uring.sq.sqes[sqe_index]
-        sqe.opcode, sqe.fd, sqe.off = io_uring.IORING_OP_READ, self.dev.fd, fd_offset + next_read_offset
-        sqe.addr, sqe.len, sqe.user_data = copy_batch[0].addr, min(seg_len, total_copy_size - next_read_offset), len(reqs)
-
-        # Send sqe
-        DiskDevice.io_uring.sq.array[sqe_index] = sqe_index
-        DiskDevice.io_uring.sq.ktail[0] = tail + 1
-        libc.syscall(io_uring.NR_io_uring_enter, DiskDevice.io_uring.ring_fd, 1, 1, io_uring.IORING_ENTER_GETEVENTS)
-
-        reqs.append((copy_batch, copied_in, minor_offset, real_copy_size:=min(sqe.len - minor_offset, size - copied_in)))
-        next_read_offset += sqe.len
-        copied_in += real_copy_size
-        minor_offset = 0
-
-      if (head:=DiskDevice.io_uring.cq.khead[0]) != DiskDevice.io_uring.cq.ktail[0]:
-        cqe = DiskDevice.io_uring.cq.cqes[head & DiskDevice.io_uring.cq.kring_mask[0]]
-        assert cqe.res >= 0, f"read from disk failed, err: {cqe.res}"
-        yield reqs[cqe.user_data]
-        DiskDevice.io_uring.cq.khead[0] = head + 1 # advance
-        processed_reqs_cnt += 1
-
-  def _offset(self, buf:DiskBuffer, size:int, offset:int): return DiskBuffer(buf.device, size, offset)
+        while (n := fo.readinto(dst[bytes_read:])) is not None and n > 0: bytes_read += n
+    else: super()._copyout(dst, buf)

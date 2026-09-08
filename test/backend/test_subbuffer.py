@@ -52,7 +52,6 @@ class TestSubBuffer(unittest.TestCase):
     with Context(LRU=0):
       vbuf = self.buf.view(2, dtypes.uint8, offset=3).ensure_allocated()
       self.buf.deallocate()
-      vbuf.deallocate()
 
       # Allocate a fake one on the same place
       _ = Buffer(Device.DEFAULT, 10, dtypes.uint8).ensure_allocated()
@@ -69,41 +68,22 @@ class TestSubBuffer(unittest.TestCase):
     buf = self.buf_unalloc
     sub_buf = buf.view(3, dtypes.uint8, offset=4)
     self.assertFalse(buf.is_allocated())
-    self.assertFalse(buf.is_initialized())
     self.assertFalse(sub_buf.is_allocated())
-    self.assertFalse(sub_buf.is_initialized())
 
     # base buffer alloc
     buf.allocate()
     self.assertTrue(buf.is_allocated())
-    self.assertTrue(buf.is_initialized())
     self.assertTrue(sub_buf.is_allocated())
-    self.assertFalse(sub_buf.is_initialized())
-
-    # sub buffer alloc
-    sub_buf.allocate()
-    self.assertTrue(sub_buf.is_initialized())
-
-    # sub buffer dealloc
-    sub_buf.deallocate()
-    self.assertTrue(buf.is_allocated())
-    self.assertTrue(buf.is_initialized())
-    self.assertTrue(sub_buf.is_allocated())
-    self.assertFalse(sub_buf.is_initialized())
 
     # base buffer dealloc
     buf.deallocate()
     self.assertFalse(buf.is_allocated())
-    self.assertFalse(buf.is_initialized())
     self.assertFalse(sub_buf.is_allocated())
-    self.assertFalse(sub_buf.is_initialized())
 
-    # sub buffer alloc
+    # sub buffer alloc allocates the base
     sub_buf.ensure_allocated()
     self.assertTrue(buf.is_allocated())
-    self.assertTrue(buf.is_initialized())
     self.assertTrue(sub_buf.is_allocated())
-    self.assertTrue(sub_buf.is_initialized())
 
   def test_subbuffer_copy_in_out(self):
     sub_buf = self.buf.view(3, dtypes.uint8, offset=3).ensure_allocated() # [3:6]
@@ -153,7 +133,7 @@ class TestSubBuffer(unittest.TestCase):
 
   def test_subbuffer_dealloc(self):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
-    sub_buf.deallocate()
+    del sub_buf # a view owns nothing, dropping it leaves the base alone
     assert self.buf.as_memoryview().tolist() == list(range(10))
 
   def test_subbuffer_double_dealloc(self):
@@ -161,17 +141,16 @@ class TestSubBuffer(unittest.TestCase):
     self.buf.deallocate()
     with self.assertRaises(AssertionError):
       self.buf.deallocate()
-    sub_buf.deallocate()
-    with self.assertRaises(AssertionError):
+    with self.assertRaises(AssertionError): # views can't be deallocated
       sub_buf.deallocate()
 
   def test_subbuffer_uaf(self):
     sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
     assert self.buf.as_memoryview().tolist(), list(range(10))
-    sub_buf.deallocate()
+    self.buf.deallocate()
     with self.assertRaises(AssertionError):
       sub_buf.as_memoryview().tolist()
-    assert self.buf.as_memoryview().tolist(), list(range(10))
+    self.buf.ensure_allocated()
 
     sub_buf = self.buf.view(4, dtypes.int8, offset=3).ensure_allocated()
     assert sub_buf.as_memoryview().tolist(), list(range(3, 7))

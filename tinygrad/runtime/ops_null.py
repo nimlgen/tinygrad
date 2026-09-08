@@ -1,5 +1,5 @@
 import inspect, math
-from tinygrad.device import Compiled, Allocator, ProfileGraphEntry, ProfileGraphEvent, Program, TinyELF
+from tinygrad.device import Compiled, Allocator, Buffer, ProfileGraphEntry, ProfileGraphEvent, Program, TinyELF
 from tinygrad.engine.jit import MultiGraphRunner
 from tinygrad.renderer import Renderer, cstyle, nir, ptx, llvmir, wgsl
 from tinygrad.renderer.cstyle import CStyleLanguage
@@ -22,13 +22,12 @@ class NullProgram(Program['NullDevice']):
     with cpu_profile(self.name, self.device, profile_key=self.profile_key): return 1e-3
 
 class NullAllocator(Allocator['NullDevice']):
-  def _alloc(self, size, options): pass
-  def _copyin(self, dest, src:memoryview): pass
-  def _copyout(self, dest:memoryview, src):
+  def _alloc(self, buf:Buffer, opaque=None): return 0, None, None
+  def _copyin(self, buf:Buffer, src:memoryview): pass
+  def _copyout(self, dst:memoryview, buf:Buffer):
     if not NULL_ALLOW_COPYOUT: raise RuntimeError("no copyout on NULL")
-  def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
-    with cpu_profile(f"{src_dev.device} -> {dest_dev.device}", f"{src_dev.device}:SDMA:0"): pass
-  def _offset(self, buf, size:int, offset:int): pass
+  def _transfer(self, dst:Buffer, src:Buffer):
+    with cpu_profile(f"{src.device} -> {dst.device}", f"{src.device}:SDMA:0"): pass
 
 class NullGraph(MultiGraphRunner):
   def __call__(self, input_uops:tuple[UOp, ...], var_vals:dict[str, int], wait=False) -> float|None:

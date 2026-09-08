@@ -86,14 +86,14 @@ class TestHCQ2Schedule(unittest.TestCase):
   def test_jit_has_no_rt_buffers(self):
     dev = Device[Device.DEFAULT]
     rings = [dev.rt_buffer(True, host) for host in (False, True)]
-    ranges = [(b._buf.va_addr, b._buf.va_addr + b.nbytes) for b in rings]
+    ranges = [(b.gpu, b.gpu + b.nbytes) for b in rings]
     for n in (1, 65):
       with self.subTest(kernels=n):
         x, f = self.input(), TinyJit(lambda a: chain(a, n).realize())
         for _ in range(2): f(x)
         for u in f.captured.linear.toposort():
           if u.op is Ops.BUFFER and (buf:=u.buffer).device == dev.device:
-            addr = buf._buf.va_addr
+            addr = buf.gpu
             self.assertFalse(any(addr < end and start < addr + buf.nbytes for start, end in ranges))
 
   def test_small_eager_cached(self):
@@ -184,7 +184,7 @@ class TestHCQ2Schedule(unittest.TestCase):
     src = Buffer("CPU", 16, dtypes.uint8, preallocate=True)
     data = bytes(range(16))
     src.as_memoryview(force_zero_copy=True)[:] = data
-    src.get_buf(Device.DEFAULT)
+    src.addr(Device.DEFAULT)
     self.assertEqual(bytes(src.as_memoryview(force_zero_copy=True)), data)
 
   def test_staged_copy_roundtrip(self):
@@ -271,7 +271,7 @@ class TestHCQ2Schedule(unittest.TestCase):
           self.assertIs(programs[-1], programs[0])
           linear = hcq2.hcq_link(compiled, allow_cache=False)
           run_linear(linear, jit=True)
-          self.assertEqual(linear.src[0].without_after.src[1].buffer._buf.cpu_view().view(fmt='I')[0], 35)
+          self.assertEqual(linear.src[0].without_after.src[1].buffer.cpu.view(fmt='I')[0], 35)
       self.assertLessEqual(build.call_count, 1)
 
   def test_patched_view(self):
@@ -285,8 +285,8 @@ class TestHCQ2Schedule(unittest.TestCase):
       self.assertTrue(all(s.op is Ops.STORE for s in call.src[1:]))
       linked = hcq2.hcq_link(UOp(Ops.LINEAR, src=(call,)), allow_cache=False).src[0]
       inner_buf, outer_buf = linked.src[1].buffer, linked.without_after.src[1].buffer
-      self.assertEqual(inner_buf._buf.cpu_view().view(fmt='I')[1], 42)
-      self.assertEqual(outer_buf._buf.cpu_view().view(fmt='Q')[0], inner_buf._buf.va_addr + 4)
+      self.assertEqual(inner_buf.cpu.view(fmt='I')[1], 42)
+      self.assertEqual(outer_buf.cpu.view(fmt='Q')[0], inner_buf.gpu + 4)
 
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "CALL is rendered in C style only")
 class TestHCQ2FFI(unittest.TestCase):
@@ -300,7 +300,7 @@ class TestHCQ2FFI(unittest.TestCase):
     with Context(HCQ_RUNTIME_DEV="CPU"):
       out = cpu_buf(dtype=dtypes.int32, slot=1, volatile=True, tag="ffi_result")
       bufs = self._run(out.index(0).store(hcq2.ccall(libc.dll.ffs, 0x10)))
-    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.int)._buf.cpu_view().view(fmt='i')[0], 5)
+    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.int).cpu.view(fmt='i')[0], 5)
 
   def test_ffi_cstruct(self):
     struct_t = init_c_struct_t(16, (("u8", ctypes.c_uint8, 0), ("u16", ctypes.c_uint16, 2),
@@ -309,7 +309,7 @@ class TestHCQ2FFI(unittest.TestCase):
     with Context(HCQ_RUNTIME_DEV="CPU"):
       s = hcq2.cstruct(struct_t, u8=0x12, u16=UOp.const(0x3456, dtypes.uint16), u32=0x789ABCDE, u64=0xFEDCBA9876543210)
       bufs = self._run(s.index(0).load())
-    got = struct_t.from_buffer_copy(bytes(next(b for b in bufs if b.nbytes == ctypes.sizeof(struct_t))._buf.cpu_view()))
+    got = struct_t.from_buffer_copy(bytes(next(b for b in bufs if b.nbytes == ctypes.sizeof(struct_t)).cpu.view(fmt='B')[:]))
     self.assertEqual((got.u8, got.u16, got.u32, got.u64), (0x12, 0x3456, 0x789ABCDE, 0xFEDCBA9876543210))
 
   def test_nested_cstruct_patches(self):
@@ -319,7 +319,7 @@ class TestHCQ2FFI(unittest.TestCase):
       out = cpu_buf(dtype=dtypes.uint32, tag="result")
       copied = hcq2.ccall(libc.memcpy, out.index(0), outer.bitcast(dtypes.uint64).index(0).load(), 4)
       bufs = self._run(out.after(copied).index(0).load())
-    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32)._buf.cpu_view().view(fmt='I')[0], 42)
+    self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32).cpu.view(fmt='I')[0], 42)
 
 if __name__ == "__main__":
   unittest.main()

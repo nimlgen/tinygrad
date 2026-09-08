@@ -1,13 +1,13 @@
 import numpy as np
-from tinygrad.helpers import flat_mv
-from tinygrad.device import Compiled, Allocator
+from typing import Any
+from tinygrad.device import Compiled, Buffer
+from tinygrad.runtime.ops_cpu import HostAllocator
+from tinygrad.runtime.support.memory import MMIOInterface
 
-class NpyAllocator(Allocator['NpyDevice']):
-  def _alloc(self, size:int, options=None) -> np.ndarray: return np.empty(size, dtype=np.uint8)
-  def _as_buffer(self, src:np.ndarray) -> memoryview: return flat_mv(np.require(src, requirements='C').data)
-  def _copyout(self, dest:memoryview, src:np.ndarray): dest[:] = self._as_buffer(src)
-  def _offset(self, buf:np.ndarray, size:int, offset:int) -> np.ndarray:
-    return np.require(buf, requirements='C').reshape(-1).view(np.uint8)[offset:offset+size]
+class NpyAllocator(HostAllocator):
+  def _alloc(self, buf:Buffer, opaque:Any=None) -> tuple[int|None, MMIOInterface|None, Any]:
+    arr = np.require(opaque, requirements='C') if opaque is not None else np.empty(buf.nbytes, dtype=np.uint8)
+    return arr.ctypes.data, MMIOInterface(arr.ctypes.data, buf.nbytes), arr
 
 class NpyDevice(Compiled):
   def __init__(self, device:str): super().__init__(device, NpyAllocator(self), [], None)

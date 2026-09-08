@@ -187,8 +187,7 @@ class CapturedJit(Generic[ReturnType]):
     for u in self._written_uops:
       if u.op is not Ops.BUFFER or (buf:=u.arg.buffer) is None: continue
       for b in (buf.bufs if isinstance(buf, MultiBuffer) else (buf,)):
-        if b.is_initialized(): b.deallocate()
-        if (base:=b._base) is not None and base.allocated_views == 0 and base.is_allocated(): base.deallocate()
+        if b.base.is_allocated(): b.base.deallocate()
 
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]

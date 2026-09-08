@@ -97,7 +97,6 @@ jobs:
         shell: bash -e -o pipefail {0}
     env:
       DEV: ${{ matrix.dev }}
-      HCQ2: ${{ matrix.dev == 'AMD' && '1' || '0' }}
     if: github.repository_owner == 'tinygrad'
     steps:
     - name: Checkout Code
@@ -137,7 +136,6 @@ jobs:
         shell: bash -e -o pipefail {0}
     env:
       DEV: ${{ matrix.dev }}
-      HCQ2: ${{ matrix.dev == 'AMD' && '1' || '0' }}
     if: github.repository_owner == 'tinygrad'
     steps:
     - name: Checkout Code
@@ -185,7 +183,6 @@ jobs:
         shell: bash -e -o pipefail {0}
     env:
       DEV: ${{ matrix.dev }}
-      HCQ2: ${{ matrix.dev == 'AMD' && '1' || '0' }}
     if: github.repository_owner == 'tinygrad'
     steps:
     - name: Checkout Code
@@ -227,7 +224,6 @@ jobs:
         shell: bash -e -o pipefail {0}
     env:
       DEV: ${{ matrix.dev }}
-      HCQ2: ${{ matrix.dev == 'AMD' && '1' || '0' }}
     if: github.repository_owner == 'tinygrad'
     steps:
     - name: Checkout Code
@@ -272,7 +268,6 @@ jobs:
         shell: bash -e -o pipefail {0}
     env:
       DEV: ${{ matrix.dev }}
-      HCQ2: ${{ matrix.dev == 'AMD' && '1' || '0' }}
     if: github.repository_owner == 'tinygrad'
     steps:
     - name: Checkout Code

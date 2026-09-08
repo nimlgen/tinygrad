@@ -1,6 +1,6 @@
 import ctypes
 from tinygrad.helpers import mv_address, getenv, suppress_finalizing
-from tinygrad.device import Compiled, LRUAllocator, BufferSpec, Program, TinyELF
+from tinygrad.device import Compiled, LRUAllocator, Buffer, Program, TinyELF
 from tinygrad.runtime.autogen import hip
 from tinygrad.renderer.cstyle import HIPRenderer
 from tinygrad.runtime.support.c import init_c_var, init_c_struct_t
@@ -57,14 +57,13 @@ class HIPProgram(Program[HIPDevice]):
       return ret.value * 1e-3
 
 class HIPAllocator(LRUAllocator[HIPDevice]):
-  def _alloc(self, size:int, options:BufferSpec):
+  def _alloc(self, buf:Buffer, opaque=None):
     check(hip.hipSetDevice(self.dev.device_id))
-    return init_c_var(hip.hipDeviceptr_t, lambda x: check(hip.hipMalloc(ctypes.byref(x), size)))
-  def _free(self, opaque, options:BufferSpec): check(hip.hipFree(opaque))
-  def _copyin(self, dest, src: memoryview):
+    return init_c_var(hip.hipDeviceptr_t, lambda x: check(hip.hipMalloc(ctypes.byref(x), buf.nbytes))).value, None, None
+  def _free(self, buf:Buffer): check(hip.hipFree(buf.gpu))
+  def _copyin(self, buf:Buffer, src: memoryview):
     check(hip.hipSetDevice(self.dev.device_id))
-    check(hip.hipMemcpy(dest, mv_address(src), len(src), hip.hipMemcpyHostToDevice))
-  def _copyout(self, dest:memoryview, src):
+    check(hip.hipMemcpy(buf.gpu, mv_address(src), len(src), hip.hipMemcpyHostToDevice))
+  def _copyout(self, dst:memoryview, buf:Buffer):
     self.dev.synchronize()
-    check(hip.hipMemcpy(mv_address(dest), src, len(dest), hip.hipMemcpyDeviceToHost))
-  def _offset(self, buf, size:int, offset:int): return hip.hipDeviceptr_t(buf.value + offset)
+    check(hip.hipMemcpy(mv_address(dst), buf.gpu, len(dst), hip.hipMemcpyDeviceToHost))

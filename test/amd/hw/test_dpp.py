@@ -5,6 +5,7 @@ minimal wave64 lane-store harness and compares emulator vs hardware directly
 when USE_HW=1.
 """
 import ctypes, unittest
+from tinygrad.dtype import dtypes
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
 from tinygrad.helpers import Target, flat_mv
 from test.amd.hw.helpers import USE_HW, assemble
@@ -37,7 +38,7 @@ def _run_wave64_emu(instructions: list, out_reg: int = 1) -> list[int]:
   return list(out_buf)
 
 def _run_wave64_hw(instructions: list, out_reg: int = 1) -> list[int]:
-  from tinygrad.device import Device, TinyELF
+  from tinygrad.device import Device, TinyELF, Buffer
   from tinygrad.runtime.support.compiler_amd import HIPCompiler
 
   dev = Device["AMD"]
@@ -84,7 +85,7 @@ amdhsa.kernels:
 """
   lib = compiler.compile(asm_src)
   prg = dev.runtime(TinyELF(lib, "test", Target("AMD", arch=dev.arch), ()))
-  out_gpu = dev.allocator.alloc(WAVE64 * 4)
+  out_gpu = Buffer(dev.device, WAVE64 * 4, dtypes.uint8, preallocate=True)
   prg(out_gpu, global_size=(1, 1, 1), local_size=(WAVE64, 1, 1), wait=True)
   out = bytearray(WAVE64 * 4)
   dev.allocator._copyout(flat_mv(memoryview(out)), out_gpu)

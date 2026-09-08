@@ -1,5 +1,5 @@
 import functools, struct
-from tinygrad.device import Compiled, Allocator, BufferSpec, Program, TinyELF
+from tinygrad.device import Compiled, Allocator, Buffer, Program, TinyELF
 from tinygrad.renderer.wgsl import WGSLRenderer
 from tinygrad.helpers import round_up, suppress_finalizing, getenv, to_mv
 from tinygrad.runtime.autogen import webgpu
@@ -66,8 +66,9 @@ class WebGPUProgram(Program['WebGpuDevice']):
   @suppress_finalizing
   def __del__(self): webgpu.wgpuShaderModuleRelease(self.prg)
 
-  def __call__(self, *bufs:webgpu.WGPUBuffer, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
+  def __call__(self, *bufs:Buffer, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
                vals:tuple[int, ...]=(), wait=False, **kw) -> float|None:
+    wbufs = tuple(b.data for b in bufs)
     wait = wait and webgpu.WGPUFeatureName_TimestampQuery in self.dev.features
 
     # Creating bind group layout
@@ -94,7 +95,7 @@ class WebGPUProgram(Program['WebGpuDevice']):
     def bg_entry(n:int, x:webgpu.WGPUBuffer|int|float):
       buf = x if isinstance(x, webgpu.WGPUBuffer) else self.dev.create_uniform(x)
       return webgpu.WGPUBindGroupEntry(binding=n, buffer=buf, offset=0, size=webgpu.wgpuBufferGetSize(buf))
-    bindings = (webgpu.WGPUBindGroupEntry * (1+len(bufs)+len(vals)))(bg_entry(0, float('inf')), *(bg_entry(i+1, x) for i,x in enumerate(bufs+vals)))
+    bindings = (webgpu.WGPUBindGroupEntry * (1+len(bufs)+len(vals)))(bg_entry(0, float('inf')), *(bg_entry(i+1, x) for i,x in enumerate(wbufs+vals)))
 
     bind_group_desc = webgpu.WGPUBindGroupDescriptor(layout=bind_layout, entryCount=len(bindings), entries=bindings)
     webgpu.wgpuDevicePushErrorScope(self.dev.device_res, webgpu.WGPUErrorFilter_Validation)
@@ -147,20 +148,20 @@ class WebGPUProgram(Program['WebGpuDevice']):
     return None
 
 class WebGpuAllocator(Allocator['WebGpuDevice']):
-  def _alloc(self, size:int, options:BufferSpec) -> webgpu.WGPUBuffer:
+  def _alloc(self, buf:Buffer, opaque=None):
     # WebGPU buffers have to be 4-byte aligned
-    return webgpu.wgpuDeviceCreateBuffer(self.dev.device_res, webgpu.WGPUBufferDescriptor(size=round_up(size, 4),
+    return None, None, webgpu.wgpuDeviceCreateBuffer(self.dev.device_res, webgpu.WGPUBufferDescriptor(size=round_up(buf.nbytes, 4),
       usage=webgpu.WGPUBufferUsage_Storage | webgpu.WGPUBufferUsage_CopyDst | webgpu.WGPUBufferUsage_CopySrc))
-  def _copyin(self, dest:webgpu.WGPUBuffer, src:memoryview):
+  def _copyin(self, buf:Buffer, src:memoryview):
     if src.nbytes % 4:
       padded_src = bytearray(round_up(src.nbytes, 4))
       padded_src[:src.nbytes] = src
-    self.dev.write_buffer(dest, padded_src if src.nbytes % 4 else src)
-  def _copyout(self, dest:memoryview, src:webgpu.WGPUBuffer):
-    dest[:] = buf_to_mv(tmp_buf:=self.dev._readable_buffer(src))[:dest.nbytes]
+    self.dev.write_buffer(buf.data, padded_src if src.nbytes % 4 else src)
+  def _copyout(self, dst:memoryview, buf:Buffer):
+    dst[:] = buf_to_mv(tmp_buf:=self.dev._readable_buffer(buf.data))[:dst.nbytes]
     self.dev.free(tmp_buf)
 
-  def _free(self, opaque:webgpu.WGPUBuffer, options:BufferSpec): self.dev.free(opaque)
+  def _free(self, buf:Buffer): self.dev.free(buf.data)
 
 class WebGpuDevice(Compiled):
   def __init__(self, device:str):

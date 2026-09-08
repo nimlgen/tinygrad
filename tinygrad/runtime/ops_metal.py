@@ -1,7 +1,9 @@
 import subprocess, pathlib, struct, ctypes, tempfile, functools, decimal, platform
-from tinygrad.helpers import prod, to_mv, round_up, cache_dir, PROFILE, ProfileRangeEvent, cpu_profile, unwrap, suppress_finalizing
+from typing import cast
+from tinygrad.helpers import prod, to_mv, round_up, cache_dir, PROFILE, ProfileRangeEvent, unwrap, suppress_finalizing
 import tinygrad.runtime.support.objc as objc
-from tinygrad.device import Compiled, Compiler, CompileError, Program, TinyELF, LRUAllocator, ProfileDeviceEvent
+from tinygrad.device import Compiled, Compiler, CompileError, Program, TinyELF, LRUAllocator, ProfileDeviceEvent, Buffer, Device
+from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.renderer.cstyle import MetalRenderer
 from tinygrad.runtime.autogen import metal
 from tinygrad.runtime.support.c import DLL
@@ -138,7 +140,7 @@ class MetalProgram(Program[MetalDevice]):
     command_buffer = self.dev.mtl_queue.commandBuffer().retained()
     encoder = command_buffer.computeCommandEncoder().retained()
     encoder.setComputePipelineState(self.pipeline_state)
-    for i,a in enumerate(bufs): encoder.setBuffer_offset_atIndex(a.buf, a.offset, i)
+    for i,a in enumerate(bufs): encoder.setBuffer_offset_atIndex(a.data, a.offset, i)
     for a,(_,i,dt,_) in zip(vals, self.signature[len(bufs):]):
       encoder.setBytes_length_atIndex(bytes(getattr(ctypes, f"c_int{dt.bitsize}")(a)), dt.itemsize, i)
     encoder.dispatchThreadgroups_threadsPerThreadgroup(metal.MTLSize(*global_size), metal.MTLSize(*local_size))
@@ -151,26 +153,24 @@ class MetalProgram(Program[MetalDevice]):
       wait_check(command_buffer)
       return command_buffer.GPUEndTime() - command_buffer.GPUStartTime()
 
-class MetalBuffer:
-  def __init__(self, buf:metal.MTLBuffer, size:int, offset=0): self.buf, self.size, self.offset = buf, size, offset
-
 class MetalAllocator(LRUAllocator[MetalDevice]):
-  def _alloc(self, size:int, options) -> MetalBuffer:
-    if options.external_ptr: return MetalBuffer(metal.MTLBuffer(options.external_ptr), size)
-
-    # Buffer is explicitly released in _free() rather than garbage collected via reference count
-    ret = self.dev.sysdevice.newBufferWithLength_options(size, metal.MTLResourceStorageModeShared)
-    ret.retain = False
-    if ret.value is None: raise MemoryError(f"Metal OOM while allocating {size=}")
-    return MetalBuffer(ret, size)
+  def _alloc(self, buf:Buffer, opaque=None):
+    if buf.options.external_ptr: ret = metal.MTLBuffer(buf.options.external_ptr)
+    else:
+      # Buffer is explicitly released in _free() rather than garbage collected via reference count
+      ret = self.dev.sysdevice.newBufferWithLength_options(buf.nbytes, metal.MTLResourceStorageModeShared)
+      ret.retain = False
+      if ret.value is None: raise MemoryError(f"Metal OOM while allocating {buf.nbytes=}")
+    return None, MMIOInterface(ret.contents(), buf.nbytes), ret
   @suppress_finalizing
-  def _free(self, opaque:MetalBuffer, options):
-    if not options.external_ptr: opaque.buf.release()
-  def _transfer(self, dest:MetalBuffer, src:MetalBuffer, sz:int, src_dev:MetalDevice, dest_dev:MetalDevice):
+  def _free(self, buf:Buffer):
+    if not buf.options.external_ptr: buf.data.release()
+  def _transfer(self, dst:Buffer, src:Buffer):
+    src_dev, dest_dev = cast(MetalDevice, Device[src.device]), self.dev
     dest_dev.synchronize()
     src_command_buffer = src_dev.mtl_queue.commandBuffer().retained()
     encoder = src_command_buffer.blitCommandEncoder().retained()
-    encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(src.buf, src.offset, dest.buf, dest.offset, sz)
+    encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(src.data, src.offset, dst.data, dst.offset, dst.nbytes)
     encoder.endEncoding()
     if src_dev != dest_dev:
       src_command_buffer.encodeSignalEvent_value(ctypes.cast(src_dev.timeline_signal, metal.MTLEvent), src_dev.timeline_value)
@@ -185,10 +185,3 @@ class MetalAllocator(LRUAllocator[MetalDevice]):
     # Transfers currently synchronize the completion. Otherwise, copies can sometimes lead to incorrect values.
     # There is no real metal multidevice support for now, so transfer is used only for tests.
     src_dev.synchronize()
-  def _cp_mv(self, dst, src, prof_desc):
-    self.dev.synchronize()
-    with cpu_profile(prof_desc, f"{self.dev.device}:COPY"): dst[:] = src
-  def _as_buffer(self, src:MetalBuffer) -> memoryview: return to_mv(src.buf.contents(), src.size + src.offset)[src.offset:]
-  def _copyin(self, dest:MetalBuffer, src:memoryview): self._cp_mv(self._as_buffer(dest), src, "TINY -> METAL")
-  def _copyout(self, dest:memoryview, src:MetalBuffer): self._cp_mv(dest, self._as_buffer(src), "METAL -> TINY")
-  def _offset(self, buf:MetalBuffer, size:int, offset:int): return MetalBuffer(buf.buf, size, offset)

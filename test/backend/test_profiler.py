@@ -67,7 +67,7 @@ class TestProfiler(unittest.TestCase):
     runner_name = TestProfiler.runtime.name
     with helper_collect_profile(TestProfiler.d0) as profile:
       gs, ls = TestProfiler.prg.arg.launch_dims({})
-      TestProfiler.runtime(TestProfiler.b.uop.buffer._buf, TestProfiler.a.uop.buffer._buf, global_size=gs, local_size=ls, wait=wait)
+      TestProfiler.runtime(TestProfiler.b.uop.buffer, TestProfiler.a.uop.buffer, global_size=gs, local_size=ls, wait=wait)
 
     profile, _ = helper_profile_filter_device(profile, TestProfiler.d0.device)
     kernel_runs = [x for x in profile if isinstance(x, ProfileRangeEvent)]
@@ -94,7 +94,7 @@ class TestProfiler(unittest.TestCase):
     with helper_collect_profile(TestProfiler.d0) as profile:
       buf1.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 1)))))
       gs, ls = TestProfiler.prg.arg.launch_dims({})
-      TestProfiler.runtime(buf1._buf, TestProfiler.a.uop.buffer._buf, global_size=gs, local_size=ls)
+      TestProfiler.runtime(buf1, TestProfiler.a.uop.buffer, global_size=gs, local_size=ls)
       buf1.as_memoryview()
 
     evs = [x for x in profile if isinstance(x, ProfileRangeEvent) and x.device.startswith((TestProfiler.d0.device, "PYTHON"))]
@@ -120,7 +120,7 @@ class TestProfiler(unittest.TestCase):
 
     for dev in [TestProfiler.d0.device, d1.device]:
       evs = [x for x in profile if isinstance(x, ProfileRangeEvent) and _dev_base(x.device) == dev]
-      assert len(evs) == (0 if hasattr(TestProfiler.d0.allocator, '_as_buffer') else 1), "one kernel runs are expected"
+      assert len(evs) == (0 if buf1._host_mv() is not None else 1), "one kernel runs are expected"
 
   def test_profile_multidev_transfer(self):
     try: d1 = Device[f"{Device.DEFAULT}:1"]

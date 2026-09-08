@@ -1,7 +1,8 @@
 from __future__ import annotations
 import ctypes, os, mmap, tempfile, pathlib, array, threading, contextlib, sys, subprocess, struct
 assert sys.platform != 'win32'
-from tinygrad.device import BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF
+from tinygrad.device import Buffer, BufferSpec, Compiled, Allocator, Compiler, Program, TinyELF
+from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.helpers import getenv, round_up, mv_address, to_mv, cpu_objdump, system, DEBUG, suppress_finalizing, Target, unwrap
@@ -63,36 +64,29 @@ class DSPProgram(Program['DSPDevice']):
     if len(bufs) >= 16: raise RuntimeError(f"Too many buffers to execute: {len(bufs)}")
 
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
-                                       outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.size)
+                                       outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.data.fd for b in bufs])
+    for i,b in enumerate(bufs): struct.pack_into('i', var_vals_mv, i*8, b.nbytes)
     for i,(v,(_,_,dt,_)) in enumerate(zip(vals, self.signature[len(bufs):]), start=len(bufs)): struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, v)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
     self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
     return timer[0] / 1e6
 
-class DSPBuffer:
-  def __init__(self, va_addr:int, size:int, share_info, offset:int=0):
-    self.va_addr, self.size, self.share_info, self.offset = va_addr, size, share_info, offset
-
 class DSPAllocator(Allocator['DSPDevice']):
-  def _alloc(self, size:int, options:BufferSpec):
+  def _alloc(self, buf:Buffer, opaque=None):
     if getenv("MOCKDSP"): fd, share_info, flags = -1, None, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS
     else:
-      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=size, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID, flags=qcom_dsp.ION_FLAG_CACHED)
+      b = qcom_dsp.ION_IOC_ALLOC(self.dev.ion_fd, len=buf.nbytes, align=0x200, heap_id_mask=1<<qcom_dsp.ION_SYSTEM_HEAP_ID,
+                                 flags=qcom_dsp.ION_FLAG_CACHED)
       fd, flags = (share_info:=qcom_dsp.ION_IOC_SHARE(self.dev.ion_fd, handle=b.handle)).fd, mmap.MAP_SHARED
-    return DSPBuffer(libc.mmap(0, size, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0), size, share_info, offset=0)
+    va = libc.mmap(0, buf.nbytes, mmap.PROT_READ|mmap.PROT_WRITE, flags, fd, 0)
+    return va, MMIOInterface(va, buf.nbytes), share_info
 
   @suppress_finalizing
-  def _free(self, opaque:DSPBuffer, options:BufferSpec):
-    libc.munmap(opaque.va_addr, opaque.size)
-    if opaque.share_info is not None:
-      os.close(opaque.share_info.fd)
-      qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=opaque.share_info.handle)
-
-  def _as_buffer(self, src:DSPBuffer) -> memoryview: return to_mv(src.va_addr, src.size)
-  def _copyin(self, dest:DSPBuffer, src:memoryview): ctypes.memmove(dest.va_addr, mv_address(src), src.nbytes)
-  def _copyout(self, dest:memoryview, src:DSPBuffer): ctypes.memmove(mv_address(dest), src.va_addr, dest.nbytes)
-  def _offset(self, buf, size:int, offset:int): return DSPBuffer(buf.va_addr+offset, size, buf.share_info, buf.offset+offset)
+  def _free(self, buf:Buffer):
+    libc.munmap(buf.gpu, buf.nbytes)
+    if buf.data is not None:
+      os.close(buf.data.fd)
+      qcom_dsp.ION_IOC_FREE(self.dev.ion_fd, handle=buf.data.handle)
 
 class DSPCompiler(Compiler):
   def __init__(self, mock:bool=False):
@@ -131,8 +125,8 @@ class DSPDevice(Compiled):
       self.ion_fd = os.open('/dev/ion', os.O_RDONLY)
       super().__init__(device, DSPAllocator(self), [DSPRenderer], DSPProgram)
       fastrpc_shell = memoryview(bytearray(pathlib.Path('/dsp/cdsp/fastrpc_shell_3').read_bytes()))
-      self.shell_buf = self.allocator.alloc(round_up(fastrpc_shell.nbytes, 0x1000), BufferSpec(nolru=True))
-      ctypes.memmove(self.shell_buf.va_addr, mv_address(fastrpc_shell), fastrpc_shell.nbytes)
+      self.shell_buf = Buffer(self.device, round_up(fastrpc_shell.nbytes, 0x1000), dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+      self.shell_buf.cpu[:fastrpc_shell.nbytes] = fastrpc_shell
 
       self.init_dsp()
       RPCListener(self).start()
@@ -171,7 +165,7 @@ class DSPDevice(Compiled):
     self.rpc_fd: int = os.open('/dev/adsprpc-smd', os.O_RDONLY | os.O_NONBLOCK)
     qcom_dsp.FASTRPC_IOCTL_GETINFO(self.rpc_fd, 3)
     qcom_dsp.FASTRPC_IOCTL_CONTROL(self.rpc_fd, req=0x3)
-    qcom_dsp.FASTRPC_IOCTL_INIT(self.rpc_fd, flags=0x1, file=self.shell_buf.va_addr, filelen=self.shell_buf.size, filefd=self.shell_buf.share_info.fd)
+    qcom_dsp.FASTRPC_IOCTL_INIT(self.rpc_fd, flags=0x1, file=self.shell_buf.gpu, filelen=self.shell_buf.nbytes, filefd=self.shell_buf.data.fd)
     qcom_dsp.FASTRPC_IOCTL_INVOKE(self.rpc_fd, handle=3, sc=rpc_sc(method=3, ins=0, outs=0))
 
 class RPCListener(threading.Thread):
@@ -280,12 +274,12 @@ class MockDSPProgram(Program[DSPDevice]):
       dsp_lib.flush()
       os.chmod(dsp_lib.name, 0o0777)
       proc = subprocess.run(["qemu-hexagon-static", *(['-strace'] if DEBUG >= 5 else []), dsp_lib.name],
-        input=b''.join([bytes(to_mv(x.va_addr, x.size)) for x in bufs] +
+        input=b''.join([bytes(x.cpu.view(fmt='B')[:]) for x in bufs] +
                        [struct.pack(unwrap(dt.fmt), x) for x,(_,_,dt,_) in zip(vals, self.signature[len(bufs):])]),
         stdout=subprocess.PIPE, check=True)
     offset = 4
     for x in bufs:
-      to_mv(x.va_addr, x.size)[:] = proc.stdout[offset:offset+x.size]
-      offset += x.size
+      x.cpu.view(fmt='B')[:] = proc.stdout[offset:offset+x.nbytes]
+      offset += x.nbytes
     assert offset == len(proc.stdout)
     return struct.unpack("I", proc.stdout[0:4])[0] / 1e9  # pretend it's 1 Ghz, but this is an inscount, not a time
