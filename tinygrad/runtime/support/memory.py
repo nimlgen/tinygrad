@@ -114,6 +114,20 @@ class TLSFAllocator:
   def free(self, start:int):
     self._insert_block(start - self.base, self.blocks[start - self.base][0])._merge_block(start - self.base)
 
+  def _take(self, blk:int, start:int, size:int) -> int: # carve [start, start+size) out of the free block blk
+    if blk != start: self._split_block(blk, self.blocks[blk][0], start - blk)
+    if self.blocks[start][0] > size: self._split_block(start, self.blocks[start][0], size)
+    self._remove_block(start, size)
+    return start + self.base
+  def alloc_low(self, size:int, align:int=1) -> int: # the lowest fit: a repack slides memory down without landing on unmoved data
+    for b, (sz, _, _, free) in sorted(self.blocks.items()):
+      if free and (st:=round_up(b, align)) + size <= b + sz: return self._take(b, st, size)
+    raise MemoryError(f"Can't allocate {size} bytes")
+  def alloc_high(self, size:int, align:int=1) -> int: # the highest fit: pinned memory gathers at the top, out of the way of the repack
+    for b, (sz, _, _, free) in sorted(self.blocks.items(), reverse=True):
+      if free and (st:=(b + sz - size) // align * align) >= b: return self._take(b, st, size)
+    raise MemoryError(f"Can't allocate {size} bytes")
+
 # Memory Management
 
 class AddrSpace(enum.Enum): PHYS = enum.auto(); SYS = enum.auto(); PEER = enum.auto() # noqa: E702
@@ -182,8 +196,9 @@ class MemoryManager:
   va_allocator: ClassVar[TLSFAllocator|None] = None
 
   def __init__(self, dev, vram_size:int, boot_size:int, pt_t, va_bits:int, va_shifts:list[int], va_base:int,
-               palloc_ranges:list[tuple[int, int]], first_lv:int=0, reserve_ptable=False):
+               palloc_ranges:list[tuple[int, int]], first_lv:int=0, reserve_ptable=False, identity_base:int|None=None):
     self.dev, self.vram_size, self.va_shifts, self.va_base, lvl_msb = dev, vram_size, va_shifts, va_base, va_shifts + [va_bits + 1]
+    self.identity_base = identity_base # static map: vram at a fixed identity va (cached window, uncached window at +512GB), no gmmu allocations
     self.pte_covers, self.pte_cnt = [1 << x for x in va_shifts][::-1], [1 << (lvl_msb[i+1] - lvl_msb[i]) for i in range(len(lvl_msb) - 1)][::-1]
     self.pt_t, self.palloc_ranges, self.level_cnt, self.va_bits, self.reserve_ptable = pt_t, palloc_ranges, len(va_shifts), va_bits, reserve_ptable
 
@@ -242,12 +257,13 @@ class MemoryManager:
 
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def identity_va(self, uncached:bool) -> int:
-    self.map_range(va:=self.alloc_vaddr(self.vram_size, self.vram_size), self.vram_size, [(0, self.vram_size)], AddrSpace.PHYS, uncached=uncached)
+    va = self.identity_base + (uncached << 39) if self.identity_base is not None else self.alloc_vaddr(self.vram_size, self.vram_size)
+    self.map_range(va, self.vram_size, [(0, self.vram_size)], AddrSpace.PHYS, uncached=uncached)
     return va
 
-  def valloc(self, size:int, align=0x1000, uncached=False, contiguous=False, zero=False) -> VirtMapping:
-    if not getenv("GMMU", 1):
-      paddr = self.palloc(size:=round_up(size, 0x1000), align, zero=False)
+  def valloc(self, size:int, align=0x1000, uncached=False, contiguous=False, zero=False, pinned=False) -> VirtMapping:
+    if self.identity_base is not None or not getenv("GMMU", 1):
+      paddr = self.palloc(size:=round_up(size, 0x1000), align, zero=False, high=pinned)
       return VirtMapping(self.identity_va(uncached) + paddr, size, [(paddr, size)], aspace=AddrSpace.PHYS, uncached=uncached)
 
     # Alloc physical memory and map it to the virtual address
@@ -273,17 +289,17 @@ class MemoryManager:
     return self.map_range(va, size, paddrs, aspace=AddrSpace.PHYS, uncached=uncached)
 
   def vfree(self, vm:VirtMapping):
-    if not getenv("GMMU", 1): return self.pfree(vm.paddrs[0][0])
+    if self.identity_base is not None or not getenv("GMMU", 1): return self.pfree(vm.paddrs[0][0])
 
     assert self.va_allocator is not None, "must be set"
     self.unmap_range(vm.va_addr, vm.size)
     self.va_allocator.free(vm.va_addr)
     for paddr, _ in vm.paddrs: self.pfree(paddr)
 
-  def palloc(self, size:int, align:int=0x1000, zero=True, boot=False, ptable=False) -> int:
+  def palloc(self, size:int, align:int=0x1000, zero=True, boot=False, ptable=False, high=False) -> int:
     assert self.dev.is_booting == boot, "During booting, only boot memory can be allocated"
     allocator = self.boot_allocator if boot else (self.ptable_allocator if self.reserve_ptable and ptable else self.pa_allocator)
-    paddr = allocator.alloc(round_up(size, 0x1000), align)
+    paddr = (allocator.alloc_high if high else allocator.alloc)(round_up(size, 0x1000), align)
     if zero: self.dev.vram[paddr:paddr+size] = bytes(size)
     return paddr
 

@@ -125,7 +125,7 @@ class DSPDevice(Compiled):
       self.ion_fd = os.open('/dev/ion', os.O_RDONLY)
       super().__init__(device, DSPAllocator(self), [DSPRenderer], DSPProgram)
       fastrpc_shell = memoryview(bytearray(pathlib.Path('/dsp/cdsp/fastrpc_shell_3').read_bytes()))
-      self.shell_buf = Buffer(self.device, round_up(fastrpc_shell.nbytes, 0x1000), dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+      self.shell_buf = Buffer(self.device, round_up(fastrpc_shell.nbytes, 0x1000), dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True)
       self.shell_buf.cpu[:fastrpc_shell.nbytes] = fastrpc_shell
 
       self.init_dsp()

@@ -349,11 +349,11 @@ class QCOMDevice(HCQ2Compiled):
     ]) + self.pm_bufferize
 
   @functools.cached_property
-  def dummy(self) -> Buffer: return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True) # cache flush target
+  def dummy(self) -> Buffer: return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True) # cache flush target
 
   @functools.cached_property
   def border_color(self) -> Buffer: # zeros: the samplers clamp to a black border
-    (b:=Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)) \
+    (b:=Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True)) \
       .as_memoryview(force_zero_copy=True)[:] = bytes(0x1000)
     return b
 
@@ -394,7 +394,7 @@ class QCOMDevice(HCQ2Compiled):
   def _ensure_stack_size(self, sz:int) -> Buffer: # one stack for the device, grown to the deepest program's private memory
     if self._stack is None or self._stack.nbytes < sz:
       if self._stack is not None: self.synchronize()
-      self._stack = Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+      self._stack = Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True)
     return self._stack
 
   def _at_profile_finalize(self):

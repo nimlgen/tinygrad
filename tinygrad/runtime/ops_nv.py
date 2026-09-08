@@ -294,7 +294,7 @@ class NVAllocator(LRUAllocator['NVDevice']):
   def _alloc(self, buf:Buffer, opaque=None):
     return self.dev.iface.alloc(buf.nbytes, cpu_access=buf.options.cpu_access, host=buf.options.host, zero=buf.options.zero)
   def _free(self, buf:Buffer): self.dev.iface.free(buf)
-  def _map(self, buf:Buffer) -> tuple[int, Any]: return self.dev.iface.map(buf)
+  def _map(self, buf:Buffer) -> tuple[int, Any]|None: return self.dev.iface.map(buf)
   def _unmap(self, buf:Buffer): self.dev.iface.unmap(buf)
 
   def _encode_decode(self, bufout:Buffer, bufin:Buffer, desc_buf:Buffer, hist:list[Buffer], shape:tuple[int,...], frame_pos:int):
@@ -685,7 +685,7 @@ class NVDevice(HCQ2Compiled):
     self.slm_per_thread = round_up(required, 32)
     bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
     self.shader_local_mem = Buffer(self.device, round_up(bytes_per_tpc*self.num_tpc_per_gpc*self.num_gpcs, 0x20000), dtypes.uint8,
-                                   options=BufferSpec(nolru=True), preallocate=True)
+                                   options=BufferSpec(pinned=True), preallocate=True)
 
     self._submit_cmds(self.fifos["COMPUTE:0"], *nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_A, *data64(self.shader_local_mem.gpu)),
                        *nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, *data64(bytes_per_tpc), 0xff))
@@ -699,7 +699,7 @@ class NVDevice(HCQ2Compiled):
     self.intra_unk_off = (round_up(self.intra_top_off, 0x10000) + (64 << 10)) if intra_unk_size > 0 else None
     filter_sz = round_up(round_up(self.intra_top_off, 0x10000) + (64 << 10) + intra_unk_size, 2 << 20)
 
-    def _vid_buf(sz): return Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(zero=True, nolru=True), preallocate=True)
+    def _vid_buf(sz): return Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(zero=True, pinned=True), preallocate=True)
     if "NVDEC:0" not in self.fifos:
       self.fifos["NVDEC:0"] = self._new_gpu_fifo("NVDEC:0", 0, self.nvdevice, offset=0x200000, entries=2048, video=True)
       self.vid_coloc_buf, self.vid_filter_buf, self.vid_stat_buf = _vid_buf(coloc_sz), _vid_buf(filter_sz), _vid_buf(0x1000)

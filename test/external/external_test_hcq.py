@@ -256,8 +256,8 @@ class TestHCQ(unittest.TestCase):
   def test_copy_bandwidth(self):
     # THEORY: the bandwidth is low here because it's only using one SDMA queue. I suspect it's more stable like this at least.
     SZ = 2_000_000_000
-    a = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
-    b = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
+    a = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(pinned=True)).allocate()
+    b = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(pinned=True)).allocate()
     q = TestHCQ.copy_queue()
     q.copy(a._buf, b._buf, SZ)
     et = _time_queue(q, TestHCQ.d0)
@@ -267,8 +267,8 @@ class TestHCQ(unittest.TestCase):
 
   def test_cross_device_copy_bandwidth(self):
     SZ = 2_000_000_000
-    b = Buffer(f"{Device.DEFAULT}:1", SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
-    a = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(nolru=True)).allocate()
+    b = Buffer(f"{Device.DEFAULT}:1", SZ, dtypes.uint8, options=BufferSpec(pinned=True)).allocate()
+    a = Buffer(Device.DEFAULT, SZ, dtypes.uint8, options=BufferSpec(pinned=True)).allocate()
     TestHCQ.d0._gpu_map(b._buf)
     q = TestHCQ.copy_queue()
     q.copy(a._buf, b._buf, SZ)

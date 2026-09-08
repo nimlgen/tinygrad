@@ -440,7 +440,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool) -> UOp:
 # 5. link
 
 @dataclass
-class LinkCtx: inputs:dict[UOp, UOp]; use_rt:bool; refs:list[UOp] = field(default_factory=list) # noqa: E702
+class LinkCtx: inputs:dict[UOp, UOp]; use_rt:bool; refs:list[UOp] = field(default_factory=list); movable:bool = False # noqa: E702
 
 def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's) owns the linear's buffers, a one-shot borrows ring slots
   if b.tag is None: return None # a param, not a placeholder
@@ -450,7 +450,7 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
   # device owns the placeholders it names
   if (r:=cast(Buffer|None, dev.pm_bufferize.rewrite(b, ctx=dev))) is not None: pass
   elif not ctx.use_rt:
-    spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile, cpu_access=True)
+    spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile, cpu_access=True, pinned=getattr(dev.allocator, '_repacking', False))
     r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
   else: r = dev.rt_view(b.max_numel() * b.dtype.itemsize, b.dtype, host=b.arg.volatile)
 
@@ -460,6 +460,8 @@ def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
   buf, off = unwrap_view(g.src[0])
   if buf.op not in {Ops.BUFFER, Ops.MSELECT}: return None
   ctx.refs.append(buf) # add to refs
+  b = cast(Buffer, buf.buffer) # a repack moves it: this link goes stale with the generation
+  ctx.movable |= not (b.options.pinned or b.options.host or Device[b.device].allocator.host)
   return UOp.const(cast(Buffer, buf.buffer).addr(to_tuple(g.arg)[0]) + off, dtypes.uint64)
 
 def fold_binary(buf:UOp, blob:UOp) -> UOp:
@@ -492,17 +494,23 @@ pm_link = PatternMatcher([
 ])
 
 link_linear_cache:weakref.WeakKeyDictionary[UOp, UOp] = weakref.WeakKeyDictionary() # a baked link lives as long as its bound linear
+link_gen:weakref.WeakKeyDictionary[UOp, int] = weakref.WeakKeyDictionary() # the generation a link baked movable addresses at
+def stale(linked:UOp) -> bool: return link_gen.get(linked, Allocator.generation) != Allocator.generation
 
 @rewrite_group(lambda _,input_uops=None,allow_cache=True,ret=None: f"HCQ Link {pluralize('Kernel', len(ret.src))}")
 def hcq_link(linear:UOp, input_uops:list[UOp]|None=None, allow_cache=True) -> UOp:
-  if allow_cache and (linked:=link_linear_cache.get(linear)) is not None: return linked
+  if allow_cache and (linked:=link_linear_cache.get(linear)) is not None and not stale(linked): return linked
 
   # if we have any link time buffers, do not cache this linear
   cache = allow_cache and not any(u.tag == "lt_input" for u in linear.toposort() if u.op is Ops.PARAM)
 
   inputs = {UOp.param(i, b.dtype, b.max_numel(), b.device).replace(tag="lt_input"): b for i, b in enumerate(input_uops or ())}
-  linked = graph_rewrite(linear, pm_link, ctx=(ctx:=LinkCtx(inputs, use_rt=allow_cache and not cache)), walk=True, name="link")
+  while True: # an allocation inside the link can repack: then the addresses baked so far are stale, link again
+    gen = Allocator.generation
+    linked = graph_rewrite(linear, pm_link, ctx=(ctx:=LinkCtx(inputs, use_rt=allow_cache and not cache)), walk=True, name="link")
+    if gen == Allocator.generation: break
   if ctx.refs: linked = linked.replace(src=(linked.src[0].after(*dedup(ctx.refs)), *linked.src[1:])) # attach refs to linear
+  if ctx.movable: link_gen[linked] = gen
   if cache and linked is not linear: link_linear_cache[linear] = linked
   return linked
 
@@ -524,7 +532,7 @@ class HCQ2Compiled(Compiled):
     self.pm_bufferize = PatternMatcher([
       (UPat(Ops.PARAM, tag="timeline"), lambda ctx: ctx.timeline),
       (UPat(Ops.PARAM, tag="program", name="b"),
-       lambda ctx, b: ctx.prog_bufs.setdefault(b, Buffer(ctx.device, b.max_numel(), b.dtype, options=BufferSpec(cpu_access=True, nolru=True)))),
+       lambda ctx, b: ctx.prog_bufs.setdefault(b, Buffer(ctx.device, b.max_numel(), b.dtype, options=BufferSpec(cpu_access=True, pinned=True)))),
       (UPat(Ops.PARAM, name="b"), lambda b: cfunc_buf(*b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == "cfunc" else None),
     ])
     super().__init__(device, allocator, compilers, runtime, None, arch=arch)
@@ -563,7 +571,7 @@ class HCQ2Compiled(Compiled):
 
   @functools.cache
   def rt_buffer(self, uncached:bool=True, host:bool=False) -> Buffer:
-    spec = BufferSpec(host=host, uncached=uncached, cpu_access=True)
+    spec = BufferSpec(host=host, uncached=uncached, cpu_access=True, pinned=True)
     return Buffer(self.device, self.rt_allocator(uncached, host).size, dtypes.uint8, options=spec, preallocate=True)
 
   def rt_view(self, nbytes:int, dtype:DType=dtypes.uint8, uncached:bool=True, host:bool=False) -> Buffer: # a slot of the ring, wraps silently

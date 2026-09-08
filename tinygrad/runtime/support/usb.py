@@ -471,17 +471,17 @@ pm_usb_lower = PatternMatcher([
 
 @functools.cache
 def _host_block(dev) -> Buffer: # link, staging, zeros
-  b = Buffer("CPU", 0x180020, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+  b = Buffer("CPU", 0x180020, dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True)
   b.cpu[:16] = struct.pack('QQ', *[ctypes.addressof(x.contents) for x in (dev.iface.pci_dev.usb.usb.handle, USB3.ctx())])
   return b
 @functools.cache
 def _xfer(dev, tag:str) -> Buffer: # fixed fields; status, length, buffer change per chunk
   t = libusb.libusb_alloc_transfer(0).contents
   t.dev_handle, t.endpoint, t.type, t.timeout = dev.iface.pci_dev.usb.usb.handle, 0x02, libusb.LIBUSB_TRANSFER_TYPE_BULK, 10000
-  return Buffer("CPU", ctypes.sizeof(t), dtypes.uint8, options=BufferSpec(external_ptr=ctypes.addressof(t), nolru=True), preallocate=True)
+  return Buffer("CPU", ctypes.sizeof(t), dtypes.uint8, options=BufferSpec(external_ptr=ctypes.addressof(t), pinned=True), preallocate=True)
 @functools.cache
 def _words(dev) -> Buffer: # zero the read signal and scratch
-  b = Buffer(dev.device, 2, dtypes.uint32, options=BufferSpec(uncached=True, cpu_access=True, nolru=True), preallocate=True)
+  b = Buffer(dev.device, 2, dtypes.uint32, options=BufferSpec(uncached=True, cpu_access=True, pinned=True), preallocate=True)
   b.cpu.view(fmt='B')[:8] = bytes(8)
   return b
 pm_usb_bufferize = PatternMatcher([

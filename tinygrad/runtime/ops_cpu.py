@@ -1,7 +1,7 @@
 from __future__ import annotations
 import platform, sys, ctypes, mmap, struct, time
 from typing import cast, Any
-from tinygrad.helpers import OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le
+from tinygrad.helpers import OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le, STATIC_MAP
 from tinygrad.device import Buffer, LRUAllocator, TinyELF, Program, Device
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.hcq2 import HCQ2Compiled
@@ -79,10 +79,18 @@ class HostAllocator(LRUAllocator): # CPU, PYTHON and NPY: host memory, an mmap w
   def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
   def _alloc(self, buf:Buffer, opaque:Any=None) -> tuple[int|None, MMIOInterface|None, Any]:
     if opaque is None and buf.options.external_ptr is None:
+      if STATIC_MAP: # host memory comes from the pinned pool every static device maps at boot
+        from tinygrad.runtime.support.system import System
+        view, _, pool = System.host_pool
+        return (va:=pool.alloc(buf.nbytes, 0x1000)), view.view(va - view.addr, buf.nbytes), None
       opaque = mmap.mmap(-1, buf.nbytes, access=mmap.ACCESS_WRITE) if WIN else \
         mmap.mmap(-1, buf.nbytes, mmap.MAP_ANON|mmap.MAP_SHARED, mmap.PROT_READ|mmap.PROT_WRITE)
     addr = unwrap(buf.options.external_ptr) if opaque is None else mv_address(mv) if (mv:=memoryview(opaque)).nbytes else 0
     return addr, MMIOInterface(addr, buf.nbytes), opaque
+  def _free(self, buf:Buffer):
+    if STATIC_MAP and buf.data is None and buf.options.external_ptr is None:
+      from tinygrad.runtime.support.system import System
+      System.host_pool[2].free(buf.gpu)
   def _map(self, buf:Buffer) -> tuple[int, Any]: return buf.cpu.addr, None # the host view is the mapping
 
 class CPUDevice(HCQ2Compiled):

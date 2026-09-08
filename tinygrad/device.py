@@ -1,8 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import defaultdict
-from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct
+from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, ClassVar, TYPE_CHECKING
+import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, weakref
 from tinygrad.helpers import LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import cpu_profile
@@ -84,7 +84,7 @@ class BufferSpec:
   uncached: bool = False
   cpu_access: bool = False
   host: bool = False
-  nolru: bool = False
+  pinned: bool = False # the runtime's own memory: never recycled, never relocated
   zero: bool = False
   external_ptr: int|None = None
 
@@ -129,7 +129,7 @@ class Buffer:
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
   def allocate(self, opaque=None, external_ptr=None) -> Buffer:
     if external_ptr is not None: self.options = replace(self.options, external_ptr=external_ptr)
-    if opaque is not None: self.options = replace(self.options, nolru=True) # someone else's memory, never recycled
+    if opaque is not None: self.options = replace(self.options, pinned=True) # someone else's memory, never recycled
     if self._base is not None:
       self._base.ensure_allocated()
       return self
@@ -139,6 +139,7 @@ class Buffer:
       raise RuntimeError(f"buffer of size {self.size/1e6:.2f}M is too large")
     # opaque is the runtime's own handle, or an already built (gpu, cpu, data) storage
     self._mem = opaque if isinstance(opaque, tuple) else self.allocator.alloc(self, opaque)
+    self.allocator.live.add(self)
     if not self.device.startswith("DISK") and self.options.external_ptr is None:
       GlobalCounters.mem_used += self.nbytes
       GlobalCounters.mem_used_per_device[self.device] += self.nbytes
@@ -184,7 +185,9 @@ class Buffer:
   def addr(self, device:str) -> int: # the address a compute device sees, mapping on demand
     b = self.base.ensure_allocated() # first: recycled storage comes with its mappings
     if (device:=Device.canonicalize(device)) == self.device: return self.gpu
-    if device not in b._maps: b._maps[device] = Device[device].allocator._map(b)
+    if device not in b._maps:
+      if (m:=Device[device].allocator._map(b)) is None: raise RuntimeError(f"{b} can't be mapped to {device}")
+      b._maps[device] = m
     return b._maps[device][0] + self.offset
   def _host_mv(self) -> memoryview|None: # the bytes as a host memoryview when the storage has one, no sync
     return self.cpu.view(fmt='B').mv if self.is_allocated() and hasattr(unwrap(self.base._mem)[1], 'mv') else None
@@ -216,9 +219,11 @@ DeviceType = TypeVar('DeviceType', bound='Compiled')
 
 class Allocator(Generic[DeviceType]):
   host:bool = False # host memory: a compute device maps it by its host address
+  generation:ClassVar[int] = 0 # bumps when live addresses move (a repack): every linked address is stale
   def __init__(self, dev:DeviceType, supports_copy_from_disk:bool=True, supports_transfer:bool=True):
     self.dev: DeviceType = dev
     self.supports_copy_from_disk, self.supports_transfer = supports_copy_from_disk, supports_transfer
+    self.live:weakref.WeakSet[Buffer] = weakref.WeakSet() # the bases with storage
   # overridden in LRUAllocator
   def alloc(self, buf:Buffer, opaque:Any=None) -> tuple[int|None, MMIOInterface|None, Any]:
     assert opaque is not None or buf.nbytes > 0, f"alloc size must be positive, getting {buf.nbytes}"
@@ -230,12 +235,15 @@ class Allocator(Generic[DeviceType]):
       Device[dev].synchronize()
       Device[dev].allocator._unmap(buf)
     self._free(buf)
+    self.live.discard(buf)
     buf._mem, buf._maps = None, {}
+  def repack(self): pass # compact the memory: live buffers move, the generation bumps
 
   # implemented by the runtime. every hook gets the Buffer: nbytes, options, gpu, cpu, data
   def _alloc(self, buf:Buffer, opaque:Any=None) -> tuple[int|None, MMIOInterface|None, Any]: raise NotImplementedError("need alloc")
   def _free(self, buf:Buffer): pass  # if the storage is a Python object, you don't need a free
-  def _map(self, buf:Buffer) -> tuple[int, Any]: raise NotImplementedError("need map") # (gpu, data): a base on another device as self.dev sees it
+  # (gpu, data): a base on another device as self.dev sees it, None when it can't be reached
+  def _map(self, buf:Buffer) -> tuple[int, Any]|None: raise NotImplementedError("need map")
   def _unmap(self, buf:Buffer): pass # reads buf._maps[self.dev.device]
   def _copyin(self, buf:Buffer, src:memoryview):
     self.dev.synchronize()
@@ -258,10 +266,10 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
     if opaque is None and len(c := self.cache[(buf.nbytes, buf.options)]):
       mem, buf._maps = c.pop()
       return mem
-    try: return super().alloc(buf, opaque)
-    except (RuntimeError, MemoryError):
-      self.free_cache()
-      return super().alloc(buf, opaque)
+    for fix in (self.free_cache, self.repack):
+      try: return super().alloc(buf, opaque)
+      except MemoryError: fix()
+    return super().alloc(buf, opaque)
   def free_cache(self):
     for (sz, options), mems in self.cache.items():
       for mem, maps in mems:
@@ -269,8 +277,9 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
         super().free(h)
       mems.clear()
   def free(self, buf:Buffer):
-    if LRU and not (buf.options.nolru or buf.options.zero) and buf.options.external_ptr is None:
+    if LRU and not (buf.options.pinned or buf.options.zero) and buf.options.external_ptr is None:
       self.cache[(buf.nbytes, buf.options)].append((buf._mem, buf._maps))
+      self.live.discard(buf)
       buf._mem, buf._maps = None, {}
     else: super().free(buf)
 

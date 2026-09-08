@@ -323,3 +323,23 @@ class TestHCQ2FFI(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+@unittest.skipUnless(Device.DEFAULT == "AMD" and getattr(Device["AMD"].iface, 'static', False), "repack needs STATIC_MAP on AM")
+class TestRepack(unittest.TestCase):
+  def test_repack(self):
+    from tinygrad import TinyJit
+    from tinygrad.device import Allocator
+    dev, mb = Device["AMD"], 1 << 20
+    free = dev.iface.dev_impl.mm.pa_allocator.size - sum(b.nbytes for b in dev.allocator.live if b.data.mapping is not None)
+    n, sz = 9, (free // 10) // (256 * mb) * (256 * mb) # nine blocks, ~90% of vram, then every other one goes: no hole fits two
+    ts = [Tensor.full((sz // 4,), float(i + 1)).contiguous().realize() for i in range(n)]
+    @TinyJit
+    def f(x): return (x * 2).sum()
+    for _ in range(3): before = f(ts[0]).item()
+    for i in range(1, n, 2): ts[i] = None
+    gen = Allocator.generation
+    big = Tensor.full((2 * sz // 4,), 9.0).contiguous().realize() # only fits after a repack
+    self.assertEqual(Allocator.generation, gen + 1)
+    for i in range(0, n, 2): self.assertEqual(ts[i].uop.buffer.as_memoryview().cast('f')[::sz // 256].tolist(), [float(i + 1)] * 64)
+    self.assertEqual(big.uop.buffer.as_memoryview().cast('f')[::sz // 256].tolist(), [9.0] * 128)
+    self.assertEqual(f(ts[0]).item(), before) # the jit relinks

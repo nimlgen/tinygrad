@@ -1,11 +1,11 @@
 from __future__ import annotations
 import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket
-from typing import Any
-from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, pluralize
+from typing import Any, ClassVar
+from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, DEV, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
 from tinygrad.device import Device, Buffer
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, hcq_filter_visible_devices
-from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator
+from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, TLSFAllocator
 from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
 
 MAP_FIXED, MAP_FIXED_NOREPLACE = 0x10, 0x100000
@@ -55,6 +55,26 @@ class _System:
   def system_paddrs(self, vaddr:int, size:int) -> list[int]:
     self.pagemap.seek(vaddr // mmap.PAGESIZE * 8)
     return [(x & ((1<<55) - 1)) * mmap.PAGESIZE for x in array.array('Q', self.pagemap.read(size//mmap.PAGESIZE*8, binary=True))]
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    assert not contiguous or size <= (2 << 20), "Contiguous allocation is only supported for sizes up to 2MB"
+    flags = (libc.MAP_HUGETLB if contiguous and (size:=round_up(size, mmap.PAGESIZE)) > mmap.PAGESIZE else 0) | (MAP_FIXED if vaddr else 0)
+    va = FileIOInterface.anon_mmap(vaddr, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS|MAP_POPULATE|MAP_LOCKED|flags, 0)
+    sysmem_view, paddrs = MMIOInterface(va, size), [(x, mmap.PAGESIZE) for x in self.system_paddrs(va, size)]
+    return sysmem_view, [p + i for p, sz in paddrs for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+
+  @functools.cached_property
+  def host_pool(self) -> tuple[MMIOInterface, list[tuple[int, int]], TLSFAllocator]: # pinned host memory at a fixed va, in every static device
+    self.reserve_va(Static.base, Static.size)
+    size = getenv("HOST_POOL_MB", 256 if DEV.interface.startswith("MOCK") else 4096) << 20
+    va = FileIOInterface.anon_mmap(Static.pool, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_PRIVATE|mmap.MAP_ANONYMOUS|MAP_FIXED, 0)
+    libc.madvise(va, size, getattr(mmap, "MADV_HUGEPAGE", 14)) # huge pages make 2MB ptes: ~2k page table writes for 4GB instead of 1M
+    self.lock_memory(va, size)
+    runs:list[tuple[int, int]] = [] # the physically contiguous runs
+    for p in self.system_paddrs(va, size):
+      if runs and runs[-1][0] + runs[-1][1] == p: runs[-1] = (runs[-1][0], runs[-1][1] + 0x1000)
+      else: runs.append((p, 0x1000))
+    return MMIOInterface(va, size), runs, TLSFAllocator(size, base=va)
 
   def pci_scan_bus(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None) -> list[str]:
     all_devs = []
@@ -196,11 +216,7 @@ class PCIDevice:
     self.cfg_fd = FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/config", os.O_RDWR | os.O_SYNC | os.O_CLOEXEC)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
-    assert not contiguous or size <= (2 << 20), "Contiguous allocation is only supported for sizes up to 2MB"
-    flags = (libc.MAP_HUGETLB if contiguous and (size:=round_up(size, mmap.PAGESIZE)) > mmap.PAGESIZE else 0) | (MAP_FIXED if vaddr else 0)
-    va = FileIOInterface.anon_mmap(vaddr, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS|MAP_POPULATE|MAP_LOCKED|flags, 0)
-    sysmem_view, paddrs = MMIOInterface(va, size), [(x, mmap.PAGESIZE) for x in System.system_paddrs(va, size)]
-    return sysmem_view, [p + i for p, sz in paddrs for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+    return System.alloc_sysmem(size, vaddr, contiguous)
 
   def reset(self): os.system(f"sudo sh -c 'echo 1 > /sys/bus/pci/devices/{self.pcibus}/reset'")
   def read_config(self, offset:int, size:int): return int.from_bytes(self.cfg_fd.read(size, binary=True, offset=offset), byteorder='little')
@@ -248,9 +264,17 @@ class USBPCIDevice(PCIDevice):
   def resize_bar(self, bar_idx:int): pass # already resized
 
 @dataclasses.dataclass
-class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=0 # noqa: E702
+class PCIAllocationMeta: mapping:VirtMapping|None; has_cpu_mapping:bool; hMemory:int=0 # noqa: E702 # no mapping: a carve-out of the host pool
+
+class Static: # STATIC_MAP's fixed va layout: a 1TB slot per device (vram at the cached window, uncached window at +512GB), then the host pool
+  base, slot = 0x400000000000, 1 << 40
+  pool, size = base + 16 * slot, 17 << 40
+  @staticmethod
+  def vram(dev_id:int) -> int: return Static.base + dev_id * Static.slot
 
 class PCIIfaceBase:
+  static:bool = False # STATIC_MAP: everything a device can address is mapped at boot, nothing touches the page tables after
+  static_devs:ClassVar[list[PCIIfaceBase]] = []
   @property
   def peer_group(self) -> str: return getattr(self.pci_dev, 'peer_group', type(self.pci_dev).__name__)
   def is_bar_small(self) -> bool: return self.pci_dev.bar_info(self.vram_bar)[1] == (256 << 20)
@@ -260,35 +284,61 @@ class PCIIfaceBase:
     self.pci_dev = System.pci_probe_device(dn:=dev.__class__.__name__[:-6], dev_id, vendor, devices, base_class=base_class)
     System.reserve_va(va_start, va_size)
     with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
+    if self.static: # the bar lands at the identity va, so a vram buffer has cpu == gpu
+      System.reserve_va(Static.base, Static.size)
+      self.pci_dev.static_va = Static.vram(dev_id)
     self.dev_impl = dev_impl_t(self.pci_dev)
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
+    if self.static: # the host pool and every open peer's vram, both ways
+      view, runs, _ = System.host_pool
+      self.dev_impl.mm.map_range(view.addr, view.nbytes, runs, aspace=AddrSpace.SYS, snooped=True, uncached=True)
+      for peer in PCIIfaceBase.static_devs:
+        self._map_peer(peer)
+        peer._map_peer(self)
+      PCIIfaceBase.static_devs.append(self)
 
-  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False, **kwargs) -> tuple:
+  def _map_peer(self, peer:PCIIfaceBase): # the peer's vram at its own identity windows
+    for uncached in (False, True):
+      paddrs, aspace = peer.p2p_paddrs([(0, peer.dev_impl.mm.vram_size)])
+      self.dev_impl.mm.map_range(peer.dev_impl.mm.identity_va(uncached), peer.dev_impl.mm.vram_size, paddrs, aspace=aspace, snooped=True,
+                                 uncached=uncached)
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False, pinned=False,
+            **kwargs) -> tuple:
     should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
 
+    if self.static and should_use_sysmem: # a carve-out of the pool
+      view, _, pool = System.host_pool
+      return (va:=pool.alloc(size, mmap.PAGESIZE)), view.view(va - view.addr, size), PCIAllocationMeta(None, has_cpu_mapping=False)
     if should_use_sysmem:
       vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return vaddr, memview, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0])
 
-    mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
-    barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
-    return mapping.va_addr, barview, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0])
+    mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero, pinned=pinned)
+    if self.static: barview = self.dev_impl.vram.view(mapping.paddrs[0][0], size) if cpu_access else None # the bar is at the identity va
+    else: barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
+    return mapping.va_addr, barview, PCIAllocationMeta(mapping, cpu_access and not self.static, hMemory=mapping.paddrs[0][0])
 
   def free(self, b:Buffer): # the owner's memory
+    if b.data.mapping is None: return System.host_pool[2].free(b.gpu)
     if b.data.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(b.data.mapping)
     if b.data.has_cpu_mapping: FileIOInterface.munmap(b.gpu, b.data.mapping.size)
 
-  def unmap(self, b:Buffer): self.dev_impl.mm.unmap_range(*b._maps[self.dev.device][1])
+  def unmap(self, b:Buffer):
+    if not self.static: self.dev_impl.mm.unmap_range(*b._maps[self.dev.device][1])
 
   def p2p_paddrs(self, paddrs:list[tuple[int,int]]) -> tuple[list[tuple[int,int]], AddrSpace]:
     return [(p + self.pci_dev.bar_info(self.vram_bar)[0], sz) for p, sz in paddrs], AddrSpace.SYS
 
-  def map(self, b:Buffer) -> tuple[int, Any]: # another device's memory at the same address: (gpu, the mapped range)
+  def map(self, b:Buffer) -> tuple[int, Any]|None: # another device's memory at the same address: (gpu, the mapped range)
+    if self.static: # the pool and the static peers are mapped at boot, nothing else is reachable
+      pool, ifa = System.host_pool[0], getattr(Device[b.device], "iface", None)
+      return (b.gpu, None) if pool.addr <= b.gpu < pool.addr + pool.nbytes or ifa in PCIIfaceBase.static_devs else None
     if Device[b.device].allocator.host: # the covering pages of the host memory
       lo, size = b.gpu & ~0xfff, round_up(b.gpu + b.nbytes, 0x1000) - (b.gpu & ~0xfff)
       System.lock_memory(lo, size)

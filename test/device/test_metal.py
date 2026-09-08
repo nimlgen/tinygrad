@@ -57,7 +57,7 @@ kernel void r_5(device int* data0, const device int* data1, uint3 gid [[threadgr
     device = Device['METAL']
     before = device.sysdevice.currentAllocatedSize()
 
-    buf = Buffer(device.device, size, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+    buf = Buffer(device.device, size, dtypes.uint8, options=BufferSpec(pinned=True), preallocate=True)
     self.assertEqual(curr:=device.sysdevice.currentAllocatedSize(), before+size, msg=f"{curr=} - {before=}")
     buf.deallocate()
     self.assertEqual(curr:=device.sysdevice.currentAllocatedSize(), before, msg=f"{curr=} - {before=}")

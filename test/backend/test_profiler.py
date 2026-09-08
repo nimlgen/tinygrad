@@ -79,7 +79,7 @@ class TestProfiler(unittest.TestCase):
     self.test_profile_kernel_run(wait=True)
 
   def test_profile_copyin(self):
-    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(nolru=True)).ensure_allocated()
+    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(pinned=True)).ensure_allocated()
 
     with helper_collect_profile(TestProfiler.d0) as profile:
       buf1.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 1)))))
@@ -89,7 +89,7 @@ class TestProfiler(unittest.TestCase):
 
   def test_profile_multiops(self):
     runner_name = TestProfiler.runtime.name
-    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(nolru=True)).ensure_allocated()
+    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(pinned=True)).ensure_allocated()
 
     with helper_collect_profile(TestProfiler.d0) as profile:
       buf1.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 1)))))
@@ -111,8 +111,8 @@ class TestProfiler(unittest.TestCase):
     try: d1 = Device[f"{Device.DEFAULT}:1"]
     except Exception as e: self.skipTest(f"second device not available {e}")
 
-    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(nolru=True)).ensure_allocated()
-    buf2 = Buffer(f"{Device.DEFAULT}:1", 2, dtypes.float, options=BufferSpec(nolru=True)).ensure_allocated()
+    buf1 = Buffer(Device.DEFAULT, 2, dtypes.float, options=BufferSpec(pinned=True)).ensure_allocated()
+    buf2 = Buffer(f"{Device.DEFAULT}:1", 2, dtypes.float, options=BufferSpec(pinned=True)).ensure_allocated()
 
     with helper_collect_profile(TestProfiler.d0, d1) as profile:
       buf1.copy_from(Buffer("PYTHON", 2, dtypes.float, opaque=memoryview(bytearray(struct.pack("ff", 0, 1)))))
