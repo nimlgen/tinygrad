@@ -306,7 +306,7 @@ class PCIIfaceBase:
       if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")
       if ifa.peer_group != self.peer_group: raise RuntimeError(f"P2P mapping across peer groups: {b.device} -> {self.dev.device}")
       lo, size, snooped, uncached = b._buf, b.meta.mapping.size, True, b.meta.mapping.uncached
-      if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace = b.meta.mapping.paddrs, AddrSpace.SYS
+      if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace, snooped = b.meta.mapping.paddrs, AddrSpace.SYS, b.meta.mapping.snooped
       else: paddrs, aspace = ifa.p2p_paddrs(b.meta.mapping.paddrs)
     else: raise RuntimeError(f"map failed: {b.device} -> {self.dev.device}")
 
@@ -407,5 +407,6 @@ class RemotePCIDevice(PCIDevice):
   # programs run on the node with raw u64 args: the addresses of its memory
   def load_prog(self, elf) -> int: return self.rpc(RemoteCmd.LOAD_PROG, len(data:=pickle.dumps(elf)), payload=data)[0]
   def exec_prog(self, handle:int, args:list[int], wait:bool=False) -> float|None:
-    if wait: return self.rpc(RemoteCmd.EXEC_PROG, handle, len(args), 1, payload=struct.pack(f'<{len(args)}Q', *args))[0] / 1e9
-    return self.post(RemoteCmd.EXEC_PROG, handle, len(args), 0, payload=struct.pack(f'<{len(args)}Q', *args))
+    payload = struct.pack(f'<{len(args)}Q', *(a & 0xffffffffffffffff for a in args))
+    if wait: return self.rpc(RemoteCmd.EXEC_PROG, handle, len(args), 1, payload=payload)[0] / 1e9
+    return self.post(RemoteCmd.EXEC_PROG, handle, len(args), 0, payload=payload)

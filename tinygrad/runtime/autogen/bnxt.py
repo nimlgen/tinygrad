@@ -433,6 +433,70 @@ class struct_hwrm_port_phy_cfg_output(c.Struct):
   valid: int
 struct_hwrm_port_phy_cfg_output.register_fields([('error_code', ctypes.c_uint16, 0), ('req_type', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('resp_len', ctypes.c_uint16, 6), ('unused_0', c.Array[ctypes.c_ubyte, Literal[7]], 8), ('valid', ctypes.c_ubyte, 15)])
 @c.record
+class struct_hwrm_port_phy_qcfg_input(c.Struct):
+  SIZE = 24
+  req_type: int
+  cmpl_ring: int
+  seq_id: int
+  target_id: int
+  resp_addr: int
+  port_id: int
+  unused_0: c.Array[ctypes.c_ubyte, Literal[6]]
+struct_hwrm_port_phy_qcfg_input.register_fields([('req_type', ctypes.c_uint16, 0), ('cmpl_ring', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('target_id', ctypes.c_uint16, 6), ('resp_addr', ctypes.c_uint64, 8), ('port_id', ctypes.c_uint16, 16), ('unused_0', c.Array[ctypes.c_ubyte, Literal[6]], 18)])
+@c.record
+class struct_hwrm_port_phy_qcfg_output(c.Struct):
+  SIZE = 104
+  error_code: int
+  req_type: int
+  seq_id: int
+  resp_len: int
+  link: int
+  active_fec_signal_mode: int
+  link_speed: int
+  duplex_cfg: int
+  pause: int
+  support_speeds: int
+  force_link_speed: int
+  auto_mode: int
+  auto_pause: int
+  auto_link_speed: int
+  auto_link_speed_mask: int
+  wirespeed: int
+  lpbk: int
+  force_pause: int
+  module_status: int
+  preemphasis: int
+  phy_maj: int
+  phy_min: int
+  phy_bld: int
+  phy_type: int
+  media_type: int
+  xcvr_pkg_type: int
+  eee_config_phy_addr: int
+  parallel_detect: int
+  link_partner_adv_speeds: int
+  link_partner_adv_auto_mode: int
+  link_partner_adv_pause: int
+  adv_eee_link_speed_mask: int
+  link_partner_adv_eee_link_speed_mask: int
+  xcvr_identifier_type_tx_lpi_timer: int
+  fec_cfg: int
+  duplex_state: int
+  option_flags: int
+  phy_vendor_name: c.Array[ctypes.c_char, Literal[16]]
+  phy_vendor_partnumber: c.Array[ctypes.c_char, Literal[16]]
+  support_pam4_speeds: int
+  force_pam4_link_speed: int
+  auto_pam4_link_speed_mask: int
+  link_partner_pam4_adv_speeds: int
+  link_down_reason: int
+  support_speeds2: int
+  force_link_speeds2: int
+  auto_link_speeds2: int
+  active_lanes: int
+  valid: int
+struct_hwrm_port_phy_qcfg_output.register_fields([('error_code', ctypes.c_uint16, 0), ('req_type', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('resp_len', ctypes.c_uint16, 6), ('link', ctypes.c_ubyte, 8), ('active_fec_signal_mode', ctypes.c_ubyte, 9), ('link_speed', ctypes.c_uint16, 10), ('duplex_cfg', ctypes.c_ubyte, 12), ('pause', ctypes.c_ubyte, 13), ('support_speeds', ctypes.c_uint16, 14), ('force_link_speed', ctypes.c_uint16, 16), ('auto_mode', ctypes.c_ubyte, 18), ('auto_pause', ctypes.c_ubyte, 19), ('auto_link_speed', ctypes.c_uint16, 20), ('auto_link_speed_mask', ctypes.c_uint16, 22), ('wirespeed', ctypes.c_ubyte, 24), ('lpbk', ctypes.c_ubyte, 25), ('force_pause', ctypes.c_ubyte, 26), ('module_status', ctypes.c_ubyte, 27), ('preemphasis', ctypes.c_uint32, 28), ('phy_maj', ctypes.c_ubyte, 32), ('phy_min', ctypes.c_ubyte, 33), ('phy_bld', ctypes.c_ubyte, 34), ('phy_type', ctypes.c_ubyte, 35), ('media_type', ctypes.c_ubyte, 36), ('xcvr_pkg_type', ctypes.c_ubyte, 37), ('eee_config_phy_addr', ctypes.c_ubyte, 38), ('parallel_detect', ctypes.c_ubyte, 39), ('link_partner_adv_speeds', ctypes.c_uint16, 40), ('link_partner_adv_auto_mode', ctypes.c_ubyte, 42), ('link_partner_adv_pause', ctypes.c_ubyte, 43), ('adv_eee_link_speed_mask', ctypes.c_uint16, 44), ('link_partner_adv_eee_link_speed_mask', ctypes.c_uint16, 46), ('xcvr_identifier_type_tx_lpi_timer', ctypes.c_uint32, 48), ('fec_cfg', ctypes.c_uint16, 52), ('duplex_state', ctypes.c_ubyte, 54), ('option_flags', ctypes.c_ubyte, 55), ('phy_vendor_name', c.Array[ctypes.c_char, Literal[16]], 56), ('phy_vendor_partnumber', c.Array[ctypes.c_char, Literal[16]], 72), ('support_pam4_speeds', ctypes.c_uint16, 88), ('force_pam4_link_speed', ctypes.c_uint16, 90), ('auto_pam4_link_speed_mask', ctypes.c_uint16, 92), ('link_partner_pam4_adv_speeds', ctypes.c_ubyte, 94), ('link_down_reason', ctypes.c_ubyte, 95), ('support_speeds2', ctypes.c_uint16, 96), ('force_link_speeds2', ctypes.c_uint16, 98), ('auto_link_speeds2', ctypes.c_uint16, 100), ('active_lanes', ctypes.c_ubyte, 102), ('valid', ctypes.c_ubyte, 103)])
+@c.record
 class struct_hwrm_vnic_alloc_input(c.Struct):
   SIZE = 24
   req_type: int
@@ -892,6 +956,31 @@ class struct_creq_register_mr_resp(c.Struct):
   event: int
   reserved48: c.Array[ctypes.c_ubyte, Literal[6]]
 struct_creq_register_mr_resp.register_fields([('type', ctypes.c_ubyte, 0), ('status', ctypes.c_ubyte, 1), ('cookie', ctypes.c_uint16, 2), ('xid', ctypes.c_uint32, 4), ('v', ctypes.c_ubyte, 8), ('event', ctypes.c_ubyte, 9), ('reserved48', c.Array[ctypes.c_ubyte, Literal[6]], 10)])
+@c.record
+class struct_cmdq_deregister_mr(c.Struct):
+  SIZE = 24
+  opcode: int
+  cmd_size: int
+  flags: int
+  cookie: int
+  resp_size: int
+  reserved8: int
+  resp_addr: int
+  lkey: int
+  unused_0: int
+struct_cmdq_deregister_mr.register_fields([('opcode', ctypes.c_ubyte, 0), ('cmd_size', ctypes.c_ubyte, 1), ('flags', ctypes.c_uint16, 2), ('cookie', ctypes.c_uint16, 4), ('resp_size', ctypes.c_ubyte, 6), ('reserved8', ctypes.c_ubyte, 7), ('resp_addr', ctypes.c_uint64, 8), ('lkey', ctypes.c_uint32, 16), ('unused_0', ctypes.c_uint32, 20)])
+@c.record
+class struct_creq_deregister_mr_resp(c.Struct):
+  SIZE = 16
+  type: int
+  status: int
+  cookie: int
+  xid: int
+  v: int
+  event: int
+  reserved16: int
+  bound_windows: int
+struct_creq_deregister_mr_resp.register_fields([('type', ctypes.c_ubyte, 0), ('status', ctypes.c_ubyte, 1), ('cookie', ctypes.c_uint16, 2), ('xid', ctypes.c_uint32, 4), ('v', ctypes.c_ubyte, 8), ('event', ctypes.c_ubyte, 9), ('reserved16', ctypes.c_uint16, 10), ('bound_windows', ctypes.c_uint32, 12)])
 @c.record
 class struct_cmdq_add_gid(c.Struct):
   SIZE = 48

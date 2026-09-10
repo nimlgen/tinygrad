@@ -3,12 +3,12 @@ from typing import cast, Any
 import os, ctypes, struct, functools, importlib, mmap, errno, contextlib, sys, hashlib, itertools, collections, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass, replace
-from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, to_name, patch, unwrap_view, rt_addr
+from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, to_name, patch, unwrap_view, rt_addr, is_rdma, RDMA_CHUNK
 from tinygrad.uop.ops import sint, UOp, ProgramInfo
 from tinygrad.device import BufferStorage, BufferSpec, Buffer, Device, Allocator, Compiled, ProfileProgramEvent
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, prod, colored
-from tinygrad.helpers import ceildiv, unwrap, pluralize, HCQ2, ContextVar, VIZ
+from tinygrad.helpers import ceildiv, unwrap, pluralize, HCQ2, ContextVar, VIZ, to_tuple
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.runtime.autogen import kfd, hsa, sqtt, amdgpu_kd, amdgpu_drm
@@ -70,6 +70,8 @@ class AMDComputeQueue(HWQueue):
     super().__init__(ctx, submit)
     self.pm4, self.gc, self.soc, self.nbio, self.target = self.dev.pm4, self.dev.gc, self.dev.soc, self.dev.nbio, self.dev.target
     self.profiled:list[UOp] = []
+    self.nic_posts:list[UOp] = []
+    self.nic_counts:dict[UOp, UOp] = {}
     if self.dev.pmc_enabled: self.pmc_start()
 
   def pkt3(self, cmd, *vals): self.q(self.pm4.PACKET3(cmd, _dw(vals) - 1), *vals)
@@ -398,6 +400,50 @@ class AMDComputeQueue(HWQueue):
     self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
     self.prof_stop(slot)
 
+  def copy(self, call:UOp):
+    from tinygrad.runtime.autogen import bnxt
+    from tinygrad.runtime.support.bnxt import db_value, send_wqe, recv_wqe, MTU
+    assert is_rdma(call)
+    dst, src = get_call_arg_uops(call)
+    recv = call.src[0].arg == "recv"
+    peer = Device[to_tuple((src if recv else dst).device)[0]]
+    nic = self.dev.nic
+    qp = nic.qp(self.dev, peer)
+    pair = tuple(sorted((self.dev.device, peer.device)))
+    ring, counter, cq, consumer, db = [nic.arg(pair, n) for n in
+      (("rq", "rq_prod", "rcq", "rcq_cons", "db") if recv else ("sq", "sq_prod", "scq", "scq_cons", "db"))]
+    buf = dst if recv else src
+    base, _ = unwrap_view(buf)
+    key = rt_addr(base, nic.device, self.ctx.host).cast(dtypes.uint32)
+    addr, cq_addr = rt_addr(buf, self.devs, self.ctx.host), rt_addr(cq, self.devs, self.ctx.host)
+    for off in range(0, buf.nbytes(), RDMA_CHUNK):
+      size = min(RDMA_CHUNK, buf.nbytes() - off)
+      p, c = [self.nic_counts.get(b, b.index(0).load()) for b in (counter, consumer)]
+      words = list(struct.unpack("<12I", (recv_wqe if recv else send_wqe)(0, 0, size)))
+      words[8:11] = [(addr + off).cast(dtypes.uint32), ((addr + off) >> 32).cast(dtypes.uint32), key]
+      self.nic_posts += [ring.bitcast(dtypes.uint32).index((p & 31).cast(dtypes.int) * 32 + i).store(w) for i, w in enumerate(words)]
+      if not recv:
+        psn = nic.arg(pair, "sq_psn")
+        start = self.nic_counts.get(psn, psn.index(0).load())
+        self.nic_counts[psn] = nxt = start + max(1, ceildiv(size, MTU))
+        entry = ((p & 31) << 48) | ((nxt & 0xffffff) << 24) | (start & 0xffffff)
+        self.nic_posts.append(ring[0x1000:0x1100].bitcast(dtypes.uint64).index((p & 31).cast(dtypes.int)).store(entry))
+      self.nic_counts[counter], self.nic_counts[consumer] = p + 1, c + 1
+      with self.pred_exec(xcc_mask=1):
+        doorbell = db.getaddr(self.devs) + (nic.iface.dev_impl.db_off & 0xfff)
+        self.release_mem(doorbell, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) & 31,
+                         ((p + 1) >> 5) & 1), self.pm4.data_sel__mec_release_mem__send_64_bit_data,
+                         self.pm4.int_sel__mec_release_mem__none, cache_flush=True)
+        self.wait_reg_mem(((c >> 7) ^ 1).cast(dtypes.uint32) & 1, mask=0xff01,
+                          mem=cq_addr + (c & 127) * 32 + 24, op=WAIT_REG_MEM_FUNCTION_EQ)
+        self.release_mem(doorbell, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) & 127,
+                         ((c + 1) >> 7) & 1), self.pm4.data_sel__mec_release_mem__send_64_bit_data,
+                         self.pm4.int_sel__mec_release_mem__none)
+      if recv: self.acquire_mem()
+
+  def nic_post(self, cmdbuf:UOp) -> UOp:
+    return cmdbuf.after(*[b.after(cmdbuf, *self.nic_posts).index(0).store(v) for b, v in self.nic_counts.items()])
+
   def wait(self, signal:UOp, value:UOp): self.wait_reg_mem(value.cast(dtypes.uint32), mem=signal.getaddr(self.devs))
 
   def timestamp(self, signal:UOp):
@@ -414,7 +460,7 @@ class AMDComputeQueue(HWQueue):
     base, off = unwrap_view(cmdbuf)
     blob = struct.pack("IIII", self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), 0, 0, cmdbuf.max_numel() // 4 | self.pm4.INDIRECT_BUFFER_VALID)
     ib = patch(self.ctx.scratch((16,), dtypes.uint8, to_name("ib", self.queue)), [(4, base.getaddr(self.devs) + off)], blob)
-    return self.push(self.prof_bump(cmdbuf), ib, self.dev.compute_queue)
+    return self.push(self.nic_post(self.prof_bump(cmdbuf)), ib, self.dev.compute_queue)
 
   def push(self, cmdbuf:UOp, words:UOp, q, unit:int=4, doorbell_lag:int=0) -> UOp:
     ring, wptr, doorbell, put = _queue_args(self, q)
@@ -460,7 +506,8 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
     self.blob, self.patches = bytearray(), [] # q again, for the aql stream
     self.q(*UOp.sink(*self.pkts).substitute({self.cmd_addr: base.getaddr(self.devs) + off}).src)
     aql = self.ctx.scratch((len(self.blob),), dtypes.uint8, to_name("aql", self.queue))
-    return self.push(self.prof_bump(cmdbuf), patch(aql, self.patches, bytes(self.blob)), self.dev.compute_queue, unit=64, doorbell_lag=1)
+    return self.push(self.nic_post(self.prof_bump(cmdbuf)), patch(aql, self.patches, bytes(self.blob)),
+                     self.dev.compute_queue, unit=64, doorbell_lag=1)
 
 # *****************
 # SDMA
@@ -910,6 +957,13 @@ class AMDDevice(Compiled):
       self.pmc_names = getenv("PMC_COUNTERS", pmc_default).split(",")
       for k in self.pmc_names:
         if k not in self.pmc_counters: raise RuntimeError(f"PMC counter {k} is not supported. Available: {','.join(self.pmc_counters.keys())}")
+
+  @functools.cached_property
+  def nic(self):
+    from tinygrad.runtime.ops_bnxt import BNXTDevice
+    for i in itertools.count():
+      if (nic:=cast(BNXTDevice, Device[f"BNXT:{i}"])).peer_group == self.peer_group: return nic
+    raise RuntimeError(f"no BNXT device on {self.peer_group}")
 
   def create_queue(self, queue_type, ring_size, ctx_save_restore_size=0, eop_buffer_size=0, ctl_stack_size=0, debug_memory_size=0, idx=0):
     ring = Buffer(self.device, ring_size // 4, dtypes.uint32, options=BufferSpec(uncached=True, cpu_access=True), preallocate=True)

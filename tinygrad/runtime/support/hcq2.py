@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import cast, Any
 import functools, itertools, weakref, ctypes, importlib
 from dataclasses import replace, dataclass, field
-from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV
+from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, getenv, ceildiv
 from tinygrad.device import Device, Buffer, BufferSpec, DepsTracker
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu
 from tinygrad.dtype import dtypes, DType, DTYPES_DICT, AddrSpace
@@ -19,6 +19,7 @@ HCQ_DEVS = frozenset(("NV", "QCOM")) | (frozenset(("AMD",)) if HCQ2 else frozens
 @dataclass(frozen=True)
 class HCQInfo:
   device:tuple[str, ...]
+  rdma:bool = False
 
   kernels:tuple[tuple[tuple[str, ...], str, Estimates, tuple[int, ...], bytes], ...] = () # (devices, name, estimates, timestamp slots, profile key)
   estimates:Estimates = Estimates()
@@ -31,10 +32,19 @@ class HCQInfo:
 
 def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for x in to_tuple(d)} <= c
 
+def is_rdma(call:UOp) -> bool:
+  if not HCQ2 or not getenv("RDMA") or call.src[0].op is not Ops.COPY: return False
+  devs = [to_tuple(b.device) for b in get_call_arg_uops(call)]
+  return len(devs) == 2 and all(len(d) == 1 and all_devices_in(d, frozenset(("AMD",))) for d in devs) and \
+    Device[devs[0][0]].peer_group != Device[devs[1][0]].peer_group
+
 def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op not in (Ops.PROGRAM, Ops.COPY): return None # only these bodies can be enqueued
   if not (bufs:=get_call_arg_uops(call)): return None
-  if call.src[0].op is Ops.COPY: bufs = bufs[::-1] # copies push from the src device: p2p writes are faster than reads
+  if is_rdma(call): return bufs[0 if call.src[0].arg == "recv" else 1].device
+  if call.src[0].op is Ops.COPY:
+    if all(is_host_buffer(b) for b in bufs): return None
+    bufs = tuple(sorted(bufs[::-1], key=is_host_buffer)) # push from the source GPU, pull when the source is host staging
   devs = min(bufs, key=lambda b: not all_devices_in(b.device, HCQ_DEVS)).device
   if not all_devices_in(devs, HCQ_DEVS): return None
   dev = Device[to_tuple(devs)[0]]
@@ -58,9 +68,9 @@ def to_name(*parts:str) -> str: return "_".join(parts).replace(":", "_").lower()
 def timeline(devs:tuple[str, ...]) -> UOp: return UOp.placeholder((2,), dtypes.uint64, 0, device=devs, volatile=True, tag="timeline")
 def timeline_value(devs:tuple[str, ...]) -> UOp: return timeline(devs).index(1).load()
 
-def rt_addr(b:UOp, dev="CPU") -> UOp:
+def rt_addr(b:UOp, dev="CPU", host="CPU") -> UOp:
   base, off = unwrap_view(b)
-  word = UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="addr")
+  word = UOp.placeholder((1,), dtypes.uint64, device=host, volatile=host != "CPU", tag="addr")
   return patch(word, [(0, base.bitcast(dtypes.uint8)[off:off + b.nbytes()].getaddr(dev))]).index(0).load()
 
 def make_submit(*cmds, devs:str|tuple[str, ...], queue:str) -> UOp:
@@ -122,6 +132,7 @@ def _staging(device:str="CPU") -> Buffer: # this host's memory, or host memory o
   return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
 
 def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
+  if is_rdma(call): return None
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
@@ -142,6 +153,21 @@ pm_insert_copy_staging = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.COPY), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), stage_copy),
 ])
 
+# Each node prepares its entire batch before ringing a doorbell: no ring may wrap within one batch.
+RDMA_CHUNK, RDMA_SLOTS = 1 << 30, 32
+
+def split_rdma(call:UOp) -> UOp|None:
+  if not is_rdma(call) or call.src[0].arg in ("send", "recv"): return None
+  dst, src = get_call_arg_uops(call)
+  chunk, calls = RDMA_CHUNK * RDMA_SLOTS // src.dtype.itemsize, []
+  for off in range(0, src.max_numel(), chunk):
+    end = min(off + chunk, src.max_numel())
+    args = (dst[off:end], src[off:end], *call.src[3:])
+    calls += [call.replace(src=(call.src[0].replace(arg=side), *args)) for side in ("send", "recv")]
+  return UOp(Ops.LINEAR, src=tuple(calls))
+
+pm_split_rdma = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.COPY),), allow_any_len=True, name="call"), split_rdma)])
+
 # *****************
 # 2. deps
 
@@ -156,6 +182,7 @@ class HCQDepsTracker(DepsTracker):
 class BatchCtx:
   batch:list[tuple[UOp, tuple[str, ...], str]] # (call, devices, queue) per enqueued call
   profile:bool
+  rdma:bool = False
   tracker:HCQDepsTracker = field(default_factory=HCQDepsTracker)
   queues:dict[str, list[str]] = field(init=False)
   first:dict[tuple[str, str], int] = field(init=False); last:dict[tuple[str, str], int] = field(init=False) # noqa: E702
@@ -184,8 +211,10 @@ class BatchCtx:
 
 def _wait_ins(ctx:BatchCtx, call:UOp, device:str, queue:str, tag:int) -> list[UOp]:
   bufs, write = list(get_call_arg_uops(call)), get_call_outs_ins(call)[0]
+  if is_rdma(call): bufs, write = ([bufs[0]], (0,)) if call.src[0].arg == "recv" else ([bufs[1]], ())
   latest:dict[tuple[str, str], int] = {} # (producer device, queue) -> the latest submit tag to wait on, same-queue submits are fifo
   for d, q, t in ctx.tracker.access_resources(bufs, list(range(len(bufs)) if write is None else write), (device, queue, tag)):
+    assert Device[d].peer_group == Device[device].peer_group, "queue dependencies must stay on one node"
     if t < tag and (d, q) != (device, queue): latest[(d, q)] = max(latest.get((d, q), 0), t)
 
   # NV waits break QMD chaining, so also wait for the previous launch
@@ -237,25 +266,36 @@ def _finalize_batch(ctx:BatchCtx) -> UOp:
   merged:list[UOp] = [] # the submits in order, after the fence
   for m in _merge_queues(submits): merged.append(m.after(fence, *merged[-1:]))
   estimates = sum((estimate_uop(call) for call, _, _ in ctx.batch), start=Estimates()).simplify()
-  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit"), tag=1)
+  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit", estimates=Estimates()), tag=1) # GPU estimates are in HCQInfo; polling has no fixed cost
   for pm in [Device[d].pm_batch for d in ctx.queues if Device[d].pm_batch is not None]: # a device adds its own work to the batch
     if (r:=pm.rewrite(sink)) is not None: sink = r
-  host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch for buf in get_call_arg_uops(call)
+  host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch if not is_rdma(call) for buf in get_call_arg_uops(call)
                          for host in to_tuple(buf.device) if host not in ctx.queues))
   return sink.call(*(ctx.slots.values() if ctx.profile else ()),
-                   aux=HCQInfo(tuple(ctx.queues), kernels=tuple(kerns), estimates=estimates, host_deps=host_deps))
+                   aux=HCQInfo(tuple(ctx.queues), rdma=ctx.rdma, kernels=tuple(kerns), estimates=estimates, host_deps=host_deps))
 
 @rewrite_group(new_ctx=False)
 def sched_batches(l:UOp, profile:bool) -> UOp:
   devs = [() if (d:=get_enqueue_devs(c)) is None else tuple(Device.canonicalize(x) for x in to_tuple(d)) for c in l.src]
-  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM else "COPY:0" for c in l.src]
+  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM or is_rdma(c) else "COPY:0" for c in l.src]
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs, queues), key=lambda e: bool(e[1])):
     if not hcq: srcs += [c for c, _, _ in grp]
     else: # one batch per node: its program runs there, nodes only meet through rdma copies
       peers:dict[str, list] = {}
-      for e in grp: peers.setdefault(Device[e[1][0]].peer_group, []).append(e)
-      srcs += [_finalize_batch(BatchCtx(b, profile)) for b in peers.values()]
+      posts:dict[tuple[str, str], int] = {}
+      for e in grp:
+        if is_rdma(e[0]) and e[0].src[0].arg == "send":
+          dst, src = get_call_arg_uops(e[0])
+          pair = (Device.canonicalize(to_tuple(src.device)[0]), Device.canonicalize(to_tuple(dst.device)[0]))
+          n = ceildiv(src.nbytes(), RDMA_CHUNK)
+          assert n <= RDMA_SLOTS
+          if posts.get(pair, 0) + n > RDMA_SLOTS:
+            srcs += [_finalize_batch(BatchCtx(b, profile, rdma=True)) for b in peers.values()]
+            peers, posts = {}, {}
+          posts[pair] = posts.get(pair, 0) + n
+        peers.setdefault(Device[e[1][0]].peer_group, []).append(e)
+      srcs += [_finalize_batch(BatchCtx(b, profile, rdma=bool(posts))) for b in peers.values()]
   return l.replace(src=tuple(srcs))
 
 # *****************
@@ -264,6 +304,7 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 @dataclass
 class EncodeCtx:
   devs:tuple[str, ...]
+  rdma:bool = False
   inputs:dict[tuple[UOp, str, int], int] = field(default_factory=dict)
   lt_patches:list[UOp] = field(default_factory=list)
 
@@ -320,6 +361,7 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
     slots, off = unwrap_view(lasts[i])
     slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
     target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
+    if ctx.rdma: target = timeline((dev,)).after(*last).index(1).load() # shared NIC rings cannot be rewritten until the preceding batch has completed
     done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
     bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
     last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
@@ -405,7 +447,7 @@ def lower_call(call:UOp) -> UOp|None:
   if not isinstance(call.arg.aux, HCQInfo) or call.arg.aux.nargs: return None # not an hcq call, or lowered already
 
   # encode bodies
-  ctx = EncodeCtx(call.arg.aux.device)
+  ctx = EncodeCtx(call.arg.aux.device, rdma=call.arg.aux.rdma)
   devs = [Device[d] for d in dedup([d.split(":")[0] for d in ctx.devs])]
   body = graph_rewrite(call.src[0], sum([d.pm_encode for d in devs if d.pm_encode is not None], PatternMatcher([])) + pm_hcq_encode,
                        ctx=ctx, bpm=pm_patches, name="encode")
@@ -413,6 +455,13 @@ def lower_call(call:UOp) -> UOp|None:
 
   # resize table
   body = body.substitute({ctx.table: (table:=ctx.scratch((len(ctx.inputs),), dtypes.uint64, "inputs"))})
+
+  # Address patches share one allocation and one CPU argument.
+  if words := [u for u in body.toposort() if u.op is Ops.PARAM and u.tag == "addr"]:
+    addrs = ctx.scratch((len(words),), dtypes.uint64, "addrs")
+    packed = {b: addrs[i:i+1] for i, b in enumerate(words)}
+    body = body.substitute(packed, enter_calls=True)
+    ctx.lt_patches = [p.substitute(packed) for p in ctx.lt_patches]
 
   # the placeholders become the body's params in visit order, variables bind by name after them, the ranges renumber
   bufs, alus = partition([u for u in body.toposort() if u.op is Ops.PARAM], lambda u: u.tag is not None)
@@ -444,7 +493,8 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False
     use_rt = len(linear.src) < HCQ_CACHE_THRESH # small schedules use runtime address patches so linked schedules can be cached without input buffers
     slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(use_rt, input_uops, slots), walk=True, name="replace buffers")
-  linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, ctx=tuple(input_uops or ()), name="prep calls")
+  linear = graph_rewrite(linear, pm_unwrap_multi+pm_split_rdma+pm_insert_copy_staging+pm_flatten_linear,
+                         ctx=tuple(input_uops or ()), name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_encode, walk=True, name="encode")
   with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin)

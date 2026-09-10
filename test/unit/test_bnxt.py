@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tinygrad.runtime.autogen import bnxt
-from extra.bnxt_driver.bnxtdev import BNXT_BACKING_STORE, BNXTDev, BNXTQP, _queue, _qwrite, ipv4_to_gid
+from tinygrad.runtime.support.bnxt import BNXT_BACKING_STORE, BNXTDev, BNXTQP, _queue, _qwrite, ipv4_to_gid, cqe_ready, msn_entry
 
 class FakePCI:
   def __init__(self): self.next_addr, self.allocations = 0x100000, []
@@ -25,7 +25,7 @@ class FakeRCFW:
   def __init__(self): self.calls, self.doorbells = [], []
   def exec(self, name, **fields):
     self.calls.append((name, fields))
-    return SimpleNamespace(xid={"create_cq":77, "create_qp":88, "register_mr":0x5678}.get(name, 0))
+    return SimpleNamespace(xid={"create_cq":77 + sum(n == "create_cq" for n, _ in self.calls), "create_qp":88, "register_mr":0x5678}.get(name, 0))
   def doorbell(self, *args, **kwargs): self.doorbells.append((args, kwargs))
 
 class FakeQPDev:
@@ -45,16 +45,16 @@ class TestMemory(unittest.TestCase):
     self.assertEqual(len(BNXT_BACKING_STORE), 9)
     dev = FakeDev()
     small = ((0, 6), (15, 0))
-    with patch("extra.bnxt_driver.bnxtdev.BNXT_BACKING_STORE", small): BNXTDev.setup_backing_store(dev)
+    with patch("tinygrad.runtime.support.bnxt.BNXT_BACKING_STORE", small): BNXTDev.setup_backing_store(dev)
     cfg = [fields for name, fields in dev.calls if name == "func_backing_store_cfg_v2"]
     self.assertEqual([(x["type"], x["instance"]) for x in cfg], [(0, 0), (0, 2), (15, 0)])
     self.assertTrue(all(not x["flags"] for x in cfg[:-1]))
     self.assertEqual(cfg[-1]["flags"], bnxt.FUNC_BACKING_STORE_CFG_V2_REQ_FLAGS_BS_CFG_ALL_DONE)
-    self.assertEqual((dev.pci_dev.allocations[0][4], dev.pci_dev.allocations[0][20]), (0x5a, 0x5a))
+    self.assertEqual(dev.pci_dev.allocations[0][:32], (bytes(4) + b"\x5a" + bytes(11)) * 2)
 
 class TestRCFW(unittest.TestCase):
   def setUp(self):
-    patch("extra.bnxt_driver.bnxtdev.System.memory_barrier").start()
+    patch("tinygrad.runtime.support.bnxt.System.memory_barrier").start()
     self.addCleanup(patch.stopall)
 
   def test_doorbell_encodes_xid_type_and_index(self):
@@ -77,7 +77,25 @@ class TestRCFW(unittest.TestCase):
     prod = dev.bar0[(bnxt.RCFW_COMM_BASE_OFFSET+bnxt.RCFW_PF_VF_COMM_PROD_OFFSET)//4]
     self.assertEqual((req.cookie, ret.cookie, prod), (0, 0, 1 | 1<<bnxt.FIRMWARE_FIRST_FLAG))
 
+  def test_firmware_queue_wrap(self):
+    dev = BNXTDev.__new__(BNXTDev)
+    dev.bar0, dev.cmdq, dev.creq = [0]*1024, _queue(FakeDev()), _queue(FakeDev())
+    dev.rcfw_first, dev.creq_id, dev.devfmt = True, 23, "test"
+    bells = []
+    dev.doorbell = lambda *args: bells.append(args)
+    for i in range(513):
+      _qwrite(dev.creq, i, bytes(bnxt.struct_creq_query_version_resp(v=(i // 256 & 1) ^ 1)))
+      dev.rcfw("query_version", timeout_ms=100)
+      self.assertEqual(bells[-1], (23, bnxt.DBC_DBC_TYPE_NQ_ARM, (i + 1) % 256, (i + 1) // 256 & 1))
+    self.assertEqual((dev.creq["cons"], dev.cmdq["prod"]), (513, 513))
+
 class TestFastPath(unittest.TestCase):
+  def test_firmware_layouts(self):
+    self.assertEqual(len(bytes(bnxt.struct_cmdq_deregister_mr(lkey=0x1234))), 24)
+    self.assertEqual(bytes(bnxt.struct_cmdq_deregister_mr(lkey=0x1234))[16:20], b"\x34\x12\x00\x00")
+    self.assertEqual(len(bytes(bnxt.struct_creq_deregister_mr_resp())), 16)
+    self.assertEqual(len(bytes(bnxt.struct_hwrm_port_phy_qcfg_output())), 104)
+
   def test_unified_mr(self):
     dev = BNXTDev.__new__(BNXTDev)
     fw = FakeRCFW()
@@ -92,24 +110,55 @@ class TestFastPath(unittest.TestCase):
     dev = FakeQPDev()
     qp = BNXTQP(dev)
     create = next(fields for name, fields in dev.fw.calls if name == "create_qp")
-    self.assertEqual((create["sq_size"], "rq_size" in create, qp.qpn), (16, False, 88))
+    self.assertEqual((create["sq_size"], create["rq_size"], create["sq_fwo_sq_sge"], create["rq_fwo_rq_sge"]), (32, 32, 6, 6))
+    self.assertNotEqual(create["scq_cid"], create["rcq_cid"])
+    self.assertEqual((qp.sq["stride"], qp.rq["stride"], qp.scq["stride"], qp.rcq["stride"]), (128, 128, 32, 32))
     qp.connect(0x123, ipv4_to_gid("10.0.0.2"), 0x001122334455)
     rtr, rts = dev.fw.calls[-2][1], dev.fw.calls[-1][1]
     self.assertEqual((bytes(rtr["dgid"]), bytes(rtr["dest_mac"])),
       (ipv4_to_gid("10.0.0.2"), bytes.fromhex("001122334455")))
-    self.assertEqual((rtr["modify_mask"], rts["modify_mask"]), (0x41515ad, 0xae005))
+    self.assertTrue(rtr["modify_mask"] & bnxt.CMDQ_MODIFY_QP_MODIFY_MASK_MIN_RNR_TIMER)
+    for mask in (bnxt.CMDQ_MODIFY_QP_MODIFY_MASK_TIMEOUT, bnxt.CMDQ_MODIFY_QP_MODIFY_MASK_RETRY_CNT,
+                 bnxt.CMDQ_MODIFY_QP_MODIFY_MASK_RNR_RETRY): self.assertTrue(rts["modify_mask"] & mask)
+    self.assertEqual((rtr["min_rnr_timer"], rts["rnr_retry"], rts["retry_cnt"], rts["timeout"]), (1, 7, 7, 14))
 
-  def test_rdma_write_builds_three_slots_and_host_msn(self):
-    qp = BNXTQP.__new__(BNXTQP)
-    qp.dev, qp.qpn = FakeQPDev(), 88
-    qp.sq, qp.sq_psn, qp.msn = _queue(FakeDev(), aux=True), 5, 0
-    qp._poll = lambda timeout: bytes(bnxt.struct_cq_req())
-    qp.rdma_write(0x1122334455667788, 0x99aa, 0x12345000, 0x55aa, 100)
-    hdr = bnxt.struct_sq_rdma_hdr.from_buffer_copy(bytes(qp.sq["mem"][:32]))
-    sge = bnxt.struct_sq_sge.from_buffer_copy(bytes(qp.sq["mem"][32:48]))
-    self.assertEqual((hdr.remote_va, hdr.remote_key, hdr.length, sge.va_or_pa, sge.l_key, sge.size),
-      (0x1122334455667788, 0x99aa, 100, 0x12345000, 0x55aa, 100))
-    self.assertEqual(struct.unpack_from("<Q", qp.sq["mem"], 0x1000)[0], 6<<24 | 5)
-    self.assertEqual(qp.dev.fw.doorbells, [((88, bnxt.DBC_DBC_TYPE_SQ, 3, 0), {})])
+  def test_send_recv_ring_wrap(self):
+    qp = BNXTQP(FakeQPDev())
+    qp.sq_psn = 0xfffffe
+    psn = qp.sq_psn
+    for i in range(97):
+      size = (i % 3) * 4096 + 1
+      qp.post_send(0x12345000 + i, 0x55aa, size)
+      qp.post_recv(0x22345000 + i, 0x66aa, size)
+      off = i % 32 * 128
+      self.assertEqual(bytes(qp.sq["mem"][off:off + 4]), b"\x00\x01\x03\x00")
+      self.assertEqual(struct.unpack_from("<I", qp.sq["mem"], off + 8)[0], size)
+      self.assertEqual(bytes(qp.rq["mem"][off:off + 4]), b"\x80\x00\x03\x00")
+      self.assertEqual(struct.unpack_from("<QII", qp.sq["mem"], off + 32), (0x12345000 + i, 0x55aa, size))
+      self.assertEqual(struct.unpack_from("<QII", qp.rq["mem"], off + 32), (0x22345000 + i, 0x66aa, size))
+      nxt = (psn + i % 3 + 1) & 0xffffff
+      self.assertEqual(struct.unpack_from("<Q", qp.sq["mem"], 0x1000 + i % 32 * 8)[0], (i % 32) << 48 | nxt << 24 | psn)
+      self.assertEqual(qp.sq_psn, nxt)
+      psn = nxt
+      for typ, doorbell in zip((bnxt.DBC_DBC_TYPE_SQ, bnxt.DBC_DBC_TYPE_RQ), qp.dev.fw.doorbells[-2:]):
+        self.assertEqual(doorbell, ((qp.qpn, typ, (i + 1) % 32, (i + 1) // 32 & 1), {}))
+    self.assertEqual(qp.sq["mem"][0x1100:], bytes(0xf00))
+
+  def test_zero_length_send_consumes_psn(self):
+    self.assertEqual(msn_entry(32, 0x1ffffff, 0), (0xffffff, 0))
+
+  def test_cq_wrap_and_status(self):
+    qp = BNXTQP(FakeQPDev())
+    for i in range(385):
+      cqe = bytearray(32)
+      cqe[24] = (i // 128 & 1) ^ 1
+      self.assertTrue(cqe_ready(cqe, i))
+      self.assertFalse(cqe_ready(cqe, i + 128))
+      _qwrite(qp.scq, i, cqe)
+      self.assertEqual(qp.poll(qp.scq, qp.scq_id), bytes(cqe))
+      self.assertEqual(qp.dev.fw.doorbells[-1], ((qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (i + 1) % 128, (i + 1) // 128 & 1), {}))
+    cqe[25] = 1
+    _qwrite(qp.scq, 385, cqe)
+    with self.assertRaisesRegex(AssertionError, "BNXT CQE status 1"): qp.poll(qp.scq, qp.scq_id)
 
 if __name__ == "__main__": unittest.main()

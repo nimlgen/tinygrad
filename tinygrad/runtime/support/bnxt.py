@@ -3,14 +3,30 @@ from tinygrad.helpers import ceildiv, getenv, wait_cond, DEBUG
 from tinygrad.runtime.autogen import bnxt, pci
 from tinygrad.runtime.support.system import PCIDevice, System, ipv4_to_gid
 
+# BCM57608 static WQEs: 32 x 128B per ring, with the SQ MSN table on the next page. Doorbells count WQEs, not 16B slots.
+
 BNXT_DEBUG = getenv("BNXT_DEBUG", 0)
 BNXT_ACCESS, BNXT_INIT_MASK, BNXT_RTR_MASK, BNXT_RTS_MASK = 3, 0xd, 0x41515ad, 0xae005
 BNXT_CHIMP_COMM, BNXT_CHIMP_COMM_TRIGGER = 0x0, 0x100
-BNXT_BACKING_STORE = ((0, 2), (1, 0), (2, 2), (3, 0), (4, 2), (5, 0), (6, 0), (14, 2), (15, 0))
+BNXT_BACKING_STORE = ((0, 64), (1, 0), (2, 128), (3, 0), (4, 2), (5, 0), (6, 0), (14, 1024), (15, 0))
+WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU = 128, 32, 128, 4096
+SEND_HDR = struct.Struct("<BBBBIIIIIII") # wqe_type, flags, wqe_size, rsvd, inv_key_or_imm_data, length, q_key, dst_qp, avid, rsvd, timestamp
+RECV_HDR = struct.Struct("<BBBBIII16x") # wqe_type, flags, wqe_size, rsvd, rsvd, wr_id[2]
+SGE = struct.Struct("<QII") # va, key, size
 
 def db_value(xid, typ, index, epoch):
   return (xid & bnxt.DBC_DBC_XID_MASK | bnxt.DBC_DBC_PATH_ROCE | typ | bnxt.BNXT_QPLIB_DBR_VALID) << 32 | \
          index & bnxt.DBC_DBC_INDEX_MASK | epoch << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT
+
+def send_wqe(va:int, key:int, size:int) -> bytes:
+  return SEND_HDR.pack(0, bnxt.SQ_SEND_FLAGS_SIGNAL_COMP, 3, 0, 0, size, 0, 0, 0, 0, 0) + SGE.pack(va, key, size)
+def recv_wqe(va:int, key:int, size:int) -> bytes: return RECV_HDR.pack(0x80, 0, 3, 0, 0, 0, 0) + SGE.pack(va, key, size)
+def msn_entry(wqe_idx:int, psn:int, size:int) -> tuple[int, int]: # the entry and the psn after this send
+  psn &= 0xffffff
+  nxt = (psn + max(1, ceildiv(size, MTU))) & 0xffffff
+  # Thor2 static-mode retransmission indexes WQEs, not 16B slots.
+  return (wqe_idx % RING_ENTRIES) << bnxt.SQ_MSN_SEARCH_START_IDX_SFT | nxt << bnxt.SQ_MSN_SEARCH_NEXT_PSN_SFT | psn, nxt
+def cqe_ready(cqe:bytes, cons:int) -> bool: return (cqe[24] & bnxt.CQ_BASE_TOGGLE) != (cons // CQ_ENTRIES & 1)
 
 def _pbl(dev, paddrs, queue=False):
   if len(paddrs) == 1: return 0, paddrs[0]
@@ -26,16 +42,16 @@ def _pbl(dev, paddrs, queue=False):
   return 2, top_paddrs[0]
 
 def _queue(dev, stride:int=16, aux=False):
-  mem, paddrs = dev.pci_dev.alloc_sysmem(0x1000 + aux * 0x400)
+  mem, paddrs = dev.pci_dev.alloc_sysmem(0x1000 + aux * 0x1000)
   level, base = _pbl(dev, paddrs, queue=True)
   return {"mem":mem, "paddrs":paddrs, "stride":stride, "prod":0, "cons":0, "level":level, "base":base}
 
 def _qread(q, i):
-  off = (i & 15) * q["stride"]
+  off = i % (0x1000 // q["stride"]) * q["stride"]
   return q["mem"][off:off + q["stride"]]
 
 def _qwrite(q, i, data, aux=False):
-  off = 0x1000 + i % 128 * 8 if aux else (i & 15) * q["stride"]
+  off = 0x1000 + i % RING_ENTRIES * 8 if aux else i % (0x1000 // q["stride"]) * q["stride"]
   q["mem"][off:off + len(data)] = data
 
 class BNXTDev:
@@ -91,7 +107,9 @@ class BNXTDev:
       for instance in [i for i in range(8) if caps.instance_bit_map >> i & 1] or [0]:
         mem, paddrs = self.pci_dev.alloc_sysmem(ceildiv(n * size, 0x1000) * 0x1000)
         if caps.ctx_init_value:
-          for off in range(caps.ctx_init_offset, len(mem), size): mem[off] = caps.ctx_init_value
+          init = bytearray(len(mem))
+          init[caps.ctx_init_offset::size] = bytes([caps.ctx_init_value]) * len(range(caps.ctx_init_offset, len(mem), size))
+          mem[:] = init
         lvl, base = _pbl(self, paddrs)
         self.hwrm("func_backing_store_cfg_v2", type=typ, instance=instance, entry_size=size, num_entries=n, page_dir=base,
           page_size_pbl_level=lvl, subtype_valid_cnt=len(splits),
@@ -103,12 +121,12 @@ class BNXTDev:
 
     self.creq = _queue(self)
     self.creq_id = self.hwrm("ring_alloc", ring_type=bnxt.RING_ALLOC_REQ_RING_TYPE_NQ, page_tbl_addr=self.creq["base"],
-      page_size=12, page_tbl_depth=self.creq["level"], length=16, int_mode=bnxt.RING_ALLOC_REQ_INT_MODE_MSIX).ring_id
+      page_size=12, page_tbl_depth=self.creq["level"], length=256, int_mode=bnxt.RING_ALLOC_REQ_INT_MODE_MSIX).ring_id
 
     self.cmdq = _queue(self)
     self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, 0, 0)
     init = bnxt.struct_cmdq_init(cmdq_pbl=self.cmdq["base"], creq_ring_id=self.creq_id,
-                                 cmdq_size_cmdq_lvl=16 << bnxt.CMDQ_INIT_CMDQ_SIZE_SFT)
+                                 cmdq_size_cmdq_lvl=256 << bnxt.CMDQ_INIT_CMDQ_SIZE_SFT)
 
     System.memory_barrier()
     for i, w in enumerate(memoryview(bytearray(bytes(init))).cast('I')): self.bar0[bnxt.RCFW_COMM_BASE_OFFSET // 4 + i] = w
@@ -139,14 +157,14 @@ class BNXTDev:
 
     def poll():
       h = bnxt.struct_creq_base.from_buffer_copy(bytes(_qread(self.creq, self.creq["cons"])))
-      return bool(h.v & bnxt.CREQ_BASE_V) != bool((self.creq["cons"] // 16) & 1)
+      return bool(h.v & bnxt.CREQ_BASE_V) != bool((self.creq["cons"] // 256) & 1)
     wait_cond(poll, timeout_ms=timeout_ms, msg=f"RCFW {name}")
 
     ret = resp_t.from_buffer_copy(bytes(_qread(self.creq, self.creq["cons"])))
     self.creq["cons"] += 1
 
     # NQ_ARM also publishes the CREQ consumer index, which is what frees ring space for the next command
-    self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, self.creq["cons"] & 15, (self.creq["cons"] // 16) & 1)
+    self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, self.creq["cons"] & 255, (self.creq["cons"] // 256) & 1)
     assert ret.status == 0, f"RCFW {name}: {ret.status}"
 
     if BNXT_DEBUG >= 1: print(f"bnxt {self.devfmt}: rcfw {name} xid={getattr(ret, 'xid', 0):#x}")
@@ -173,26 +191,28 @@ class BNXTDev:
       enables=bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR | bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR_MASK |
       bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_DST_ID, l2_addr=tuple(self.mac.to_bytes(6, 'big')), l2_addr_mask=(0xff,) * 6, dst_id=vi)
 
-  def register_mem(self, paddrs:list[int], size:int, log_page_size:int=12) -> int:
+  # a memory region over pages: the key addresses [va, va + size) as those pages
+  def register_mem(self, paddrs:list[int], size:int, log_page_size:int=12, va:int|None=None) -> int:
     level, base = _pbl(self, paddrs[:ceildiv(size, 1 << log_page_size)])
     return self.rcfw("register_mr", flags=bnxt.CMDQ_REGISTER_MR_FLAGS_ALLOC_MR,
       log2_pg_size_lvl=level << bnxt.CMDQ_REGISTER_MR_LVL_SFT | log_page_size << bnxt.CMDQ_REGISTER_MR_LOG2_PG_SIZE_SFT,
       access=bnxt.CMDQ_REGISTER_MR_ACCESS_LOCAL_WRITE | bnxt.CMDQ_REGISTER_MR_ACCESS_REMOTE_WRITE,
-      log2_pbl_pg_size=12, pbl=base, va=paddrs[0], mr_size=size).xid
+      log2_pbl_pg_size=12, pbl=base, va=paddrs[0] if va is None else va, mr_size=size).xid
+  def unregister_mem(self, key:int): self.rcfw("deregister_mr", lkey=key)
 
 class BNXTQP:
   def __init__(self, dev:BNXTDev):
-    self.dev, self.sq_psn, self.msn = dev, 0, 0
-
-    self.cqq = _queue(dev, ctypes.sizeof(bnxt.struct_cq_base))
-    self.cq_id = dev.rcfw("create_cq", cq_size=16, pbl=self.cqq["base"],
-                          pg_size_lvl=self.cqq["level"], cq_fco_cnq_id=dev.nq_id).xid
-
-    self.sq = _queue(dev, aux=True)
-    self.qpn = dev.rcfw("create_qp", type=bnxt.CMDQ_CREATE_QP_TYPE_RC,
-      sq_size=16, sq_fwo_sq_sge=1, scq_cid=self.cq_id, rcq_cid=self.cq_id,
-      sq_pbl=self.sq["base"], sq_pg_size_sq_lvl=self.sq["level"]).xid
+    self.dev, self.sq_psn = dev, 0
+    self.scq, self.rcq = _queue(dev, ctypes.sizeof(bnxt.struct_cq_base)), _queue(dev, ctypes.sizeof(bnxt.struct_cq_base))
+    self.scq_id, self.rcq_id = (self._create_cq(q) for q in (self.scq, self.rcq))
+    self.sq, self.rq = _queue(dev, WQE_SIZE, aux=True), _queue(dev, WQE_SIZE)
+    self.qpn = dev.rcfw("create_qp", type=bnxt.CMDQ_CREATE_QP_TYPE_RC, scq_cid=self.scq_id, rcq_cid=self.rcq_id,
+      sq_size=RING_ENTRIES, sq_fwo_sq_sge=6, sq_pbl=self.sq["base"], sq_pg_size_sq_lvl=self.sq["level"],
+      rq_size=RING_ENTRIES, rq_fwo_rq_sge=6, rq_pbl=self.rq["base"], rq_pg_size_rq_lvl=self.rq["level"]).xid
     self.qp_op(1, BNXT_INIT_MASK, access=BNXT_ACCESS, pkey=0xffff)
+
+  def _create_cq(self, q) -> int:
+    return self.dev.rcfw("create_cq", cq_size=CQ_ENTRIES, pbl=q["base"], pg_size_lvl=q["level"], cq_fco_cnq_id=self.dev.nq_id).xid
 
   def qp_op(self, state, mask, network_type=0, **fields):
     self.dev.rcfw("modify_qp", qp_cid=self.qpn, modify_mask=mask,
@@ -204,35 +224,39 @@ class BNXTQP:
     dmac = (ctypes.c_uint16 * 3)(*(int.from_bytes(mac.to_bytes(6, 'big')[i:i + 2], 'little') for i in (0, 2, 4)))
 
     self.qp_op(2, BNXT_RTR_MASK, network_type=network_type, qp_type=bnxt.CMDQ_MODIFY_QP_QP_TYPE_RC, access=BNXT_ACCESS,
-      pkey=0xffff, dgid=dgid, sgid_index=self.dev.gid_id, hop_limit=64, dest_mac=dmac,
-      path_mtu_pingpong_push_enable=bnxt.CMDQ_MODIFY_QP_PATH_MTU_MTU_1024, max_dest_rd_atomic=4,
-      dest_qp_id=qpn)
+      pkey=0xffff, dgid=dgid, sgid_index=self.dev.gid_id, hop_limit=64, dest_mac=dmac, min_rnr_timer=1,
+      path_mtu_pingpong_push_enable=bnxt.CMDQ_MODIFY_QP_PATH_MTU_MTU_4096, max_dest_rd_atomic=4, dest_qp_id=qpn)
+    # a send to a not yet posted receive is retried forever
     self.qp_op(3, BNXT_RTS_MASK, network_type=network_type, qp_type=bnxt.CMDQ_MODIFY_QP_QP_TYPE_RC, access=BNXT_ACCESS,
-      max_rd_atomic=1)
+      max_rd_atomic=1, rnr_retry=7, retry_cnt=7, timeout=14)
 
     if BNXT_DEBUG >= 1: print(f"bnxt: QP {self.qpn:#x} connected (remote={qpn:#x})")
 
-  def _poll(self, timeout):
-    def poll():
-      base = bnxt.struct_cq_base.from_buffer_copy(bytes(_qread(self.cqq, self.cqq["cons"])))
-      return bool(base.cqe_type_toggle & bnxt.CQ_BASE_TOGGLE) == (not bool((self.cqq["cons"] // 16) & 1))
-    wait_cond(poll, timeout_ms=timeout, msg="BNXT CQ")
-    raw = bytes(_qread(self.cqq, self.cqq["cons"]))
-    self.cqq["cons"] += 1
-    self.dev.doorbell(self.cq_id, bnxt.DBC_DBC_TYPE_CQ, self.cqq["cons"] & 15, (self.cqq["cons"] // 16) & 1)
+  # cpu driven posting and polling, the hcq2 queues encode the same rings from the runtime program and the gpu
+  def poll(self, cq, cq_id, timeout_ms=20000) -> bytes:
+    wait_cond(lambda: cqe_ready(bytes(_qread(cq, cq["cons"])), cq["cons"]), timeout_ms=timeout_ms, msg="BNXT CQ")
+    raw = bytes(_qread(cq, cq["cons"]))
+    cq["cons"] += 1
+    self.dev.doorbell(cq_id, bnxt.DBC_DBC_TYPE_CQ, cq["cons"] % CQ_ENTRIES, (cq["cons"] // CQ_ENTRIES) & 1)
+    assert raw[25] == 0, f"BNXT CQE status {raw[25]}"
     return raw
 
-  def rdma_write(self, rva, rkey, lva, lkey, size, timeout_ms=20000):
-    start = self.sq["prod"] & 15
-    hdr = bytes(bnxt.struct_sq_rdma_hdr(wqe_type=bnxt.SQ_RDMA_HDR_WQE_TYPE_WRITE_WQE,
-                flags=bnxt.SQ_SEND_FLAGS_SIGNAL_COMP, wqe_size=3, length=size, remote_va=rva, remote_key=rkey))
-    for i, data in enumerate((hdr[:16], hdr[16:32], bytes(bnxt.struct_sq_sge(va_or_pa=lva, l_key=lkey, size=size)))):
-      _qwrite(self.sq, start + i, data)
-    nxt = (self.sq_psn + max(1, ceildiv(size, 1024))) & 0xffffff
-    value = start << bnxt.SQ_MSN_SEARCH_START_IDX_SFT | nxt << bnxt.SQ_MSN_SEARCH_NEXT_PSN_SFT | self.sq_psn
-    _qwrite(self.sq, self.msn, struct.pack("<Q", value), aux=True)
+  def post_send(self, va:int, key:int, size:int):
+    idx = self.sq["prod"]
+    _qwrite(self.sq, idx, send_wqe(va, key, size))
+    entry, self.sq_psn = msn_entry(idx, self.sq_psn, size)
+    _qwrite(self.sq, idx, struct.pack("<Q", entry), aux=True)
+    self.sq["prod"] += 1
+    self.dev.doorbell(self.qpn, bnxt.DBC_DBC_TYPE_SQ, self.sq["prod"] % RING_ENTRIES, (self.sq["prod"] // RING_ENTRIES) & 1)
 
-    self.msn, self.sq_psn, self.sq["prod"] = (self.msn + 1) % 128, nxt, self.sq["prod"] + 3
-    self.dev.doorbell(self.qpn, bnxt.DBC_DBC_TYPE_SQ, self.sq["prod"] & 15, (self.sq["prod"] // 16) & 1)
-    cqe = bnxt.struct_cq_req.from_buffer_copy(self._poll(timeout_ms))
-    assert cqe.status == 0
+  def post_recv(self, va:int, key:int, size:int):
+    _qwrite(self.rq, self.rq["prod"], recv_wqe(va, key, size))
+    self.rq["prod"] += 1
+    self.dev.doorbell(self.qpn, bnxt.DBC_DBC_TYPE_RQ, self.rq["prod"] % RING_ENTRIES, (self.rq["prod"] // RING_ENTRIES) & 1)
+
+  def send(self, va:int, key:int, size:int, timeout_ms=20000):
+    self.post_send(va, key, size)
+    self.poll(self.scq, self.scq_id, timeout_ms)
+  def recv(self, va:int, key:int, size:int, timeout_ms=20000):
+    self.post_recv(va, key, size)
+    self.poll(self.rcq, self.rcq_id, timeout_ms)
