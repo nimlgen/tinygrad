@@ -2,10 +2,12 @@
 import math, unittest
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import Timing, Context, cdiv
+from tinygrad.helpers import Timing, Context, cdiv, Target
 from tinygrad.dtype import dtypes, AddrSpace, ConstFloat, Invalid  # noqa: F401
 from tinygrad.device import Device
 from tinygrad.uop.ops import Ops, AxisType, ParamArg, PatternMatcher, UOp, UPat, dtype_from_uop, exec_alu, graph_rewrite  # noqa: F401  # ParamArg used by eval(str(uop)) roundtrip tests
+from tinygrad.codegen.late.coalesce import memory_coalescing
+from tinygrad.renderer import Renderer
 from tinygrad.uop.weak import pm_lower_weak
 from tinygrad.uop.spec import spec_program, spec_shared, type_verify
 from tinygrad.uop.symbolic import sym, pm_remove_invalid
@@ -62,6 +64,18 @@ class TestDTypeFromUOp(unittest.TestCase):
     out = graph_rewrite(stack, pm_remove_invalid)
     self.assertEqual(out.src, (UOp.const(1, dtypes.half), UOp.const(0, dtypes.half)))
     type_verify(out.sink(), spec_program)
+
+class TestMemoryCoalescing(unittest.TestCase):
+  def test_wrapped_volatile_accesses(self):
+    for volatile in (False, True):
+      buf = UOp.param(0, dtypes.uint32, 4, volatile=volatile)
+      for wrapped in (buf, buf.after(UOp(Ops.BARRIER)), buf.bitcast(dtypes.uint8).bitcast(dtypes.uint32),
+                      buf.after(UOp(Ops.BARRIER)).bitcast(dtypes.uint8).bitcast(dtypes.uint32)):
+        for op in (Ops.LOAD, Ops.STORE):
+          with self.subTest(volatile=volatile, wrapper=wrapped.op, op=op):
+            accesses = [wrapped.index(i).load() if op is Ops.LOAD else wrapped.index(i).store(i) for i in range(4)]
+            sink = memory_coalescing(UOp.sink(*accesses), Renderer(Target("CPU")))
+            self.assertEqual(sum(u.op is op for u in sink.toposort()), 4 if volatile else 1)
 
 class TestLowerIndexDtype(unittest.TestCase):
   def test_gated_shrink_lowers_to_selected_width(self):
