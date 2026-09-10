@@ -38,8 +38,12 @@ def get_enqueue_devs(call:UOp) -> Any|None:
   devs = min(bufs, key=lambda b: not all_devices_in(b.device, HCQ_DEVS)).device
   if not all_devices_in(devs, HCQ_DEVS): return None
   dev = Device[to_tuple(devs)[0]]
-  # a device without a copy queue leaves copies to its allocator
-  return devs if call.src[0].op is not Ops.COPY or dev.has_copy_queue else None
+  if call.src[0].op is not Ops.COPY: return devs
+  # a device without a copy queue leaves copies to its allocator, a remote node's host memory is filled and drained from here (exec_copy)
+  host_copy = dev.remote_peer is not None and any(is_host_buffer(b) for b in bufs) and not all(all_devices_in(b.device, HCQ_DEVS) for b in bufs)
+  return devs if dev.has_copy_queue and not host_copy else None
+
+def is_host_buffer(u:UOp) -> bool: return (b:=unwrap_view(u)[0]).op is Ops.BUFFER and cast(Buffer, b.buffer).options.host
 
 def unwrap_view(v:UOp) -> tuple[UOp, int]: # look through views to (base, byte offset)
   if v.op in (Ops.BITCAST, Ops.AFTER): return unwrap_view(v.src[0])
@@ -114,20 +118,24 @@ pm_unwrap_multi = PatternMatcher([(UPat(Ops.CALL, name="call"), unwrap_call)])
 STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) << 20, 2
 
 @functools.cache
-def _staging() -> Buffer: return Buffer("CPU", STAGING_SIZE, dtypes.uint8, preallocate=True)
+def _staging(device:str="CPU") -> Buffer: # this host's memory, or host memory of a remote node for its devices
+  return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
 
 def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
     return None
-  except (RuntimeError, OSError): _staging().get_buf(device)
+  except (RuntimeError, OSError): pass
+  staging = _staging(dev if Device[dev:=to_tuple(device)[0]].remote_peer is not None else "CPU")
+  staging.get_buf(device)
 
-  base, it, copies = UOp.from_buffer(_staging()), src.dtype.itemsize, []
+  base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
   chunk = (STAGING_SIZE // STAGING_SLOTS) // it
   for i, off in enumerate(range(0, src.max_numel(), chunk)):
     stage = base[(so:=(i % STAGING_SLOTS) * chunk * it):so + (n:=min(chunk, src.max_numel() - off)) * it]
-    copies += [src[off:off+n].copy_to_device("CPU").call(stage, src[off:off+n]), stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
+    copies += [src[off:off+n].copy_to_device(staging.device).call(stage, src[off:off+n]),
+               stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
   return UOp(Ops.LINEAR, src=tuple(copies))
 
 pm_insert_copy_staging = PatternMatcher([
@@ -243,7 +251,11 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM else "COPY:0" for c in l.src]
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs, queues), key=lambda e: bool(e[1])):
-    srcs += [_finalize_batch(BatchCtx(list(grp), profile))] if hcq else [c for c, _, _ in grp]
+    if not hcq: srcs += [c for c, _, _ in grp]
+    else: # one batch per node: its program runs there, nodes only meet through rdma copies
+      peers:dict[str, list] = {}
+      for e in grp: peers.setdefault(Device[e[1][0]].peer_group, []).append(e)
+      srcs += [_finalize_batch(BatchCtx(b, profile)) for b in peers.values()]
   return l.replace(src=tuple(srcs))
 
 # *****************
@@ -253,8 +265,14 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 class EncodeCtx:
   devs:tuple[str, ...]
   inputs:dict[tuple[UOp, str, int], int] = field(default_factory=dict)
-  table:UOp = field(default_factory=lambda: UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="inputs"))
   lt_patches:list[UOp] = field(default_factory=list)
+
+  def __post_init__(self):
+    # the submit program's scratch: this host's memory, or host memory of a device on the remote node the program runs on
+    self.host = (self.devs[0],) if Device[self.devs[0]].remote_peer is not None else "CPU"
+    self.table = self.scratch((1,), dtypes.uint64, "inputs")
+  def scratch(self, shape:tuple[int, ...], dtype:DType, tag:str) -> UOp:
+    return UOp.placeholder(shape, dtype, device=self.host, volatile=self.host != "CPU", tag=tag)
 
 class HWQueue:
   q_rewrite = PatternMatcher([ # the ops of a queue: a queue defines the methods it supports
@@ -394,7 +412,7 @@ def lower_call(call:UOp) -> UOp|None:
   body = graph_rewrite(body, sum([d.pm_lower for d in devs if d.pm_lower is not None], PatternMatcher([])), ctx=ctx, bpm=pm_patches, name="lower")
 
   # resize table
-  body = body.substitute({ctx.table: (table:=UOp.placeholder((len(ctx.inputs),), dtypes.uint64, device="CPU", tag="inputs"))})
+  body = body.substitute({ctx.table: (table:=ctx.scratch((len(ctx.inputs),), dtypes.uint64, "inputs"))})
 
   # the placeholders become the body's params in visit order, variables bind by name after them, the ranges renumber
   bufs, alus = partition([u for u in body.toposort() if u.op is Ops.PARAM], lambda u: u.tag is not None)

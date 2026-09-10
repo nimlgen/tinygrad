@@ -70,9 +70,9 @@ class CPUProgram(Program['CPUDevice']):
     return time.perf_counter() - st if wait else None
 
   # the same program on another node (RemotePCIDevice): loaded there once, the args are that node's addresses
-  def remote_exec(self, peer, *bufs:int, vals:tuple[int, ...]=(), wait:bool=False) -> float|None:
+  def remote_exec(self, peer, *bufs:int, vals:tuple[int|None, ...]=(), wait:bool=False, **kwargs) -> float|None:
     if (handle:=self.remote_handles.get(peer.sock)) is None: handle = self.remote_handles[peer.sock] = peer.load_prog(self.obj)
-    return peer.exec_prog(handle, [*bufs, *vals], wait)
+    return peer.exec_prog(handle, [*bufs, *cast(tuple[int, ...], vals)], wait)
 
   @suppress_finalizing
   def __del__(self):

@@ -22,9 +22,10 @@ def device(dev_id:int) -> PCIDevice:
   return opened[dev_id]
 
 def view(addr:int, size:int, fmt:str):
+  # the whole mapping and the element index in it: the mock emulates registers by their index in the bar
   if (m:=next((m for m in maps if m.addr <= addr and addr + size <= m.addr + m.nbytes), None)) is None:
     raise RuntimeError(f"{addr:#x}+{size:#x} is not mapped on this node")
-  return m.view(addr - m.addr, size, fmt)
+  return m.view(fmt=fmt), (addr - m.addr) // struct.calcsize(fmt)
 
 def kick_mock():
   # native programs bypass the mock's memoryview hooks: run the emulated queues after every program
@@ -33,7 +34,6 @@ def kick_mock():
     for d in drivers: d._emulate_execute()
 
 def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:bytes) -> bytes|None:
-  if cmd == RemoteCmd.PING: return resp()
   if cmd == RemoteCmd.PROBE:
     filters:dict[int, list[int]] = {}
     for mask, dev in struct.iter_unpack('<II', payload): filters.setdefault(mask, []).append(dev)
@@ -42,20 +42,17 @@ def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:b
       if d not in devices: devices.append(d)
     return resp(payload="\n".join(f"{d[1]}:{devices.index(d)}" for d in devs).encode())
   if cmd == RemoteCmd.MEM_READ:
-    v = view(a0, a1, FMT[a2])
-    return resp(payload=bytes(v[0:a1]) if a2 == 1 else struct.pack(f'<{a1 // a2}{FMT[a2]}', *v[0:a1 // a2]))
+    v, i = view(a0, a1, FMT[a2])
+    return resp(payload=bytes(v[i:i + a1]) if a2 == 1 else struct.pack(f'<{a1 // a2}{FMT[a2]}', *v[i:i + a1 // a2]))
   if cmd == RemoteCmd.MEM_WRITE:
-    v = view(a0, len(payload), FMT[a2])
-    if a2 == 1: v[0:len(payload)] = payload
-    elif len(payload) == a2: v[0] = struct.unpack(f'<{FMT[a2]}', payload)[0]
-    else: v[0:len(payload) // a2] = array.array(FMT[a2], payload)
+    v, i = view(a0, len(payload), FMT[a2])
+    if a2 == 1: v[i:i + len(payload)] = payload
+    elif len(payload) == a2: v[i] = struct.unpack(f'<{FMT[a2]}', payload)[0]
+    else: v[i:i + len(payload) // a2] = array.array(FMT[a2], payload)
     return None
   if cmd == RemoteCmd.LOAD_PROG:
     progs[h:=len(progs) + 1] = Device["CPU"].runtime(pickle.loads(payload))
     return resp(h)
-  if cmd == RemoteCmd.FREE_PROG:
-    progs.pop(a0)
-    return resp()
   if cmd == RemoteCmd.EXEC_PROG:
     et = progs[a0](*struct.unpack(f'<{a1}Q', payload), wait=bool(a2))
     kick_mock()

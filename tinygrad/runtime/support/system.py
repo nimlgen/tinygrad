@@ -317,7 +317,7 @@ class PCIIfaceBase:
 # the programs hcq2 links for its devices run there (LOAD_PROG/EXEC_PROG).
 
 class RemoteCmd(enum.IntEnum):
-  PROBE, PING, CFG_READ, CFG_WRITE, RESET, RESIZE_BAR, MAP_BAR, MAP_SYSMEM, MEM_READ, MEM_WRITE, LOAD_PROG, FREE_PROG, EXEC_PROG = range(13)
+  PROBE, CFG_READ, CFG_WRITE, RESET, RESIZE_BAR, MAP_BAR, MAP_SYSMEM, MEM_READ, MEM_WRITE, LOAD_PROG, EXEC_PROG = range(11)
 
 REMOTE_REQ, REMOTE_RESP = '<BIIQQQ', '<BQQ' # (cmd, dev, bar, a0, a1, a2) and (status, r0, payload length)
 
@@ -386,7 +386,6 @@ class RemotePCIDevice(PCIDevice):
     return RemotePCIDevice._rpc(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
   def post(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b''):
     RemotePCIDevice._post(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
-  def ping(self): self.rpc(RemoteCmd.PING)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     host_va, data = self.rpc(RemoteCmd.MAP_SYSMEM, size, int(contiguous), vaddr) # mapped at vaddr on the node: cpu pointer == GPU VA there
@@ -407,7 +406,6 @@ class RemotePCIDevice(PCIDevice):
 
   # programs run on the node with raw u64 args: the addresses of its memory
   def load_prog(self, elf) -> int: return self.rpc(RemoteCmd.LOAD_PROG, len(data:=pickle.dumps(elf)), payload=data)[0]
-  def free_prog(self, handle:int): self.rpc(RemoteCmd.FREE_PROG, handle)
   def exec_prog(self, handle:int, args:list[int], wait:bool=False) -> float|None:
     if wait: return self.rpc(RemoteCmd.EXEC_PROG, handle, len(args), 1, payload=struct.pack(f'<{len(args)}Q', *args))[0] / 1e9
     return self.post(RemoteCmd.EXEC_PROG, handle, len(args), 0, payload=struct.pack(f'<{len(args)}Q', *args))
