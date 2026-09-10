@@ -1,24 +1,28 @@
 from __future__ import annotations
-from typing import cast
-import functools
+from typing import cast, Any
+import functools, struct
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import round_up, getenv
+from tinygrad.helpers import round_up, getenv, ceildiv, to_tuple
+from tinygrad.engine.realize import get_call_arg_uops
+from tinygrad.runtime.autogen import bnxt
 from tinygrad.runtime.support.am.amdev import AMMemoryManager
-from tinygrad.runtime.support.bnxt import BNXTDev, BNXTQP
+from tinygrad.runtime.support.bnxt import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
+from tinygrad.runtime.support.hcq2 import unwrap_view, nic_for
 from tinygrad.runtime.support.memory import AddrSpace, MMIOInterface, VirtMapping
-from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta, System
+from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
+
+RDMA_CHUNK = 1 << 30 # a send length is 32 bits
 
 class BNXTIface(PCIIfaceBase):
   def __init__(self, dev:BNXTDevice, index:int):
-    self.dev, self.vram_bar = dev, 2
-    self.pci_dev = System.pci_probe_device("BNXT", index, 0x14e4, ((0xffff, (0x1760,)),), 0x02)
-    if self.is_local(): System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size)
-    self.dev_impl = BNXTDev(self.pci_dev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}"))
+    super().__init__(dev, index, vendor=0x14e4, devices=((0xffff, (0x1760,)),), vram_bar=2, va_start=AMMemoryManager.va_allocator.base,
+      va_size=AMMemoryManager.va_allocator.size, dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=0x02)
 
   def is_bar_small(self) -> bool: return False
 
+  # nic memory as a buffer any gpu of the node maps: sysmem rings and counters, the doorbell page of the bar
   def buffer(self, mem:MMIOInterface, paddrs:list[int], snooped:bool=True) -> Buffer:
     va = AMMemoryManager.alloc_vaddr(size:=round_up(mem.nbytes, 0x1000), 0x1000)
     mapping = VirtMapping(va, size, [(p, 0x1000) for p in paddrs], AddrSpace.SYS, uncached=True, snooped=snooped)
@@ -36,7 +40,7 @@ class BNXTIface(PCIIfaceBase):
 
 class BNXTAllocator(Allocator):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage: raise RuntimeError("BNXT only maps buffers")
-  def _map(self, buf:Buffer) -> BufferStorage:
+  def _map(self, buf:Buffer) -> BufferStorage: # a memory region over the buffer's pages, keyed at the gpu virtual address
     iface = getattr(Device[buf.device], "iface", None)
     if not isinstance(iface, PCIIfaceBase) or iface.peer_group != self.dev.peer_group: raise RuntimeError("BNXT requires memory on its node")
     mapping = buf.meta.mapping
@@ -62,21 +66,45 @@ class BNXTDevice(Compiled):
   def synchronize(self, timeout:int|None=None):
     for d in {d for pair in self.qps for d in pair if Device[d].peer_group == self.peer_group}: Device[d].synchronize(timeout)
 
-  def qp(self, local, peer) -> BNXTQP:
+  def qp(self, local, peer) -> BNXTQP: # one queue pair per gpu pair, on this nic and the peer's, with their rings and counters
     pair = tuple(sorted((local.device, peer.device)))
     if pair not in self.qps:
-      other = cast(BNXTDevice, peer.nic)
+      other = cast(BNXTDevice, nic_for(peer))
       for nic in (self, other):
         nic.qps[pair] = q = BNXTQP(nic.iface.dev_impl)
-        for name in ("sq", "rq", "scq", "rcq"):
-          ring = getattr(q, name)
-          nic.bufs[pair, name] = nic.iface.buffer(ring["mem"], ring["paddrs"])
+        for name in ("sq", "rq", "scq", "rcq"): nic.bufs[pair, name] = nic.iface.buffer(getattr(q, name)["mem"], getattr(q, name)["paddrs"])
         for name in ("sq_prod", "sq_psn", "rq_prod", "scq_cons", "rcq_cons"): nic.bufs[pair, name] = nic.iface.counter()
         nic.bufs[pair, "db"] = nic.iface.doorbell
-      for a, b in ((self, other), (other, self)):
-        a.qps[pair].connect(b.qps[pair].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
+      for a, b in ((self, other), (other, self)): a.qps[pair].connect(b.qps[pair].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
     return self.qps[pair]
 
   def arg(self, pair:tuple[str, str], name:str) -> UOp:
     b = self.bufs[pair, name]
     return UOp.placeholder((b.size,), b.dtype, 0, device=(self.device,), volatile=True, tag=("rdma", pair, name))
+
+  # one side of a copy between nodes, on the queue of its gpu: write the wqe, ring the nic, wait for the completion, ack it
+  def copy(self, hq:Any, call:UOp):
+    dst, src = get_call_arg_uops(call)
+    recv = call.src[0].arg == "recv"
+    buf, peer = (dst, Device[to_tuple(src.device)[0]]) if recv else (src, Device[to_tuple(dst.device)[0]])
+    qp, pair = self.qp(hq.dev, peer), tuple(sorted((hq.dev.device, peer.device)))
+    ring, prod, cq, cons = (self.arg(pair, n) for n in (("rq", "rq_prod", "rcq", "rcq_cons") if recv else ("sq", "sq_prod", "scq", "scq_cons")))
+    ring_addr, cq_addr = hq.rt(ring, hq.devs), hq.rt(cq, hq.devs)
+    db = self.arg(pair, "db").getaddr(hq.devs) + (self.iface.dev_impl.db_off & 0xfff)
+    key = unwrap_view(buf)[0].getaddr(self.device).cast(dtypes.uint32)
+    for off in range(0, buf.nbytes(), RDMA_CHUNK):
+      size = min(RDMA_CHUNK, buf.nbytes() - off)
+      p, c = [hq.host_stores.get(b, b.index(0).load()) for b in (prod, cons)]
+      hdr = struct.unpack("<8I", (recv_wqe if recv else send_wqe)(0, 0, size)[:32])
+      hq.write(ring_addr + (p % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(hq.devs) + off, key, UOp.const(size, dtypes.uint32))
+      if not recv: # the msn entry of the send, then the data the nic reads must be in memory
+        psn = hq.host_stores.get(psn_buf:=self.arg(pair, "sq_psn"), psn_buf.index(0).load())
+        hq.host_stores[psn_buf] = nxt = psn + max(1, ceildiv(size, MTU))
+        hq.write(ring_addr + 0x1000 + (p % RING_ENTRIES) * 8, ((p % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
+        hq.memory_barrier()
+      hq.write(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) % RING_ENTRIES, (p + 1) // RING_ENTRIES & 1))
+      # the cqe: toggle bit of this pass, its type (RES_RC for a receive), status 0
+      hq.wait(cq_addr + (c % CQ_ENTRIES) * 32 + 24, (((c // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
+      hq.write(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) % CQ_ENTRIES, (c + 1) // CQ_ENTRIES & 1))
+      if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
+      hq.host_stores[prod], hq.host_stores[cons] = p + 1, c + 1

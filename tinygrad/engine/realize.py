@@ -159,7 +159,7 @@ def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
     elif src.device.split(":")[0] in HCQ_DEVS and dest._host_mv() is not None and src._host_mv() is not None:
       dst_mv, src_mv = dest.as_memoryview(allow_zero_copy=True), src.as_memoryview(allow_zero_copy=True)
       with cpu_profile(f"{src.device} -> TINY", f"{src.device}:COPY"): dst_mv[:] = src_mv[:]
-    # Host views include memory of remote nodes, read and written through their transport.
+    # host views of remote nodes are read and written through their transport
     elif (host:=dest.get_storage().host or dest._host_mv()) is not None and (src_host:=src.get_storage().host or src._host_mv()) is not None:
       Device[dest.device].synchronize()
       Device[src.device].synchronize()
@@ -205,14 +205,13 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   if (info:=call.arg.aux).inputs:
     addrs = [cast(Buffer, _resolve(u, ctx.input_uops).buffer).get_buf(dev) + off for u, dev, off in info.inputs]
     cast(Buffer, call.src[1 + info.table].buffer).host.view(fmt='Q')[:] = array.array('Q', addrs)
-  ctx = replace(ctx, var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
+  # a batch with rdma copies completes only once its peer batches are posted: it is never waited on here
+  ctx = replace(ctx, wait=ctx.wait and not info.rdma,
+                var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
   ets = exec_kernel(ctx, call, ast, devices=(HCQ_RUNTIME_DEV.value,), peer=Device[info.device[0]].remote_peer)
   for host, dev in info.host_deps: Device[host].pending[dev] = Device[dev].timeline.host.view(fmt='Q')[1]
-  return ets if info.rdma else finish_hcq(ctx, call, ets)
-
-def finish_hcq(ctx:ExecContext, call:UOp, ets:list[float|None]) -> list[float|None]:
   if not (ctx.wait or PROFILE): return ets
-  info = call.arg.aux
+
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
   for devs, name, _, prof, pkey in info.kernels:
     for d in (devs if prof else ()): cast(Any, Device[d]).prof_ents[(slots[d], prof[0])] = ProfileGraphEntry(d, name, prof[0], prof[1], pkey)
@@ -306,21 +305,7 @@ def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequenc
   inputs = list(input_uops)
   if not jit: linear = link_linear(compile_linear(linear, validate=VALIDATE_WITH_CPU, input_uops=inputs, cache=True), input_uops=inputs)
   ctx = ExecContext(var_vals or {}, tuple(inputs), update_stats, jit, wait or DEBUG>=2)
-  for call, st, ets in exec_linear(ctx, linear): track_stats(ctx, call, st, ets)
-
-def exec_linear(ctx:ExecContext, linear:UOp) -> Iterator[tuple[UOp, decimal.Decimal, list[float|None]]]:
-  pending:list[tuple[UOp, decimal.Decimal, list[float|None]]] = []
-  for call in (*linear.src, None):
-    call = call.without_after if call is not None else None
-    rdma = call is not None and isinstance(call.arg.aux, HCQInfo) and call.arg.aux.rdma
-    if not rdma:
-      for c, st, ets in pending: yield c, st, finish_hcq(ctx, c, ets)
-      pending.clear()
-    if call is None: break
-    st = perf_counter_us()
-    ets = pm_exec.rewrite(call, replace(ctx, wait=False) if rdma else ctx)
-    if rdma: pending.append((call, st, ets))
-    else: yield call, st, ets
+  for call in linear.src: track_stats(ctx, call.without_after, perf_counter_us(), pm_exec.rewrite(call.without_after, ctx))
 
 def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None, clear_l2:bool=False) -> Iterator[float]:
   ctx = ExecContext(var_vals or {}, update_stats=False, wait=True, timeout=timeout, cache=False)
@@ -331,4 +316,4 @@ def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None
       else:
         from tinygrad.tensor import Tensor
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024, 1024).contiguous().realize(do_update_stats=False)
-    yield max((et or 0.0 for _, _, ets in exec_linear(ctx, linear) for et in ets), default=0.0)
+    yield max(pm_exec.rewrite(linear.src[0].without_after, ctx) or [0.0])

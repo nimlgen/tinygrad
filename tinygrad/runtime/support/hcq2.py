@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import cast, Any
 import functools, itertools, weakref, ctypes, importlib
 from dataclasses import replace, dataclass, field
-from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, getenv, ceildiv
+from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, getenv
 from tinygrad.device import Device, Buffer, BufferSpec, DepsTracker
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu
 from tinygrad.dtype import dtypes, DType, DTYPES_DICT, AddrSpace
@@ -32,11 +32,10 @@ class HCQInfo:
 
 def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for x in to_tuple(d)} <= c
 
-def is_rdma(call:UOp) -> bool:
-  if not HCQ2 or not getenv("RDMA") or call.src[0].op is not Ops.COPY: return False
-  devs = [to_tuple(b.device) for b in get_call_arg_uops(call)]
-  return len(devs) == 2 and all(len(d) == 1 and all_devices_in(d, frozenset(("AMD",))) for d in devs) and \
-    Device[devs[0][0]].peer_group != Device[devs[1][0]].peer_group
+def is_rdma(call:UOp) -> bool: return call.src[0].op is Ops.COPY and call.src[0].arg in ("send", "recv") # one side of a copy between nodes
+
+def nic_for(dev:Any) -> Any: # the node's nic: the BNXT device in the same peer group
+  return next(nic for i in itertools.count() if (nic:=Device[f"BNXT:{i}"]).peer_group == dev.peer_group)
 
 def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op not in (Ops.PROGRAM, Ops.COPY): return None # only these bodies can be enqueued
@@ -153,18 +152,11 @@ pm_insert_copy_staging = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.COPY), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), stage_copy),
 ])
 
-# Each node prepares its entire batch before ringing a doorbell: no ring may wrap within one batch.
-RDMA_CHUNK, RDMA_SLOTS = 1 << 30, 32
-
-def split_rdma(call:UOp) -> UOp|None:
-  if not is_rdma(call) or call.src[0].arg in ("send", "recv"): return None
-  dst, src = get_call_arg_uops(call)
-  chunk, calls = RDMA_CHUNK * RDMA_SLOTS // src.dtype.itemsize, []
-  for off in range(0, src.max_numel(), chunk):
-    end = min(off + chunk, src.max_numel())
-    args = (dst[off:end], src[off:end], *call.src[3:])
-    calls += [call.replace(src=(call.src[0].replace(arg=side), *args)) for side in ("send", "recv")]
-  return UOp(Ops.LINEAR, src=tuple(calls))
+def split_rdma(call:UOp) -> UOp|None: # a copy between nodes: a send on the source device and a receive on the destination
+  bufs = get_call_arg_uops(call)
+  if is_rdma(call) or not getenv("RDMA") or not all(all_devices_in(b.device, HCQ_DEVS) for b in bufs): return None
+  if len({Device[to_tuple(b.device)[0]].peer_group for b in bufs}) == 1: return None
+  return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
 
 pm_split_rdma = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.COPY),), allow_any_len=True, name="call"), split_rdma)])
 
@@ -182,7 +174,6 @@ class HCQDepsTracker(DepsTracker):
 class BatchCtx:
   batch:list[tuple[UOp, tuple[str, ...], str]] # (call, devices, queue) per enqueued call
   profile:bool
-  rdma:bool = False
   tracker:HCQDepsTracker = field(default_factory=HCQDepsTracker)
   queues:dict[str, list[str]] = field(init=False)
   first:dict[tuple[str, str], int] = field(init=False); last:dict[tuple[str, str], int] = field(init=False) # noqa: E702
@@ -266,13 +257,14 @@ def _finalize_batch(ctx:BatchCtx) -> UOp:
   merged:list[UOp] = [] # the submits in order, after the fence
   for m in _merge_queues(submits): merged.append(m.after(fence, *merged[-1:]))
   estimates = sum((estimate_uop(call) for call, _, _ in ctx.batch), start=Estimates()).simplify()
-  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit", estimates=Estimates()), tag=1) # GPU estimates are in HCQInfo; polling has no fixed cost
+  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit"), tag=1)
   for pm in [Device[d].pm_batch for d in ctx.queues if Device[d].pm_batch is not None]: # a device adds its own work to the batch
     if (r:=pm.rewrite(sink)) is not None: sink = r
   host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch if not is_rdma(call) for buf in get_call_arg_uops(call)
                          for host in to_tuple(buf.device) if host not in ctx.queues))
   return sink.call(*(ctx.slots.values() if ctx.profile else ()),
-                   aux=HCQInfo(tuple(ctx.queues), rdma=ctx.rdma, kernels=tuple(kerns), estimates=estimates, host_deps=host_deps))
+                   aux=HCQInfo(tuple(ctx.queues), rdma=any(is_rdma(c) for c, _, _ in ctx.batch), kernels=tuple(kerns), estimates=estimates,
+                               host_deps=host_deps))
 
 @rewrite_group(new_ctx=False)
 def sched_batches(l:UOp, profile:bool) -> UOp:
@@ -283,19 +275,8 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
     if not hcq: srcs += [c for c, _, _ in grp]
     else: # one batch per node: its program runs there, nodes only meet through rdma copies
       peers:dict[str, list] = {}
-      posts:dict[tuple[str, str], int] = {}
-      for e in grp:
-        if is_rdma(e[0]) and e[0].src[0].arg == "send":
-          dst, src = get_call_arg_uops(e[0])
-          pair = (Device.canonicalize(to_tuple(src.device)[0]), Device.canonicalize(to_tuple(dst.device)[0]))
-          n = ceildiv(src.nbytes(), RDMA_CHUNK)
-          assert n <= RDMA_SLOTS
-          if posts.get(pair, 0) + n > RDMA_SLOTS:
-            srcs += [_finalize_batch(BatchCtx(b, profile, rdma=True)) for b in peers.values()]
-            peers, posts = {}, {}
-          posts[pair] = posts.get(pair, 0) + n
-        peers.setdefault(Device[e[1][0]].peer_group, []).append(e)
-      srcs += [_finalize_batch(BatchCtx(b, profile, rdma=bool(posts))) for b in peers.values()]
+      for e in grp: peers.setdefault(Device[e[1][0]].peer_group, []).append(e)
+      srcs += [_finalize_batch(BatchCtx(b, profile)) for b in peers.values()]
   return l.replace(src=tuple(srcs))
 
 # *****************
@@ -304,7 +285,6 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 @dataclass
 class EncodeCtx:
   devs:tuple[str, ...]
-  rdma:bool = False
   inputs:dict[tuple[UOp, str, int], int] = field(default_factory=dict)
   lt_patches:list[UOp] = field(default_factory=list)
 
@@ -318,7 +298,9 @@ class EncodeCtx:
 class HWQueue:
   q_rewrite = PatternMatcher([ # the ops of a queue: a queue defines the methods it supports
     (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), lambda ctx, call, prg: ctx.exec(call, prg)),
-    (UPat(Ops.CALL, src=(UPat(Ops.COPY),), name="call", allow_any_len=True), lambda ctx, call: ctx.copy(call)),
+    (UPat(Ops.CALL, src=(UPat(Ops.COPY),), name="call", allow_any_len=True),
+     lambda ctx, call: nic_for(ctx.dev).copy(ctx, call) if is_rdma(call) else ctx.copy(call)),
+    (UPat(Ops.INS, arg=("write", dtypes.void), name="w"), lambda ctx, w: ctx.write(w.src[0], *w.src[1:])),
     (UPat(Ops.INS, arg=("barrier", dtypes.void)), lambda ctx: ctx.memory_barrier()),
     (UPat(Ops.INS, arg=("wait", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val)),
     (UPat(Ops.INS, arg=("wait_eq", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val, eq=True)),
@@ -331,6 +313,10 @@ class HWQueue:
     self.devs, self.queue = self.lin.arg
     self.dev = Device[self.devs[0]]
     self.blob, self.patches = bytearray(), list[tuple[int, UOp]]()
+    self.host_stores:dict[UOp, UOp] = {} # host words the submit program updates after the push, e.g. ring counters
+    self.words:dict[tuple[UOp, Any], UOp] = {}
+
+  def rt(self, b:UOp, dev) -> UOp: return self.words.setdefault((b, dev), rt_addr(b, dev, self.ctx.host)) # b's address, read at runtime
 
   def q(self, *words) -> int:
     for w in words:
@@ -361,7 +347,6 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
     slots, off = unwrap_view(lasts[i])
     slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
     target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
-    if ctx.rdma: target = timeline((dev,)).after(*last).index(1).load() # shared NIC rings cannot be rewritten until the preceding batch has completed
     done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
     bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
     last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
@@ -433,7 +418,8 @@ def encode_submit(hq:HWQueue) -> UOp:
   buf = UOp.placeholder((len(hq.blob),), dtypes.uint8, device=hq.devs, tag=to_name("cmdbuf", hq.queue))
 
   words = UOp.sink(*[w for _, w in hq.patches]).substitute({l: buf[o:e] for l, (o, e) in views.items()}).src
-  return hq.submit(patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),)))
+  out = hq.submit(patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),)))
+  return out.after(*[b.after(out).index(0).store(v) for b, v in hq.host_stores.items()])
 
 # *****************
 # 4. lower call
@@ -447,7 +433,7 @@ def lower_call(call:UOp) -> UOp|None:
   if not isinstance(call.arg.aux, HCQInfo) or call.arg.aux.nargs: return None # not an hcq call, or lowered already
 
   # encode bodies
-  ctx = EncodeCtx(call.arg.aux.device, rdma=call.arg.aux.rdma)
+  ctx = EncodeCtx(call.arg.aux.device)
   devs = [Device[d] for d in dedup([d.split(":")[0] for d in ctx.devs])]
   body = graph_rewrite(call.src[0], sum([d.pm_encode for d in devs if d.pm_encode is not None], PatternMatcher([])) + pm_hcq_encode,
                        ctx=ctx, bpm=pm_patches, name="encode")
@@ -455,13 +441,6 @@ def lower_call(call:UOp) -> UOp|None:
 
   # resize table
   body = body.substitute({ctx.table: (table:=ctx.scratch((len(ctx.inputs),), dtypes.uint64, "inputs"))})
-
-  # Address patches share one allocation and one CPU argument.
-  if words := [u for u in body.toposort() if u.op is Ops.PARAM and u.tag == "addr"]:
-    addrs = ctx.scratch((len(words),), dtypes.uint64, "addrs")
-    packed = {b: addrs[i:i+1] for i, b in enumerate(words)}
-    body = body.substitute(packed, enter_calls=True)
-    ctx.lt_patches = [p.substitute(packed) for p in ctx.lt_patches]
 
   # the placeholders become the body's params in visit order, variables bind by name after them, the ranges renumber
   bufs, alus = partition([u for u in body.toposort() if u.op is Ops.PARAM], lambda u: u.tag is not None)
