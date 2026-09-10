@@ -1,6 +1,6 @@
 from __future__ import annotations
 import platform, sys, ctypes, mmap, struct, time
-from typing import cast
+from typing import cast, Any
 from tinygrad.helpers import OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le
 from tinygrad.device import Compiled, TinyELF, Program, HostAllocator
 from tinygrad.runtime.support.c import DLL
@@ -20,7 +20,8 @@ class CPUProgram(Program['CPUDevice']):
   def _load(self, lib, base=0): return lib if lib[:4] != libc.ELFMAG.encode() else jit_loader(lib, base=base, link_libs=[self.libm, self.rt_lib])
 
   def __init__(self, dev:CPUDevice, obj:TinyELF):
-    self.dev, self.name, self.signature = dev, obj.name, obj.signature
+    self.dev, self.obj, self.name, self.signature = dev, obj, obj.name, obj.signature
+    self.remote_handles:dict[Any, int] = {} # per node socket
     self.lvp = obj.target.renderer == "LVP"
 
     if sys.platform == "win32": # mypy doesn't understand when WIN is used here
@@ -67,6 +68,11 @@ class CPUProgram(Program['CPUDevice']):
       args = [*bufs, *cast(tuple[int, ...], vals)]
       self.fxn(*[ctypes.c_uint64(x) for x in args])
     return time.perf_counter() - st if wait else None
+
+  # the same program on another node (RemotePCIDevice): loaded there once, the args are that node's addresses
+  def remote_exec(self, peer, *bufs:int, vals:tuple[int, ...]=(), wait:bool=False) -> float|None:
+    if (handle:=self.remote_handles.get(peer.sock)) is None: handle = self.remote_handles[peer.sock] = peer.load_prog(self.obj)
+    return peer.exec_prog(handle, [*bufs, *vals], wait)
 
   @suppress_finalizing
   def __del__(self):

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools, pickle
 from tinygrad.device import BufferStorage, Buffer, Device
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
@@ -81,6 +81,8 @@ class _System:
 
   @functools.cache
   def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
+    if getenv("REMOTE", ""):
+      return [(functools.partial(RemotePCIDevice, sock=s), x) for s, x in RemotePCIDevice.remote_list(vendor, devices, base_class)]
     return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
 
   def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
@@ -252,12 +254,15 @@ class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=
 class PCIIfaceBase:
   @property
   def peer_group(self) -> str: return getattr(self.pci_dev, 'peer_group', type(self.pci_dev).__name__)
+  def is_local(self) -> bool: return not isinstance(self.pci_dev, RemotePCIDevice)
+  @property
+  def remote(self) -> RemotePCIDevice|None: return self.pci_dev if isinstance(self.pci_dev, RemotePCIDevice) else None
   def is_bar_small(self) -> bool: return self.pci_dev.bar_info(self.vram_bar)[1] == (256 << 20)
 
   def __init__(self, dev, dev_id, vendor, devices:tuple[tuple[int, tuple[int, ...]], ...], vram_bar, va_start, va_size,
                dev_impl_t, base_class:int|None=None):
     self.pci_dev = System.pci_probe_device(dn:=dev.__class__.__name__[:-6], dev_id, vendor, devices, base_class=base_class)
-    System.reserve_va(va_start, va_size)
+    if self.is_local(): System.reserve_va(va_start, va_size)
     with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
     self.dev_impl = dev_impl_t(self.pci_dev)
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
@@ -281,7 +286,7 @@ class PCIIfaceBase:
 
   def free(self, storage:BufferStorage):
     if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
-    if storage.meta.has_cpu_mapping: FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
+    if storage.meta.has_cpu_mapping and self.is_local(): FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
 
   def unmap(self, mapping:BufferStorage): self.dev_impl.mm.unmap_range(*mapping.meta)
 
@@ -290,6 +295,7 @@ class PCIIfaceBase:
 
   def map(self, b:Buffer) -> BufferStorage:
     if b.device.split(":")[0] in {"CPU", "PYTHON", "NPY"}:
+      if not self.is_local(): raise RuntimeError(f"host memory of this process is not on the node of {self.dev.device}")
       if b._buf % 0x1000: raise RuntimeError("Host mapping requires a page-aligned address")
       lo, size = b._buf, round_up(b.nbytes, 0x1000)
       if not self.dev_impl.mm.va_base <= lo < lo + size <= self.dev_impl.mm.va_base + (1 << self.dev_impl.mm.va_bits):
@@ -298,6 +304,7 @@ class PCIIfaceBase:
       paddrs, aspace, snooped, uncached = [(x, 0x1000) for x in System.system_paddrs(lo, size)], AddrSpace.SYS, True, True
     elif isinstance(ifa:=getattr(Device[b.device], "iface", None), PCIIfaceBase):
       if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")
+      if ifa.peer_group != self.peer_group: raise RuntimeError(f"P2P mapping across peer groups: {b.device} -> {self.dev.device}")
       lo, size, snooped, uncached = b._buf, b.meta.mapping.size, True, b.meta.mapping.uncached
       if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace = b.meta.mapping.paddrs, AddrSpace.SYS
       else: paddrs, aspace = ifa.p2p_paddrs(b.meta.mapping.paddrs)
@@ -305,3 +312,102 @@ class PCIIfaceBase:
 
     self.dev_impl.mm.map_range(lo, size, paddrs, aspace=aspace, snooped=snooped, uncached=uncached)
     return BufferStorage(b._buf, (lo, size))
+
+# *** Remote PCI devices: a node behind extra/remote/serve.py. Its devices' config space, bars and sysmem are driven from here by address, and
+# the programs hcq2 links for its devices run there (LOAD_PROG/EXEC_PROG).
+
+class RemoteCmd(enum.IntEnum):
+  PROBE, PING, CFG_READ, CFG_WRITE, RESET, RESIZE_BAR, MAP_BAR, MAP_SYSMEM, MEM_READ, MEM_WRITE, LOAD_PROG, FREE_PROG, EXEC_PROG = range(13)
+
+REMOTE_REQ, REMOTE_RESP = '<BIIQQQ', '<BQQ' # (cmd, dev, bar, a0, a1, a2) and (status, r0, payload length)
+
+class RemoteMMIOInterface(MMIOInterface):
+  # memory of the node at its address: reads are round trips, writes are posted in order
+  def __init__(self, dev:RemotePCIDevice, addr:int, nbytes:int, fmt='B'): self.dev, self.addr, self.nbytes, self.fmt = dev, addr, nbytes, fmt
+  def __getitem__(self, k):
+    sl, el = k if isinstance(k, slice) else slice(k, k + 1), struct.calcsize(self.fmt)
+    st, en = (sl.start or 0) * el, (len(self) if sl.stop is None else sl.stop) * el
+    data = self.dev.rpc(RemoteCmd.MEM_READ, self.addr + st, en - st, el)[1]
+    res = data if self.fmt == 'B' else list(struct.unpack(f'<{(en - st) // el}{self.fmt}', data))
+    return res if isinstance(k, slice) else res[0]
+  def __setitem__(self, k, v):
+    st = ((k.start or 0) if isinstance(k, slice) else k) * (el:=struct.calcsize(self.fmt))
+    data = (bytes(v) if self.fmt == 'B' else struct.pack(f'<{len(v)}{self.fmt}', *v)) if isinstance(k, slice) else struct.pack(f'<{self.fmt}', v)
+    self.dev.post(RemoteCmd.MEM_WRITE, self.addr + st, len(data), el, payload=data)
+  def view(self, offset:int=0, size:int|None=None, fmt=None) -> MMIOInterface:
+    return RemoteMMIOInterface(self.dev, self.addr + offset, (self.nbytes - offset) if size is None else size, fmt or self.fmt)
+
+class RemotePCIDevice(PCIDevice):
+  @staticmethod
+  @functools.cache
+  def connect(host:str, port:int) -> socket.socket:
+    sock = socket.create_connection((host, port), timeout=getenv("REMOTE_TIMEOUT", 3))
+    sock.settimeout(None)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): sock.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
+    return sock
+
+  @staticmethod
+  @functools.cache
+  def remote_list(vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None) -> list[tuple[socket.socket, str]]:
+    payload, ret = array.array('I', itertools.chain.from_iterable((m, d) for m, ds in devices for d in ds)).tobytes(), []
+    for r in [r.strip() for r in getenv("REMOTE", "").split(",") if r.strip()]:
+      host, port = r.split(":")[0], int(r.split(":")[1]) if ":" in r else 6667
+      sock = RemotePCIDevice.connect(host, port)
+      _, data = RemotePCIDevice._rpc(sock, RemoteCmd.PROBE, base_class or 0, vendor, len(payload), payload=payload)
+      ret += [(sock, f"remote:{host}:{port}:{d}") for d in data.decode().split()]
+    return ret
+
+  @staticmethod
+  def _recvall(sock:socket.socket, n:int) -> bytes:
+    data = bytearray()
+    while len(data) < n:
+      if not (chunk:=sock.recv(n - len(data))): raise RuntimeError("the node closed the connection: a posted command failed there")
+      data += chunk
+    return bytes(data)
+  @staticmethod
+  def _post(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b''):
+    sock.sendall(struct.pack(REMOTE_REQ, cmd, dev, bar, *(*args, 0, 0, 0)[:3]))
+    if len(payload): sock.sendall(payload)
+  @staticmethod
+  def _rpc(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b'') -> tuple[int, bytes]:
+    RemotePCIDevice._post(sock, cmd, *args, dev=dev, bar=bar, payload=payload)
+    status, r0, n = struct.unpack(REMOTE_RESP, RemotePCIDevice._recvall(sock, struct.calcsize(REMOTE_RESP)))
+    data = RemotePCIDevice._recvall(sock, n)
+    if status: raise RuntimeError(f"remote {cmd.name} failed: {data.decode()}")
+    return r0, data
+
+  def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
+    self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, int(pcibus.split(':')[-1]), None
+    self.peer_group = "%s:%d" % sock.getpeername()[:2] # the node
+    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+
+  def rpc(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b'') -> tuple[int, bytes]:
+    return RemotePCIDevice._rpc(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
+  def post(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b''):
+    RemotePCIDevice._post(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
+  def ping(self): self.rpc(RemoteCmd.PING)
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    host_va, data = self.rpc(RemoteCmd.MAP_SYSMEM, size, int(contiguous), vaddr) # mapped at vaddr on the node: cpu pointer == GPU VA there
+    return RemoteMMIOInterface(self, host_va, size), list(struct.unpack(f'<{len(data) // 8}Q', data))
+  def reset(self): self.rpc(RemoteCmd.RESET)
+  def read_config(self, offset:int, size:int): return self.rpc(RemoteCmd.CFG_READ, offset, size)[0]
+  def write_config(self, offset:int, value:int, size:int): self.rpc(RemoteCmd.CFG_WRITE, offset, size, value)
+  def resize_bar(self, bar_idx:int): self.rpc(RemoteCmd.RESIZE_BAR, bar=bar_idx)
+  @functools.cache
+  def _bar(self, bar:int) -> tuple[int, int, int]: # paddr, size, the node's address of the whole bar
+    paddr, data = self.rpc(RemoteCmd.MAP_BAR, bar=bar)
+    return paddr, *struct.unpack('<QQ', data)
+  @functools.cache
+  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar(bar_idx)[:2]
+  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
+    _, sz, host_va = self._bar(bar)
+    return RemoteMMIOInterface(self, host_va + off, size or (sz - off), fmt)
+
+  # programs run on the node with raw u64 args: the addresses of its memory
+  def load_prog(self, elf) -> int: return self.rpc(RemoteCmd.LOAD_PROG, len(data:=pickle.dumps(elf)), payload=data)[0]
+  def free_prog(self, handle:int): self.rpc(RemoteCmd.FREE_PROG, handle)
+  def exec_prog(self, handle:int, args:list[int], wait:bool=False) -> float|None:
+    if wait: return self.rpc(RemoteCmd.EXEC_PROG, handle, len(args), 1, payload=struct.pack(f'<{len(args)}Q', *args))[0] / 1e9
+    return self.post(RemoteCmd.EXEC_PROG, handle, len(args), 0, payload=struct.pack(f'<{len(args)}Q', *args))
