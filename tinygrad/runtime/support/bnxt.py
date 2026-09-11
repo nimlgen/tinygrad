@@ -170,6 +170,8 @@ class BNXTDev:
     if BNXT_DEBUG >= 1: print(f"bnxt {self.devfmt}: rcfw {name} xid={getattr(ret, 'xid', 0):#x}")
     return ret
 
+  def fini(self): self.hwrm("func_drv_unrgtr") # the firmware forgets this driver: the next takeover starts clean
+
   def doorbell(self, xid, typ, index, epoch):
     System.memory_barrier()
     self.db[self.db_off // 8] = db_value(xid, typ, index, epoch)

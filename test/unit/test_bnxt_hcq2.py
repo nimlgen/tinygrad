@@ -5,7 +5,8 @@ from tinygrad import Device, dtypes
 from tinygrad.device import Buffer, BufferStorage
 from tinygrad.runtime.ops_rdma import BNXTAllocator
 from tinygrad.runtime.support import hcq2
-from tinygrad.runtime.support.bnxt import send_wqe, recv_wqe, msn_entry, RING_ENTRIES, CQ_ENTRIES
+from tinygrad.runtime.autogen import bnxt
+from tinygrad.runtime.support.bnxt import send_wqe, recv_wqe, msn_entry, db_value, RING_ENTRIES, CQ_ENTRIES
 from tinygrad.runtime.ops_rdma import RDMADevice
 from tinygrad.engine import realize
 from tinygrad.runtime.support.memory import AddrSpace, VirtMapping
@@ -101,7 +102,7 @@ class TestBNXTCopy(unittest.TestCase):
       recorded:list = []
       hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), host_stores={}, words={},
                            memory_barrier=lambda: None, write=lambda dst, *w: recorded.extend([dst, *w]),
-                           wait=lambda a, v, eq: recorded.extend([a, v]))
+                           signal=lambda dst, v: recorded.extend([dst, v]), wait=lambda a, v, eq: recorded.extend([a, v]))
       hq.rt = lambda b, dev: hq.words.setdefault((b, dev), hcq2.rt_addr(b, dev, "CPU"))
       src, dst = [Buffer("CPU", 4096, dtypes.uint8, preallocate=True) for _ in range(2)]
       call = UOp.from_buffer(src).copy_to_device("CPU").replace(arg="recv" if recv else "send").call(UOp.from_buffer(dst), UOp.from_buffer(src))
@@ -126,10 +127,10 @@ class TestBNXTCopy(unittest.TestCase):
         if not recv:
           self.assertEqual(rest[:2], [rings[ring]._buf + 0x1000 + i % RING_ENTRIES * 8, msn_entry(i, i, 4096)[0]])
           rest = rest[2:]
-        doorbell = (i + 1) % RING_ENTRIES | ((i + 1) // RING_ENTRIES & 1) << 24
-        cq_doorbell = (i + 1) % CQ_ENTRIES | ((i + 1) // CQ_ENTRIES & 1) << 24
+        doorbell = db_value(5, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (i + 1) % RING_ENTRIES, (i + 1) // RING_ENTRIES & 1)
+        cq_doorbell = db_value(7 if recv else 6, bnxt.DBC_DBC_TYPE_CQ, (i + 1) % CQ_ENTRIES, (i + 1) // CQ_ENTRIES & 1)
         toggle = (i // CQ_ENTRIES & 1) ^ 1 | (2 if recv else 0)
-        self.assertEqual((rest[1] & 0xffffffff, rest[3], rest[5] & 0xffffffff), (doorbell, toggle, cq_doorbell))
+        self.assertEqual((rest[1], rest[3], rest[5]), (doorbell, toggle, cq_doorbell)) # full width doorbell words
         self.assertEqual(rest[2], rings[cq]._buf + i % CQ_ENTRIES * 32 + 24)
         self.assertEqual((bufs[prod].host.view(fmt="Q")[0], bufs[cons].host.view(fmt="Q")[0]), (i + 1, i + 1))
 

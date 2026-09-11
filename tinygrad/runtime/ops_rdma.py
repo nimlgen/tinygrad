@@ -21,6 +21,7 @@ class BNXTIface(PCIIfaceBase):
       va_size=AMMemoryManager.va_allocator.size, dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=0x02)
 
   def is_bar_small(self) -> bool: return False
+  def device_fini(self): self.dev_impl.fini()
 
   # nic memory as a buffer any gpu of the node maps: sysmem rings and counters, the doorbell page of the bar
   def buffer(self, mem:MMIOInterface, paddrs:list[int], snooped:bool=True) -> Buffer:
@@ -98,14 +99,14 @@ class RDMADevice(Compiled):
       p, c = [hq.host_stores.get(b, b.index(0).load()) for b in (prod, cons)]
       hdr = struct.unpack("<8I", (recv_wqe if recv else send_wqe)(0, 0, size)[:32])
       hq.write(ring_addr + (p % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(hq.devs) + off, key, UOp.const(size, dtypes.uint32))
-      if not recv: # the msn entry of the send, then the data the nic reads must be in memory
+      if not recv: # the msn entry of the send
         psn = hq.host_stores.get(psn_buf:=self.arg(pair, "sq_psn"), psn_buf.index(0).load())
         hq.host_stores[psn_buf] = nxt = psn + max(1, ceildiv(size, MTU))
         hq.write(ring_addr + 0x1000 + (p % RING_ENTRIES) * 8, ((p % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
-        hq.memory_barrier()
-      hq.write(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) % RING_ENTRIES, (p + 1) // RING_ENTRIES & 1))
+      # the doorbell is a signal: an end of pipe write, after the data the nic reads is in memory. a plain cp write does not ring it
+      hq.signal(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) % RING_ENTRIES, (p + 1) // RING_ENTRIES & 1))
       # the cqe: toggle bit of this pass, its type (RES_RC for a receive), status 0
       hq.wait(cq_addr + (c % CQ_ENTRIES) * 32 + 24, (((c // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
-      hq.write(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) % CQ_ENTRIES, (c + 1) // CQ_ENTRIES & 1))
+      hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) % CQ_ENTRIES, (c + 1) // CQ_ENTRIES & 1))
       if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
       hq.host_stores[prod], hq.host_stores[cons] = p + 1, c + 1

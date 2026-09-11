@@ -412,10 +412,12 @@ class AMDComputeQueue(HWQueue):
       self.release_mem(signal.getaddr(self.devs) + UOp.const(8, dtypes.uint64), 0, self.pm4.data_sel__mec_release_mem__send_gpu_clock_counter,
                        self.pm4.int_sel__mec_release_mem__none)
 
-  def signal(self, signal:UOp, value:UOp):
+  def signal(self, signal:UOp, value:UOp): # as wide as its destination: a 64-bit word for a doorbell
+    wide = signal.dtype.itemsize == 8
+    data_sel = self.pm4.data_sel__mec_release_mem__send_64_bit_data if wide else self.pm4.data_sel__mec_release_mem__send_32_bit_low
     with self.pred_exec(xcc_mask=0b1):
-      self.release_mem(signal.getaddr(self.devs), value, self.pm4.data_sel__mec_release_mem__send_32_bit_low,
-                       self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm, cache_flush=True)
+      self.release_mem(signal.getaddr(self.devs), value, data_sel, self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm,
+                       cache_flush=True)
 
   def submit(self, cmdbuf:UOp) -> UOp: # the ring gets an indirect buffer packet: 4 dwords, put stays aligned so it never wraps mid packet
     base, off = unwrap_view(cmdbuf)

@@ -4,7 +4,7 @@
 #   every node, the local one too:  PYTHONPATH=. DEV=PCI+AMD python extra/remote/serve.py 6667
 #   the driver:  REMOTE="localhost:6667,192.168.52.213:6667" DEV=PCI+AMD RDMA=1 python ...   (AMD:n counts through the nodes in REMOTE order,
 #   RDMA:n is node n's nic; RDMA=1 copies between nodes over the nics, without it they stage through the nodes' host memory)
-import socket, struct, sys, pickle, array, traceback
+import socket, struct, sys, pickle, array, traceback, signal
 from tinygrad.device import Device
 from tinygrad.helpers import DEBUG, DEV
 from tinygrad.runtime.support.system import PCIDevice, RemoteCmd, REMOTE_REQ, REMOTE_RESP, System
@@ -100,6 +100,7 @@ def serve(conn:socket.socket):
       conn.sendall(resp(payload=str(e).encode(), status=1))
 
 if __name__ == "__main__":
+  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)) # a kill still finalizes the devices
   port = int(sys.argv[1]) if len(sys.argv) > 1 else 6667
   System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size) # sysmem is mapped at the GPU VA the client plans
   server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
