@@ -50,7 +50,8 @@ def server():
   connect(qp, read_json(sys.stdin))
   for i in range(ITERS):
     put(mem, bytes(SIZE))
-    qp.recv(addr, key, SIZE)
+    qp.post_recv(addr, key, SIZE)
+    qp.poll(qp.rcq, qp.rcq_id)
     assert get(mem) == bytes([i % 255 + 1]) * SIZE, f"receive mismatch at iteration {i}"
   write_json(sys.stdout, {"received":ITERS})
 
@@ -70,7 +71,8 @@ if __name__ == "__main__":
       start = time.perf_counter()
       for i in range(ITERS):
         put(mem, bytes([i % 255 + 1]) * SIZE)
-        qp.send(addr, key, SIZE)
+        qp.post_send(addr, key, SIZE)
+        qp.poll(qp.scq, qp.scq_id)
       assert read_json(remote.stdout) == {"received":ITERS}
       assert remote.wait() == 0
       print(f"BNXT SEND/RECV passed: {ITERS} x {SIZE} bytes, {SIZE * ITERS / (time.perf_counter() - start) / 1e9:.3f} GB/s")

@@ -399,9 +399,8 @@ class AMDComputeQueue(HWQueue):
     self.prof_stop(slot)
 
   def wait(self, signal:UOp, value:UOp, eq:bool=False): # a value narrower than a dword compares under its mask
-    mask = (1 << 8 * value.dtype.itemsize) - 1 if value.dtype.itemsize < 4 else 0xffffffff
-    op = WAIT_REG_MEM_FUNCTION_EQ if eq else WAIT_REG_MEM_FUNCTION_GEQ
-    self.wait_reg_mem(value.cast(dtypes.uint32), mask=mask, mem=signal.getaddr(self.devs), op=op)
+    self.wait_reg_mem(value.cast(dtypes.uint32), mask=(1 << 8 * min(value.dtype.itemsize, 4)) - 1, mem=signal.getaddr(self.devs),
+                      op=WAIT_REG_MEM_FUNCTION_EQ if eq else WAIT_REG_MEM_FUNCTION_GEQ)
 
   def write(self, dst:UOp, *words:UOp): # the cp writes the words to memory, confirmed before the next packet
     with self.pred_exec(xcc_mask=0b1):
@@ -413,10 +412,9 @@ class AMDComputeQueue(HWQueue):
                        self.pm4.int_sel__mec_release_mem__none)
 
   def signal(self, signal:UOp, value:UOp): # as wide as its destination: a 64-bit word for a doorbell
-    wide = signal.dtype.itemsize == 8
-    data_sel = self.pm4.data_sel__mec_release_mem__send_64_bit_data if wide else self.pm4.data_sel__mec_release_mem__send_32_bit_low
     with self.pred_exec(xcc_mask=0b1):
-      self.release_mem(signal.getaddr(self.devs), value, data_sel, self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm,
+      self.release_mem(signal.getaddr(self.devs), value, self.pm4.data_sel__mec_release_mem__send_64_bit_data if signal.dtype.itemsize == 8 else
+                       self.pm4.data_sel__mec_release_mem__send_32_bit_low, self.pm4.int_sel__mec_release_mem__send_interrupt_after_write_confirm,
                        cache_flush=True)
 
   def submit(self, cmdbuf:UOp) -> UOp: # the ring gets an indirect buffer packet: 4 dwords, put stays aligned so it never wraps mid packet

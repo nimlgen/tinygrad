@@ -20,7 +20,6 @@ class BNXTIface(PCIIfaceBase):
     super().__init__(dev, index, vendor=0x14e4, devices=((0xffff, (0x1760,)),), vram_bar=2, va_start=AMMemoryManager.va_allocator.base,
       va_size=AMMemoryManager.va_allocator.size, dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=0x02)
 
-  def is_bar_small(self) -> bool: return False
   def device_fini(self): self.dev_impl.fini()
 
   # nic memory as a buffer any gpu of the node maps: sysmem rings and counters, the doorbell page of the bar
@@ -28,11 +27,6 @@ class BNXTIface(PCIIfaceBase):
     va = AMMemoryManager.alloc_vaddr(size:=round_up(mem.nbytes, 0x1000), 0x1000)
     mapping = VirtMapping(va, size, [(p, 0x1000) for p in paddrs], AddrSpace.SYS, uncached=True, snooped=snooped)
     return Buffer(self.dev.device, mem.nbytes, dtypes.uint8, opaque=BufferStorage(va, PCIAllocationMeta(mapping, True), mem))
-
-  def counter(self) -> Buffer:
-    mem, paddrs = self.pci_dev.alloc_sysmem(0x1000)
-    mem[:8] = bytes(8)
-    return self.buffer(mem, paddrs).view(1, dtypes.uint64, 0).ensure_allocated()
 
   @functools.cached_property
   def doorbell(self) -> Buffer:
@@ -68,14 +62,14 @@ class RDMADevice(Compiled):
   def synchronize(self, timeout:int|None=None):
     for d in {d for pair in self.qps for d in pair if Device[d].peer_group == self.peer_group}: Device[d].synchronize(timeout)
 
-  def qp(self, local, peer) -> BNXTQP: # one queue pair per gpu pair, on this nic and the peer's, with their rings and counters
-    pair = tuple(sorted((local.device, peer.device)))
+  def qp(self, pair:tuple[str, str], peer) -> BNXTQP: # one queue pair per gpu pair, on this nic and the peer's, with their rings and counters
     if pair not in self.qps:
       other = cast(RDMADevice, nic_for(peer))
       for nic in (self, other):
         nic.qps[pair] = q = BNXTQP(nic.iface.dev_impl)
         for name in ("sq", "rq", "scq", "rcq"): nic.bufs[pair, name] = nic.iface.buffer(getattr(q, name)["mem"], getattr(q, name)["paddrs"])
-        for name in ("sq_seq", "rq_seq", "psn"): nic.bufs[pair, name] = nic.iface.counter()
+        for name in ("sq_seq", "rq_seq", "psn"): # zeroed sequence numbers in fresh sysmem
+          nic.bufs[pair, name] = nic.iface.buffer(*nic.iface.pci_dev.alloc_sysmem(0x1000)).view(1, dtypes.uint64, 0).ensure_allocated()
         nic.bufs[pair, "db"] = nic.iface.doorbell
       for a, b in ((self, other), (other, self)): a.qps[pair].connect(b.qps[pair].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
     return self.qps[pair]
@@ -89,7 +83,7 @@ class RDMADevice(Compiled):
     dst, src = get_call_arg_uops(call)
     recv = call.src[0].arg == "recv"
     buf, peer = (dst, Device[to_tuple(src.device)[0]]) if recv else (src, Device[to_tuple(dst.device)[0]])
-    qp, pair = self.qp(hq.dev, peer), tuple(sorted((hq.dev.device, peer.device)))
+    qp = self.qp(pair:=tuple(sorted((hq.dev.device, peer.device))), peer)
     ring, seq, cq = (self.arg(pair, n) for n in (("rq", "rq_seq", "rcq") if recv else ("sq", "sq_seq", "scq")))
     ring_addr, cq_addr = hq.rt(ring, hq.devs), hq.rt(cq, hq.devs)
     db = self.arg(pair, "db").getaddr(hq.devs) + (self.iface.dev_impl.db_off & 0xfff)
