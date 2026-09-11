@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools, pickle
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools, pickle, re
 from tinygrad.device import BufferStorage, Buffer, Device
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
@@ -157,6 +157,7 @@ class _System:
 System = _System()
 
 # *** PCI Devices
+PCI_ADDR = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]"
 
 class PCIDevice:
   def __init__(self, devpref:str, pcibus:str):
@@ -169,6 +170,16 @@ class PCIDevice:
     if FileIOInterface.exists(f"/sys/bus/pci/devices/{self.pcibus}/driver"):
       FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver/unbind", os.O_WRONLY).write(self.pcibus)
     if FileIOInterface.exists(f"/sys/bus/pci/devices/{self.pcibus}/driver"): raise RuntimeError(f"Driver is bound to {pcibus}")
+
+    # peers reach this device through the switches directly: no acs redirect of requests and completions up to the root complex
+    for bridge in [b for b in os.path.realpath(f"/sys/bus/pci/devices/{self.pcibus}").split("/")[:-1] if re.fullmatch(PCI_ADDR, b)]:
+      cfg, off = FileIOInterface(f"/sys/bus/pci/devices/{bridge}/config", os.O_RDWR), 0x100
+      while off and (hdr:=int.from_bytes(cfg.read(4, binary=True, offset=off), 'little')) not in (0, 0xffffffff):
+        if hdr & 0xffff == 0xd: # the acs capability: its control word
+          ctrl = int.from_bytes(cfg.read(2, binary=True, offset=off + 6), 'little')
+          cfg.write((ctrl & ~0xc).to_bytes(2, 'little'), binary=True, offset=off + 6)
+          break
+        off = hdr >> 20
 
     # remove sibling functions of the gpu, if any
     for fn in range(1, 8):
