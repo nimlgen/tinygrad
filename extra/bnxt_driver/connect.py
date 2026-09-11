@@ -58,7 +58,7 @@ if __name__ == "__main__":
   if "--server" in sys.argv: server()
   else:
     env = {"PYTHONPATH":".", "BNXT_PCI":getenv("REMOTE_PCI", "0000:41:00.0"), "BNXT_IP":getenv("REMOTE_IP", "10.0.200.6"),
-           "GPU":getenv("GPU", ""), "SIZE":str(SIZE), "ITERS":str(ITERS)}
+           "GPU":getenv("GPU", ""), "DEV":os.environ.get("DEV", ""), "SIZE":str(SIZE), "ITERS":str(ITERS)}
     command = f"cd {shlex.quote(getenv('REMOTE_DIR', 'tinygrad'))} && " + shlex.join([
       "env", *(f"{k}={v}" for k, v in env.items()), "python3", "-u", "extra/bnxt_driver/connect.py", "--server"])
     with subprocess.Popen(["ssh", "-o", "BatchMode=yes", getenv("REMOTE_HOST", "192.168.52.213"), command],
