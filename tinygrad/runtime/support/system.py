@@ -341,8 +341,7 @@ class RemotePCIDevice(PCIDevice):
   @staticmethod
   @functools.cache
   def connect(host:str, port:int) -> socket.socket:
-    sock = socket.create_connection((host, port), timeout=getenv("REMOTE_TIMEOUT", 3))
-    sock.settimeout(None)
+    sock = socket.create_connection((host, port), timeout=getenv("REMOTE_TIMEOUT", 60)) # a node that stops answering is an error, not a hang
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): sock.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
     return sock
