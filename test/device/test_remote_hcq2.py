@@ -73,6 +73,31 @@ class TestRemoteHCQ2(unittest.TestCase):
         np.testing.assert_equal(x.to("AMD:1").numpy(), np.arange(65))
     ''', nodes=2)
 
+  def test_data_parallel_sgd(self): # every replica follows the full batch numpy reference through jit replay with changing inputs
+    self.run_remote('''
+      import numpy as np
+      from tinygrad import Tensor, TinyJit, nn, Context
+      devs, rng = ("AMD", "AMD:1"), np.random.default_rng(0)
+      w_ref = rng.standard_normal((4, 3), dtype=np.float32)
+      w = Tensor(w_ref.copy()).shard(devs).realize()
+      optim = nn.optim.SGD([w], lr=0.01)
+      @TinyJit
+      def step(x, y):
+        optim.zero_grad()
+        loss = ((x @ w - y) ** 2).mean()
+        loss.backward()
+        return loss.realize(*optim.schedule_step())
+      with Context(TRAINING=1):
+        for i in range(6):
+          x_np, y_np = rng.standard_normal((8, 4), dtype=np.float32), rng.standard_normal((8, 3), dtype=np.float32)
+          x, y = [Tensor(t).shard(devs, axis=0).realize() for t in (x_np, y_np)]
+          loss = step(x, y).item()
+          err = x_np @ w_ref - y_np
+          np.testing.assert_allclose(loss, (err ** 2).mean(), rtol=1e-4)
+          w_ref -= 0.01 * (2 / err.size) * x_np.T @ err
+          for j in range(len(devs)): np.testing.assert_allclose(Tensor(w.uop.mselect(j)).numpy(), w_ref, rtol=1e-4, atol=1e-6)
+    ''', nodes=2)
+
   def test_bad_posted_exec_disconnects(self):
     self.run_remote('''
       import os, socket
