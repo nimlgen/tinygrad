@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any
-import functools, struct
+import functools, struct, operator
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import round_up, getenv, ceildiv, to_tuple
@@ -42,9 +42,10 @@ class BNXTAllocator(Allocator):
     mapping = buf.meta.mapping
     # the nic reaches vram over pcie: the bar, even where gpus reach each other over xgmi
     paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else PCIIfaceBase.p2p_paddrs(iface, mapping.paddrs)[0]
-    page = (2 << 20) if buf._buf % (2 << 20) == 0 and all(p % (2 << 20) == 0 and s % (2 << 20) == 0 for p, s in paddrs) else 0x1000
-    key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, page)],
-                                              mapping.size, page.bit_length() - 1, va=buf._buf)
+    align = buf._buf | functools.reduce(operator.or_, (p | s for p, s in paddrs)) # every address a multiple of the page: fewer pbl entries
+    log_page = max(l for l in (12, 13, 16, 18, 20, 21, 22, 30) if not align & ((1 << l) - 1)) # the page sizes the nic has
+    key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, 1 << log_page)],
+                                              mapping.size, log_page, va=buf._buf)
     return BufferStorage(key, key)
   def _offset(self, buf, size:int, offset:int): return buf
   def _unmap(self, storage:BufferStorage): self.dev.iface.dev_impl.unregister_mem(storage.meta)

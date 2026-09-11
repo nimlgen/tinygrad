@@ -33,6 +33,7 @@ def _pbl(dev, paddrs, queue=False):
   table, table_paddrs = dev.pci_dev.alloc_sysmem(ceildiv(len(values), 512) * 0x1000)
   table[:len(values) * 8] = struct.pack(f"<{len(values)}Q", *values)
   if len(table_paddrs) == 1: return 1, table_paddrs[0]
+  assert len(table_paddrs) <= 512, f"a pbl has two levels: {len(values)} pages need bigger pages"
   top, top_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
   top[:len(table_paddrs) * 8] = struct.pack(f"<{len(table_paddrs)}Q", *(p | bnxt.PTU_PTE_VALID for p in table_paddrs))
   return 2, top_paddrs[0]
