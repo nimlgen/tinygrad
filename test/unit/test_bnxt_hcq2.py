@@ -94,7 +94,7 @@ class TestBNXTCopy(unittest.TestCase):
   def test_words_replay(self): # the words of a send and a receive, linked and run: rings and cqs wrap, counters advance
     for recv in (False, True):
       rings = {n: Buffer("CPU", 8192, dtypes.uint8, preallocate=True) for n in ("sq", "rq", "scq", "rcq", "db")} # addressed, never written here
-      counters = ("sq_prod", "sq_psn", "rq_prod", "scq_cons", "rcq_cons")
+      counters = ("sq_seq", "rq_seq", "psn")
       args = {n: UOp.from_buffer(b) for n, b in rings.items()}
       args |= {n: UOp.placeholder((1,), dtypes.uint64, 0, device="CPU", volatile=True, tag=n) for n in counters}
       nic = SimpleNamespace(device="CPU", iface=SimpleNamespace(dev_impl=SimpleNamespace(db_off=0)), arg=lambda pair, n: args[n],
@@ -115,7 +115,7 @@ class TestBNXTCopy(unittest.TestCase):
       lowered = hcq2.lower_call(UOp.sink(out.index(0).load(), arg=KernelInfo("bnxt_copy_test"), tag=1).call(aux=hcq2.HCQInfo(("CPU",))))
       linked = hcq2.hcq_link(realize.lower_and_compile(UOp(Ops.LINEAR, src=(lowered,))), allow_cache=False)
       bufs = {p.tag: b.buffer for p, b in zip(lowered.without_after.src[1:], linked.src[0].without_after.src[1:])}
-      ring, prod, cq, cons = ("rq", "rq_prod", "rcq", "rcq_cons") if recv else ("sq", "sq_prod", "scq", "scq_cons")
+      ring, seq, cq = ("rq", "rq_seq", "rcq") if recv else ("sq", "sq_seq", "scq")
       data = dst if recv else src
       for i in range(130):
         realize.run_linear(linked, jit=True)
@@ -132,6 +132,6 @@ class TestBNXTCopy(unittest.TestCase):
         toggle = (i // CQ_ENTRIES & 1) ^ 1 | (2 if recv else 0)
         self.assertEqual((rest[1], rest[3], rest[5]), (doorbell, toggle, cq_doorbell)) # full width doorbell words
         self.assertEqual(rest[2], rings[cq]._buf + i % CQ_ENTRIES * 32 + 24)
-        self.assertEqual((bufs[prod].host.view(fmt="Q")[0], bufs[cons].host.view(fmt="Q")[0]), (i + 1, i + 1))
+        self.assertEqual(bufs[seq].host.view(fmt="Q")[0], i + 1)
 
 if __name__ == "__main__": unittest.main()

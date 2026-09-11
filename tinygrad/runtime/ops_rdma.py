@@ -75,7 +75,7 @@ class RDMADevice(Compiled):
       for nic in (self, other):
         nic.qps[pair] = q = BNXTQP(nic.iface.dev_impl)
         for name in ("sq", "rq", "scq", "rcq"): nic.bufs[pair, name] = nic.iface.buffer(getattr(q, name)["mem"], getattr(q, name)["paddrs"])
-        for name in ("sq_prod", "sq_psn", "rq_prod", "scq_cons", "rcq_cons"): nic.bufs[pair, name] = nic.iface.counter()
+        for name in ("sq_seq", "rq_seq", "psn"): nic.bufs[pair, name] = nic.iface.counter()
         nic.bufs[pair, "db"] = nic.iface.doorbell
       for a, b in ((self, other), (other, self)): a.qps[pair].connect(b.qps[pair].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
     return self.qps[pair]
@@ -90,22 +90,22 @@ class RDMADevice(Compiled):
     recv = call.src[0].arg == "recv"
     buf, peer = (dst, Device[to_tuple(src.device)[0]]) if recv else (src, Device[to_tuple(dst.device)[0]])
     qp, pair = self.qp(hq.dev, peer), tuple(sorted((hq.dev.device, peer.device)))
-    ring, prod, cq, cons = (self.arg(pair, n) for n in (("rq", "rq_prod", "rcq", "rcq_cons") if recv else ("sq", "sq_prod", "scq", "scq_cons")))
+    ring, seq, cq = (self.arg(pair, n) for n in (("rq", "rq_seq", "rcq") if recv else ("sq", "sq_seq", "scq")))
     ring_addr, cq_addr = hq.rt(ring, hq.devs), hq.rt(cq, hq.devs)
     db = self.arg(pair, "db").getaddr(hq.devs) + (self.iface.dev_impl.db_off & 0xfff)
     key = unwrap_view(buf)[0].getaddr(self.device).cast(dtypes.uint32)
     for off in range(0, buf.nbytes(), RDMA_CHUNK):
       size = min(RDMA_CHUNK, buf.nbytes() - off)
-      p, c = hq.bump(prod), hq.bump(cons)
+      n = hq.bump(seq) # the operation's slot in the ring and, as every operation completes with one cqe, in the cq
       hdr = struct.unpack("<8I", (recv_wqe if recv else send_wqe)(0, 0, size)[:32])
-      hq.write(ring_addr + (p % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(hq.devs) + off, key, UOp.const(size, dtypes.uint32))
+      hq.write(ring_addr + (n % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(hq.devs) + off, key, UOp.const(size, dtypes.uint32))
       if not recv: # the msn entry of the send
-        psn = hq.bump(self.arg(pair, "sq_psn"), packets:=max(1, ceildiv(size, MTU)))
+        psn = hq.bump(self.arg(pair, "psn"), packets:=max(1, ceildiv(size, MTU)))
         nxt = psn + packets
-        hq.write(ring_addr + 0x1000 + (p % RING_ENTRIES) * 8, ((p % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
+        hq.write(ring_addr + 0x1000 + (n % RING_ENTRIES) * 8, ((n % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
       # the doorbell is a signal: an end of pipe write, after the data the nic reads is in memory. a plain cp write does not ring it
-      hq.signal(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) % RING_ENTRIES, (p + 1) // RING_ENTRIES & 1))
+      hq.signal(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (n + 1) % RING_ENTRIES, (n + 1) // RING_ENTRIES & 1))
       # the cqe: toggle bit of this pass, its type (RES_RC for a receive), status 0
-      hq.wait(cq_addr + (c % CQ_ENTRIES) * 32 + 24, (((c // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
-      hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) % CQ_ENTRIES, (c + 1) // CQ_ENTRIES & 1))
+      hq.wait(cq_addr + (n % CQ_ENTRIES) * 32 + 24, (((n // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
+      hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (n + 1) % CQ_ENTRIES, (n + 1) // CQ_ENTRIES & 1))
       if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
