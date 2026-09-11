@@ -14,11 +14,12 @@ from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
 
 RDMA_CHUNK = 1 << 30 # a send length is 32 bits
+NIC = (0x14e4, ((0xffff, (0x1760,)),), 0x02) # BCM57608: vendor, device ids, base class
 
 class BNXTIface(PCIIfaceBase):
   def __init__(self, dev:RDMADevice, index:int):
-    super().__init__(dev, index, vendor=0x14e4, devices=((0xffff, (0x1760,)),), vram_bar=2, va_start=AMMemoryManager.va_allocator.base,
-      va_size=AMMemoryManager.va_allocator.size, dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=0x02)
+    super().__init__(dev, index, *NIC[:2], vram_bar=2, va_start=AMMemoryManager.va_allocator.base, va_size=AMMemoryManager.va_allocator.size,
+      dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=NIC[2])
 
   def device_fini(self): self.dev_impl.fini()
 

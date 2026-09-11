@@ -389,7 +389,7 @@ class RemotePCIDevice(PCIDevice):
 
   def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
     self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, int(pcibus.split(':')[-1]), None
-    self.peer_group = "%s:%d" % sock.getpeername()[:2] # the node
+    self.peer_group = ":".join(pcibus.split(":")[1:3]) # the node, as named in REMOTE
 
   def rpc(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b'') -> tuple[int, bytes]:
     return RemotePCIDevice._rpc(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)

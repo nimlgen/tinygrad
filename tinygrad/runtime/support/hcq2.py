@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any, Callable
-import functools, itertools, weakref, ctypes, importlib
+import functools, itertools, weakref, ctypes, importlib, re
 from dataclasses import replace, dataclass, field
 from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, getenv
 from tinygrad.device import Device, Buffer, BufferSpec, DepsTracker
@@ -34,8 +34,14 @@ def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for
 
 def is_rdma(call:UOp) -> bool: return call.src[0].op is Ops.COPY and call.src[0].arg in ("send", "recv") # one side of a copy between nodes
 
-def nic_for(dev:Any) -> Any: # the node's nic: the RDMA device in the same peer group
-  return next(nic for i in itertools.count() if (nic:=Device[f"RDMA:{i}"]).peer_group == dev.peer_group)
+def nic_for(dev:Any) -> Any: # the gpu's nic: on its node, the one with the nearest pci bus (its own switch, or the node's only nic)
+  from tinygrad.runtime.ops_rdma import NIC
+  from tinygrad.runtime.support.system import System, PCIDevice
+  from tinygrad.runtime.support.hcq import hcq_filter_visible_devices
+  def bus(name:str) -> int: return int(unwrap(re.search(r"[0-9a-f]{4}:([0-9a-f]{2}):[0-9a-f]{2}\.", name)).group(1), 16)
+  def node(name:str) -> str: return ":".join(name.split(":")[1:3]) if name.startswith("remote:") else PCIDevice.__name__
+  nics = [(i, bus(name)) for i, (_, name) in enumerate(hcq_filter_visible_devices(System.list_devices(*NIC), "RDMA")) if node(name) == dev.peer_group]
+  return Device[f"RDMA:{min(nics, key=lambda n: abs(n[1] - bus(dev.iface.pci_dev.pcibus)))[0]}"]
 
 def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op not in (Ops.PROGRAM, Ops.COPY): return None # only these bodies can be enqueued
