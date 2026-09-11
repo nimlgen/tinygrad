@@ -61,6 +61,7 @@ def kernel(b, write=True): return UOp(Ops.PROGRAM, arg=ProgramInfo(outs=(0,) if 
 class TestRDMASchedule(unittest.TestCase):
   def setUp(self):
     self.enterContext(patch.object(hcq2, "getenv", return_value=1))
+    self.enterContext(patch.object(hcq2, "nic_index", lambda dev: (0, 0)))
     self.devs = {d: SimpleNamespace(peer_group=g, remote_peer=None, has_copy_queue=True, pm_batch=None)
                  for d, g in (("AMD:1", "a"), ("AMD:2", "b"), ("AMD:3", "a"))}
     get_device = type(Device).__getitem__

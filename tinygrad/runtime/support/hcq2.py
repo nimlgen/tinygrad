@@ -34,14 +34,22 @@ def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for
 
 def is_rdma(call:UOp) -> bool: return call.src[0].op is Ops.COPY and call.src[0].arg in ("send", "recv") # one side of a copy between nodes
 
-def nic_for(dev:Any) -> Any: # the gpu's nic: on its node, the one with the nearest pci bus (its own switch, or the node's only nic)
+def _bus(name:str) -> int: return int(unwrap(re.search(r"[0-9a-f]{4}:([0-9a-f]{2}):[0-9a-f]{2}\.", name)).group(1), 16)
+
+@functools.cache
+def _nics() -> list[tuple[str, int]]: # (node, pci bus) of RDMA:i, from the probe list: nothing is opened
   from tinygrad.runtime.ops_rdma import NIC
   from tinygrad.runtime.support.system import System, PCIDevice
   from tinygrad.runtime.support.hcq import hcq_filter_visible_devices
-  def bus(name:str) -> int: return int(unwrap(re.search(r"[0-9a-f]{4}:([0-9a-f]{2}):[0-9a-f]{2}\.", name)).group(1), 16)
   def node(name:str) -> str: return ":".join(name.split(":")[1:3]) if name.startswith("remote:") else PCIDevice.__name__
-  nics = [(i, bus(name)) for i, (_, name) in enumerate(hcq_filter_visible_devices(System.list_devices(*NIC), "RDMA")) if node(name) == dev.peer_group]
-  return Device[f"RDMA:{min(nics, key=lambda n: abs(n[1] - bus(dev.iface.pci_dev.pcibus)))[0]}"]
+  return [(node(name), _bus(name)) for _, name in hcq_filter_visible_devices(System.list_devices(*NIC), "RDMA")]
+
+def nic_index(dev:Any) -> tuple[int, int]: # the gpu's nic: the nearest pci bus on its node (its own switch, or the only nic), and its rank there
+  nics = [(i, bus) for i, (node, bus) in enumerate(_nics()) if node == dev.peer_group]
+  i = min(nics, key=lambda n: abs(n[1] - _bus(dev.iface.pci_dev.pcibus)))[0]
+  return i, [n for n, _ in nics].index(i)
+
+def nic_for(dev:Any) -> Any: return Device[f"RDMA:{nic_index(dev)[0]}"]
 
 def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op not in (Ops.PROGRAM, Ops.COPY): return None # only these bodies can be enqueued
@@ -138,8 +146,10 @@ def _staging(device:str="CPU") -> Buffer: # this host's memory, or host memory o
 
 def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if is_rdma(call): return None
-  if getenv("RDMA") and all(all_devices_in(b.device, HCQ_DEVS) for b in (dst, src)) and \
-     Device[to_tuple(dst.device)[0]].peer_group != Device[to_tuple(src.device)[0]].peer_group:
+  devs = [Device[to_tuple(b.device)[0]] for b in (dst, src)]
+  # over the nics when the two are linked: nic k of a node is cabled to nic k of the other. any other pair stages through host memory
+  if getenv("RDMA") and all(all_devices_in(b.device, HCQ_DEVS) for b in (dst, src)) and devs[0].peer_group != devs[1].peer_group and \
+     nic_index(devs[0])[1] == nic_index(devs[1])[1]:
     return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
