@@ -260,7 +260,7 @@ def _finalize_batch(ctx:BatchCtx) -> UOp:
 @rewrite_group(new_ctx=False)
 def sched_batches(l:UOp, profile:bool) -> UOp:
   devs = [() if (d:=get_enqueue_devs(c)) is None else tuple(Device.canonicalize(x) for x in to_tuple(d)) for c in l.src]
-  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM or is_rdma(c) else "COPY:0" for c in l.src]
+  queues = ["COMPUTE:0" if c.src[0].op is Ops.PROGRAM else "COPY:0" for c in l.src] # rdma copies post from the copy queue too
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs, queues), key=lambda e: bool(e[1])):
     if not hcq: srcs += [c for c, _, _ in grp]
