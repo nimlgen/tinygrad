@@ -301,7 +301,6 @@ class HWQueue:
     (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), lambda ctx, call, prg: ctx.exec(call, prg)),
     (UPat(Ops.CALL, src=(UPat(Ops.COPY),), name="call", allow_any_len=True),
      lambda ctx, call: nic_for(ctx.dev).copy(ctx, call) if is_rdma(call) else ctx.copy(call)),
-    (UPat(Ops.INS, arg=("write", dtypes.void), name="w"), lambda ctx, w: ctx.write(w.src[0], *w.src[1:])),
     (UPat(Ops.INS, arg=("barrier", dtypes.void)), lambda ctx: ctx.memory_barrier()),
     (UPat(Ops.INS, arg=("wait", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val)),
     (UPat(Ops.INS, arg=("wait_eq", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val, eq=True)),
