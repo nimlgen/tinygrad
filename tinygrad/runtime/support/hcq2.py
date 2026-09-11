@@ -34,8 +34,8 @@ def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for
 
 def is_rdma(call:UOp) -> bool: return call.src[0].op is Ops.COPY and call.src[0].arg in ("send", "recv") # one side of a copy between nodes
 
-def nic_for(dev:Any) -> Any: # the node's nic: the BNXT device in the same peer group
-  return next(nic for i in itertools.count() if (nic:=Device[f"BNXT:{i}"]).peer_group == dev.peer_group)
+def nic_for(dev:Any) -> Any: # the node's nic: the RDMA device in the same peer group
+  return next(nic for i in itertools.count() if (nic:=Device[f"RDMA:{i}"]).peer_group == dev.peer_group)
 
 def get_enqueue_devs(call:UOp) -> Any|None:
   if call.src[0].op not in (Ops.PROGRAM, Ops.COPY): return None # only these bodies can be enqueued

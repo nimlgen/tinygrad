@@ -3,7 +3,7 @@
 # programs it linked for them here. nothing here knows about GPUs.
 #   every node, the local one too:  PYTHONPATH=. DEV=PCI+AMD python extra/remote/serve.py 6667
 #   the driver:  REMOTE="localhost:6667,192.168.52.213:6667" DEV=PCI+AMD RDMA=1 python ...   (AMD:n counts through the nodes in REMOTE order,
-#   BNXT:n is node n's nic; RDMA=1 copies between nodes over the nics, without it they stage through the nodes' host memory)
+#   RDMA:n is node n's nic; RDMA=1 copies between nodes over the nics, without it they stage through the nodes' host memory)
 import socket, struct, sys, pickle, array, traceback
 from tinygrad.device import Device
 from tinygrad.helpers import DEBUG, DEV

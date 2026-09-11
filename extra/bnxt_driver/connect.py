@@ -22,7 +22,7 @@ def write_json(stream, obj):
 def endpoint(ip):
   if gpu := getenv("GPU", ""):
     os.environ["BNXT_IP"] = ip
-    nic = Device["BNXT"]
+    nic = Device["RDMA"]
     dev = nic.iface.dev_impl
     mem = Buffer(gpu, SIZE, dtypes.uint8).ensure_allocated()
     addr, key = mem._buf, mem.get_buf(nic.device)

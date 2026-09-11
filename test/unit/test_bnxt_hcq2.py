@@ -3,10 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad import Device, dtypes
 from tinygrad.device import Buffer, BufferStorage
-from tinygrad.runtime.ops_bnxt import BNXTAllocator
+from tinygrad.runtime.ops_rdma import BNXTAllocator
 from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.support.bnxt import send_wqe, recv_wqe, msn_entry, RING_ENTRIES, CQ_ENTRIES
-from tinygrad.runtime.ops_bnxt import BNXTDevice
+from tinygrad.runtime.ops_rdma import RDMADevice
 from tinygrad.engine import realize
 from tinygrad.runtime.support.memory import AddrSpace, VirtMapping
 from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta
@@ -21,7 +21,7 @@ class TestBNXTAllocator(unittest.TestCase):
     self.nic.iface.dev_impl.register_mem.return_value = 0x1234
     self.nic.allocator = BNXTAllocator(self.nic)
     gpu = SimpleNamespace(iface=self.iface, allocator=Mock(_offset=lambda b, size, off: b + off))
-    self.lookup = patch.object(type(Device), "__getitem__", lambda _, d: {"AMD": gpu, "BNXT": self.nic}[d])
+    self.lookup = patch.object(type(Device), "__getitem__", lambda _, d: {"AMD": gpu, "RDMA": self.nic}[d])
     self.lookup.start()
     self.addCleanup(self.lookup.stop)
 
@@ -35,23 +35,23 @@ class TestBNXTAllocator(unittest.TestCase):
     buf = self.buffer([(0x400000, 0x400000)])
     view = buf.view(16, dtypes.uint8, 128).ensure_allocated()
     self.addCleanup(view.deallocate)
-    self.assertEqual((view.get_buf("AMD"), view.get_buf("BNXT"), buf.get_buf("BNXT")), (0x200080, 0x1234, 0x1234))
+    self.assertEqual((view.get_buf("AMD"), view.get_buf("RDMA"), buf.get_buf("RDMA")), (0x200080, 0x1234, 0x1234))
     self.nic.iface.dev_impl.register_mem.assert_called_once_with([0x100400000, 0x100600000], 0x400000, 21, va=0x200000)
-    self.nic.allocator._unmap(buf.get_storage("BNXT"))
+    self.nic.allocator._unmap(buf.get_storage("RDMA"))
     self.nic.iface.dev_impl.unregister_mem.assert_called_once_with(0x1234)
 
   def test_fragmented_pages(self):
     buf = self.buffer([(0x401000, 0x1000), (0x800000, 0x2000)])
-    self.assertEqual(buf.get_buf("BNXT"), 0x1234)
+    self.assertEqual(buf.get_buf("RDMA"), 0x1234)
     self.nic.iface.dev_impl.register_mem.assert_called_once_with([0x100401000, 0x100800000, 0x100801000], 0x3000, 12, va=0x200000)
 
   def test_sysmem_does_not_add_bar(self):
-    self.buffer([(0x401000, 0x2000)], aspace=AddrSpace.SYS).get_buf("BNXT")
+    self.buffer([(0x401000, 0x2000)], aspace=AddrSpace.SYS).get_buf("RDMA")
     self.nic.iface.dev_impl.register_mem.assert_called_once_with([0x401000, 0x402000], 0x2000, 12, va=0x200000)
 
   def test_reject_other_node(self):
     self.nic.peer_group = "other"
-    with self.assertRaisesRegex(RuntimeError, "memory on its node"): self.buffer([(0x400000, 0x1000)]).get_buf("BNXT")
+    with self.assertRaisesRegex(RuntimeError, "memory on its node"): self.buffer([(0x400000, 0x1000)]).get_buf("RDMA")
     self.nic.iface.dev_impl.register_mem.assert_not_called()
 
 def copy(src, dst): return src.copy_to_device(dst.device).call(dst, src)
@@ -92,19 +92,23 @@ class TestRDMASchedule(unittest.TestCase):
 class TestBNXTCopy(unittest.TestCase):
   def test_words_replay(self): # the words of a send and a receive, linked and run: rings and cqs wrap, counters advance
     for recv in (False, True):
-      rings = {n: Buffer("CPU", 8192, dtypes.uint8, preallocate=True) for n in ("sq", "rq", "scq", "rcq", "db")} # addressed, not written by the program
-      args = {n: UOp.from_buffer(b) for n, b in rings.items()} | {n: UOp.placeholder((1,), dtypes.uint64, 0, device="CPU", volatile=True, tag=n)
-                                                                  for n in ("sq_prod", "sq_psn", "rq_prod", "scq_cons", "rcq_cons")}
+      rings = {n: Buffer("CPU", 8192, dtypes.uint8, preallocate=True) for n in ("sq", "rq", "scq", "rcq", "db")} # addressed, never written here
+      counters = ("sq_prod", "sq_psn", "rq_prod", "scq_cons", "rcq_cons")
+      args = {n: UOp.from_buffer(b) for n, b in rings.items()}
+      args |= {n: UOp.placeholder((1,), dtypes.uint64, 0, device="CPU", volatile=True, tag=n) for n in counters}
       nic = SimpleNamespace(device="CPU", iface=SimpleNamespace(dev_impl=SimpleNamespace(db_off=0)), arg=lambda pair, n: args[n],
                             qp=lambda a, b: SimpleNamespace(qpn=5, scq_id=6, rcq_id=7))
-      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), host_stores={}, words={},
-                           memory_barrier=lambda: None, write=lambda dst, *w: recorded.extend([dst, *w]), wait=lambda a, v, eq: recorded.extend([a, v]))
-      hq.rt = lambda b, dev: hq.words.setdefault((b, dev), hcq2.rt_addr(b, dev, "CPU"))
       recorded:list = []
+      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), host_stores={}, words={},
+                           memory_barrier=lambda: None, write=lambda dst, *w: recorded.extend([dst, *w]),
+                           wait=lambda a, v, eq: recorded.extend([a, v]))
+      hq.rt = lambda b, dev: hq.words.setdefault((b, dev), hcq2.rt_addr(b, dev, "CPU"))
       src, dst = [Buffer("CPU", 4096, dtypes.uint8, preallocate=True) for _ in range(2)]
-      BNXTDevice.copy(nic, hq, UOp.from_buffer(src).copy_to_device("CPU").replace(arg="recv" if recv else "send").call(*[UOp.from_buffer(b) for b in (dst, src)]))
+      call = UOp.from_buffer(src).copy_to_device("CPU").replace(arg="recv" if recv else "send").call(UOp.from_buffer(dst), UOp.from_buffer(src))
+      RDMADevice.copy(nic, hq, call)
+      # every recorded word at its own width, read back as u64
       checks = UOp.placeholder((8 * len(recorded),), dtypes.uint8, device="CPU", tag="checks")
-      words = [w if isinstance(w, UOp) else UOp.const(w, dtypes.uint32) for w in recorded] # each at its own width, read back as u64
+      words = [w if isinstance(w, UOp) else UOp.const(w, dtypes.uint32) for w in recorded]
       out = hcq2.patch(checks, [(8 * i, w) for i, w in enumerate(words)], bytes(8 * len(words)))
       out = out.after(*[b.after(out).index(0).store(v) for b, v in hq.host_stores.items()])
       lowered = hcq2.lower_call(UOp.sink(out.index(0).load(), arg=KernelInfo("bnxt_copy_test"), tag=1).call(aux=hcq2.HCQInfo(("CPU",))))
@@ -117,12 +121,15 @@ class TestBNXTCopy(unittest.TestCase):
         words = bufs["checks"].host.view(fmt="Q")[:]
         wqe, rest = words[:12], words[12:] # the slot address, 8 header dwords, va, key, size
         self.assertEqual(wqe[0], rings[ring]._buf + i % RING_ENTRIES * 128)
-        self.assertEqual(bytes(struct.pack("<8I", *wqe[1:9])) + struct.pack("<QII", *wqe[9:12]), (recv_wqe if recv else send_wqe)(data._buf, data._buf & 0xffffffff, 4096))
+        self.assertEqual(struct.pack("<8I", *wqe[1:9]) + struct.pack("<QII", *wqe[9:12]),
+                         (recv_wqe if recv else send_wqe)(data._buf, data._buf & 0xffffffff, 4096))
         if not recv:
           self.assertEqual(rest[:2], [rings[ring]._buf + 0x1000 + i % RING_ENTRIES * 8, msn_entry(i, i, 4096)[0]])
           rest = rest[2:]
-        self.assertEqual((rest[1] & 0xffffffff, rest[3] & 0xffffffff, rest[5] & 0xffffffff),
-                         ((i + 1) % RING_ENTRIES | ((i + 1) // RING_ENTRIES & 1) << 24, (i // CQ_ENTRIES & 1) ^ 1 | (2 if recv else 0), (i + 1) % CQ_ENTRIES | ((i + 1) // CQ_ENTRIES & 1) << 24))
+        doorbell = (i + 1) % RING_ENTRIES | ((i + 1) // RING_ENTRIES & 1) << 24
+        cq_doorbell = (i + 1) % CQ_ENTRIES | ((i + 1) // CQ_ENTRIES & 1) << 24
+        toggle = (i // CQ_ENTRIES & 1) ^ 1 | (2 if recv else 0)
+        self.assertEqual((rest[1] & 0xffffffff, rest[3], rest[5] & 0xffffffff), (doorbell, toggle, cq_doorbell))
         self.assertEqual(rest[2], rings[cq]._buf + i % CQ_ENTRIES * 32 + 24)
         self.assertEqual((bufs[prod].host.view(fmt="Q")[0], bufs[cons].host.view(fmt="Q")[0]), (i + 1, i + 1))
 
