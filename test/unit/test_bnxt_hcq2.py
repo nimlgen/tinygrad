@@ -101,14 +101,16 @@ class TestBNXTCopy(unittest.TestCase):
       args |= {n: UOp.placeholder((1,), dtypes.uint64, 0, device="CPU", volatile=True, tag=n) for n in counters}
       nic = SimpleNamespace(device="CPU", iface=SimpleNamespace(dev_impl=SimpleNamespace(db_off=0)), arg=lambda pair, n: args[n],
                             qp=lambda a, b: SimpleNamespace(qpn=5, scq_id=6, rcq_id=7))
+      nic.wait = types.MethodType(RDMADevice.wait, nic)
       recorded:list = []
-      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), counts={}, words={},
+      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), counts={}, words={}, pending=[],
                            memory_barrier=lambda: None, write=lambda dst, *w: recorded.extend([dst, *w]),
                            signal=lambda dst, v: recorded.extend([dst, v]), wait=lambda a, v, eq: recorded.extend([a, v]))
-      hq.rt, hq.bump = types.MethodType(hcq2.HWQueue.rt, hq), types.MethodType(hcq2.HWQueue.bump, hq)
+      hq.rt, hq.bump, hq.flush = (types.MethodType(f, hq) for f in (hcq2.HWQueue.rt, hcq2.HWQueue.bump, hcq2.HWQueue.flush))
       src, dst = [Buffer("CPU", 4096, dtypes.uint8, preallocate=True) for _ in range(2)]
       call = UOp.from_buffer(src).copy_to_device("CPU").replace(arg="recv" if recv else "send").call(UOp.from_buffer(dst), UOp.from_buffer(src))
       RDMADevice.copy(nic, hq, call)
+      hq.flush()
       # every recorded word at its own width, read back as u64
       checks = UOp.placeholder((8 * len(recorded),), dtypes.uint8, device="CPU", tag="checks")
       words = [w if isinstance(w, UOp) else UOp.const(w, dtypes.uint32) for w in recorded]

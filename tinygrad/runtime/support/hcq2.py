@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast, Any
+from typing import cast, Any, Callable
 import functools, itertools, weakref, ctypes, importlib
 from dataclasses import replace, dataclass, field
 from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, getenv
@@ -288,14 +288,15 @@ class EncodeCtx:
 
 class HWQueue:
   q_rewrite = PatternMatcher([ # the ops of a queue: a queue defines the methods it supports
-    (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), lambda ctx, call, prg: ctx.exec(call, prg)),
+    (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True),
+     lambda ctx, call, prg: ctx.flush() or ctx.exec(call, prg)),
     (UPat(Ops.CALL, src=(UPat(Ops.COPY),), name="call", allow_any_len=True),
-     lambda ctx, call: nic_for(ctx.dev).copy(ctx, call) if is_rdma(call) else ctx.copy(call)),
+     lambda ctx, call: nic_for(ctx.dev).copy(ctx, call) if is_rdma(call) else ctx.flush() or ctx.copy(call)),
     (UPat(Ops.INS, arg=("barrier", dtypes.void)), lambda ctx: ctx.memory_barrier()),
     (UPat(Ops.INS, arg=("wait", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val)),
     (UPat(Ops.INS, arg=("wait_eq", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val, eq=True)),
     (UPat(Ops.INS, arg=("timestamp", dtypes.void), src=(UPat(name="dst"),)), lambda ctx, dst: ctx.timestamp(dst)),
-    (UPat(Ops.INS, arg=("store", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.signal(dst, val)),
+    (UPat(Ops.INS, arg=("store", dtypes.void), src=(UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.flush() or ctx.signal(dst, val)),
   ])
 
   def __init__(self, ctx:EncodeCtx, submit:UOp):
@@ -305,7 +306,11 @@ class HWQueue:
     self.blob, self.patches = bytearray(), list[tuple[int, UOp]]()
     self.counts:dict[UOp, tuple[UOp, int]] = {} # host counters: (the value loaded, uses so far), stored back after the push
     self.words:dict[tuple[UOp, Any], UOp] = {}
+    self.pending:list[tuple[UOp, Callable]] = [] # rdma completions not waited for yet: (the buffer in flight, the wait); posts overlap
 
+  def flush(self): # before the queue consumes or signals anything, the copies in flight have completed
+    for _, wait in self.pending: wait()
+    self.pending = []
   def rt(self, b:UOp, dev) -> UOp: return self.words.setdefault((b, dev), rt_addr(b, dev, self.ctx.host)) # b's address, read at runtime
   def bump(self, b:UOp, by:int=1) -> UOp: # the counter's value for this use
     base, n = self.counts.setdefault(b, (b.index(0).load(), 0))
@@ -402,6 +407,7 @@ def patch(buf:UOp, rows:list[tuple[int, UOp]], blob:bytes|None=None) -> UOp:
 def encode_submit(hq:HWQueue) -> UOp:
   # applying the rewrite
   for u in hq.lin.src: hq.q_rewrite.rewrite(u, ctx=hq)
+  hq.flush()
 
   # merge blobs into one
   stream, views = len(hq.blob), {}

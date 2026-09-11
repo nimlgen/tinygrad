@@ -78,7 +78,7 @@ class RDMADevice(Compiled):
     b = self.bufs[pair, name]
     return UOp.placeholder((b.size,), b.dtype, 0, device=(self.device,), volatile=True, tag=("rdma", pair, name))
 
-  # one side of a copy between nodes, on the queue of its gpu: write the wqe, ring the nic, wait for the completion, ack it
+  # one side of a copy between nodes, on the queue of its gpu: write the wqe, ring the nic; the completion wait is pending on the queue
   def copy(self, hq:Any, call:UOp):
     dst, src = get_call_arg_uops(call)
     recv = call.src[0].arg == "recv"
@@ -87,8 +87,10 @@ class RDMADevice(Compiled):
     ring, seq, cq = (self.arg(pair, n) for n in (("rq", "rq_seq", "rcq") if recv else ("sq", "sq_seq", "scq")))
     ring_addr, cq_addr = hq.rt(ring, hq.devs), hq.rt(cq, hq.devs)
     db = self.arg(pair, "db").getaddr(hq.devs) + (self.iface.dev_impl.db_off & 0xfff)
-    key = unwrap_view(buf)[0].getaddr(self.device).cast(dtypes.uint32)
+    key = (base:=unwrap_view(buf)[0]).getaddr(self.device).cast(dtypes.uint32)
     for off in range(0, buf.nbytes(), RDMA_CHUNK):
+      # a ring holds RING_ENTRIES posts; a buffer still in flight is not reused
+      if len(hq.pending) == RING_ENTRIES - 1 or any(b is base for b, _ in hq.pending): hq.flush()
       size = min(RDMA_CHUNK, buf.nbytes() - off)
       n = hq.bump(seq) # the operation's slot in the ring and, as every operation completes with one cqe, in the cq
       hdr = struct.unpack("<8I", (recv_wqe if recv else send_wqe)(0, 0, size)[:32])
@@ -99,7 +101,9 @@ class RDMADevice(Compiled):
         hq.write(ring_addr + 0x1000 + (n % RING_ENTRIES) * 8, ((n % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
       # the doorbell is a signal: an end of pipe write, after the data the nic reads is in memory. a plain cp write does not ring it
       hq.signal(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (n + 1) % RING_ENTRIES, (n + 1) // RING_ENTRIES & 1))
-      # the cqe: toggle bit of this pass, its type (RES_RC for a receive), status 0
-      hq.wait(cq_addr + (n % CQ_ENTRIES) * 32 + 24, (((n // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
-      hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (n + 1) % CQ_ENTRIES, (n + 1) // CQ_ENTRIES & 1))
-      if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
+      hq.pending.append((base, functools.partial(self.wait, hq, qp, recv, cq_addr, db, n)))
+
+  def wait(self, hq:Any, qp:BNXTQP, recv:bool, cq_addr:UOp, db:UOp, n:UOp): # the cqe: toggle of this pass, type (RES_RC for a receive), status 0
+    hq.wait(cq_addr + (n % CQ_ENTRIES) * 32 + 24, (((n // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
+    hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (n + 1) % CQ_ENTRIES, (n + 1) // CQ_ENTRIES & 1))
+    if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
