@@ -1,4 +1,4 @@
-import unittest, struct
+import unittest, struct, types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad import Device, dtypes
@@ -100,10 +100,10 @@ class TestBNXTCopy(unittest.TestCase):
       nic = SimpleNamespace(device="CPU", iface=SimpleNamespace(dev_impl=SimpleNamespace(db_off=0)), arg=lambda pair, n: args[n],
                             qp=lambda a, b: SimpleNamespace(qpn=5, scq_id=6, rcq_id=7))
       recorded:list = []
-      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), host_stores={}, words={},
+      hq = SimpleNamespace(dev=SimpleNamespace(device="AMD:1"), devs=("CPU",), ctx=SimpleNamespace(host="CPU"), counts={}, words={},
                            memory_barrier=lambda: None, write=lambda dst, *w: recorded.extend([dst, *w]),
                            signal=lambda dst, v: recorded.extend([dst, v]), wait=lambda a, v, eq: recorded.extend([a, v]))
-      hq.rt = lambda b, dev: hq.words.setdefault((b, dev), hcq2.rt_addr(b, dev, "CPU"))
+      hq.rt, hq.bump = types.MethodType(hcq2.HWQueue.rt, hq), types.MethodType(hcq2.HWQueue.bump, hq)
       src, dst = [Buffer("CPU", 4096, dtypes.uint8, preallocate=True) for _ in range(2)]
       call = UOp.from_buffer(src).copy_to_device("CPU").replace(arg="recv" if recv else "send").call(UOp.from_buffer(dst), UOp.from_buffer(src))
       RDMADevice.copy(nic, hq, call)
@@ -111,7 +111,7 @@ class TestBNXTCopy(unittest.TestCase):
       checks = UOp.placeholder((8 * len(recorded),), dtypes.uint8, device="CPU", tag="checks")
       words = [w if isinstance(w, UOp) else UOp.const(w, dtypes.uint32) for w in recorded]
       out = hcq2.patch(checks, [(8 * i, w) for i, w in enumerate(words)], bytes(8 * len(words)))
-      out = out.after(*[b.after(out).index(0).store(v) for b, v in hq.host_stores.items()])
+      out = out.after(*[b.after(out).index(0).store(base + n) for b, (base, n) in hq.counts.items()])
       lowered = hcq2.lower_call(UOp.sink(out.index(0).load(), arg=KernelInfo("bnxt_copy_test"), tag=1).call(aux=hcq2.HCQInfo(("CPU",))))
       linked = hcq2.hcq_link(realize.lower_and_compile(UOp(Ops.LINEAR, src=(lowered,))), allow_cache=False)
       bufs = {p.tag: b.buffer for p, b in zip(lowered.without_after.src[1:], linked.src[0].without_after.src[1:])}

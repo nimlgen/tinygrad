@@ -96,12 +96,12 @@ class RDMADevice(Compiled):
     key = unwrap_view(buf)[0].getaddr(self.device).cast(dtypes.uint32)
     for off in range(0, buf.nbytes(), RDMA_CHUNK):
       size = min(RDMA_CHUNK, buf.nbytes() - off)
-      p, c = [hq.host_stores.get(b, b.index(0).load()) for b in (prod, cons)]
+      p, c = hq.bump(prod), hq.bump(cons)
       hdr = struct.unpack("<8I", (recv_wqe if recv else send_wqe)(0, 0, size)[:32])
       hq.write(ring_addr + (p % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(hq.devs) + off, key, UOp.const(size, dtypes.uint32))
       if not recv: # the msn entry of the send
-        psn = hq.host_stores.get(psn_buf:=self.arg(pair, "sq_psn"), psn_buf.index(0).load())
-        hq.host_stores[psn_buf] = nxt = psn + max(1, ceildiv(size, MTU))
+        psn = hq.bump(self.arg(pair, "sq_psn"), packets:=max(1, ceildiv(size, MTU)))
+        nxt = psn + packets
         hq.write(ring_addr + 0x1000 + (p % RING_ENTRIES) * 8, ((p % RING_ENTRIES) << 48) | ((nxt & 0xffffff) << 24) | (psn & 0xffffff))
       # the doorbell is a signal: an end of pipe write, after the data the nic reads is in memory. a plain cp write does not ring it
       hq.signal(db, db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if recv else bnxt.DBC_DBC_TYPE_SQ, (p + 1) % RING_ENTRIES, (p + 1) // RING_ENTRIES & 1))
@@ -109,4 +109,3 @@ class RDMADevice(Compiled):
       hq.wait(cq_addr + (c % CQ_ENTRIES) * 32 + 24, (((c // CQ_ENTRIES) & 1) ^ 1 | (2 if recv else 0)).cast(dtypes.uint16), eq=True)
       hq.signal(db, db_value(qp.rcq_id if recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, (c + 1) % CQ_ENTRIES, (c + 1) // CQ_ENTRIES & 1))
       if recv: hq.memory_barrier() # the gpu caches see what the nic wrote
-      hq.host_stores[prod], hq.host_stores[cons] = p + 1, c + 1

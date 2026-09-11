@@ -320,6 +320,27 @@ class struct_hwrm_func_drv_rgtr_output(c.Struct):
   valid: int
 struct_hwrm_func_drv_rgtr_output.register_fields([('error_code', ctypes.c_uint16, 0), ('req_type', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('resp_len', ctypes.c_uint16, 6), ('flags', ctypes.c_uint32, 8), ('unused_0', c.Array[ctypes.c_ubyte, Literal[3]], 12), ('valid', ctypes.c_ubyte, 15)])
 @c.record
+class struct_hwrm_func_drv_unrgtr_input(c.Struct):
+  SIZE = 24
+  req_type: int
+  cmpl_ring: int
+  seq_id: int
+  target_id: int
+  resp_addr: int
+  flags: int
+  unused_0: c.Array[ctypes.c_ubyte, Literal[4]]
+struct_hwrm_func_drv_unrgtr_input.register_fields([('req_type', ctypes.c_uint16, 0), ('cmpl_ring', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('target_id', ctypes.c_uint16, 6), ('resp_addr', ctypes.c_uint64, 8), ('flags', ctypes.c_uint32, 16), ('unused_0', c.Array[ctypes.c_ubyte, Literal[4]], 20)])
+@c.record
+class struct_hwrm_func_drv_unrgtr_output(c.Struct):
+  SIZE = 16
+  error_code: int
+  req_type: int
+  seq_id: int
+  resp_len: int
+  unused_0: c.Array[ctypes.c_ubyte, Literal[7]]
+  valid: int
+struct_hwrm_func_drv_unrgtr_output.register_fields([('error_code', ctypes.c_uint16, 0), ('req_type', ctypes.c_uint16, 2), ('seq_id', ctypes.c_uint16, 4), ('resp_len', ctypes.c_uint16, 6), ('unused_0', c.Array[ctypes.c_ubyte, Literal[7]], 8), ('valid', ctypes.c_ubyte, 15)])
+@c.record
 class struct_hwrm_func_backing_store_cfg_v2_input(c.Struct):
   SIZE = 64
   req_type: int

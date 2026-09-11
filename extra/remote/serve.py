@@ -96,7 +96,7 @@ def serve(conn:socket.socket):
     except Exception as e:
       # posted commands have no reply to carry the error, so the connection is the error
       if cmd == RemoteCmd.MEM_WRITE or (cmd == RemoteCmd.EXEC_PROG and not a2): raise ConnectionError(f"{RemoteCmd(cmd).name} failed: {e}") from e
-      traceback.print_exc()
+      if DEBUG >= 1: traceback.print_exc() # the client gets the error, some are expected (a bar that cannot be resized)
       conn.sendall(resp(payload=str(e).encode(), status=1))
 
 if __name__ == "__main__":

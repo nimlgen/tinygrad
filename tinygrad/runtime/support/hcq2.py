@@ -313,10 +313,14 @@ class HWQueue:
     self.devs, self.queue = self.lin.arg
     self.dev = Device[self.devs[0]]
     self.blob, self.patches = bytearray(), list[tuple[int, UOp]]()
-    self.host_stores:dict[UOp, UOp] = {} # host words the submit program updates after the push, e.g. ring counters
+    self.counts:dict[UOp, tuple[UOp, int]] = {} # host counters: (the value loaded, uses so far), stored back after the push
     self.words:dict[tuple[UOp, Any], UOp] = {}
 
   def rt(self, b:UOp, dev) -> UOp: return self.words.setdefault((b, dev), rt_addr(b, dev, self.ctx.host)) # b's address, read at runtime
+  def bump(self, b:UOp, by:int=1) -> UOp: # the counter's value for this use
+    base, n = self.counts.setdefault(b, (b.index(0).load(), 0))
+    self.counts[b] = (base, n + by)
+    return base + n
 
   def q(self, *words) -> int:
     for w in words:
@@ -419,7 +423,7 @@ def encode_submit(hq:HWQueue) -> UOp:
 
   words = UOp.sink(*[w for _, w in hq.patches]).substitute({l: buf[o:e] for l, (o, e) in views.items()}).src
   out = hq.submit(patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),)))
-  return out.after(*[b.after(out).index(0).store(v) for b, v in hq.host_stores.items()])
+  return out.after(*[b.after(out).index(0).store(base + n) for b, (base, n) in hq.counts.items()])
 
 # *****************
 # 4. lower call
