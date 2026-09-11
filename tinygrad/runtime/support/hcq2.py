@@ -257,7 +257,8 @@ def _finalize_batch(ctx:BatchCtx) -> UOp:
   merged:list[UOp] = [] # the submits in order, after the fence
   for m in _merge_queues(submits): merged.append(m.after(fence, *merged[-1:]))
   estimates = sum((estimate_uop(call) for call, _, _ in ctx.batch), start=Estimates()).simplify()
-  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit"), tag=1)
+  # no estimates for the submit program: those of its polling loops are symbolic sums over every command, thousands of uops deep
+  sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit", estimates=Estimates()), tag=1)
   for pm in [Device[d].pm_batch for d in ctx.queues if Device[d].pm_batch is not None]: # a device adds its own work to the batch
     if (r:=pm.rewrite(sink)) is not None: sink = r
   host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch if not is_rdma(call) for buf in get_call_arg_uops(call)
@@ -422,8 +423,9 @@ def encode_submit(hq:HWQueue) -> UOp:
   buf = UOp.placeholder((len(hq.blob),), dtypes.uint8, device=hq.devs, tag=to_name("cmdbuf", hq.queue))
 
   words = UOp.sink(*[w for _, w in hq.patches]).substitute({l: buf[o:e] for l, (o, e) in views.items()}).src
-  out = hq.submit(patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),)))
-  return out.after(*[b.after(out).index(0).store(base + n) for b, (base, n) in hq.counts.items()])
+  cmdbuf = patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),))
+  # the counters store their next values once the cmdbuf holds the current ones. not after the push: a void root rechains every store
+  return hq.submit(cmdbuf.after(*[b.after(cmdbuf).index(0).store(base + n) for b, (base, n) in hq.counts.items()]))
 
 # *****************
 # 4. lower call
