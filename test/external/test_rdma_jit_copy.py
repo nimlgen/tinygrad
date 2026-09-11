@@ -4,6 +4,7 @@ from unittest.mock import patch
 from tinygrad.runtime.ops_cpu import CPUProgram
 from tinygrad import Device, Tensor, TinyJit
 from tinygrad.helpers import getenv
+from tinygrad.dtype import dtypes
 
 @unittest.skipUnless(getenv("RDMA"), "requires two AMD nodes with BNXT NICs and RDMA=1")
 class TestRDMACopy(unittest.TestCase):
@@ -35,6 +36,23 @@ class TestRDMACopy(unittest.TestCase):
     elapsed = time.perf_counter() - start
     np.testing.assert_equal(y.numpy(), expected)
     print(f"RDMA copy: {50 * expected.nbytes / elapsed / 1e9:.2f} GB/s, 50 x 16 MiB")
+
+  def test_copy_wrap(self): # 300 copies each way of changing contents: the 32 entry rings and the 128 entry cqs wrap, every result is checked
+    from tinygrad.runtime import ops_rdma
+    n = 3 << 18
+    original = CPUProgram.remote_exec
+    with patch.object(ops_rdma, "RDMA_CHUNK", 1 << 18): # three chunks per copy
+      for src, dst in (self.devs, self.devs[::-1]):
+        xs = [Tensor.zeros(n, dtype=dtypes.uint8, device=src).contiguous().realize() for _ in range(2)] # two input allocations, used in turn
+        f = TinyJit(lambda x: x[4096:].to(dst).contiguous().realize()) # an offset view
+        def late_receiver(prg, peer, *args, **kwargs): # the send is posted before the receive
+          if peer.peer_group == Device[dst].peer_group: time.sleep(0.05)
+          return original(prg, peer, *args, **kwargs)
+        for i in range(300):
+          data = np.random.default_rng(i).integers(0, 256, n, dtype=np.uint8)
+          xs[i % 2].assign(Tensor(data, device=src)).realize()
+          with patch.object(CPUProgram, "remote_exec", late_receiver if 34 <= i < 38 else original): y = f(xs[i % 2])
+          np.testing.assert_equal(y.numpy(), data[4096:])
 
   def test_sharded_reduce(self):
     def reduce(x): return (x + 1).sum().realize()
