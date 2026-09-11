@@ -333,7 +333,7 @@ class RemoteMMIOInterface(MMIOInterface):
   def __setitem__(self, k, v):
     st = ((k.start or 0) if isinstance(k, slice) else k) * (el:=struct.calcsize(self.fmt))
     data = (bytes(v) if self.fmt == 'B' else struct.pack(f'<{len(v)}{self.fmt}', *v)) if isinstance(k, slice) else struct.pack(f'<{self.fmt}', v)
-    self.dev.post(RemoteCmd.MEM_WRITE, self.addr + st, len(data), el, payload=data)
+    self.dev._post(self.dev.sock, RemoteCmd.MEM_WRITE, self.addr + st, len(data), el, payload=data)
   def view(self, offset:int=0, size:int|None=None, fmt=None) -> MMIOInterface:
     return RemoteMMIOInterface(self.dev, self.addr + offset, (self.nbytes - offset) if size is None else size, fmt or self.fmt)
 
@@ -379,12 +379,9 @@ class RemotePCIDevice(PCIDevice):
   def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
     self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, int(pcibus.split(':')[-1]), None
     self.peer_group = "%s:%d" % sock.getpeername()[:2] # the node
-    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
 
   def rpc(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b'') -> tuple[int, bytes]:
     return RemotePCIDevice._rpc(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
-  def post(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b''):
-    RemotePCIDevice._post(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     host_va, data = self.rpc(RemoteCmd.MAP_SYSMEM, size, int(contiguous), vaddr) # mapped at vaddr on the node: cpu pointer == GPU VA there
@@ -397,15 +394,10 @@ class RemotePCIDevice(PCIDevice):
   def _bar(self, bar:int) -> tuple[int, int, int]: # paddr, size, the node's address of the whole bar
     paddr, data = self.rpc(RemoteCmd.MAP_BAR, bar=bar)
     return paddr, *struct.unpack('<QQ', data)
-  @functools.cache
-  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar(bar_idx)[:2]
+  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar(bar_idx)[:2]  # type: ignore[override]
   def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
     _, sz, host_va = self._bar(bar)
     return RemoteMMIOInterface(self, host_va + off, size or (sz - off), fmt)
 
-  # programs run on the node with raw u64 args: the addresses of its memory
+  # programs run on the node with raw u64 args: the addresses of its memory (CPUProgram.remote_exec)
   def load_prog(self, elf) -> int: return self.rpc(RemoteCmd.LOAD_PROG, len(data:=pickle.dumps(elf)), payload=data)[0]
-  def exec_prog(self, handle:int, args:list[int], wait:bool=False) -> float|None:
-    payload = struct.pack(f'<{len(args)}Q', *(a & 0xffffffffffffffff for a in args))
-    if wait: return self.rpc(RemoteCmd.EXEC_PROG, handle, len(args), 1, payload=payload)[0] / 1e9
-    return self.post(RemoteCmd.EXEC_PROG, handle, len(args), 0, payload=payload)

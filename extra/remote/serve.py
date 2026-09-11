@@ -18,23 +18,11 @@ FMT = {1: 'B', 4: 'I', 8: 'Q'} # single elements are real 32/64-bit accesses (re
 
 def resp(r0:int=0, payload:bytes=b'', status:int=0) -> bytes: return struct.pack(REMOTE_RESP, status, r0, len(payload)) + payload
 
-def device(dev_id:int) -> PCIDevice:
-  if dev_id not in opened:
-    cl, pcibus = devices[dev_id]
-    opened[dev_id] = cl("SV", pcibus)
-  return opened[dev_id]
-
 def view(addr:int, size:int, fmt:str):
   # the whole mapping and the element index in it: the mock emulates registers by their index in the bar
   if (m:=next((m for m in maps if m.addr <= addr and addr + size <= m.addr + m.nbytes), None)) is None:
     raise RuntimeError(f"{addr:#x}+{size:#x} is not mapped on this node")
   return m.view(fmt=fmt), (addr - m.addr) // struct.calcsize(fmt)
-
-def kick_mock():
-  # native programs bypass the mock's memoryview hooks: run the emulated queues after every program
-  if DEV.interface.startswith("MOCK"):
-    from test.mockgpu.mockgpu import drivers
-    for d in drivers: d._emulate_execute()
 
 def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:bytes) -> bytes|None:
   if cmd == RemoteCmd.PROBE:
@@ -58,30 +46,26 @@ def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:b
     return resp(h)
   if cmd == RemoteCmd.EXEC_PROG:
     et = progs[a0](*struct.unpack(f'<{a1}Q', payload), wait=bool(a2))
-    kick_mock()
+    if DEV.interface.startswith("MOCK"): # native programs bypass the mock's memoryview hooks: run the emulated queues after every program
+      from test.mockgpu.mockgpu import drivers
+      for d in drivers: d._emulate_execute()
     return resp(int(et * 1e9)) if a2 else None
   # device commands
-  pci_dev = device(dev_id)
-  if cmd == RemoteCmd.MAP_BAR:
-    if (v:=next((m for m in maps if getattr(m, 'bar', None) == (dev_id, bar)), None)) is None:
-      maps.append(v:=pci_dev.map_bar(bar))
-      v.bar = (dev_id, bar) # type: ignore[attr-defined]
+  if dev_id not in opened: opened[dev_id] = devices[dev_id][0]("SV", devices[dev_id][1])
+  pci_dev = opened[dev_id]
+  if cmd == RemoteCmd.MAP_BAR: # once per bar: the client caches it
+    maps.append(v:=pci_dev.map_bar(bar))
     return resp(pci_dev.bar_info(bar)[0], struct.pack('<QQ', v.nbytes, v.addr))
   if cmd == RemoteCmd.MAP_SYSMEM:
     v, paddrs = pci_dev.alloc_sysmem(a0, vaddr=a2, contiguous=bool(a1))
     maps.append(v)
     return resp(v.addr, struct.pack(f'<{len(paddrs)}Q', *paddrs))
   if cmd == RemoteCmd.CFG_READ: return resp(pci_dev.read_config(a0, a1))
-  if cmd == RemoteCmd.CFG_WRITE:
-    pci_dev.write_config(a0, a2, a1)
-    return resp()
-  if cmd == RemoteCmd.RESIZE_BAR:
-    pci_dev.resize_bar(bar)
-    return resp()
-  if cmd == RemoteCmd.RESET:
-    pci_dev.reset()
-    return resp()
-  raise RuntimeError(f"unknown command {cmd}")
+  if cmd == RemoteCmd.CFG_WRITE: pci_dev.write_config(a0, a2, a1)
+  elif cmd == RemoteCmd.RESIZE_BAR: pci_dev.resize_bar(bar)
+  elif cmd == RemoteCmd.RESET: pci_dev.reset()
+  else: raise RuntimeError(f"unknown command {cmd}")
+  return resp()
 
 def serve(conn:socket.socket):
   while True:

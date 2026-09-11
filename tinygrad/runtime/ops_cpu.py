@@ -3,6 +3,7 @@ import platform, sys, ctypes, mmap, struct, time
 from typing import cast, Any
 from tinygrad.helpers import OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le
 from tinygrad.device import Compiled, TinyELF, Program, HostAllocator
+from tinygrad.runtime.support.system import RemoteCmd
 from tinygrad.runtime.support.c import DLL
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.renderer.llvmir import CPULLVMRenderer
@@ -72,7 +73,9 @@ class CPUProgram(Program['CPUDevice']):
   # the same program on another node (RemotePCIDevice): loaded there once, the args are that node's addresses
   def remote_exec(self, peer, *bufs:int, vals:tuple[int|None, ...]=(), wait:bool=False, **kwargs) -> float|None:
     if (handle:=self.remote_handles.get(peer.sock)) is None: handle = self.remote_handles[peer.sock] = peer.load_prog(self.obj)
-    return peer.exec_prog(handle, [*bufs, *cast(tuple[int, ...], vals)], wait)
+    payload = struct.pack(f'<{len(bufs) + len(vals)}Q', *(a & 0xffffffffffffffff for a in (*bufs, *cast(tuple[int, ...], vals))))
+    if wait: return peer.rpc(RemoteCmd.EXEC_PROG, handle, len(payload) // 8, 1, payload=payload)[0] / 1e9
+    return peer._post(peer.sock, RemoteCmd.EXEC_PROG, handle, len(payload) // 8, 0, payload=payload)
 
   @suppress_finalizing
   def __del__(self):
