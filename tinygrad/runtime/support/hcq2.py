@@ -141,24 +141,10 @@ pm_unwrap_multi = PatternMatcher([(UPat(Ops.CALL, name="call"), unwrap_call)])
 STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) << 20, 2
 
 @functools.cache
-def _staging(device:str="CPU") -> Buffer: # this host's memory, or host memory of a remote node for its devices
-  return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
+def _staging(device:str="CPU", host:bool=True) -> Buffer: # this host's memory, host memory of a remote node for its devices, or a gpu's own
+  return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=host and device != "CPU"), preallocate=True)
 
-def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
-  if is_rdma(call): return None
-  devs = [Device[to_tuple(b.device)[0]] for b in (dst, src)]
-  # over the nics when the two are linked: nic k of a node is cabled to nic k of the other. any other pair stages through host memory
-  if getenv("RDMA") and all(all_devices_in(b.device, HCQ_DEVS) for b in (dst, src)) and devs[0].peer_group != devs[1].peer_group and \
-     nic_index(devs[0])[1] == nic_index(devs[1])[1]:
-    return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
-  if (device:=get_enqueue_devs(call)) is None: return None
-  try:
-    for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
-    return None
-  except (RuntimeError, OSError): pass
-  staging = _staging(dev if Device[dev:=to_tuple(device)[0]].remote_peer is not None else "CPU")
-  staging.get_buf(device)
-
+def through(staging:Buffer, dst:UOp, src:UOp) -> UOp: # the copy in chunks through the staging buffer's slots
   base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
   chunk = (STAGING_SIZE // STAGING_SLOTS) // it
   for i, off in enumerate(range(0, src.max_numel(), chunk)):
@@ -166,6 +152,27 @@ def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
     copies += [src[off:off+n].copy_to_device(staging.device).call(stage, src[off:off+n]),
                stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
   return UOp(Ops.LINEAR, src=tuple(copies))
+
+def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
+  if is_rdma(call): return None
+  devs = [Device[to_tuple(b.device)[0]] for b in (dst, src)]
+  if getenv("RDMA") and all(all_devices_in(b.device, HCQ_DEVS) for b in (dst, src)) and devs[0].peer_group != devs[1].peer_group:
+    # over the nics when the two are linked: nic k of a node is cabled to nic k of the other
+    if nic_index(devs[0])[1] == nic_index(devs[1])[1]:
+      return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
+    # else through the gpu on the source's node that is linked to the destination
+    fam, hop = devs[1].device.split(":")[0], None
+    for i in range(cast(Any, devs[1]).iface.count):
+      if Device[d:=f"{fam}:{i}"].peer_group == devs[1].peer_group and nic_index(Device[d])[1] == nic_index(devs[0])[1]: hop = d
+    return through(_staging(unwrap(hop), host=False), dst, src)
+  if (device:=get_enqueue_devs(call)) is None: return None
+  try:
+    for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
+    return None
+  except (RuntimeError, OSError): pass
+  staging = _staging(dev if Device[dev:=to_tuple(device)[0]].remote_peer is not None else "CPU")
+  staging.get_buf(device)
+  return through(staging, dst, src)
 
 pm_prepare_copy = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.COPY), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), prepare_copy),
