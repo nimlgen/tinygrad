@@ -39,7 +39,8 @@ class BNXTAllocator(Allocator):
     iface = getattr(Device[buf.device], "iface", None)
     if not isinstance(iface, PCIIfaceBase) or iface.peer_group != self.dev.peer_group: raise RuntimeError("RDMA requires memory on its node")
     mapping = buf.meta.mapping
-    paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else iface.p2p_paddrs(mapping.paddrs)[0]
+    # the nic reaches vram over pcie: the bar, even where gpus reach each other over xgmi
+    paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else PCIIfaceBase.p2p_paddrs(iface, mapping.paddrs)[0]
     page = (2 << 20) if buf._buf % (2 << 20) == 0 and all(p % (2 << 20) == 0 and s % (2 << 20) == 0 for p, s in paddrs) else 0x1000
     key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, page)],
                                               mapping.size, page.bit_length() - 1, va=buf._buf)

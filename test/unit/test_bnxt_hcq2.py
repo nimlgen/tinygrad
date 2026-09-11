@@ -16,8 +16,7 @@ from tinygrad.uop.ops import UOp, Ops, ProgramInfo, KernelInfo, graph_rewrite
 class TestBNXTAllocator(unittest.TestCase):
   def setUp(self):
     self.iface = PCIIfaceBase.__new__(PCIIfaceBase)
-    self.iface.pci_dev = SimpleNamespace(peer_group="node")
-    self.iface.p2p_paddrs = lambda pages: ([(p + 0x100000000, s) for p, s in pages], False)
+    self.iface.pci_dev, self.iface.vram_bar = SimpleNamespace(peer_group="node", bar_info=lambda bar: (0x100000000, 1 << 40)), 0 # the bar
     self.nic = SimpleNamespace(peer_group="node", iface=SimpleNamespace(dev_impl=Mock()))
     self.nic.iface.dev_impl.register_mem.return_value = 0x1234
     self.nic.allocator = BNXTAllocator(self.nic)
