@@ -241,7 +241,7 @@ def _epilogue(ctx:BatchCtx, dev:str) -> list[UOp]:
 def _finalize_batch(ctx:BatchCtx) -> UOp:
   call_waits = [_wait_ins(ctx, c, d[0], q, tag) for tag, (c, d, q) in enumerate(ctx.batch)]
   submits, kerns = _emit_submits(ctx, call_waits)
-  for dev in ctx.queues: submits[((dev,), ctx.epilogue_queue(dev))].extend(_epilogue(ctx, dev))
+  for dev in ctx.queues: submits.setdefault(((dev,), ctx.epilogue_queue(dev)), []).extend(_epilogue(ctx, dev)) # copy-only batch: no stream yet
   fence = UOp.custom_function("hcq_fence", *[ctx.sched_timeline((dev,)) for dev in ctx.queues],
                               *[ctx.queue_signal((dev,), q) for dev, qs in ctx.queues.items() for q in qs])
   merged:list[UOp] = [] # the submits in order, after the fence
