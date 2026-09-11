@@ -67,16 +67,18 @@ class TestRDMASchedule(unittest.TestCase):
     get_device = type(Device).__getitem__
     self.enterContext(patch.object(type(Device), "__getitem__", lambda obj, d: self.devs[d] if d in self.devs else get_device(obj, d)))
 
-  def prepare(self, calls): return graph_rewrite(UOp(Ops.LINEAR, src=tuple(calls)), hcq2.pm_split_rdma+realize.pm_flatten_linear)
+  def prepare(self, calls): return graph_rewrite(UOp(Ops.LINEAR, src=tuple(calls)), hcq2.pm_prepare_copy+realize.pm_flatten_linear)
 
   def test_split(self):
     src, dst = buf(0, "AMD:1"), buf(1, "AMD:2")
     send, recv = self.prepare([copy(src, dst)]).src
     self.assertEqual((send.src[0].arg, recv.src[0].arg), ("send", "recv"))
     self.assertEqual((hcq2.get_enqueue_devs(send), hcq2.get_enqueue_devs(recv)), ("AMD:1", "AMD:2"))
-    self.assertIsNone(hcq2.stage_copy((), send, dst, src))
-    self.assertIsNone(hcq2.split_rdma(copy(src, buf(2, "AMD:3")))) # same node
-    with patch.object(hcq2, "getenv", return_value=0): self.assertIsNone(hcq2.split_rdma(copy(src, dst)))
+    self.assertIsNone(hcq2.prepare_copy((), send, dst, src))
+    # The ordinary-copy path is tested with real buffers elsewhere; this checks that these calls are not split.
+    with patch.object(hcq2, "get_enqueue_devs", return_value=None):
+      self.assertIsNone(hcq2.prepare_copy((), copy(src, same:=buf(2, "AMD:3")), same, src))
+      with patch.object(hcq2, "getenv", return_value=0): self.assertIsNone(hcq2.prepare_copy((), copy(src, dst), dst, src))
 
   def test_dependencies_stay_on_each_node(self):
     src, dst = buf(0, "AMD:1"), buf(1, "AMD:2")

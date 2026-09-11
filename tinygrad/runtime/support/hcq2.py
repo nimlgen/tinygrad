@@ -130,8 +130,11 @@ STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) <
 def _staging(device:str="CPU") -> Buffer: # this host's memory, or host memory of a remote node for its devices
   return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
 
-def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
+def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if is_rdma(call): return None
+  if getenv("RDMA") and all(all_devices_in(b.device, HCQ_DEVS) for b in (dst, src)) and \
+     Device[to_tuple(dst.device)[0]].peer_group != Device[to_tuple(src.device)[0]].peer_group:
+    return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
@@ -148,17 +151,9 @@ def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
                stage.copy_to_device(dst.device).call(dst[off:off+n], stage)]
   return UOp(Ops.LINEAR, src=tuple(copies))
 
-pm_insert_copy_staging = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat(Ops.COPY), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), stage_copy),
+pm_prepare_copy = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.COPY), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), prepare_copy),
 ])
-
-def split_rdma(call:UOp) -> UOp|None: # a copy between nodes: a send on the source device and a receive on the destination
-  bufs = get_call_arg_uops(call)
-  if is_rdma(call) or not getenv("RDMA") or not all(all_devices_in(b.device, HCQ_DEVS) for b in bufs): return None
-  if len({Device[to_tuple(b.device)[0]].peer_group for b in bufs}) == 1: return None
-  return UOp(Ops.LINEAR, src=tuple(call.replace(src=(call.src[0].replace(arg=side), *call.src[1:])) for side in ("send", "recv")))
-
-pm_split_rdma = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.COPY),), allow_any_len=True, name="call"), split_rdma)])
 
 # *****************
 # 2. deps
@@ -176,16 +171,15 @@ class BatchCtx:
   profile:bool
   tracker:HCQDepsTracker = field(default_factory=HCQDepsTracker)
   queues:dict[str, list[str]] = field(init=False)
-  first:dict[tuple[str, str], int] = field(init=False); last:dict[tuple[str, str], int] = field(init=False) # noqa: E702
+  last:dict[tuple[str, str], int] = field(init=False)
   prev:list[int|None] = field(init=False)
   signal_tags:set[int] = field(init=False)
   slots:dict[str, UOp] = field(init=False)
 
   def __post_init__(self):
-    self.queues, self.first, self.last, self.prev = {}, {}, {}, []
+    self.queues, self.last, self.prev = {}, {}, []
     for tag, (_, devs, q) in enumerate(self.batch):
       if q not in self.queues.setdefault(devs[0], []): self.queues[devs[0]].append(q)
-      self.first.setdefault((devs[0], q), tag)
       self.prev.append(self.last.get((devs[0], q)))
       self.last[(devs[0], q)] = tag
     self.signal_tags = {tag for (dev, q), tag in self.last.items() if q != self.epilogue_queue(dev)}
@@ -214,17 +208,13 @@ def _wait_ins(ctx:BatchCtx, call:UOp, device:str, queue:str, tag:int) -> list[UO
   ctx.signal_tags |= set(latest.values())
   return [UOp(Ops.INS, arg=("wait", dtypes.void), src=(ctx.queue_signal((d,), q), UOp.const(t + 1, dtypes.uint64))) for (d, q), t in latest.items()]
 
-def _merge_queues(submits:list[UOp]) -> list[UOp]:
-  # grouped by queues. can be sent in any order, sync convers that
-  return [make_submit(*[c for s in submits if s.src[0].arg == k for c in s.src[0].src], devs=k[0], queue=k[1])
-          for k in dedup([s.src[0].arg for s in submits])]
-
-def _emit_submits(ctx:BatchCtx, call_waits:list[list[UOp]]) -> tuple[list[UOp], list[tuple]]:
-  # one submit per call: timeline sync on first queue use, timestamps, the call, and a signal if someone waits on it
-  src, kerns = [], []
+def _emit_submits(ctx:BatchCtx, call_waits:list[list[UOp]]) -> tuple[dict[tuple[tuple[str, ...], str], list[UOp]], list[tuple]]:
+  # build each queue in call order: timeline sync on first use, timestamps, calls, and dependency signals
+  src:dict[tuple[tuple[str, ...], str], list[UOp]] = {}
+  kerns = []
   for tag, ((call, devices, queue), q) in enumerate(zip(ctx.batch, call_waits)):
     # first queue use, sync prior device work with the device timeline
-    if ctx.first[(devices[0], queue)] == tag:
+    if (key:=(devices, queue)) not in src:
       q = [UOp(Ops.INS, arg=("barrier", dtypes.void), src=()),
            UOp(Ops.INS, arg=("wait", dtypes.void), src=(timeline(devices), timeline_value(devices)))] + q
 
@@ -238,25 +228,25 @@ def _emit_submits(ctx:BatchCtx, call_waits:list[list[UOp]]) -> tuple[list[UOp], 
     # signal the queue if someone waits for us
     if tag in ctx.signal_tags:
       q += [UOp(Ops.INS, arg=("store", dtypes.void), src=(ctx.queue_signal(devices, queue), UOp.const(tag + 1, dtypes.uint64)))]
-    src.append(make_submit(*q, devs=devices, queue=queue))
+    src.setdefault(key, []).extend(q)
   return src, kerns
 
-def _epilogue(ctx:BatchCtx, dev:str) -> UOp:
+def _epilogue(ctx:BatchCtx, dev:str) -> list[UOp]:
   # one queue signals the timeline once the last call of every other queue signaled
   waits = [UOp(Ops.INS, arg=("wait", dtypes.void), src=(ctx.queue_signal((dev,), q), UOp.const(ctx.last[(dev, q)] + 1, dtypes.uint64)))
            for q in ctx.queues[dev] if q != ctx.epilogue_queue(dev)]
   bump = UOp(Ops.INS, arg=("store", dtypes.void), src=(timeline((dev,)), timeline_value((dev,)) + UOp.const(1, dtypes.uint64)))
-  return make_submit(*waits, bump, devs=dev, queue=ctx.epilogue_queue(dev))
+  return [*waits, bump]
 
 def _finalize_batch(ctx:BatchCtx) -> UOp:
   call_waits = [_wait_ins(ctx, c, d[0], q, tag) for tag, (c, d, q) in enumerate(ctx.batch)]
   submits, kerns = _emit_submits(ctx, call_waits)
-  submits += [_epilogue(ctx, dev) for dev in ctx.queues]
+  for dev in ctx.queues: submits[((dev,), ctx.epilogue_queue(dev))].extend(_epilogue(ctx, dev))
   fence = UOp.custom_function("hcq_fence", *[ctx.sched_timeline((dev,)) for dev in ctx.queues],
                               *[ctx.queue_signal((dev,), q) for dev, qs in ctx.queues.items() for q in qs])
   merged:list[UOp] = [] # the submits in order, after the fence
-  for m in _merge_queues(submits): merged.append(m.after(fence, *merged[-1:]))
-  estimates = sum((estimate_uop(call) for call, _, _ in ctx.batch), start=Estimates()).simplify()
+  for (devs, queue), cmds in submits.items(): merged.append(make_submit(*cmds, devs=devs, queue=queue).after(fence, *merged[-1:]))
+  estimates = sum((k[2] for k in kerns), start=Estimates()).simplify()
   # no estimates for the submit program: those of its polling loops are symbolic sums over every command, thousands of uops deep
   sink = UOp.sink(*merged, arg=KernelInfo("hcq_submit", estimates=Estimates()), tag=1)
   for pm in [Device[d].pm_batch for d in ctx.queues if Device[d].pm_batch is not None]: # a device adds its own work to the batch
@@ -479,7 +469,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False
     use_rt = len(linear.src) < HCQ_CACHE_THRESH # small schedules use runtime address patches so linked schedules can be cached without input buffers
     slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(use_rt, input_uops, slots), walk=True, name="replace buffers")
-  linear = graph_rewrite(linear, pm_unwrap_multi+pm_split_rdma+pm_insert_copy_staging+pm_flatten_linear,
+  linear = graph_rewrite(linear, pm_unwrap_multi+pm_prepare_copy+pm_flatten_linear,
                          ctx=tuple(input_uops or ()), name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_encode, walk=True, name="encode")
