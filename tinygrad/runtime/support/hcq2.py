@@ -420,7 +420,9 @@ def encode_submit(hq:HWQueue) -> UOp:
     hq.blob += bytes(-len(hq.blob) % 128)
     views[l] = (len(hq.blob), hq.q(*l.src))
 
-  buf = UOp.placeholder((len(hq.blob),), dtypes.uint8, device=hq.devs, tag=to_name("cmdbuf", hq.queue))
+  # the command processor itself reads the words of an rdma copy (doorbells, cqe polls): never from a cached copy of the last run
+  rdma = any(u.op is Ops.CALL and is_rdma(u) for u in hq.lin.src)
+  buf = UOp.placeholder((len(hq.blob),), dtypes.uint8, device=hq.devs, volatile=rdma, tag=to_name("cmdbuf", hq.queue))
 
   words = UOp.sink(*[w for _, w in hq.patches]).substitute({l: buf[o:e] for l, (o, e) in views.items()}).src
   cmdbuf = patch(buf, list(zip([o for o, _ in hq.patches], words)), bytes(hq.blob)).shrink(((0, stream),))

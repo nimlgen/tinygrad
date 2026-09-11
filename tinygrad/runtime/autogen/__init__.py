@@ -194,7 +194,7 @@ def __getattr__(nm):
                         "-D__le32=unsigned int", "-D__le64=unsigned long long", "-D__be16=unsigned short", "-D__be32=unsigned int", f"-I{kh}"],
                   patterns=[r"hwrm_((ver_get|func_(qcaps|qcfg|reset|drv_(rgtr|unrgtr)|backing_store_(qcaps|cfg)_v2)|stat_ctx_alloc|ring_alloc"
                             r"|vnic_(alloc|cfg)|cfa_l2_filter_alloc|port_phy_(cfg|qcfg))_(input|output)|(cmd|resp)_hdr)$",
-                            r"((cmdq|creq)_(base|init|add_gid|create_(cq|qp)|initialize_fw|modify_qp|query_version|register_mr|deregister_mr)(_resp)?"
+                            r"((cmdq|creq)_(base|init|add_gid|create_(cq|qp)|initialize_fw|modify_qp|query_(version|qp)|register_mr|deregister_mr)(_resp)?"
                             r"|cq_(base|req)|sq_(rdma_hdr|sge))$",
                             r"(BNXT|CMDQ|CREQ|CQ|SQ|DBC|PTU|RCFW|HWRM|VNIC|RING_ALLOC|STAT_CTX|CFA_L2_FILTER|PORT_PHY_CFG|FIRMWARE_FIRST"
                             r"|FUNC_(QCAPS|QCFG|RESET|DRV_RGTR|BACKING_STORE))_"], preprocess=_extract_deb)

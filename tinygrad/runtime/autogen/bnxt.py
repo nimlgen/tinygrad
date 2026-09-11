@@ -915,6 +915,30 @@ class struct_creq_modify_qp_resp(c.Struct):
   lag_src_mac: int
 struct_creq_modify_qp_resp.register_fields([('type', ctypes.c_ubyte, 0), ('status', ctypes.c_ubyte, 1), ('cookie', ctypes.c_uint16, 2), ('xid', ctypes.c_uint32, 4), ('v', ctypes.c_ubyte, 8), ('event', ctypes.c_ubyte, 9), ('pingpong_push_state_index_enabled', ctypes.c_ubyte, 10), ('reserved8', ctypes.c_ubyte, 11), ('lag_src_mac', ctypes.c_uint32, 12)])
 @c.record
+class struct_cmdq_query_qp(c.Struct):
+  SIZE = 24
+  opcode: int
+  cmd_size: int
+  flags: int
+  cookie: int
+  resp_size: int
+  reserved8: int
+  resp_addr: int
+  qp_cid: int
+  unused_0: int
+struct_cmdq_query_qp.register_fields([('opcode', ctypes.c_ubyte, 0), ('cmd_size', ctypes.c_ubyte, 1), ('flags', ctypes.c_uint16, 2), ('cookie', ctypes.c_uint16, 4), ('resp_size', ctypes.c_ubyte, 6), ('reserved8', ctypes.c_ubyte, 7), ('resp_addr', ctypes.c_uint64, 8), ('qp_cid', ctypes.c_uint32, 16), ('unused_0', ctypes.c_uint32, 20)])
+@c.record
+class struct_creq_query_qp_resp(c.Struct):
+  SIZE = 16
+  type: int
+  status: int
+  cookie: int
+  size: int
+  v: int
+  event: int
+  reserved48: c.Array[ctypes.c_ubyte, Literal[6]]
+struct_creq_query_qp_resp.register_fields([('type', ctypes.c_ubyte, 0), ('status', ctypes.c_ubyte, 1), ('cookie', ctypes.c_uint16, 2), ('size', ctypes.c_uint32, 4), ('v', ctypes.c_ubyte, 8), ('event', ctypes.c_ubyte, 9), ('reserved48', c.Array[ctypes.c_ubyte, Literal[6]], 10)])
+@c.record
 class struct_cmdq_create_cq(c.Struct):
   SIZE = 64
   opcode: int
