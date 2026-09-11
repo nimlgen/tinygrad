@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # a node behind a socket (tinygrad.runtime.support.system.RemotePCIDevice): the client drives this node's PCI devices by address and runs the
 # programs it linked for them here. nothing here knows about GPUs.
-#   every node, the local one too:  PYTHONPATH=. DEV=PCI+AMD python extra/remote/serve.py 6667
+#   every node, the local one too, once per job:  PYTHONPATH=. DEV=PCI+AMD python extra/remote/serve.py 6667
 #   the driver:  REMOTE="localhost:6667,192.168.52.213:6667" DEV=PCI+AMD RDMA=1 python ...   (AMD:n counts through the nodes in REMOTE order,
 #   RDMA:n is node n's nic; RDMA=1 copies between nodes over the nics, without it they stage through the nodes' host memory)
 import socket, struct, sys, pickle, array, traceback, signal
@@ -108,10 +108,8 @@ if __name__ == "__main__":
   server.bind(("0.0.0.0", port))
   server.listen(1)
   print(f"listening on {port}")
-  while True:
-    conn, addr = server.accept()
-    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): conn.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
-    try: serve(conn)
-    except ConnectionError as e: print(f"disconnected: {e}")
-    finally: conn.close()
+  conn, addr = server.accept() # one job per process: what the job loaded and mapped dies with it
+  conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+  for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): conn.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
+  try: serve(conn)
+  except ConnectionError as e: print(f"disconnected: {e}")
