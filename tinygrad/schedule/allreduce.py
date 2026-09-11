@@ -1,6 +1,7 @@
 import functools, itertools
 from tinygrad.helpers import all_int, prod, DEBUG, RING, ALL2ALL, getenv
 from tinygrad.uop.ops import UOp
+from tinygrad.device import Device
 
 # *** allreduce implementation ***
 def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
@@ -22,6 +23,18 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   # naive: copy to all devices. if you shrink later, that'll be handled
   if not use_ring and not use_all2all:
     return functools.reduce(lambda x,y: x.alu(op, y), [buf.mselect(i).copy_to_device(device) for i in range(ndev)]).shrink_to(shape)
+
+  # two nodes: reduce-scatter in each node, every chunk owner exchanges with its counterpart on the other node, all-gather in each node
+  nodes = [[i for i, d in enumerate(buf.device) if Device[d].peer_group == g] for g in dict.fromkeys(Device[d].peer_group for d in buf.device)]
+  if use_all2all and len(nodes) == 2 and len(nodes[0]) == len(nodes[1]):
+    n, flat = len(nodes[0]), buf.reshape((numel,))
+    chunks = list(itertools.pairwise(itertools.accumulate([numel // n + (i < numel % n) for i in range(n)], initial=0)))
+    owned = {i: functools.reduce(lambda x, y: x.alu(op, y), [flat.mselect(j).shrink((chunks[k],)).copy_to_device(buf.device[i]) for j in node])
+             for node in nodes for k, i in enumerate(node)}
+    for a, b in zip(*nodes): # the counterparts, linked by their nics
+      owned[a], owned[b] = owned[a].alu(op, owned[b].copy_to_device(buf.device[a])), owned[b].alu(op, owned[a].copy_to_device(buf.device[b]))
+    gathered = [UOp.mstack(*(owned[node[k]].copy_to_device(buf.device[j]) for node in nodes for j in node)) for k in range(n)]
+    return UOp.usum(*[c.pad(((s, numel - e),)) for (s, e), c in zip(chunks, gathered)]).reshape(shape)
 
   # chunk data into ndev pieces
   assert isinstance(numel, int)
