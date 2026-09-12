@@ -206,7 +206,8 @@ class PythonProgram(Program['PythonDevice']):
           else: raise NotImplementedError(f"unimplemented tensor core {u.arg}")
         elif u.op in GroupOp.ALU:
           assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
-          assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE}, f"dtype mismatch on {u.op}"
+          assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE} or \
+            (u.op in {Ops.SHL, Ops.SHR} and src_dtypes[1] in (dtypes.uint, dtypes.weakint)), f"dtype mismatch on {u.op}"
           values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
         assert u in values, u
         i += 1
