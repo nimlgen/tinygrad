@@ -8,7 +8,7 @@ from tinygrad.uop.ops import sint, UOp, ProgramInfo
 from tinygrad.device import BufferStorage, BufferSpec, Buffer, Device, Allocator, Compiled, ProfileProgramEvent
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import getenv, round_up, data64_le, DEBUG, PROFILE, ProfileEvent, lo32, hi32, prod, colored
-from tinygrad.helpers import ceildiv, unwrap, pluralize, HCQ2, ContextVar, VIZ
+from tinygrad.helpers import ceildiv, unwrap, pluralize, HCQ2, ContextVar, VIZ, to_tuple
 from tinygrad.renderer.cstyle import HIPRenderer, HIPCCRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.runtime.autogen import kfd, hsa, sqtt, amdgpu_kd, amdgpu_drm
@@ -455,6 +455,16 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
       self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w for w in [hdr, *ib, 10, *[0] * 10]]
     self.run_start = end
 
+  def wait(self, signal:UOp, value:UOp, eq:bool=False):
+    base, off = unwrap_view(signal)
+    if (base.tag, off) not in (("signal", 8), ("timeline", 0)) or not Device[to_tuple(base.device)[0]].signal_header:
+      return super().wait(signal, value, eq) # raw memory (e.g. NIC completions) has no AMD signal header
+    self.close_run(len(self.blob))
+    hdr = AQL_HDR | (hsa.HSA_PACKET_TYPE_VENDOR_SPECIFIC << hsa.HSA_PACKET_HEADER_TYPE) | (hsa.HSA_AMD_PACKET_TYPE_BARRIER_VALUE << 16)
+    self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w for w in
+                  [hdr, 0, signal.getaddr(self.devs) - 8, value.cast(dtypes.uint64), UOp.const((1 << (8 * value.dtype.itemsize)) - 1, dtypes.uint64),
+                   hsa.HSA_SIGNAL_CONDITION_EQ if eq else hsa.HSA_SIGNAL_CONDITION_GTE, *[0] * 7]]
+
   def signal(self, signal:UOp, value:UOp):
     self.close_run(len(self.blob)) # all XCCs must finish the preceding waits before XCC0 signals completion
     super().signal(signal, value)
@@ -810,7 +820,7 @@ class PCIIface(PCIIfaceBase):
       for b in (cq.put_value, cq.read_ptr, cq.write_ptr): b.host.view(fmt='Q')[0] = 0
       d.iface.dev_impl.gfx.setup_ring(*cq.params)
       tl = d.timeline.host.view(fmt='Q')
-      tl[0] = tl[1]
+      tl[0] = tl[-1]
 
   def sleep(self, timeout):
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
@@ -866,6 +876,15 @@ class AMDDevice(Compiled):
 
   ifaces = [KFDIface, PCIIface, USBIface, _mock(KFDIface, "MOCKIface"), _mock(KFDIface), _mock(PCIIface), _mock(USBIface)]
 
+  def aql_signal_buffer(self, timeline:bool=False) -> Buffer:
+    # The handle points at a 64-byte AMD signal; HCQ addresses its value at +8. Keep the host counter outside the signal.
+    blob = self.signal_header + (bytes(8) if timeline else b"")
+    return Buffer(self.device, len(blob) // 8, dtypes.uint64, options=BufferSpec(host=True, uncached=True, cpu_access=True),
+                  initial_value=blob).view(8 if timeline else 2, dtypes.uint64, 8).ensure_allocated()
+
+  @functools.cached_property
+  def timeline(self) -> Buffer: return self.aql_signal_buffer(timeline=True) if self.is_aql else super().timeline
+
   def device_props(self): return self.iface.props
 
   def is_am(self) -> bool: return isinstance(self.iface, (PCIIface,))
@@ -897,6 +916,8 @@ class AMDDevice(Compiled):
                       bases={i: tuple(getattr(self.ip_off, f'NBIO_BASE__INST{i}_SEG{s}', 0) for s in range(9)) for i in range(6)})
 
     self.is_aql = getenv("AMD_AQL", int(self.xccs > 1))
+    self.timeline_size = 8 if self.is_aql else 2
+    self.signal_header = bytes(hsa.amd_signal_t(kind=hsa.AMD_SIGNAL_KIND_USER)) if self.is_aql else b""
     self.max_copy_size = 0x40000000 if (4, 4, 2) <= (v:=self.iface.ip_versions[am.SDMA0_HWIP]) < (5, 0, 0) or v >= (5, 2, 0) else 0x400000
     self.sdma_queues:dict = {}
     self.has_copy_queue = not getenv("AMD_DISABLE_SDMA")

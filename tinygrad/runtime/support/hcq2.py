@@ -78,8 +78,9 @@ def select_lane(u:UOp, lane:int) -> UOp: return u.src[lane] if u.op is Ops.MSTAC
 
 def to_name(*parts:str) -> str: return "_".join(parts).replace(":", "_").lower()
 
-def timeline(devs:tuple[str, ...]) -> UOp: return UOp.placeholder((2,), dtypes.uint64, 0, device=devs, volatile=True, tag="timeline")
-def timeline_value(devs:tuple[str, ...]) -> UOp: return timeline(devs).index(1).load()
+def timeline(devs:tuple[str, ...]) -> UOp:
+  return UOp.placeholder((Device[devs[0]].timeline_size,), dtypes.uint64, 0, device=devs, volatile=True, tag="timeline")
+def timeline_value(devs:tuple[str, ...]) -> UOp: return (t:=timeline(devs)).index(t.max_numel() - 1).load()
 
 def rt_addr(b:UOp, dev="CPU", host="CPU") -> UOp:
   base, off = unwrap_view(b)
@@ -198,6 +199,7 @@ class BatchCtx:
   prev:list[int|None] = field(init=False)
   signal_tags:set[int] = field(init=False)
   slots:dict[str, UOp] = field(init=False)
+  signals:dict[tuple[str, str], UOp] = field(default_factory=dict)
 
   def __post_init__(self):
     self.queues, self.last, self.prev = {}, {}, []
@@ -213,7 +215,11 @@ class BatchCtx:
   def epilogue_queue(self, dev:str) -> str: return "COMPUTE:0" if len(self.queues[dev]) > 1 else self.queues[dev][0] # closes the device
 
   def slot(self, devs:tuple[str, ...], i:int) -> UOp: return self.slots[devs[0]].shrink(((2 * i, 2 * i + 2),)) # not a slice: 10x the cost
-  def queue_signal(self, devs:tuple[str, ...], queue:str) -> UOp: return self.slot(devs, self.queues[devs[0]].index(queue))
+  def queue_signal(self, devs:tuple[str, ...], queue:str) -> UOp:
+    if not (header:=Device[devs[0]].signal_header): return self.slot(devs, self.queues[devs[0]].index(queue))
+    if (key:=(devs[0], queue)) not in self.signals:
+      self.signals[key] = UOp.placeholder((len(header) // 8,), dtypes.uint64, device=devs, volatile=True, tag="signal").shrink(((1, 3),))
+    return self.signals[key]
   def sched_timeline(self, devs:tuple[str, ...]) -> UOp: return self.slot(devs, len(self.queues[devs[0]]))
   def stamps(self, devs:tuple[str, ...], tag:int) -> tuple[int, ...]: return (st:=len(self.queues[devs[0]])+1+2*tag, st + 1) if self.profile else ()
 
@@ -370,12 +376,13 @@ def hcq_fence(ctx:EncodeCtx, f:UOp) -> UOp:
     slots = patch(slots, [], bytes(slots.max_numel() * slots.dtype.itemsize)) # zeroed at link
     target = slots.after(*last, tv:=timeline_value((dev,))).index(off // slots.dtype.itemsize).load()
     done = timeline((dev,)).after(target, loop:=UOp.loop(i)).index(0).load()
-    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+    bumped = timeline((dev,)).after(done.end(loop, done < target)).index(Device[dev].timeline_size - 1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
     last = (slots.after(bumped).index(off // slots.dtype.itemsize).store(nxt),)
 
   # re-arm the signals
   for sig in sigs:
     base, off = unwrap_view(sig)
+    if base.tag == "signal": base = patch(base, [], Device[to_tuple(base.device)[0]].signal_header)
     last = (base.after(*last).index(off // sig.dtype.itemsize).store(0),)
   return last[0].barrier(*last[1:])
 

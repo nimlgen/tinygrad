@@ -209,7 +209,7 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   ctx = replace(ctx, wait=ctx.wait and not info.rdma,
                 var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
   ets = exec_kernel(ctx, call, ast, devices=(HCQ_RUNTIME_DEV.value,), peer=Device[info.device[0]].remote_peer)
-  for host, dev in info.host_deps: Device[host].pending[dev] = Device[dev].timeline.host.view(fmt='Q')[1]
+  for host, dev in info.host_deps: Device[host].pending[dev] = Device[dev].timeline.host.view(fmt='Q')[-1]
   if not (ctx.wait or PROFILE): return ets
 
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}

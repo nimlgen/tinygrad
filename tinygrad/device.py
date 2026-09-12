@@ -396,6 +396,8 @@ class Compiled:
   wait_timeout_ms: float = 30000.0
   sleep_timeout_ms: int|None = None
   can_recover:bool = False
+  signal_header:bytes = b"" # optional header for queue signals, whose value follows its first word
+  timeline_size:int = 2 # first word is the signal, last word is the host submission counter
   rtalloc_size:int = 64<<20 # the pool every per-linear buffer is carved out of
   var_vals: dict[str, int] = {}
 
@@ -464,7 +466,7 @@ class Compiled:
 
   def synchronize(self, timeout:int|None=None):
     try:
-      self._wait_signal(tl:=self.timeline.host.view(fmt='Q'), tl[1], timeout)
+      self._wait_signal(tl:=self.timeline.host.view(fmt='Q'), tl[-1], timeout)
       for d, v in self.pending.items(): Device[d]._wait_signal(Device[d].timeline.host.view(fmt='Q'), v, timeout)
     except RuntimeError:
       self.on_device_hang()

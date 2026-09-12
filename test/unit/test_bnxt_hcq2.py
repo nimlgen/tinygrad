@@ -62,7 +62,7 @@ class TestRDMASchedule(unittest.TestCase):
   def setUp(self):
     self.enterContext(patch.object(hcq2, "getenv", return_value=1))
     self.enterContext(patch.object(hcq2, "nic_index", lambda dev: (0, 0)))
-    self.devs = {d: SimpleNamespace(peer_group=g, remote_peer=None, has_copy_queue=True, pm_batch=None)
+    self.devs = {d: SimpleNamespace(peer_group=g, remote_peer=None, has_copy_queue=True, pm_batch=None, timeline_size=2, signal_header=b"")
                  for d, g in (("AMD:1", "a"), ("AMD:2", "b"), ("AMD:3", "a"))}
     get_device = type(Device).__getitem__
     self.enterContext(patch.object(type(Device), "__getitem__", lambda obj, d: self.devs[d] if d in self.devs else get_device(obj, d)))
@@ -86,11 +86,14 @@ class TestRDMASchedule(unittest.TestCase):
     calls = [(kernel(src), ("AMD:1",), "COPY:0"), (kernel(dst, False), ("AMD:2",), "COPY:0"),
              (send, ("AMD:1",), "COMPUTE:0"), (recv, ("AMD:2",), "COMPUTE:0"),
              (kernel(src), ("AMD:1",), "COPY:0"), (kernel(dst, False), ("AMD:2",), "COPY:0")]
-    ctx = hcq2.BatchCtx(calls, False)
-    waits = [hcq2._wait_ins(ctx, c, ds[0], q, i) for i, (c, ds, q) in enumerate(calls)]
-    self.assertEqual([[w.src[1].val for w in ws] for ws in waits], [[], [], [1], [2], [3], [4]])
-    batches = hcq2.sched_batches(self.prepare([copy(src, dst), copy(buf(2, "AMD:3"), dst)]), False).src
-    self.assertEqual([(b.arg.aux.device, b.arg.aux.rdma) for b in batches], [(("AMD:1", "AMD:3"), True), (("AMD:2",), True)])
+    for size in (2, 8):
+      with self.subTest(timeline_size=size):
+        for dev in self.devs.values(): dev.timeline_size, dev.signal_header = size, bytes(64) if size == 8 else b""
+        ctx = hcq2.BatchCtx(calls, False)
+        waits = [hcq2._wait_ins(ctx, c, ds[0], q, i) for i, (c, ds, q) in enumerate(calls)]
+        self.assertEqual([[w.src[1].val for w in ws] for ws in waits], [[], [], [1], [2], [3], [4]])
+        batches = hcq2.sched_batches(self.prepare([copy(src, dst), copy(buf(2, "AMD:3"), dst)]), False).src
+        self.assertEqual([(b.arg.aux.device, b.arg.aux.rdma) for b in batches], [(("AMD:1", "AMD:3"), True), (("AMD:2",), True)])
 
 class TestBNXTCopy(unittest.TestCase):
   def test_words_replay(self): # the words of a send and a receive, linked and run: rings and cqs wrap, counters advance
