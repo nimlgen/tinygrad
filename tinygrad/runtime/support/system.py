@@ -305,7 +305,7 @@ class PCIIfaceBase:
       if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")
       if ifa.peer_group != self.peer_group: raise RuntimeError(f"P2P mapping across peer groups: {b.device} -> {self.dev.device}")
       lo, size, snooped, uncached = b._buf, b.meta.mapping.size, True, b.meta.mapping.uncached
-      if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace, snooped = b.meta.mapping.paddrs, AddrSpace.SYS, b.meta.mapping.snooped
+      if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace = b.meta.mapping.paddrs, AddrSpace.SYS
       else: paddrs, aspace = ifa.p2p_paddrs(b.meta.mapping.paddrs)
     else: raise RuntimeError(f"map failed: {b.device} -> {self.dev.device}")
 

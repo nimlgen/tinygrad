@@ -172,10 +172,10 @@ def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None, peer=None) -> 
     var_vals = {**ctx.var_vals, **device_vars}
     prg_bufs = [b.ensure_allocated() for b in bufs]
     rt = get_runtime(device, ast, cache=ctx.cache)
-    launch = rt if peer is None else functools.partial(rt.remote_exec, peer)
+    if peer is not None: rt = functools.partial(rt.remote_exec, peer)
     global_size, local_size = ast.arg.launch_dims(var_vals)
-    ets.append(launch(*[b.get_buf(device) for b in prg_bufs], global_size=global_size, local_size=local_size, vals=ast.arg.vals(var_vals),
-                      wait=ctx.wait, timeout=ctx.timeout))
+    ets.append(rt(*[b.get_buf(device) for b in prg_bufs], global_size=global_size, local_size=local_size, vals=ast.arg.vals(var_vals),
+                  wait=ctx.wait, timeout=ctx.timeout))
   return ets
 
 def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:

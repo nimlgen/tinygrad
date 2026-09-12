@@ -129,15 +129,14 @@ pm_unwrap_multi = PatternMatcher([(UPat(Ops.CALL, name="call"), unwrap_call)])
 STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) << 20, 2
 
 @functools.cache
-def _staging(device:str="CPU") -> Buffer:
-  return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
+def _staging(device:str) -> Buffer: return Buffer(device, STAGING_SIZE, dtypes.uint8, options=BufferSpec(host=device != "CPU"), preallocate=True)
 
 def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
   except (RuntimeError, OSError):
-    staging = _staging(dev if Device[dev:=to_tuple(device)[0]].remote_peer is not None else "CPU")
+    staging = _staging(device if Device[device].remote_peer is not None else "CPU")
     staging.get_buf(device)
     base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
     chunk = (STAGING_SIZE // STAGING_SLOTS) // it

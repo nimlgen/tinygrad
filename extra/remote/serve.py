@@ -3,7 +3,7 @@ import socket, struct, sys, pickle, signal
 from tinygrad.runtime.support.system import PCIDevice, RemoteCmd, System
 from tinygrad.runtime.support.am.amdev import AMMemoryManager
 from tinygrad.device import Device
-from tinygrad.helpers import DEBUG, DEV
+from tinygrad.helpers import DEBUG
 
 def resp(resp0=0, resp1=0, status=0): return struct.pack('<BQQ', status, resp0, resp1)
 def resp_err(msg): return struct.pack('<BQQ', 1, len(err:=msg.encode()), 0) + err
@@ -77,9 +77,8 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     conn.sendall(resp(len(programs) - 1))
   elif cmd == RemoteCmd.EXEC_PROG:
     et = programs[arg0](*struct.unpack(f'<{arg1}Q', conn.recv(arg1 * 8, socket.MSG_WAITALL)), wait=bool(arg2))
-    if DEV.interface.startswith("MOCK"): # native programs bypass the mock's memoryview hooks
-      from test.mockgpu.mockgpu import drivers
-      for d in drivers: d._emulate_execute()
+    if (mock:=sys.modules.get("test.mockgpu.mockgpu")) is not None: # native programs bypass the mock's memoryview hooks
+      for d in mock.drivers: d._emulate_execute()
     if arg2: conn.sendall(resp(int(et * 1e9)))
   else: raise RuntimeError(f"unknown command {cmd}")
 
