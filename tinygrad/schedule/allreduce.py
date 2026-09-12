@@ -12,7 +12,12 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   # ring allreduce doesn't provide a benefit with only 2 nodes or where number of elements is less than 256k (empirically)
   # fallback to naive allreduce to save on kernel dispatch, chunking and reassembling chunks.
   concrete = all_int(shape)
-  use_all2all = concrete and (ALL2ALL >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and ALL2ALL >= 1))
+  nodes = [[i for i, d in enumerate(buf.device) if Device[d].peer_group == g] for g in
+           dict.fromkeys(Device[d].peer_group for d in buf.device)] if concrete and ALL2ALL >= 1 else []
+  # Even small reductions should stay hierarchical across two nodes: naive sends every input to every remote GPU.
+  two_nodes = len(nodes) == 2 and len(nodes[0]) == len(nodes[1])
+  use_all2all = concrete and (ALL2ALL >= 2 or (ALL2ALL >= 1 and
+    (two_nodes or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000)))))
   use_ring = concrete and not use_all2all and (RING >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and RING >= 1))
   if DEBUG >= 2: print(f"{'ALL2ALL' if use_all2all else 'RING' if use_ring else 'NAIVE'} ALLREDUCE {ndev}x{numel} | {buf.dtype}")
 
@@ -25,8 +30,7 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
     return functools.reduce(lambda x,y: x.alu(op, y), [buf.mselect(i).copy_to_device(device) for i in range(ndev)]).shrink_to(shape)
 
   # two nodes: reduce-scatter in each node, every chunk owner exchanges with its counterpart on the other node, all-gather in each node
-  nodes = [[i for i, d in enumerate(buf.device) if Device[d].peer_group == g] for g in dict.fromkeys(Device[d].peer_group for d in buf.device)]
-  if use_all2all and len(nodes) == 2 and len(nodes[0]) == len(nodes[1]):
+  if use_all2all and two_nodes:
     n, flat = len(nodes[0]), buf.reshape((numel,))
     chunks = list(itertools.pairwise(itertools.accumulate([numel // n + (i < numel % n) for i in range(n)], initial=0)))
     owned = {i: functools.reduce(lambda x, y: x.alu(op, y), [flat.mselect(j).shrink((chunks[k],)).copy_to_device(buf.device[i]) for j in node])

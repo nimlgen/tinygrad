@@ -61,6 +61,24 @@ class TestRingAllReduce(unittest.TestCase):
       shards = out.reshape(1, M).expand(N, M)+dev_nums
       self.assertListEqual(shards.tolist(), [[x+d+1 for x in expected] for d in range(N)])
 
+  def test_small_two_node_reductions(self):
+    import numpy as np
+    from unittest.mock import patch
+    from tinygrad.device import Device
+    ds = tuple(f"CPU:{i}" for i in range(16))
+    node = property(lambda self: int(self.device.split(":")[1] if ":" in self.device else 0) // 8)
+    with Context(ALL2ALL=1, SCACHE=0), patch.object(type(Device["CPU"]), "peer_group", node):
+      for size in (1, 7, 17, 4097):
+        data = np.arange(16*size, dtype=np.int32).reshape(16, size) % 13
+        t = Tensor(data).shard(ds, axis=0).realize()
+        out = t.sum(0).contiguous()
+        linear, vals = out.linear_with_vars()
+        pairs = [(c.src[1].buffer.device, c.src[2].buffer.device) for c in linear.src if c.src[0].op is Ops.COPY]
+        across = [(a, b) for a, b in pairs if Device[a].peer_group != Device[b].peer_group]
+        self.assertEqual(len(across), 2*min(size, 8))
+        run_linear(linear, vals)
+        for i in range(16): np.testing.assert_array_equal(Tensor(out.uop.mselect(i)).numpy(), data.sum(0))
+
   @Context(RING=0, ALL2ALL=0)
   def test_schedule_naive(self):
     N = 4
