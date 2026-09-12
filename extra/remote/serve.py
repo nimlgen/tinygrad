@@ -51,7 +51,8 @@ def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:b
       for d in drivers: d._emulate_execute()
     return resp(int(et * 1e9)) if a2 else None
   # device commands
-  if dev_id not in opened: opened[dev_id] = devices[dev_id][0]("SV", devices[dev_id][1])
+  # the lock prefix a driver on the node itself uses (AMDDevice -> "AM"): a local job and a remote one exclude each other
+  if dev_id not in opened: opened[dev_id] = devices[dev_id][0]("AM", devices[dev_id][1])
   pci_dev = opened[dev_id]
   if cmd == RemoteCmd.MAP_BAR: # once per bar: the client caches it
     maps.append(v:=pci_dev.map_bar(bar))
