@@ -55,11 +55,17 @@ class BNXTDev:
   def __init__(self, pci_dev:PCIDevice, ip:str=getenv("BNXT_IP", "10.0.0.1")):
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
     self.bar0, self.db = pci_dev.map_bar(0, fmt='I'), pci_dev.map_bar(2, fmt='Q')
-    pci_dev.write_config(pci.PCI_COMMAND, pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.resp, self.resp_pa = pci_dev.alloc_sysmem(0x1000)
     self.seq = 0
 
-    ver = self.hwrm("ver_get")
+    for attempt in range(2):
+      pci_dev.write_config(pci.PCI_COMMAND, pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+      try:
+        ver = self.hwrm("ver_get")
+        break
+      except TimeoutError: # a job killed before func_drv_unrgtr leaves the firmware deaf to the next driver: a function level reset
+        if attempt: raise
+        pci_dev.reset()
     if DEBUG >= 2: print(f"bnxt {self.devfmt}: firmware {ver.hwrm_fw_maj_8b}.{ver.hwrm_fw_min_8b}.{ver.hwrm_fw_bld_8b}")
     self.hwrm("func_reset", timeout_ms=40000)
     caps = self.hwrm("func_qcaps", fid=0xffff)

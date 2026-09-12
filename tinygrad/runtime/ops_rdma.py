@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any
-import functools, struct, operator
+import functools, struct, operator, signal, sys
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import round_up, getenv, ceildiv, to_tuple
@@ -20,6 +20,8 @@ class BNXTIface(PCIIfaceBase):
   def __init__(self, dev:RDMADevice, index:int):
     super().__init__(dev, index, *NIC[:2], vram_bar=2, va_start=AMMemoryManager.va_allocator.base, va_size=AMMemoryManager.va_allocator.size,
       dev_impl_t=functools.partial(BNXTDev, ip=getenv("BNXT_IP", f"10.0.0.{index + 1}")), base_class=NIC[2])
+    # a kill (timeout, pkill) still runs the atexit finalizers: a driver the firmware never forgot wedges the nic for every next driver
+    if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL: signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
   def device_fini(self): self.dev_impl.fini()
 
