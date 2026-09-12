@@ -5,7 +5,7 @@ export ROCM_PATH=${ROCM_PATH:-/opt/rocm-7.1.1}
 export PATH="$ROCM_PATH/bin:$PATH"
 export DEV=${DEV:-AMD}
 export CHECK_OOB=0
-export HCQ2=0
+export HCQ2=${HCQ2:-0}
 export REWRITE_STACK_LIMIT=5000000 HCQDEV_WAIT_TIMEOUT_MS=240000
 export DEVICE_IN_FUNCTION_BUG=1
 
@@ -35,7 +35,7 @@ export DP=${DP:-8} MP=${MP:-1} BS=${BS:-16} EVAL_BS=${EVAL_BS:-8} GRADIENT_ACC_S
 export GBS=$((BS * GRADIENT_ACC_STEPS))
 
 export MODEL="llama3"
-export BASEDIR="/raid/datasets/c4-8b/"
+export BASEDIR=${BASEDIR:-"/raid/datasets/c4-8b/"}
 export SMALL=1
 export LLAMA3_SIZE=${LLAMA3_SIZE:-"8B"}
 export EVAL_TARGET=3.3 EVAL_FREQ=12288
