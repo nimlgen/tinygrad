@@ -336,12 +336,16 @@ class RemoteMMIOInterface(MMIOInterface):
   # memory of the node at its address: reads are round trips, writes are posted in order
   def __init__(self, dev:RemotePCIDevice, addr:int, nbytes:int, fmt='B'): self.dev, self.addr, self.nbytes, self.fmt = dev, addr, nbytes, fmt
   def __getitem__(self, k):
+    if isinstance(k, int) and k < 0: k += len(self)
+    if isinstance(k, int) and not 0 <= k < len(self): raise IndexError("index out of bounds")
     sl, el = k if isinstance(k, slice) else slice(k, k + 1), struct.calcsize(self.fmt)
     st, en = (sl.start or 0) * el, (len(self) if sl.stop is None else sl.stop) * el
     data = self.dev.rpc(RemoteCmd.MEM_READ, self.addr + st, en - st, el)[1]
     res = data if self.fmt == 'B' else list(struct.unpack(f'<{(en - st) // el}{self.fmt}', data))
     return res if isinstance(k, slice) else res[0]
   def __setitem__(self, k, v):
+    if isinstance(k, int) and k < 0: k += len(self)
+    if isinstance(k, int) and not 0 <= k < len(self): raise IndexError("index out of bounds")
     st = ((k.start or 0) if isinstance(k, slice) else k) * (el:=struct.calcsize(self.fmt))
     data = (bytes(v) if self.fmt == 'B' else struct.pack(f'<{len(v)}{self.fmt}', *v)) if isinstance(k, slice) else struct.pack(f'<{self.fmt}', v)
     self.dev._post(self.dev.sock, RemoteCmd.MEM_WRITE, self.addr + st, len(data), el, payload=data)

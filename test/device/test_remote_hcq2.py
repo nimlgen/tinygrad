@@ -40,6 +40,29 @@ class TestRemoteHCQ2(unittest.TestCase):
         np.testing.assert_equal(f(x).numpy(), (np.arange(32) + i + 1) * 3)
     ''')
 
+  def test_signal_view_negative_index(self):
+    self.run_remote('''
+      import struct
+      from tinygrad import Device
+      from tinygrad.device import Buffer, BufferSpec
+      from tinygrad.dtype import dtypes
+      # The AQL header precedes the value view; its last word is the host timeline counter.
+      b = Buffer("AMD", 9, dtypes.uint64, options=BufferSpec(host=True, cpu_access=True),
+                 initial_value=struct.pack("<9Q", 1, *([0] * 8)))
+      signal = b.view(8, dtypes.uint64, 8).ensure_allocated().host.view(fmt="Q")
+      assert signal[-1] == 0
+      signal[-1] = 7
+      assert signal[7] == 7 and signal[0] == 0
+      assert b.host.view(fmt="Q")[0] == 1
+      for index in (-9, 8):
+        try: signal[index]
+        except IndexError: pass
+        else: raise AssertionError(index)
+        try: signal[index] = 42
+        except IndexError: pass
+        else: raise AssertionError(index)
+    ''')
+
   def test_peer_batches(self):
     self.run_remote('''
       from tinygrad import Device, Tensor, TinyJit
