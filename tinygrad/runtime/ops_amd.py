@@ -455,6 +455,10 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
       self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w for w in [hdr, *ib, 10, *[0] * 10]]
     self.run_start = end
 
+  def signal(self, signal:UOp, value:UOp):
+    self.close_run(len(self.blob)) # all XCCs must finish the preceding waits before XCC0 signals completion
+    super().signal(signal, value)
+
   def exec(self, call:UOp, prg:UOp):
     data, lib = amd_build_program(self.dev, prg, self.devs)
     self.dev.scratch_buffer(data.private_segment_size) # the queue descriptor holds the scratch
