@@ -727,7 +727,12 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     sz = self.shape[axis] // dcount
     return self.shrink(tuple((0,s) if i != axis else (rng*sz,rng*sz+sz) for i,s in enumerate(self.shape)))
   def shard(self, devices:tuple[str, ...], axis:int|None=None) -> UOp:
-    copied = self.copy_to_device(devices)
+    # Reusing the same partition needs only its local view, not a gather followed by a scatter.
+    same_partition = False
+    if axis is not None and self.device == devices:
+      try: same_partition = self.axis == axis
+      except RuntimeError: pass # multi-axis views still use the general resharding path
+    copied = self if same_partition else self.copy_to_device(devices)
     return copied if axis is None else copied._shard(axis, UOp.range(len(devices), -1, AxisType.DEVICE)).unshard(axis)
 
   def copy_to_device(self, device:str|tuple[str, ...], arg=None):

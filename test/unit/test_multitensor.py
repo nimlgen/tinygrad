@@ -19,6 +19,51 @@ devices_3 = (d1, d2, d3)
 devices_4 = (d1, d2, d3, d4)
 N = 128
 
+class TestShardReuse(unittest.TestCase):
+  def test_same_partition_has_no_copies(self):
+    from tinygrad.engine.realize import run_linear
+    ds = tuple(Device.canonicalize(f"CPU:{i}") for i in range(4))
+    data = np.arange(64, dtype=np.float32).reshape(8, 8)
+    for axis in (0, 1):
+      x = Tensor(data, device="CPU").shard(ds, axis=axis).realize()
+      with Context(SCACHE=0):
+        out = Tensor((x+x).uop.shard(ds, axis))
+        linear, vals = out.linear_with_vars()
+        self.assertFalse(any(c.src[0].op is Ops.COPY for c in linear.src))
+        run_linear(linear, vals)
+      np.testing.assert_array_equal(out.numpy(), data*2)
+
+  def test_sharded_upstream_gradient_has_no_copies(self):
+    from tinygrad.engine.realize import run_linear
+    ds = tuple(Device.canonicalize(f"CPU:{i}") for i in range(4))
+    w = Tensor(np.ones((2, 4), dtype=np.float32), device="CPU").shard(ds).realize()
+    y = Tensor((w*3).uop.unshard(0))
+    data = np.arange(32, dtype=np.float32).reshape(8, 4)
+    g = Tensor(data, device="CPU").shard(ds, axis=0).realize()
+    with Context(SCACHE=0):
+      out = y.gradient(w, gradient=g+g)[0]
+      linear, vals = out.linear_with_vars()
+      self.assertFalse(any(c.src[0].op is Ops.COPY for c in linear.src))
+      run_linear(linear, vals)
+    for i in range(4): np.testing.assert_array_equal(Tensor(out.uop.mselect(i)).numpy(), data[i*2:i*2+2]*6)
+
+  def test_different_partition_preserves_values(self):
+    ds = tuple(Device.canonicalize(f"CPU:{i}") for i in range(4))
+    data = np.arange(64, dtype=np.float32).reshape(8, 8)
+    x = Tensor(data, device="CPU").shard(ds, axis=0).realize()
+    for target, axis in ((ds, 1), (ds[::-1], 0), (ds, None)):
+      with Context(SCACHE=0): out = Tensor((x+x).uop.shard(target, axis)).realize()
+      np.testing.assert_array_equal(out.numpy(), data*2)
+
+  def test_multi_axis_uses_general_path(self):
+    from tinygrad.uop.ops import AxisType
+    ds = tuple(Device.canonicalize(f"CPU:{i}") for i in range(4))
+    ranges = (UOp.range(2, -1, AxisType.DEVICE), UOp.range(2, -2, AxisType.DEVICE))
+    x = UOp.param(0, dtypes.float, (2, 2), ds).unshard((0, 1), ranges)
+    for value in (x, x+x):
+      expected = value.copy_to_device(ds)._shard(0, UOp.range(len(ds), -1, AxisType.DEVICE)).unshard(0)
+      self.assertIs(value.shard(ds, 0), expected)
+
 @unittest.skipIf(not_support_multi_device(), "no multi")
 class TestMultiTensor(unittest.TestCase):
   @needs_second_gpu
