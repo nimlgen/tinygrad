@@ -431,6 +431,12 @@ class Compiled:
   @property
   def renderer(self) -> Renderer: return self._select_renderer()
 
+  # the devices of one node map each other's memory; a remote node runs its programs through its RemotePCIDevice
+  @property
+  def peer_group(self) -> str: return getattr(getattr(self, 'iface', None), 'peer_group', 'local')
+  @property
+  def remote_peer(self): return getattr(getattr(self, 'iface', None), 'remote', None)
+
   @property
   def compiler(self) -> Compiler:
     if (ret:=self.renderer.compiler) is None: raise RuntimeError(f"no compiler for {self.device}")

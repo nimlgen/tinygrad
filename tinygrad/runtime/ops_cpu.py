@@ -1,6 +1,6 @@
 from __future__ import annotations
 import platform, sys, ctypes, mmap, struct
-from typing import cast
+from typing import cast, Any
 from tinygrad.helpers import OSX, WIN, mv_address, suppress_finalizing, unwrap, data64_le, cpu_profile
 from tinygrad.device import Compiled, TinyELF, Program, HostAllocator
 from tinygrad.runtime.support.c import DLL
@@ -21,6 +21,7 @@ class CPUProgram(Program['CPUDevice']):
 
   def __init__(self, dev:CPUDevice, obj:TinyELF):
     self.dev, self.name, self.signature, self.profile_key = dev, obj.name, obj.signature, obj.profile_key
+    self.obj, self.remote_handles = obj, dict[Any, int]() # program handles per node socket
     self.lvp = obj.target.renderer == "LVP"
 
     if sys.platform == "win32": # mypy doesn't understand when WIN is used here
@@ -67,6 +68,13 @@ class CPUProgram(Program['CPUDevice']):
         args = [*bufs, *cast(tuple[int, ...], vals)]
         self.fxn(*[ctypes.c_uint64(x) for x in args])
     return float(unwrap(prof.en) - prof.st) * 1e-6 if wait else None
+
+  def remote_exec(self, peer, *bufs:int, vals:tuple[int|None, ...]=(), wait:bool=False, **kwargs) -> float|None:
+    from tinygrad.runtime.support.system import RemoteCmd
+    if (handle:=self.remote_handles.get(peer.sock)) is None: handle = self.remote_handles[peer.sock] = peer.load_prog(self.obj)
+    payload = struct.pack(f'<{len(bufs) + len(vals)}Q', *(a & 0xffffffffffffffff for a in (*bufs, *cast(tuple[int, ...], vals))))
+    if wait: return peer.rpc(RemoteCmd.EXEC_PROG, handle, len(payload) // 8, 1, payload=payload)[0] / 1e9
+    return peer._post(peer.sock, RemoteCmd.EXEC_PROG, handle, len(payload) // 8, 0, dev=peer.dev_id, payload=payload)
 
   @suppress_finalizing
   def __del__(self):
