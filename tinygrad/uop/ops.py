@@ -545,6 +545,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # the trace must not retain the device Buffer: store a placeholder instead (the real one would pin memory and fail pickling),
     # keeping bound and unbound buffers distinguishable in viz
     arg = replace(self.arg, buffer=cast("Buffer", object())) if isinstance(self.arg, ParamArg) and self.arg.buffer is not None else self.arg
+    # hcq2 calls have BUFFER UOps in the arg, tracing must store them as trace_nums
+    if isinstance(arg, CallInfo) and hasattr(aux:=arg.aux, "written_bufs"):
+      arg = replace(arg, aux=replace(aux, written_bufs=tuple(b.trace_num for b in aux.written_bufs),
+                                     inputs=tuple((u.trace_num, d, i) for u, d, i in aux.inputs)))
     uop_fields[num] = (self.op, tuple(s.trace_num for s in self.src), arg, tag)+((self.metadata,) if TRACEMETA>=2 else ())
     return num
 
@@ -1297,7 +1301,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     gmap = {s:j for j, s in enumerate(self.arg.globals)}
     sig = tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
           tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
-    return TinyELF(self.src[3].arg, self.arg.function_name, self.arg.target, sig, self.key)
+    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, sig, self.key)
 
 @dataclass(frozen=True)
 class KernelInfo:
@@ -1311,7 +1315,6 @@ class KernelInfo:
 
 @dataclass(frozen=True)
 class ProgramInfo:
-  name: str = "test"
   global_size: tuple[int|float, ...] = (1, 1, 1)
   local_size: tuple[int, ...] = (1, 1, 1)
   vars: tuple[UOp, ...] = ()
@@ -1320,9 +1323,6 @@ class ProgramInfo:
   ins: tuple[int, ...] = ()
   target: Target = Target()
 
-  @property
-  def function_name(self): return to_function_name(self.name)
-
   def launch_dims(self, var_vals:dict[str, int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     global_size = tuple([sym_infer(sz, var_vals) for sz in self.global_size])  # type: ignore[arg-type]
     local_size = tuple([sym_infer(sz, var_vals) for sz in self.local_size])
@@ -1330,7 +1330,7 @@ class ProgramInfo:
 
   def vals(self, var_vals:dict[str, int]) -> tuple[int, ...]:
     try: return tuple(var_vals[k.expr] for k in self.vars)
-    except KeyError as e: raise RuntimeError(f"unbound Variable {e} used by {self.function_name}") from None
+    except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
 
   @staticmethod
   def from_sink(sink:UOp, target:Target=Target()) -> ProgramInfo:
@@ -1347,7 +1347,8 @@ class ProgramInfo:
         if (idx:=u.src[0]).op in (Ops.INDEX, Ops.SHRINK) or (u.src[0].op is Ops.CAST and (idx:=u.src[0].src[0]).op is Ops.INDEX):
           if (buf:=idx.src[0].buf_uop).op is Ops.PARAM: (outs if u.op is Ops.STORE else ins).append(buf.arg.slot)
       if u.op is Ops.SPECIAL: (local_size if u.arg[0] == 'l' else global_size)[int(u.arg[-1])] = cast(int, u.src[0].ssimplify())
-    return ProgramInfo(sink.arg.name if isinstance(sink.arg, KernelInfo) else "test", tuple(global_size), tuple(local_size),
+    if not outs and not ins: outs = ins = _globals # if neither is inferred, default to all buffers
+    return ProgramInfo(tuple(global_size), tuple(local_size),
                        tuple(sorted(dedup(_vars), key=lambda v: v.arg.slot)), tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))),
                        tuple(sorted(dedup(ins))), target)
 
