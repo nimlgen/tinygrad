@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class TestRemoteHCQ2(unittest.TestCase):
   def run_remote(self, code:str, nodes:int=1):
-    env = os.environ | {"PYTHONPATH": str(ROOT), "REMOTE": "", "DEV": "MOCKPCI+AMD", "DEBUG": "0", "RDMA": "0"}
+    env = os.environ | {"PYTHONPATH": str(ROOT), "REMOTE": "", "DEV": "MOCKPCI+AMD", "DEBUG": "0", "RDMA": "0", "HCQ2": "1"}
     peers = []
     with contextlib.ExitStack() as stack:
       for _ in range(nodes):
@@ -17,7 +17,7 @@ class TestRemoteHCQ2(unittest.TestCase):
                                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
         stack.callback(server.terminate)
         self.assertTrue(select.select([server.stdout], [], [], 30)[0], "remote server did not start")
-        self.assertEqual(server.stdout.readline().decode().strip(), f"listening on {port}")
+        self.assertRegex(server.stdout.readline().decode().strip(), rf"^listening on .+:{port}$")
         peers.append(f"127.0.0.1:{port}")
       code = "from tinygrad.runtime.support import hcq2\nhcq2.STAGING_SIZE = 4096\n" + textwrap.dedent(code)
       result = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
@@ -29,7 +29,7 @@ class TestRemoteHCQ2(unittest.TestCase):
       import numpy as np
       from tinygrad import Device, Tensor, TinyJit
       from tinygrad.uop.ops import UOp
-      assert Device["AMD"].remote_peer is not None
+      assert Device["AMD"].host.startswith("CPU:")
       x = Tensor(np.arange(32, dtype=np.int32)).to("AMD").realize()
       np.testing.assert_equal(((x + 1).contiguous() * 2).numpy(), (np.arange(32) + 1) * 2)
       np.testing.assert_equal((x + UOp.variable("offset", -8, 8).bind(-3)).numpy(), np.arange(32) - 3)

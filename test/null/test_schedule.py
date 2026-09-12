@@ -6,7 +6,7 @@ from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo, AxisType
 from tinygrad.helpers import GlobalCounters, Context
 from tinygrad.engine.realize import run_linear, compile_linear
 from tinygrad.codegen import to_program, full_rewrite_to_sink
-from test.helpers import check_schedule, assert_kernel_count, KernelCountException
+from test.helpers import check_schedule, assert_kernel_count, KernelCountException, jit_cache_count
 
 def _realize_weights(m):
   for p in nn.state.get_parameters(m): p.realize()
@@ -30,6 +30,10 @@ class TestBufferUOp(unittest.TestCase):
     buf1 = buf.uop.buffer
     buf2 = buf.uop.buffer
     self.assertIs(buf1, buf2)
+
+  def test_buffer_view_has_unique_buffer(self):
+    view = Tensor.empty(10).realize()[2:8]
+    self.assertIs(view.uop.buffer, view.uop.buffer)
 
   # we also allow VIEW(BUFFER) to access the underlying device Buffer, as long as it's contiguous
   def test_buffer_view_allowed(self):
@@ -610,7 +614,7 @@ class TestSchedule(unittest.TestCase):
         x, y, z = Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float')
         a = (x @ y).relu()
         linear = compile_linear(((a @ z).relu() + a).schedule_linear())
-        return len([call for call in linear.src if call.src[0].op is Ops.PROGRAM])
+        return jit_cache_count(linear)
 
       with Context(IMAGE=1):
         got = cnt()
@@ -626,7 +630,7 @@ class TestSchedule(unittest.TestCase):
         b16, c16 = Tensor.empty((512, 16), dtype='float'), Tensor.empty((16,), dtype='float')
         b32, c32 = Tensor.empty((512, 32), dtype='float'), Tensor.empty((32,), dtype='float')
         linear = compile_linear(Tensor.schedule_linear((rb @ b16 + c16).relu(), (rb @ b32 + c32).relu()))
-        return len([call for call in linear.src if call.src[0].op is Ops.PROGRAM])
+        return jit_cache_count(linear)
 
       with Context(IMAGE=1):
         got = cnt()

@@ -76,6 +76,10 @@ class TestMemoryCoalescing(unittest.TestCase):
             accesses = [wrapped.index(i).load() if op is Ops.LOAD else wrapped.index(i).store(i) for i in range(4)]
             sink = memory_coalescing(UOp.sink(*accesses), Renderer(Target("CPU")))
             self.assertEqual(sum(u.op is op for u in sink.toposort()), 4 if volatile else 1)
+  def test_volatile_view_not_coalesced(self):
+    buf = UOp.param(0, dtypes.uint32, 4, volatile=True).bitcast(dtypes.int32)
+    sink = memory_coalescing(UOp.sink(*(buf.index(i).load() for i in range(4))), Renderer(Target()))
+    self.assertEqual(sum(u.op is Ops.LOAD for u in sink.toposort()), 4)
 
 class TestLowerIndexDtype(unittest.TestCase):
   def test_gated_shrink_lowers_to_selected_width(self):

@@ -51,6 +51,16 @@ def lower_hcq(body:UOp) -> UOp:
   return unwrap(hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test")).call(aux=hcq2.HCQInfo(("CPU",)))))
 
 class TestHCQ2Deps(unittest.TestCase):
+  def test_copy_only_batch_with_multiple_queues(self):
+    from types import SimpleNamespace
+    bufs = [UOp.param(i, dtypes.uint8, 16, device="AMD") for i in range(4)]
+    calls = [(src.copy_to_device("AMD").call(dst, src), ("AMD",), f"COPY:{i}") for i, (dst, src) in enumerate(zip(bufs[:2], bufs[2:]))]
+    with patch.object(type(Device), "__getitem__", return_value=SimpleNamespace(pm_batch=None)):
+      batch = hcq2._finalize_batch(hcq2.BatchCtx(calls, False))
+    streams = [s.without_after.src[0] for s in batch.src[0].src]
+    self.assertEqual([s.arg[1] for s in streams], ["COPY:0", "COPY:1", "COMPUTE:0"])
+    self.assertEqual([u.arg[0] for u in streams[-1].src], ["wait", "wait", "store"])
+
   def test_disjoint_write_preserves_dependencies(self):
     b = UOp.param(0, dtypes.uint8, 16, device="CPU")
     for write in ([], [0]):
@@ -198,19 +208,6 @@ class TestHCQ2Schedule(unittest.TestCase):
     ((device, index),) = call.arg.aux.slots
     self.assertEqual(device, Device.DEFAULT)
     self.assertEqual(call.src[1 + index].buffer.dtype, dtypes.uint64)
-
-  def test_host_copies(self):
-    dev = Device[Device.DEFAULT]
-    if not dev.has_copy_queue: self.skipTest("copy queue required")
-    for host_device in ("CPU", "PYTHON", "NPY", "DISK"):
-      for upload in (False, True):
-        with self.subTest(host_device=host_device, upload=upload):
-          host, gpu = UOp.new_buffer(host_device, 4, dtypes.uint8), UOp.new_buffer(dev.device, 4, dtypes.uint8)
-          src, dst = (host, gpu) if upload else (gpu, host)
-          linear = UOp(Ops.LINEAR, src=(src.copy_to_device(dst.device).call(dst, src),))
-          compiled = compile_linear(linear, profile=False)
-          self.assertEqual(len(compiled.src), 2 if host_device == "DISK" else 1)
-          self.assertEqual(sum(call_is_hcq(call) for call in compiled.src), 1)
 
   def test_large_eager_not_cached(self):
     _, compiled, inputs = self.compiled(65)

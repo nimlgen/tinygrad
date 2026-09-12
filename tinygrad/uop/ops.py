@@ -51,7 +51,7 @@ axis_colors = {AxisType.DEVICE: "green", AxisType.GLOBAL: "blue", AxisType.LOCAL
 axis_to_pos = {AxisType.DEVICE: -2, AxisType.WEAK: -1, AxisType.LOOP: -1, AxisType.GLOBAL: 0, AxisType.WARP: 1,
                AxisType.LOCAL: 2, AxisType.UPCAST: 3, AxisType.GROUP_REDUCE: 2, AxisType.REDUCE: 4, AxisType.UNROLL: 5}
 
-range_start = {Ops.STAGE: 1, Ops.REDUCE: 1, Ops.WMMA: 3, Ops.END: 1, Ops.CALL: 1, Ops.LINEAR: 0}
+range_start = {Ops.STAGE: 1, Ops.REDUCE: 1, Ops.END: 1, Ops.CALL: 1, Ops.LINEAR: 0}
 
 # https://en.wikipedia.org/wiki/Identity_element
 def identity_element(op:Ops, dt:DType) -> PyConst: return dt.const({Ops.ADD:0, Ops.MUL:1, Ops.MAX:dt.min}[op])
@@ -141,7 +141,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
       if (b:=src[0]).op is Ops.PARAM and is_image_shape(b.shape): return dtypes.float
       return b.dtype
     case Ops.LOAD | Ops.UNSHARD | Ops.REDUCE | Ops.AFTER | Ops.RANGE | \
-         Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.COPY | Ops.STAGE | Ops.DETACH | \
+         Ops.CONTIGUOUS_BACKWARD | Ops.COPY | Ops.STAGE | Ops.DETACH | \
          Ops.MSTACK | Ops.MSELECT | Ops.ALLREDUCE | Ops.SPECIAL:
       # pass through first
       return src[0].dtype
@@ -209,6 +209,7 @@ class UOpMetaClass(type):
 
 # some uops map to other stuff
 all_metadata:weakref.WeakKeyDictionary[UOp, tuple[Metadata, ...]] = weakref.WeakKeyDictionary() # TODO: should this be here?
+buffer_views:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary()
 
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
 class recursive_property(property):
@@ -255,7 +256,19 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def is_invalid(self) -> bool: return self.op is Ops.CONST and self.val is Invalid
   @recursive_property
   def key(self) -> bytes:
-    return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
+    # Program metadata can contain symbolic UOps. Hash those structurally: repr would recursively render their full
+    # graphs, which is both quadratic and deep enough to overflow on large HCQ submission programs.
+    def skey(x): return x.key if isinstance(x, UOp) else x
+    arg:Any
+    if isinstance(self.arg, ProgramInfo):
+      arg = (self.arg.name, tuple(map(skey, self.arg.global_size)), tuple(map(skey, self.arg.local_size)),
+             tuple(x.key for x in self.arg.vars), self.arg.globals, self.arg.outs, self.arg.ins, self.arg.target)
+    elif isinstance(self.arg, KernelInfo):
+      est = None if self.arg.estimates is None else tuple(skey(x) for x in
+        (self.arg.estimates.ops, self.arg.estimates.lds, self.arg.estimates.mem))
+      arg = (self.arg.name, self.arg.applied_opts, self.arg.opts_to_apply, est, self.arg.beam)
+    else: arg = self.arg
+    return hashlib.sha256(str((self.op, self.dtype, arg)).encode() + b"".join([s.key for s in self.src])).digest()
   def __repr__(self):
     from tinygrad.uop.render import pretty_print
     return pretty_print(self)
@@ -375,7 +388,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
         return wmma_b + (self.src[2].shape[-1],)
 
       # passthrough ops
-      case Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD | \
+      case Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD | \
            Ops.COPY | Ops.ALLREDUCE | Ops.STORE | Ops.END:
         return self.src[0]._shape
 
@@ -413,6 +426,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
           return tuple(ssimplify(sz) for _,sz in self.marg)
         case Ops.SHRINK:
           # TODO: why do i need resolve here?
+          # All-reduce views address the underlying allocation as a flat physical buffer. This preserves the
+          # semantics of the former SLICE op when a FUNCTION parameter is rebound to a differently shaped view.
+          if self.tag == ("allreduce",) and len(self.marg) == 1:
+            o,sz = self.marg[0]
+            if not (resolve(0<=o) and resolve(sz>=0) and resolve(o+sz<=prod(ps))):
+              raise ValueError(f"invalid allreduce shrink {self.marg} for {ps}")
+            return (ssimplify(sz),)
           if len(ps) != len(self.marg) or not all(resolve(0<=o) and resolve(sz>=0) and resolve(o+sz<=s) for s,(o,sz) in zip(ps, self.marg)):
             raise ValueError(f"invalid shrink {self.marg} for {ps}")
           return tuple(ssimplify(sz) for _,sz in self.marg)
@@ -526,6 +546,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # the trace must not retain the device Buffer: store a placeholder instead (the real one would pin memory and fail pickling),
     # keeping bound and unbound buffers distinguishable in viz
     arg = replace(self.arg, buffer=cast("Buffer", object())) if isinstance(self.arg, ParamArg) and self.arg.buffer is not None else self.arg
+    # hcq2 calls have BUFFER UOps in the arg, tracing must store them as trace_nums
+    if isinstance(arg, CallInfo) and hasattr(aux:=arg.aux, "written_bufs"):
+      arg = replace(arg, aux=replace(aux, written_bufs=tuple(b.trace_num for b in aux.written_bufs),
+                                     inputs=tuple((u.trace_num, d, i) for u, d, i in aux.inputs)))
     uop_fields[num] = (self.op, tuple(s.trace_num for s in self.src), arg, tag)+((self.metadata,) if TRACEMETA>=2 else ())
     return num
 
@@ -683,8 +707,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def axis(self) -> int|None:
-    # COPY removes axis. TODO: add more tests for this, and consider MSELECT/MSTACK
-    if self.op is Ops.COPY: return None
+    # COPY removes axis, except a self COPY (contiguous) which keeps the sharding of its source
+    if self.op is Ops.COPY: return self.src[0].axis if self.is_self_copy and self.tag != ("replicate",) else None
     if self.op is Ops.UNSHARD:
       if len(self.arg) != 1: raise RuntimeError(f"UOp is sharded on multiple axes {self.arg}, use .sharding")
       return self.arg[0]
@@ -739,7 +763,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     assert arg is None or isinstance(self.device, tuple)
     inp = self if arg is None else UOp(Ops.MSELECT, src=(self,), arg=arg)
     if inp.dtype in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {inp.dtype}")
-    return UOp(Ops.COPY, src=(inp.pad_to(inp.max_shape),), arg=device).shrink_to(inp.shape)
+    return UOp(Ops.COPY, src=(inp,), arg=device)
   def mselect(self, arg:int) -> UOp: return UOp(Ops.MSELECT, src=(self,), arg=arg)
   def mstack(self, *srcs: UOp) -> UOp: return UOp(Ops.MSTACK, src=(self,)+srcs) if len(srcs) else self
   @property
@@ -861,6 +885,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       if x.device is not None: return x.device
     return None
   @property
+  def is_self_copy(self) -> bool: return self.op is Ops.COPY and self.device == self.src[0].device
+  @property
   def is_virtual(self) -> bool:
     # NOTE: no device means no place to store, weak means no width to store. neither can back a buffer as-is
     # TODO: unify with has_buffer_identity
@@ -884,12 +910,18 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op in {Ops.BUFFER, Ops.PARAM}: return self
     if self.op is Ops.MSELECT: return self.src[0].buf_uop.mselect(self.arg)
     if self.op is Ops.MSTACK: return UOp(Ops.MSTACK, src=tuple(x.buf_uop for x in self.src))
+    # A hardware buffer view is part of the call argument: dropping it here loses its byte offset.
+    if self.op is Ops.SHRINK and self.tag == ("allreduce",) and self.src[0].op is not Ops.INDEX: return self
     if self.base.op is Ops.AFTER: return self.base.src[0].buf_uop.base
     s = self
-    while len(s.src) and s.op not in {Ops.BUFFER, Ops.PARAM, Ops.STAGE, Ops.MSTACK}: s = s.src[0]
+    while len(s.src) and (s.op not in {Ops.BUFFER, Ops.PARAM, Ops.STAGE, Ops.MSTACK} and
+                          not (s.op is Ops.SHRINK and s.tag == ("allreduce",) and s.src[0].op is not Ops.INDEX)): s = s.src[0]
     return s
 
-  def contiguous_view(self) -> tuple[UOp, int]|None:
+  def contiguous_view(self) -> tuple[UOp, int]|None: return self._contiguous_view
+
+  @functools.cached_property
+  def _contiguous_view(self) -> tuple[UOp, int]|None:
     from tinygrad.schedule.prepare import pm_mops
     from tinygrad.uop.symbolic import symbolic
 
@@ -899,6 +931,14 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # reasonable values for CL_DEVICE_MEM_BASE_ADDR_ALIGN. cl_ext_buffer_device_address could potentially help, but this extension is not provided
     # by relevant CL runtimes at time of writing.
     if (dev:=self.device) is not None and any(d.startswith(("WEBGPU", "CL")) for d in ((dev,) if isinstance(dev, str) else dev)): return None
+
+    # An all-reduce SHRINK is a flat physical allocation view, so its offset composes directly with its parent's
+    # contiguous view even when the parent's logical rank differs after FUNCTION argument substitution.
+    if self.op is Ops.SHRINK and self.tag == ("allreduce",) and self.src[1].op is Ops.CONST and self.src[2].op is Ops.CONST:
+      if (parent:=self.src[0].contiguous_view()) is None: return None
+      byte_offset = self.src[1].val * self.src[0].dtype.itemsize
+      assert byte_offset % parent[0].dtype.itemsize == 0, "all-reduce view offset must align to the base dtype"
+      return parent[0], parent[1] + byte_offset // parent[0].dtype.itemsize
 
     idx = self.flatten().index(UOp.range(self.numel(), 0))
     out = graph_rewrite(idx, pm_mops+symbolic+pm_contiguous_view_offset, ctx=self, name="contiguous_view_offset")
@@ -912,7 +952,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # TODO: this is confusing because UOp.variable('v', 0, 1, dtypes.weakfloat) is True for jit to work, but it doesn't have a buffer
     if self.op in {Ops.RESHAPE, Ops.UNSHARD, Ops.MSELECT}: return self.src[0].has_buffer_identity(after_ok)
     if after_ok and self.op == Ops.AFTER: return self.src[0].has_buffer_identity(after_ok)
-    return self.op in {Ops.BUFFER, Ops.PARAM} and not self.is_unbound
+    return (self.op in {Ops.BUFFER, Ops.PARAM} and not self.is_unbound) or (self.op is Ops.SHRINK and self.tag == ("allreduce",))
   @property
   def is_unbound(self) -> bool:
     # an unbound GLOBAL BUFFER has no storage bound yet: it's a declaration of storage (call output, scheduler temp)
@@ -926,17 +966,20 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   @property
   def buffer(self) -> Buffer|MultiBuffer:
-    if self.op in {Ops.CONTIGUOUS, Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER}: return self.src[0].buffer
+    if self.op in {Ops.COPY, Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER}: return self.src[0].buffer
     # this buffer can process disk tensors and simple movement ops.
-    # NOTE: the view Buffer returned here is transient (short-lived), it only wraps an offset into the base BUFFER's storage
+    # NOTE: the view Buffer returned here is transient (short-lived), it only wraps an offset into the base BUFFER's storag
+    # TODO: caching buffer views halves the python time in llama
     if self is not self.base or self.op is Ops.BITCAST:
+      if (ret:=buffer_views.get(self)) is not None: return ret
       if (cv := self.contiguous_view()) is None: raise RuntimeError(f"non-contiguous view is not supported for {self.device} buffer")
       buf, offset = (b:=cv[0]).base.buffer, cv[1]
       if isinstance(buf, MultiBuffer):
         mbuf = MultiBuffer.__new__(MultiBuffer)
         mbuf.bufs = [x.view(prod(self.max_shape), self.dtype, offset*b.dtype.itemsize) for x in buf.bufs]
-        return mbuf
-      return buf.view(prod(self.max_shape), self.dtype, offset*b.dtype.itemsize)
+        buffer_views[self] = mbuf
+      else: buffer_views[self] = buf.view(prod(self.max_shape), self.dtype, offset*b.dtype.itemsize)
+      return buffer_views[self]
     if self.op is Ops.MSELECT:
       ret = self.src[0].buffer
       assert isinstance(ret, MultiBuffer)
@@ -1094,7 +1137,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op is Ops.STACK: return min(x.vmin for x in self.src), max(x.vmax for x in self.src)
     if self.op is Ops.CONST and self.val is not Invalid: return self.val, self.val
     if self.op is Ops.PAD: return min(self.src[0].vmin, 0), max(self.src[0].vmax, 0)  # PAD adds zeros
-    if self.op in GroupOp.Movement|{Ops.INDEX, Ops.STAGE, Ops.AFTER, Ops.DETACH, Ops.CONTIGUOUS, Ops.CONTIGUOUS_BACKWARD}: return self.src[0]._min_max
+    if self.op in GroupOp.Movement|{Ops.INDEX, Ops.STAGE, Ops.AFTER, Ops.DETACH, Ops.COPY, Ops.CONTIGUOUS_BACKWARD}: return self.src[0]._min_max
     if self.op is Ops.CAST:
       # rounding is monotone (truncation toward zero into an int, to-nearest onto the value grid into a float)
       smin, smax = self.src[0]._min_max
@@ -1264,7 +1307,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     gmap = {s:j for j, s in enumerate(self.arg.globals)}
     sig = tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
           tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
-    return TinyELF(self.src[3].arg, self.arg.function_name, self.arg.target, sig, self.key)
+    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, sig, self.key)
 
 @dataclass(frozen=True)
 class KernelInfo:
@@ -1278,7 +1321,6 @@ class KernelInfo:
 
 @dataclass(frozen=True)
 class ProgramInfo:
-  name: str = "test"
   global_size: tuple[int|float, ...] = (1, 1, 1)
   local_size: tuple[int, ...] = (1, 1, 1)
   vars: tuple[UOp, ...] = ()
@@ -1287,9 +1329,6 @@ class ProgramInfo:
   ins: tuple[int, ...] = ()
   target: Target = Target()
 
-  @property
-  def function_name(self): return to_function_name(self.name)
-
   def launch_dims(self, var_vals:dict[str, int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
     global_size = tuple([sym_infer(sz, var_vals) for sz in self.global_size])  # type: ignore[arg-type]
     local_size = tuple([sym_infer(sz, var_vals) for sz in self.local_size])
@@ -1297,7 +1336,7 @@ class ProgramInfo:
 
   def vals(self, var_vals:dict[str, int]) -> tuple[int, ...]:
     try: return tuple(var_vals[k.expr] for k in self.vars)
-    except KeyError as e: raise RuntimeError(f"unbound Variable {e} used by {self.function_name}") from None
+    except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
 
   @staticmethod
   def from_sink(sink:UOp, target:Target=Target()) -> ProgramInfo:
@@ -1314,7 +1353,8 @@ class ProgramInfo:
         if (idx:=u.src[0]).op in (Ops.INDEX, Ops.SHRINK) or (u.src[0].op is Ops.CAST and (idx:=u.src[0].src[0]).op is Ops.INDEX):
           if (buf:=idx.src[0].buf_uop).op is Ops.PARAM: (outs if u.op is Ops.STORE else ins).append(buf.arg.slot)
       if u.op is Ops.SPECIAL: (local_size if u.arg[0] == 'l' else global_size)[int(u.arg[-1])] = cast(int, u.src[0].ssimplify())
-    return ProgramInfo(sink.arg.name if isinstance(sink.arg, KernelInfo) else "test", tuple(global_size), tuple(local_size),
+    if not outs and not ins: outs = ins = _globals # if neither is inferred, default to all buffers
+    return ProgramInfo(tuple(global_size), tuple(local_size),
                        tuple(sorted(dedup(_vars), key=lambda v: v.arg.slot)), tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))),
                        tuple(sorted(dedup(ins))), target)
 

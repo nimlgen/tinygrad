@@ -5,13 +5,36 @@ from tinygrad.helpers import strip_parens
 
 def pretty_print(x:UOp, cache=None, d=0)->str:
   def dfs(x:UOp, cache:dict):
-    for s in x.src:
+    stack:list[tuple[UOp, int]] = [(x, 0)]
+    while stack:
+      node, i = stack[-1]
+      if i == len(node.src):
+        stack.pop()
+        continue
+      stack[-1] = (node, i+1)
+      s = node.src[i]
       cache.setdefault(s, [len(cache), 0, False])[1] += 1
-      if cache[s][1] == 1: dfs(s, cache)
+      if cache[s][1] == 1: stack.append((s, 0))
   if cache is None: dfs(x, cache:={})
   if (cx:=cache.setdefault(x, [0,0,False]))[2]: return f"{' '*d}x{cx[0]}"
-  cx[2], srcs = True, (''.join(f'\n{pretty_print(s, cache, d+2)},' for s in x.src))
-  return f"{' '*d}{f'x{cx[0]}:=' * (cx[1]>1)}{type(x).__name__}({x.op}, arg={x.argstr()}{x.tagstr()}, src=({srcs}))"
+  cx[2] = True
+  stack:list[tuple[UOp, int, int, list[str]]] = [(x, d, 0, [])]
+  while stack:
+    node, depth, i, srcs = stack[-1]
+    if i < len(node.src):
+      stack[-1] = (node, depth, i+1, srcs)
+      child = node.src[i]
+      if (cc:=cache[child])[2]: srcs.append(f"\n{' '*(depth+2)}x{cc[0]},")
+      else:
+        cc[2] = True
+        stack.append((child, depth+2, 0, []))
+      continue
+    cn = cache[node]
+    ret = f"{' '*depth}{f'x{cn[0]}:=' * (cn[1]>1)}{type(node).__name__}({node.op}, arg={node.argstr()}{node.tagstr()}, src=({''.join(srcs)}))"
+    stack.pop()
+    if not stack: return ret
+    stack[-1][3].append(f"\n{ret},")
+  raise RuntimeError("unreachable")
 
 # ***** uop helpers *****
 
@@ -79,7 +102,7 @@ def render_marg(ctx,x:UOp):
   return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
 
 sugar = {Ops.SINK, Ops.END, Ops.STORE, Ops.LOAD, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
-         Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CONTIGUOUS, Ops.BARRIER, Ops.DETACH}
+         Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.BARRIER, Ops.DETACH}
 pm_pyrender_extra = PatternMatcher([
   (UPat(Ops.CONST, src=(), name="x"), lambda x: f"UOp.const({x.val})"),
   (UPat((Ops.CAST, Ops.BITCAST), name="x"), lambda ctx,x: f"{ctx[x.src[0]]}.{x.op.name.lower()}({x.dtype})" if x.dtype != x.src[0].dtype else None),
@@ -106,11 +129,6 @@ pm_pyrender_extra = PatternMatcher([
   (UPat(set(syms.keys())-{Ops.SUB, Ops.CDIV, Ops.CMOD}, name="x"), lambda ctx,x:
     strip_binary_parens(x, ctx[x.src[0]], ctx[x.src[1]], lambda a,b: f"({a}{syms[x.op]}{b})")
     if x.src[0]._broadcasted(x.src[1]) == x.src else f"{ctx[x.src[0]]}.alu({x.op}, {ctx[x.src[1]]})"),
-  # `.contiguous` is a no-op for weak dtypes, CONTIGUOUS, deviceless or buffer-backed inputs:
-  # the sugar would change the graph for those, so render them via .alu() instead
-  (UPat(Ops.CONTIGUOUS, name="x"), lambda ctx,x:
-   f"{ctx[x.src[0]]}.alu(Ops.CONTIGUOUS)" if x.src[0].dtype in dtypes.weaks or x.src[0].op is Ops.CONTIGUOUS
-   or x.src[0].device is None or x.src[0].has_buffer_identity() else None),
   (UPat(sugar, src=(), name="x"), lambda x: f"UOp.{x.op.name.lower()}("+', '.join(([f'arg={repr(x.arg)}'] if x.arg is not None else []))+")"),
   (UPat(sugar, name="x"), lambda ctx,x: f"{ctx[x.src[0]]}.{x.op.name.lower()}("+', '.join([ctx[y] for y in x.src[1:]] + \
     ([f'arg={repr(x.arg)}'] if x.arg is not None else []))+")"),
@@ -144,7 +162,7 @@ def pyrender(ast:UOp) -> str:
 
   cmap = consumer_map_from_toposort(lst)
   not_rendered = {Ops.CONST}
-  always_rendered = {Ops.PARAM, Ops.LOAD, Ops.SPECIAL, Ops.RANGE, Ops.CONTIGUOUS, Ops.STACK,
+  always_rendered = {Ops.PARAM, Ops.LOAD, Ops.SPECIAL, Ops.RANGE, Ops.STACK,
                      Ops.BUFFER, Ops.COPY, Ops.CALL, Ops.WHERE, Ops.END}
 
   to_render: set[UOp] = {ast}

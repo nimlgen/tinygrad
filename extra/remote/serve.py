@@ -1,100 +1,119 @@
 #!/usr/bin/env python3
-# a node behind a socket (tinygrad.runtime.support.system.RemotePCIDevice): the client drives this node's PCI devices by address and runs the
-# programs it linked for them here. nothing here knows about GPUs.
-#   every node, the local one too, once per job:  PYTHONPATH=. DEV=PCI+AMD python extra/remote/serve.py 6667
-#   the driver:  REMOTE="localhost:6667,192.168.52.213:6667" DEV=PCI+AMD RDMA=1 python ...   (AMD:n counts through the nodes in REMOTE order,
-#   RDMA:n is node n's nic; RDMA=1 copies between nodes over the nics, without it they stage through the nodes' host memory)
-import socket, struct, sys, pickle, array, traceback, signal
-from tinygrad.device import Device
-from tinygrad.helpers import DEBUG, DEV
-from tinygrad.runtime.support.system import PCIDevice, RemoteCmd, REMOTE_REQ, REMOTE_RESP, System
+import socket, struct, sys, signal
+from tinygrad.runtime.support.system import PCIDevice, RemoteCmd, System, REMOTE_REQ, REMOTE_RESP
 from tinygrad.runtime.support.am.amdev import AMMemoryManager
+from tinygrad.runtime.support.hcq import FileIOInterface
+from tinygrad.device import Device, TinyELF
+from tinygrad.helpers import DEBUG, Target, to_mv
 
-devices:list[tuple[type, str]] = [] # probe order: the dev id is the index
-opened:dict[int, PCIDevice] = {}
-maps:list = [] # bar and sysmem views, looked up by address
-progs:dict = {}
-FMT = {1: 'B', 4: 'I', 8: 'Q'} # single elements are real 32/64-bit accesses (registers, doorbells), the rest is a copy
+def resp(resp0=0, resp1=0, status=0): return struct.pack(REMOTE_RESP, status, resp0, resp1)
+def resp_err(msg): return resp(len(err:=msg.encode()), status=1) + err
 
-def resp(r0:int=0, payload:bytes=b'', status:int=0) -> bytes: return struct.pack(REMOTE_RESP, status, r0, len(payload)) + payload
+discovered_devices: list[tuple[type, str]] = []
+opened_devices: dict[int, PCIDevice] = {}
+mapped_bars: dict[tuple[int, int], object] = {}
+programs: list = []
 
-def view(addr:int, size:int, fmt:str):
-  # the whole mapping and the element index in it: the mock emulates registers by their index in the bar
-  if (m:=next((m for m in maps if m.addr <= addr and addr + size <= m.addr + m.nbytes), None)) is None:
-    raise RuntimeError(f"{addr:#x}+{size:#x} is not mapped on this node")
-  return m.view(fmt=fmt), (addr - m.addr) // struct.calcsize(fmt)
+def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
+  if cmd == RemoteCmd.PING:
+    return conn.sendall(resp())
 
-def handle(cmd:RemoteCmd, dev_id:int, bar:int, a0:int, a1:int, a2:int, payload:bytes) -> bytes|None:
   if cmd == RemoteCmd.PROBE:
-    filters:dict[int, list[int]] = {}
-    for mask, dev in struct.iter_unpack('<II', payload): filters.setdefault(mask, []).append(dev)
-    devs = System.list_devices(a1, tuple((m, tuple(d)) for m, d in filters.items()), a0 or None)
-    for d in devs:
-      if d not in devices: devices.append(d)
-    return resp(payload="\n".join(f"{d[1]}:{devices.index(d)}" for d in devs).encode())
-  if cmd == RemoteCmd.MEM_READ:
-    v, i = view(a0, a1, FMT[a2])
-    return resp(payload=bytes(v[i:i + a1]) if a2 == 1 else struct.pack(f'<{a1 // a2}{FMT[a2]}', *v[i:i + a1 // a2]))
-  if cmd == RemoteCmd.MEM_WRITE:
-    v, i = view(a0, len(payload), FMT[a2])
-    if a2 == 1: v[i:i + len(payload)] = payload
-    elif len(payload) == a2: v[i] = struct.unpack(f'<{FMT[a2]}', payload)[0]
-    else: v[i:i + len(payload) // a2] = array.array(FMT[a2], payload)
-    return None
-  if cmd == RemoteCmd.LOAD_PROG:
-    progs[h:=len(progs) + 1] = Device["CPU"].runtime(pickle.loads(payload))
-    return resp(h)
-  if cmd == RemoteCmd.EXEC_PROG:
-    et = progs[a0](*struct.unpack(f'<{a1}Q', payload), wait=bool(a2))
-    if DEV.interface.startswith("MOCK"): # native programs bypass the mock's memoryview hooks: run the emulated queues after every program
-      from test.mockgpu.mockgpu import drivers
-      for d in drivers: d._emulate_execute()
-    return resp(int(et * 1e9)) if a2 else None
-  # device commands
-  # the lock prefix a driver on the node itself uses (AMDDevice -> "AM"): a local job and a remote one exclude each other
-  if dev_id not in opened: opened[dev_id] = devices[dev_id][0]("AM", devices[dev_id][1])
-  pci_dev = opened[dev_id]
-  if cmd == RemoteCmd.MAP_BAR: # once per bar: the client caches it
-    maps.append(v:=pci_dev.map_bar(bar))
-    return resp(pci_dev.bar_info(bar)[0], struct.pack('<QQ', v.nbytes, v.addr))
-  if cmd == RemoteCmd.MAP_SYSMEM:
-    v, paddrs = pci_dev.alloc_sysmem(a0, vaddr=a2, contiguous=bool(a1))
-    maps.append(v)
-    return resp(v.addr, struct.pack(f'<{len(paddrs)}Q', *paddrs))
-  if cmd == RemoteCmd.CFG_READ: return resp(pci_dev.read_config(a0, a1))
-  if cmd == RemoteCmd.CFG_WRITE: pci_dev.write_config(a0, a2, a1)
-  elif cmd == RemoteCmd.RESIZE_BAR: pci_dev.resize_bar(bar)
-  elif cmd == RemoteCmd.RESET: pci_dev.reset()
+    payload = conn.recv(arg1, socket.MSG_WAITALL) if arg1 > 0 else b""
+    filter_devices: dict[int, list[int]] = {}
+    for i in range(0, len(payload), 8):
+      mask, dev = struct.unpack('<II', payload[i:i+8])
+      filter_devices.setdefault(mask, []).append(dev)
+    base_class = None if arg0 == 0 else int(arg0)
+    devs = System.list_devices(arg2, tuple([(x, tuple(y)) for x,y in filter_devices.items()]), base_class)
+    for p in devs:
+      if p not in discovered_devices: discovered_devices.append(p)
+    data = "\n".join(f"{p[1]}:{discovered_devices.index(p)}" for p in devs).encode()
+    return conn.sendall(resp(len(data), len(devs)) + data)
+
+  # only PCI commands need an open GPU
+  if cmd not in {RemoteCmd.MAP_SYSMEM, RemoteCmd.SYSMEM_READ, RemoteCmd.SYSMEM_WRITE, RemoteCmd.UNMAP_SYSMEM, RemoteCmd.LOAD_PROG, RemoteCmd.EXEC_PROG}:
+    if dev_id not in opened_devices:
+      if dev_id >= len(discovered_devices): raise RuntimeError(f"device {dev_id} not probed")
+      cl, pcibus = discovered_devices[dev_id]
+      opened_devices[dev_id] = cl("AM", pcibus)
+    pci_dev = opened_devices[dev_id]
+
+  if cmd == RemoteCmd.MAP_BAR:
+    if (dev_id, bar) not in mapped_bars: mapped_bars[(dev_id, bar)] = pci_dev.map_bar(bar)
+    conn.sendall(resp(*pci_dev.bar_info(bar)) + struct.pack('<Q', mapped_bars[(dev_id, bar)].addr))
+  elif cmd == RemoteCmd.CFG_READ:
+    conn.sendall(resp(pci_dev.read_config(arg0, arg1)))
+  elif cmd == RemoteCmd.CFG_WRITE:
+    pci_dev.write_config(arg0, arg2, arg1)
+    conn.sendall(resp())
+  elif cmd == RemoteCmd.RESIZE_BAR:
+    pci_dev.resize_bar(bar)
+    conn.sendall(resp())
+  elif cmd == RemoteCmd.RESET:
+    pci_dev.reset()
+    conn.sendall(resp())
+  elif cmd == RemoteCmd.MMIO_READ:
+    bar_view = mapped_bars[(dev_id, bar)]
+    if arg0 % 4 == 0 and arg1 == 4: conn.sendmsg([resp(arg1), struct.pack('<I', bar_view.view(fmt='I')[arg0 // 4])])
+    elif arg0 % 8 == 0 and arg1 == 8: conn.sendmsg([resp(arg1), struct.pack('<Q', bar_view.view(fmt='Q')[arg0 // 8])])
+    else: conn.sendmsg([resp(arg1), bar_view[arg0:arg0+arg1]])
+  elif cmd == RemoteCmd.MMIO_WRITE:
+    data = conn.recv(arg1, socket.MSG_WAITALL)
+    bar_view = mapped_bars[(dev_id, bar)]
+    if arg0 % 4 == 0 and arg1 == 4: bar_view.view(fmt='I')[arg0 // 4] = struct.unpack('<I', data)[0]
+    elif arg0 % 8 == 0 and arg1 == 8: bar_view.view(fmt='Q')[arg0 // 8] = struct.unpack('<Q', data)[0]
+    else: bar_view[arg0:arg0+arg1] = data
+  elif cmd == RemoteCmd.MAP_SYSMEM:
+    memview, paddrs = System.alloc_sysmem(arg0, vaddr=arg2, contiguous=bool(arg1))
+    paddrs_bytes = struct.pack(f'<{len(paddrs) + 1}Q', memview.addr, *paddrs)
+    conn.sendall(resp(len(paddrs_bytes)) + paddrs_bytes)
+  elif cmd == RemoteCmd.SYSMEM_READ:
+    conn.sendmsg([resp(arg1), to_mv(arg0, arg1)])
+  elif cmd == RemoteCmd.SYSMEM_WRITE:
+    to_mv(arg0, arg1)[:] = conn.recv(arg1, socket.MSG_WAITALL)
+  elif cmd == RemoteCmd.UNMAP_SYSMEM:
+    FileIOInterface.munmap(arg0, arg1)
+    conn.sendall(resp())
+  elif cmd == RemoteCmd.LOAD_PROG:
+    programs.append(Device["CPU"].runtime(TinyELF(conn.recv(arg0, socket.MSG_WAITALL), "hcq_submit", Target("CPU"), ())))
+    conn.sendall(resp(len(programs) - 1))
+  elif cmd == RemoteCmd.EXEC_PROG:
+    et = programs[arg0](*struct.unpack(f'<{arg1}Q', conn.recv(arg1 * 8, socket.MSG_WAITALL)), wait=bool(arg2))
+    if (mock:=sys.modules.get("test.mockgpu.mockgpu")) is not None: # native programs bypass the mock's memoryview hooks
+      for d in mock.drivers: d._emulate_execute()
+    if arg2: conn.sendall(resp(int(et * 1e9)))
   else: raise RuntimeError(f"unknown command {cmd}")
-  return resp()
 
 def serve(conn:socket.socket):
   while True:
-    if len(hdr:=conn.recv(struct.calcsize(REMOTE_REQ), socket.MSG_WAITALL)) < struct.calcsize(REMOTE_REQ): raise ConnectionError("client gone")
-    cmd, dev_id, bar, a0, a1, a2 = struct.unpack(REMOTE_REQ, hdr)
-    n = {RemoteCmd.PROBE: a2, RemoteCmd.MEM_WRITE: a1, RemoteCmd.LOAD_PROG: a0, RemoteCmd.EXEC_PROG: a1 * 8}.get(cmd, 0)
-    payload = conn.recv(n, socket.MSG_WAITALL) if n else b''
-    if DEBUG >= 4: print(f"cmd={RemoteCmd(cmd).name} dev={dev_id} bar={bar} a0={a0:#x} a1={a1:#x} a2={a2:#x}")
-    try:
-      if (r:=handle(RemoteCmd(cmd), dev_id, bar, a0, a1, a2, payload)) is not None: conn.sendall(r)
+    hdr = conn.recv(struct.calcsize(REMOTE_REQ), socket.MSG_WAITALL)
+    if len(hdr) < struct.calcsize(REMOTE_REQ): raise ConnectionError("client disconnected")
+    cmd, dev_id, bar, arg0, arg1, arg2 = struct.unpack(REMOTE_REQ, hdr)
+    if DEBUG >= 4: print(f"cmd={RemoteCmd(cmd).name} dev={dev_id} bar={bar} arg0={arg0:#x} arg1={arg1:#x} arg2={arg2:#x}")
+    try: handle(conn, cmd, dev_id, bar, arg0, arg1, arg2)
     except ConnectionError: raise
     except Exception as e:
-      # posted commands have no reply to carry the error, so the connection is the error
-      if cmd == RemoteCmd.MEM_WRITE or (cmd == RemoteCmd.EXEC_PROG and not a2): raise ConnectionError(f"{RemoteCmd(cmd).name} failed: {e}") from e
-      if DEBUG >= 1: traceback.print_exc() # the client gets the error, some are expected (a bar that cannot be resized)
-      conn.sendall(resp(payload=str(e).encode(), status=1))
+      if cmd in {RemoteCmd.MMIO_WRITE, RemoteCmd.SYSMEM_WRITE} or (cmd == RemoteCmd.EXEC_PROG and not arg2):
+        raise ConnectionError(f"posted command failed: {e}")
+      print(f"ERROR: {e}")
+      conn.sendall(resp_err(str(e)))
 
 if __name__ == "__main__":
-  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)) # a kill still finalizes the devices
+  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+  System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size)
   port = int(sys.argv[1]) if len(sys.argv) > 1 else 6667
-  System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size) # sysmem is mapped at the GPU VA the client plans
   server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
   server.bind(("0.0.0.0", port))
   server.listen(1)
-  print(f"listening on {port}")
-  conn, addr = server.accept() # one job per process: what the job loaded and mapped dies with it
+  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  try: s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]
+  finally: s.close()
+  print(f"listening on {ip}:{port}", flush=True)
+  conn, addr = server.accept() # one job per process: mappings and loaded programs die with the client
   conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-  for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): conn.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
+  for bt in [socket.SO_SNDBUF, socket.SO_RCVBUF]: conn.setsockopt(socket.SOL_SOCKET, bt, 64 << 20)
   try: serve(conn)
-  except ConnectionError as e: print(f"disconnected: {e}")
+  except ConnectionError: print("disconnected")
+  finally: conn.close()

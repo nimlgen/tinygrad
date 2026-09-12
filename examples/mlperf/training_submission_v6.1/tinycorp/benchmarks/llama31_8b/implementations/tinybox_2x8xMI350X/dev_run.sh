@@ -34,7 +34,7 @@ export DP=${DP:-16} MP=${MP:-1} BS=${BS:-32} EVAL_BS=${EVAL_BS:-16} GRADIENT_ACC
 export GBS=$((BS * GRADIENT_ACC_STEPS))
 
 export MODEL="llama3"
-export BASEDIR="/raid/datasets/c4-8b/"
+export BASEDIR=${BASEDIR:-"/raid/datasets/c4-8b/"}
 export SMALL=1
 export LLAMA3_SIZE=${LLAMA3_SIZE:-"8B"}
 export EVAL_TARGET=3.3 EVAL_FREQ=12288

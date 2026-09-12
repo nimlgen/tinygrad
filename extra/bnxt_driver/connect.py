@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""CPU-driven SEND/RECV between hosts. Sync the tree first; set GPU=AMD to test VRAM registration."""
-import json, os, shlex, subprocess, sys, time
-from tinygrad import Device, dtypes
-from tinygrad.device import Buffer
+"""CPU-driven SEND/RECV between hosts. Sync the tree first and run with PYTHONPATH=."""
+import atexit, json, shlex, subprocess, sys, time
 from tinygrad.helpers import getenv
-from tinygrad.runtime.support.bnxt import BNXTDev, BNXTQP
+from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP
 from tinygrad.runtime.support.system import PCIDevice
 
 SIZE, ITERS = getenv("SIZE", 0x2000), getenv("ITERS", 257)
@@ -20,27 +18,11 @@ def write_json(stream, obj):
   stream.flush()
 
 def endpoint(ip):
-  if gpu := getenv("GPU", ""):
-    os.environ["BNXT_IP"] = ip
-    nic = Device["RDMA"]
-    dev = nic.iface.dev_impl
-    mem = Buffer(gpu, SIZE, dtypes.uint8).ensure_allocated()
-    addr, key = mem._buf, mem.get_buf(nic.device)
-  else:
-    dev = BNXTDev(PCIDevice("bnxt", getenv("BNXT_PCI", "0000:41:00.0")), ip=ip)
-    mem, pages = dev.pci_dev.alloc_sysmem(SIZE)
-    addr, key = pages[0], dev.register_mem(pages, SIZE)
-  qp = BNXTQP(dev)
-  print(f"link state: {dev.hwrm('port_phy_qcfg', port_id=dev.port_id).link}", flush=True)
-  return dev, qp, mem, addr, key
+  dev = BNXTDev(PCIDevice("bnxt", getenv("BNXT_PCI", "0000:41:00.0")), ip=ip)
+  atexit.register(dev.fini)
+  mem, pages = dev.pci_dev.alloc_sysmem(SIZE)
+  return dev, BNXTQP(dev), mem, pages[0], dev.register_mem(pages, SIZE)
 
-def put(mem, data):
-  if isinstance(mem, Buffer):
-    mem.copy_from(Buffer("PYTHON", SIZE, dtypes.uint8, opaque=memoryview(bytearray(data))))
-    Device[mem.device].synchronize()
-  else: mem[:] = data
-
-def get(mem): return bytes(mem.as_memoryview()) if isinstance(mem, Buffer) else bytes(mem[:])
 def info(dev, qp): return {"qpn":qp.qpn, "gid":dev.local_gid.hex(), "mac":dev.mac}
 def connect(qp, peer): qp.connect(peer["qpn"], bytes.fromhex(peer["gid"]), peer["mac"])
 
@@ -49,17 +31,17 @@ def server():
   write_json(sys.stdout, info(dev, qp))
   connect(qp, read_json(sys.stdin))
   for i in range(ITERS):
-    put(mem, bytes(SIZE))
+    mem[:] = bytes(SIZE)
     qp.post_recv(addr, key, SIZE)
     qp.poll(qp.rcq, qp.rcq_id)
-    assert get(mem) == bytes([i % 255 + 1]) * SIZE, f"receive mismatch at iteration {i}"
+    assert bytes(mem[:]) == bytes([i % 255 + 1]) * SIZE, f"receive mismatch at iteration {i}"
   write_json(sys.stdout, {"received":ITERS})
 
 if __name__ == "__main__":
   if "--server" in sys.argv: server()
   else:
     env = {"PYTHONPATH":".", "BNXT_PCI":getenv("REMOTE_PCI", "0000:41:00.0"), "BNXT_IP":getenv("REMOTE_IP", "10.0.200.6"),
-           "GPU":getenv("GPU", ""), "DEV":os.environ.get("DEV", ""), "SIZE":str(SIZE), "ITERS":str(ITERS)}
+           "SIZE":str(SIZE), "ITERS":str(ITERS)}
     command = f"cd {shlex.quote(getenv('REMOTE_DIR', 'tinygrad'))} && " + shlex.join([
       "env", *(f"{k}={v}" for k, v in env.items()), "python3", "-u", "extra/bnxt_driver/connect.py", "--server"])
     with subprocess.Popen(["ssh", "-o", "BatchMode=yes", getenv("REMOTE_HOST", "192.168.52.213"), command],
@@ -70,7 +52,7 @@ if __name__ == "__main__":
       connect(qp, peer)
       start = time.perf_counter()
       for i in range(ITERS):
-        put(mem, bytes([i % 255 + 1]) * SIZE)
+        mem[:] = bytes([i % 255 + 1]) * SIZE
         qp.post_send(addr, key, SIZE)
         qp.poll(qp.scq, qp.scq_id)
       assert read_json(remote.stdout) == {"received":ITERS}

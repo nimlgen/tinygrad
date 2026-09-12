@@ -26,12 +26,14 @@ def get_call_outs_ins(call:UOp) -> tuple[tuple[int, ...], tuple[int, ...]]:
   return (), ()
 
 def get_call_written_bufs(call:UOp) -> list[UOp]:
+  if isinstance(call.arg.aux, HCQInfo): return list(call.arg.aux.written_bufs)
   arg_uops, (outs, ins) = get_call_arg_uops(call), get_call_outs_ins(call)
-  return dedup([b for k in outs if k not in ins and (b:=u if (cv:=(u:=arg_uops[k]).contiguous_view()) is None else cv[0]).op is Ops.BUFFER])
+  bufs = [b.src[0].storage_base if (b:=arg_uops[k].storage_base).op is Ops.MSELECT else b for k in outs if k not in ins]
+  return dedup([b for b in bufs if b.op is Ops.BUFFER])
 
 def get_call_kernels(call:UOp) -> list[tuple[str, UOp, tuple[str, Estimates, bytes]|None]]:
   if isinstance(call.arg.aux, HCQInfo): # the submitter itself, then every kernel it enqueues
-    kernels:list[tuple[str, UOp, tuple[str, Estimates, bytes]|None]] = [(HCQ_RUNTIME_DEV.value, call, None)]
+    kernels:list[tuple[str, UOp, tuple[str, Estimates, bytes]|None]] = [(Device[call.arg.aux.device[0]].host, call, None)]
     return kernels + [(d, call, (name, estimates, profile_key)) for devices,name,estimates,_,profile_key in call.arg.aux.kernels for d in devices]
   ast = call.src[0]
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return [(to_tuple(ast.device)[0], call, None)]
@@ -43,7 +45,7 @@ def get_call_name(call:UOp, bufs:Sequence[Buffer|UOp], var_vals:dict[str, int]|N
   def _dev_str(buf:Buffer|UOp) -> str: return ', '.join(d[:7] for d in to_tuple(buf.device))
 
   ast, arg_uops = call.src[0], get_call_arg_uops(call)
-  if ast.op is Ops.PROGRAM: return ast.arg.name
+  if ast.op is Ops.PROGRAM: return ast.src[0].arg.name
   if ast.op is Ops.COPY: return colored(f"copy {_uop_sz_to_str(arg_uops[0]):>10}, {_dev_str(bufs[0]):>7s} <- {_dev_str(bufs[1]):7s}", "yellow")
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec": return colored(f"enc/dec {_uop_sz_to_str(arg_uops[0])}", "yellow")
   if ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph": return colored(f"batched {len(ast.src[0].src)}", "cyan")
@@ -151,33 +153,29 @@ def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], d
 def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
     dest, src = bufs[0].ensure_allocated(), bufs[1].ensure_allocated()
+    assert dest.nbytes == src.nbytes, f"copy size mismatch, {dest.nbytes} != {src.nbytes}"
     if hasattr(dest.allocator,'_transfer') and dest.allocator.supports_transfer and dest.device.split(":")[0] == src.device.split(":")[0]:
       dest.allocator._transfer(dest._buf, src._buf, dest.nbytes, src_dev=src.allocator.dev, dest_dev=dest.allocator.dev)
     elif src.device.startswith("DISK") and getattr(src.allocator.dev, 'fd', None) is not None \
          and hasattr(dest.allocator, 'copy_from_disk') and src.nbytes >= 4096 and dest.allocator.supports_copy_from_disk:
       dest.allocator.copy_from_disk(dest._buf, src._buf, src.nbytes)
-    elif src.device.split(":")[0] in HCQ_DEVS and dest._host_mv() is not None and src._host_mv() is not None:
-      dst_mv, src_mv = dest.as_memoryview(allow_zero_copy=True), src.as_memoryview(allow_zero_copy=True)
-      with cpu_profile(f"{src.device} -> TINY", f"{src.device}:COPY"): dst_mv[:] = src_mv[:]
-    # host views of remote nodes are read and written through their transport
+    # Host views of remote nodes are read and written through their transport.
     elif (host:=dest.get_storage().host or dest._host_mv()) is not None and (src_host:=src.get_storage().host or src._host_mv()) is not None:
-      Device[dest.device].synchronize()
-      Device[src.device].synchronize()
-      host[:] = src_host[:]
+      for b in (dest, src): b.allocator.dev.synchronize()
+      with cpu_profile(f"{src.device} -> {dest.device}", f"{src.device}:COPY"): host[:] = src_host[:]
     elif dest._host_mv() is not None: src.allocator._copyout(dest.as_memoryview(allow_zero_copy=True), src._buf)
     else: dest.allocator._copyin(dest._buf, src.as_memoryview(allow_zero_copy=True))
   return []
 
-def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None, peer=None) -> list[float|None]:
+def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None) -> list[float|None]:
   ets:list[float|None] = []
   resolved = resolve_params(call, ctx.input_uops)
   for device, (bufs, device_vars) in zip(devices or to_tuple(call.src[1].device), unwrap_multi(call, [resolved[i] for i in ast.arg.globals])):
     var_vals = {**ctx.var_vals, **device_vars}
     prg_bufs = [b.ensure_allocated() for b in bufs]
     rt = get_runtime(device, ast, cache=ctx.cache)
-    launch = rt if peer is None else functools.partial(rt.remote_exec, peer) # the same program on the node of its devices
     global_size, local_size = ast.arg.launch_dims(var_vals)
-    ets.append(launch(*[b.get_buf(device) for b in prg_bufs], global_size=global_size, local_size=local_size, vals=ast.arg.vals(var_vals),
+    ets.append(rt(*[b.get_buf(device) for b in prg_bufs], global_size=global_size, local_size=local_size, vals=ast.arg.vals(var_vals),
                       wait=ctx.wait, timeout=ctx.timeout))
   return ets
 
@@ -205,11 +203,11 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   if (info:=call.arg.aux).inputs:
     addrs = [cast(Buffer, _resolve(u, ctx.input_uops).buffer).get_buf(dev) + off for u, dev, off in info.inputs]
     cast(Buffer, call.src[1 + info.table].buffer).host.view(fmt='Q')[:] = array.array('Q', addrs)
-  # a batch with rdma copies completes only once its peer batches are posted: it is never waited on here
+  # A batch with RDMA copies completes only once its peer batches are posted: it is never waited on here.
   ctx = replace(ctx, wait=ctx.wait and not info.rdma,
                 var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in cast(Any, Device[d]).var_vals.items()}})
-  ets = exec_kernel(ctx, call, ast, devices=(HCQ_RUNTIME_DEV.value,), peer=Device[info.device[0]].remote_peer)
-  for host, dev in info.host_deps: Device[host].pending[dev] = Device[dev].timeline.host.view(fmt='Q')[-1]
+  ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
+  for host, dev in info.host_deps: Device[host].pending[Device[dev]] = Device[dev].timeline.host.view(fmt='Q')[-1]
   if not (ctx.wait or PROFILE): return ets
 
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
@@ -263,7 +261,7 @@ def lower_and_compile(linear:UOp) -> UOp:
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
 
-    pool = None if len(todo) == 1 or any(getattr(c.src[0].arg, "beam", 0) for c in ar) else get_worker_pool()
+    pool = None if len(todo) == 1 or any(getattr(a[0].arg, "beam", 0) for a in ar.values()) else get_worker_pool()
     ctx = {v.key: v.value for v in to_program_context}
     tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
     try:
@@ -289,7 +287,7 @@ pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, arg="validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
 
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQ_RUNTIME_DEV, HCQInfo, HCQ_DEVS # noqa: E402 # down here, hcq2 imports realize
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo # noqa: E402 # down here, hcq2 imports realize
 
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, profile:bool|None=None, cache=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)

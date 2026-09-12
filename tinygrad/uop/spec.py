@@ -87,7 +87,7 @@ spec_shared = PatternMatcher([
   (UPat(Ops.GROUP, dtypes.void, src=UPat((Ops.GROUP, Ops.STORE, Ops.NOOP, Ops.INS, Ops.END))), lambda: True),
 
   # AFTER on Movement Op, PARAM, BUFFER, CONTIGUOUS, RETURNED, or another AFTER
-  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.BUFFER, Ops.CONTIGUOUS, Ops.INDEX,
+  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.BUFFER, Ops.COPY, Ops.INDEX,
                                                      Ops.AFTER, Ops.UNSHARD, Ops.BITCAST, Ops.INS})),),
         allow_any_len=True), lambda: True),
 
@@ -120,7 +120,7 @@ spec_shared = PatternMatcher([
   # STORE: the target must be storage or a CONTIGUOUS realization point (or an AFTER/BITCAST/view of one);
   # CONTIGUOUS targets are written into the buffer the CONTIGUOUS creates. INDEX stores are checked above
   (UPat(Ops.STORE, dtypes.void, (UPat(name="x"), UPat())), lambda x:
-   True if (b:=x.storage_base).op in {Ops.BUFFER, Ops.PARAM, Ops.CONTIGUOUS} else None if b.op is Ops.INDEX else False),
+   True if (b:=x.storage_base).op in {Ops.BUFFER, Ops.PARAM, Ops.COPY} else None if b.op is Ops.INDEX else False),
 
   # WMMA has a <a, b, acc>
   (UPat(Ops.WMMA, src=(UPat(), UPat(), UPat()), name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 5),
@@ -170,7 +170,7 @@ spec_tensor = PatternMatcher([
   (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
 
   # CONTIGUOUS ensures the source UOp realizes
-  (UPat((Ops.DETACH, Ops.CONTIGUOUS, Ops.CONTIGUOUS_BACKWARD), src=(UPat(),), arg=None), lambda: True),
+  (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), src=(UPat(),), arg=None), lambda: True),
 
   # TODO: this should not be here. STAGE is transformed to BUFFER later
   (UPat(Ops.STAGE, src=(UPat(),), allow_any_len=True), lambda: True),
@@ -248,10 +248,17 @@ spec_kernel_graph = PatternMatcher([
   # param is outside buffer, buffer is local buffer. params have a size in the arg, no shape input
   (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
   (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.GLOBAL, AddrSpace.ALU)),
+  # tagged all-reduce SHRINKs are physical runtime buffer views whose byte offsets must survive in call arguments
+  (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM), UPat(Ops.CONST), UPat(Ops.CONST)), name="x"),
+   lambda x: x.tag == ("allreduce",) and x.contiguous_view_offset() is not None),
   (UPat(Ops.BITCAST), lambda: True),
   # mstack/mselect
   (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
   (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  # physical allreduce views are direct copy arguments in the kernel graph
+  (UPat(Ops.SHRINK, src=(UPat(GroupOp.Movement.union({Ops.BUFFER, Ops.PARAM, Ops.AFTER, Ops.MSELECT})),
+                         UPat(Ops.CONST, dtype=dtypes.weakint), UPat(Ops.CONST, dtype=dtypes.weakint)), name="x"),
+   lambda x: True),
   # all calls are on opaque bodies
   (UPat(Ops.CALL, src=(UPat(tuple(OPAQUE_CALL_BODIES)),), allow_any_len=True), lambda: True),
   # after on PARAM or AFTER

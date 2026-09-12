@@ -7,6 +7,7 @@ from tinygrad.viz import serve as viz
 from tinygrad.viz.serve import fmt_colored
 from tinygrad.uop.ops import RewriteTrace
 from tinygrad.helpers import temp, ansistrip, colored, time_to_str, ansilen, ProfilePointEvent, ProfileRangeEvent, TracingKey, unwrap, NO_COLOR, DEBUG
+from tinygrad.helpers import Context, getenv
 
 # profile decoder used in CLI and tests
 def decode_profile(data:bytes) -> dict:
@@ -74,6 +75,7 @@ def fmt_all(k:dict) -> str:
   name = f"*** {k['device'][:7]:7s} "+k["name"]+" "*(46-ansilen(k["name"]))
   return f"{name} tm {ptm}/{k['st_ms']:9.2f}ms"+(f" ({fmt_data(k['fmt'])})" if k["fmt"] else "")
 
+@Context(ALLOW_DEVICE_USAGE=0)
 def main(args) -> None:
   viz.load_rewrites(viz_data:=viz.VizData(viz.load_pickle(args.rewrites_path, default=RewriteTrace([], [], {}))))
 
@@ -211,7 +213,7 @@ def main(args) -> None:
           if DEBUG >= 3 and s["name"] == "View Base AST": print_step(s)
           if DEBUG >= 4 and s["name"] == "View Source": print_step(s)
           if DEBUG >= 5 or ls: print(emit(" "*s["depth"]+s["name"]+(f" - {s['match_count']}" if s.get('match_count', 0) else '')))
-          if DEBUG >= 6 or (DEBUG >= 5 and s["name"] == "View Kernel Graph") or (s["name"] in args.src):
+          if DEBUG >= 6 or (DEBUG >= 5 and s["name"] == "View Kernel Graph") or (s["name"] in args.src) or getenv("KERNEL_GRAPH"):
             print_step(s, print_graph=True, reconstruct_matches=s["name"] in args.src)
           if DEBUG >= 7: print_step(s, reconstruct_matches=True)
       elif DEBUG >= 3 and k.get("ext"): print(emit(k["ext"]))

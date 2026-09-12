@@ -6,7 +6,7 @@ from tinygrad.device import Buffer, BufferStorage
 from tinygrad.runtime.ops_rdma import BNXTAllocator
 from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.autogen import bnxt
-from tinygrad.runtime.support.bnxt import send_wqe, recv_wqe, msn_entry, db_value, RING_ENTRIES, CQ_ENTRIES
+from tinygrad.runtime.support.rdma.bnxtdev import send_wqe, recv_wqe, msn_entry, db_value, RING_ENTRIES, CQ_ENTRIES
 from tinygrad.runtime.ops_rdma import RDMADevice
 from tinygrad.engine import realize
 from tinygrad.runtime.support.memory import AddrSpace, VirtMapping
@@ -17,7 +17,7 @@ class TestBNXTAllocator(unittest.TestCase):
   def setUp(self):
     self.iface = PCIIfaceBase.__new__(PCIIfaceBase)
     self.iface.pci_dev, self.iface.vram_bar = SimpleNamespace(peer_group="node", bar_info=lambda bar: (0x100000000, 1 << 40)), 0 # the bar
-    self.nic = SimpleNamespace(peer_group="node", iface=SimpleNamespace(dev_impl=Mock()))
+    self.nic = Mock(peer_group="node", iface=SimpleNamespace(dev_impl=Mock()))
     self.nic.iface.dev_impl.register_mem.return_value = 0x1234
     self.nic.allocator = BNXTAllocator(self.nic)
     gpu = SimpleNamespace(iface=self.iface, allocator=Mock(_offset=lambda b, size, off: b + off))
@@ -62,7 +62,7 @@ class TestRDMASchedule(unittest.TestCase):
   def setUp(self):
     self.enterContext(patch.object(hcq2, "getenv", return_value=1))
     self.enterContext(patch.object(hcq2, "nic_index", lambda dev: (0, 0)))
-    self.devs = {d: SimpleNamespace(peer_group=g, remote_peer=None, has_copy_queue=True, pm_batch=None, timeline_size=2, signal_header=b"")
+    self.devs = {d: SimpleNamespace(device=d, peer_group=g, host="CPU", has_copy_queue=True, pm_batch=None, timeline_size=2, signal_header=b"")
                  for d, g in (("AMD:1", "a"), ("AMD:2", "b"), ("AMD:3", "a"))}
     get_device = type(Device).__getitem__
     self.enterContext(patch.object(type(Device), "__getitem__", lambda obj, d: self.devs[d] if d in self.devs else get_device(obj, d)))
@@ -94,6 +94,26 @@ class TestRDMASchedule(unittest.TestCase):
         self.assertEqual([[w.src[1].val for w in ws] for ws in waits], [[], [], [1], [2], [3], [4]])
         batches = hcq2.sched_batches(self.prepare([copy(src, dst), copy(buf(2, "AMD:3"), dst)]), False).src
         self.assertEqual([(b.arg.aux.device, b.arg.aux.rdma) for b in batches], [(("AMD:1", "AMD:3"), True), (("AMD:2",), True)])
+
+  def test_sdma_queues_stay_local_and_rdma_posts_stay_ordered(self):
+    names = ["AMD" if i == 0 else f"AMD:{i}" for i in range(16)]
+    self.devs = {d: SimpleNamespace(device=d, peer_group=i//8, host="CPU", has_copy_queue=True)
+                 for i, d in enumerate(names)}
+    calls = [copy(buf(2*i, names[base]), buf(2*i+1, names[base+i])) for base in (0, 8) for i in range(1, 8)]
+    src, dst = buf(100, names[0]), buf(101, names[8])
+    calls += [copy(src, dst).replace(src=(UOp(Ops.COPY, src=(src,), arg=side), dst, src)) for side in ("send", "recv")]
+    batches = []
+    def finalize(ctx):
+      batches.append(ctx.batch)
+      return UOp(Ops.LINEAR, src=tuple(c for c, _, _ in ctx.batch))
+    with patch.object(hcq2, "getenv", side_effect=lambda key, default=0: 8 if key == "HCQ_NUM_SDMA" else default), \
+         patch.object(hcq2, "_finalize_batch", finalize):
+      hcq2.sched_batches(UOp(Ops.LINEAR, src=tuple(calls)), False)
+    self.assertEqual(len(batches), 2)
+    for batch in batches:
+      self.assertEqual(len({self.devs[ds[0]].peer_group for _, ds, _ in batch}), 1)
+      self.assertEqual({q for c, _, q in batch if not hcq2.is_rdma(c)}, {f"COPY:{i}" for i in range(7)})
+      self.assertEqual([q for c, _, q in batch if hcq2.is_rdma(c)], ["COPY:0"])
 
   def test_mapping_timeout_does_not_fall_back_to_staging(self):
     src, dst = buf(0, "AMD:1"), buf(1, "AMD:3")

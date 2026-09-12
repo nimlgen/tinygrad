@@ -2,7 +2,7 @@
 import multiprocessing, pickle, difflib, os, threading, json, time, sys, socket, argparse, codecs, io, struct, re, traceback, itertools, socketserver
 from contextlib import redirect_stdout, redirect_stderr, contextmanager
 from decimal import Decimal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler
 from typing import Any, TypedDict, TypeVar, Generator, Callable
@@ -52,7 +52,7 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.BUFFER: "#B0BDFF", Ops.GETADDR: "#9DB1F0", Ops.COPY: "#ff90c0", Ops.CUSTOM_FUNCTION: "#bf71b6",
                Ops.CALL: "#00B7C8", Ops.PARAM: "#14686F", Ops.SOURCE: "#c0c0c0", Ops.BINARY: "#404040",
                Ops.LINEAR: "#7DF4FF",
-               Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
+               Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0",
                Ops.STAGE: "#AC640D", Ops.REWRITE_ERROR: "#1a1b26", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
 addrspace_colors = {AddrSpace.ALU: "#AAAAAA", AddrSpace.REG:"#e68181", AddrSpace.LOCAL:"#e7c86a", AddrSpace.GLOBAL:"#75bd7b"}
@@ -116,7 +116,7 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
   assert isinstance(x, UOp)
   graph: dict[int, dict] = {}
   excluded: set[UOp] = set()
-  for u in (toposort:=x.toposort()):
+  for u in (toposort:=x.toposort(enter_calls=False if getenv("KERNEL_GRAPH") else True)):
     # always exclude CONST
     if u.op is Ops.CONST and u is not x: excluded.add(u)
     if u.op is Ops.STACK and len(u.src) == 0: excluded.add(u)
@@ -147,7 +147,8 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
       if u.op is Ops.CALL:
         label += f"\n{u.src[0].key.hex()[:8]}\n{u.src[0].op}"
       if u.op in {Ops.INDEX, Ops.STAGE}:
-        label += f"\n{u.render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 30 else "\nINDEX TOO LARGE"
+        # NOTE: INDEX and STAGE rendering don't need src0 which can be a large UOp, do not render those
+        label += f"\n{u.replace(src=(UOp(Ops.NOOP),)+u.src[1:]).render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 30 else "\nINDEX TOO LARGE"
         ranges: list[UOp] = []
         for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
         if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
@@ -173,6 +174,10 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
 def _reconstruct(data:VizData, a:int, depth:int|None=None):
   if depth is None and a in data.all_uops: return data.all_uops[a]
   op, src, arg, *rest = data.trace.uop_fields[a]
+  # mirror of the trace_num encoding, viz must not save buffers
+  if op is Ops.CALL and hasattr(aux:=arg.aux, "written_bufs"):
+    arg = replace(arg, aux=replace(aux, written_bufs=tuple(_reconstruct(data, b, depth) for b in aux.written_bufs),
+                                   inputs=tuple((_reconstruct(data, u, depth), d, i) for u, d, i in aux.inputs)))
   if depth is not None and depth <= 0: return UOp(op, (), arg, *rest)
   ret = UOp(op, tuple(_reconstruct(data, s, None if depth is None else depth-1) for s in src), arg, *rest)
   if depth is None: data.all_uops[a] = ret
@@ -180,7 +185,8 @@ def _reconstruct(data:VizData, a:int, depth:int|None=None):
 
 def get_full_rewrite(data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None, update_sink=True) -> Generator[GraphRewriteDetails, None, None]:
   next_sink, err = _reconstruct(data, ctx.sink, depth=depth), False
-  yield {"graph":uop_to_json(data, next_sink), "uop":pystr(next_sink), "change":None, "diff":None, "upat":None, "_sink":next_sink}
+  yield {"graph":uop_to_json(data, next_sink), "uop":"" if getenv("KERNEL_GRAPH") else pystr(next_sink),
+         "change":None, "diff":None, "upat":None, "_sink":next_sink}
   replaces: dict[UOp, UOp] = {}
   for u0_num,u1_num,upat_loc,dur in ctx.matches:
     if err: break

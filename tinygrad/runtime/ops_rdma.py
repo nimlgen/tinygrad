@@ -7,7 +7,7 @@ from tinygrad.helpers import round_up, getenv, ceildiv, to_tuple
 from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.runtime.autogen import bnxt
 from tinygrad.runtime.support.am.amdev import AMMemoryManager
-from tinygrad.runtime.support.bnxt import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
+from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
 from tinygrad.runtime.support.hcq2 import unwrap_view, nic_for
 from tinygrad.runtime.support.memory import AddrSpace, MMIOInterface, VirtMapping
 from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta
@@ -72,7 +72,7 @@ class RDMADevice(Compiled):
       other = cast(RDMADevice, nic_for(peer))
       for nic in (self, other):
         nic.qps[pair] = q = BNXTQP(nic.iface.dev_impl)
-        for name in ("sq", "rq", "scq", "rcq"): nic.bufs[pair, name] = nic.iface.buffer(getattr(q, name)["mem"], getattr(q, name)["paddrs"])
+        for name in ("sq", "rq", "scq", "rcq"): nic.bufs[pair, name] = nic.iface.buffer(getattr(q, name).ring, getattr(q, name).paddrs)
         for name in ("sq_seq", "rq_seq", "psn"): # zeroed sequence numbers in fresh sysmem
           nic.bufs[pair, name] = nic.iface.buffer(*nic.iface.pci_dev.alloc_sysmem(0x1000)).view(1, dtypes.uint64, 0).ensure_allocated()
         nic.bufs[pair, "db"] = nic.iface.doorbell

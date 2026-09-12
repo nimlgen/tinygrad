@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """CPU-driven SEND/RECV through PHY loopback. Run with PYTHONPATH=. BNXT_IP=10.0.200.5."""
-import time
+import atexit, time
 from tinygrad.helpers import getenv
 from tinygrad.runtime.autogen import bnxt
-from tinygrad.runtime.support.bnxt import BNXTDev, BNXTQP
+from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP
 from tinygrad.runtime.support.system import PCIDevice
 
 if __name__ == "__main__":
   dev = BNXTDev(PCIDevice("bnxt", getenv("BNXT_PCI", "0000:41:00.0")))
+  atexit.register(dev.fini)
   tx, rx = BNXTQP(dev), BNXTQP(dev)
   tx.connect(rx.qpn, dev.local_gid, dev.mac)
   rx.connect(tx.qpn, dev.local_gid, dev.mac)

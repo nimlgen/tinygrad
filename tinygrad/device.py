@@ -3,10 +3,10 @@ from dataclasses import dataclass, replace, field
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
 import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
-from tinygrad.helpers import WIN, mv_address, to_mv, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
+from tinygrad.helpers import mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up, is_numpy_ndarray
-from tinygrad.helpers import cpu_profile, perf_counter_us
+from tinygrad.helpers import cpu_profile, perf_counter_us, ContextVar
 from tinygrad.dtype import dtypes, DType, _to_np_dtype
 from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
 if TYPE_CHECKING:
@@ -14,6 +14,8 @@ if TYPE_CHECKING:
   from tinygrad.uop.ops import UOp
 
 # **************** Device ****************
+
+HCQ_RUNTIME_DEV = ContextVar("HCQ_RUNTIME_DEV", "PYTHON" if DEV.interface.startswith("MOCK") else "CPU")
 
 ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "CL", "CPU", "DSP", "WEBGPU"]
 class _Device:
@@ -102,7 +104,7 @@ class MultiBuffer:
   def __repr__(self): return f"<multibuf real:{self.is_allocated()} device:{tuple(x.device for x in self.bufs)} size:{self.size} dtype:{self.dtype}>"
 
 @dataclass(frozen=True)
-class BufferStorage: buf:Any; meta:Any=None; host:MMIOInterface|None=None; maps:dict[str, BufferStorage]=field(default_factory=dict) # noqa: E702
+class BufferStorage: buf:Any; meta:Any=None; host:MMIOInterface|None=None; maps:dict[Compiled, BufferStorage]=field(default_factory=dict) # noqa: E702
 
 class Buffer:
   profile_events:list[ProfileEvent] = []
@@ -149,11 +151,11 @@ class Buffer:
     storage = unwrap(self.ensure_allocated()._storage)
     device = Device.canonicalize(device) if device is not None else self.device
     if device == self.device: return storage
-    if device not in storage.maps:
-      alloc = Device[device].allocator
-      storage.maps[device] = BufferStorage(alloc._offset(self.base.get_buf(device), self.nbytes, self.offset)) if self._base else alloc.map(self)
-    if storage.maps[device].host is not storage.host: storage.maps[device] = replace(storage.maps[device], host=storage.host)
-    return storage.maps[device]
+    if (dev:=Device[device]) not in storage.maps:
+      alloc = dev.allocator
+      storage.maps[dev] = BufferStorage(alloc._offset(self.base.get_buf(device), self.nbytes, self.offset)) if self._base else alloc.map(self)
+    if storage.maps[dev].host is not storage.host: storage.maps[dev] = replace(storage.maps[dev], host=storage.host)
+    return storage.maps[dev]
 
   def get_buf(self, device:str) -> Any: return self.get_storage(device).buf
 
@@ -221,9 +223,10 @@ class Buffer:
     return None
 
   def as_memoryview(self, allow_zero_copy=False) -> memoryview:
-    if allow_zero_copy and (mv:=self._host_mv()) is not None:
+    if (mv:=self._host_mv()) is not None:
       self.allocator.dev.synchronize()
-      return mv
+      if allow_zero_copy: return mv
+      with cpu_profile(f"{self.device} -> TINY", f"{self.device}:COPY"): return memoryview(bytearray(mv))
     Buffer("PYTHON", self.size, self.dtype, opaque=(mv:=memoryview(bytearray(self.nbytes)))).copy_from(self)
     return mv
 
@@ -278,8 +281,8 @@ class Allocator(Generic[DeviceType]):
       storages.clear()
 
   def do_free(self, storage:BufferStorage, options:BufferSpec):
-    for dev in storage.maps: Device[dev].synchronize()
-    for dev, mb in storage.maps.items(): Device[dev].allocator._unmap(mb)
+    for dev in storage.maps: dev.synchronize()
+    for dev, mb in storage.maps.items(): dev.allocator._unmap(mb)
     if options.external_ptr is None: self._free(storage, options)
 
   def map(self, buf:Buffer) -> BufferStorage: return self._map(buf.ensure_allocated())
@@ -298,18 +301,28 @@ class Allocator(Generic[DeviceType]):
 class HostAllocator(Allocator):
   def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    if options.external_ptr is not None: addr, buf = options.external_ptr, None
-    elif WIN: addr = mv_address(buf:=mmap.mmap(-1, size, access=mmap.ACCESS_WRITE))
-    else: addr = mv_address(buf:=mmap.mmap(-1, size, mmap.MAP_ANON | mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE))
-    return BufferStorage(addr, buf, MMIOInterface(addr, size, fmt='B'))
+    if options.external_ptr is not None: view, meta = self._view(options.external_ptr, size), None
+    elif (remote:=getattr(self.dev, "remote", None)) is not None: view, meta = remote.alloc_sysmem(round_up(size, mmap.PAGESIZE))
+    else: view = self._view(mv_address(meta:=mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)), size)
+    return BufferStorage(view.addr, meta, view)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec):
+    if (remote:=getattr(self.dev, "remote", None)) is not None:
+      self.dev.synchronize()
+      remote.free_sysmem(storage.host)
+
+  def _view(self, addr:int, size:int) -> MMIOInterface:
+    return remote.cpu_view(addr, size) if (remote:=getattr(self.dev, "remote", None)) is not None else MMIOInterface(addr, size, fmt='B')
 
   def _copyin(self, dest:int, src:memoryview):
     self.dev.synchronize()
-    with cpu_profile(f"TINY -> {self.dev.device}", f"{self.dev.device}:COPY"): to_mv(dest, src.nbytes)[:] = src.cast('B')
+    with cpu_profile(f"TINY -> {self.dev.device}", f"{self.dev.device}:COPY"): self._view(dest, src.nbytes)[:] = src.cast('B')
   def _copyout(self, dest:memoryview, src:int):
     self.dev.synchronize()
-    with cpu_profile(f"{self.dev.device} -> TINY", f"{self.dev.device}:COPY"): dest[:] = to_mv(src, dest.nbytes)[:]
-  def _map(self, buf:Buffer) -> BufferStorage: return BufferStorage(buf.host.addr)
+    with cpu_profile(f"{self.dev.device} -> TINY", f"{self.dev.device}:COPY"): dest[:] = self._view(src, dest.nbytes)[:]
+  def _map(self, buf:Buffer) -> BufferStorage:
+    if Device[buf.device].host != self.dev.host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+    return BufferStorage(buf.host.addr)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 class DepsTracker:
@@ -391,7 +404,6 @@ class Compiled:
   ifaces:list[Callable] = []
   profile_events:list[ProfileEvent] = [ProfileDeviceEvent("CPU")] # NOTE: CPU is the default device.
 
-  has_copy_queue:bool = True
   timestamp_divider: float = 1000.0
   wait_timeout_ms: float = 30000.0
   sleep_timeout_ms: int|None = None
@@ -413,8 +425,9 @@ class Compiled:
 
     self.device, self.allocator, self.runtime_t, self.graph, self.renderers = device, allocator, runtime, graph, renderers or [Renderer]
     self.device_id, self.arch = (int(idx) if ":" in device and (idx:=device.split(":")[1]).isdigit() else 0), arch
+    self.peer_group = getattr(getattr(self, 'iface', None), 'peer_group', device.split(":")[0])
     self.cached_renderer:dict[Any, Renderer] = {}
-    self.pending:dict[str, int] = {} # timeline values of the devices that touched our memory
+    self.pending:dict[Compiled, int] = {} # timeline values of the devices that touched our memory
 
     # hcq2
     self.pm_bufferize = PatternMatcher([
@@ -429,13 +442,13 @@ class Compiled:
     self.prof_ents:dict[tuple[Buffer, int], ProfileGraphEntry] = {} # (a batch's timestamps, start slot) -> entry, read at synchronize
 
   @property
-  def renderer(self) -> Renderer: return self._select_renderer()
+  def has_copy_queue(self) -> bool: return True
 
-  # the devices of one node map each other's memory; a remote node runs its programs through its RemotePCIDevice
   @property
-  def peer_group(self) -> str: return getattr(getattr(self, 'iface', None), 'peer_group', 'local')
+  def host(self) -> str: return f"CPU:{self.peer_group[7:]}" if self.peer_group.startswith("remote:") else HCQ_RUNTIME_DEV.value
+
   @property
-  def remote_peer(self): return getattr(getattr(self, 'iface', None), 'remote', None)
+  def renderer(self) -> Renderer: return self._select_renderer()
 
   @property
   def compiler(self) -> Compiler:
@@ -467,7 +480,7 @@ class Compiled:
   def synchronize(self, timeout:int|None=None):
     try:
       self._wait_signal(tl:=self.timeline.host.view(fmt='Q'), tl[-1], timeout)
-      for d, v in self.pending.items(): Device[d]._wait_signal(Device[d].timeline.host.view(fmt='Q'), v, timeout)
+      for d, v in self.pending.items(): d._wait_signal(d.timeline.host.view(fmt='Q'), v, timeout)
     except RuntimeError:
       self.on_device_hang()
       raise
