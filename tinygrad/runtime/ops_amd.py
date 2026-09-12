@@ -70,6 +70,8 @@ class AMDComputeQueue(HWQueue):
     super().__init__(ctx, submit)
     self.pm4, self.gc, self.soc, self.nbio, self.target = self.dev.pm4, self.dev.gc, self.dev.soc, self.dev.nbio, self.dev.target
     self.profiled:list[UOp] = []
+    self.karg = HWQueue(ctx, submit)
+    self.karg_buf = UOp.placeholder((1,), dtypes.uint8, device=self.devs, tag=to_name("kernargs", self.queue))
     if self.dev.pmc_enabled: self.pmc_start()
 
   def pkt3(self, cmd, *vals): self.q(self.pm4.PACKET3(cmd, _dw(vals) - 1), *vals)
@@ -355,23 +357,23 @@ class AMDComputeQueue(HWQueue):
 
   ### exec
 
-  def kernargs(self, call:UOp, prg:UOp, data:AMDProgramData) -> list[UOp]:
+  def kernargs(self, call:UOp, prg:UOp, data:AMDProgramData) -> UOp:
     words = [get_call_arg_uops(call)[gi].getaddr(self.devs) for gi in prg.arg.globals] + \
             [b.ccast(v.dtype) for v, b in zip(prg.arg.vars, get_call_var_uops(call, prg))] # a bound value is a bare const, the var has the width
     pad = data.kernargs_segment_size - sum(w.dtype.itemsize for w in words)
     assert pad >= 0 and pad % 4 == 0, f"bad kernargs padding {pad}"
-    return words + [UOp.const(0, dtypes.uint32)] * (pad // 4) + (dispatch_packet(data, prg.arg) if data.enable_dispatch_ptr else [])
+    self.karg.blob += bytes(-len(self.karg.blob) % 128)
+    addr = self.karg_buf.getaddr(self.devs) + len(self.karg.blob)
+    self.karg.q(*words, *[UOp.const(0, dtypes.uint32)] * (pad // 4), *(dispatch_packet(data, prg.arg) if data.enable_dispatch_ptr else []))
+    return addr
 
   def exec(self, call:UOp, prg:UOp):
     data, lib = amd_build_program(self.dev, prg, self.devs)
     info = prg.arg
 
-    # kernargs: a nested blob linear inside a getaddr, packed into the tail of the cmdbuf
-    ka = UOp(Ops.LINEAR, src=tuple(self.kernargs(call, prg, data)))
-
     prog_addr = lib.getaddr(self.devs) + data.entry_point_offset
     scratch_addr = UOp.placeholder((data.private_segment_size,), dtypes.uint8, 0, device=self.devs).rtag("scratch").getaddr(self.devs)
-    args_addr = ka.getaddr(self.devs)
+    args_addr = self.kernargs(call, prg, data)
 
     user_regs:list = []
     if data.enable_private_segment_sgpr: user_regs = [scratch_addr | (1 << 63), 0xffffffff, 0x20c14000]
@@ -424,6 +426,11 @@ class AMDComputeQueue(HWQueue):
     return self.push(self.prof_bump(cmdbuf), ib, self.dev.compute_queue)
 
   def push(self, cmdbuf:UOp, words:UOp, q, unit:int=4, doorbell_lag:int=0) -> UOp:
+    if self.karg.blob: # patch the cacheable kernargs before publishing the uncached command stream
+      buf = UOp.placeholder((len(self.karg.blob),), dtypes.uint8, device=self.devs, tag=self.karg_buf.tag)
+      args = patch(buf, self.karg.patches, bytes(self.karg.blob))
+      cmdbuf, words = UOp.sink(cmdbuf, words).substitute({self.karg_buf: buf}).src
+      cmdbuf = cmdbuf.after(args)
     ring, wptr, doorbell, put = _queue_args(self, q)
     rs, n, p = q.ring.size, words.max_numel() // 4, put.index(0).load() # put counts units, the ring dwords
     first = (rs - (tail:=((p * (unit // 4)) % rs).cast(dtypes.int))).minimum(n)
@@ -453,9 +460,7 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
     self.dev.scratch_buffer(data.private_segment_size) # the queue descriptor holds the scratch
     slot = self.prof_start(data, prg.arg, lib)
     self.close_run(len(self.blob))
-    self.blob += bytes(-len(self.blob) % 16)
-    kernarg_address = self.cmd_addr + len(self.blob) # the kernargs go inline in the cmdbuf: the runs skip them
-    self.q(*self.kernargs(call, prg, data))
+    kernarg_address = self.kernargs(call, prg, data)
     self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w
                   for w in dispatch_packet(data, prg.arg, lib.getaddr(self.devs) + data.desc_offset, kernarg_address)]
     self.run_start = len(self.blob)
@@ -572,7 +577,8 @@ class AMDAllocator(Allocator['AMDDevice']):
     super().__init__(dev, supports_copy_from_disk=dev.has_copy_queue, supports_transfer=dev.has_copy_queue and not dev.is_usb)
 
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    return self.dev.iface.alloc(size, host=options.host, uncached=options.uncached, cpu_access=options.cpu_access or not self.dev.has_copy_queue)
+    return self.dev.iface.alloc(size, host=options.host, uncached=options.uncached, cpu_access=options.cpu_access or not self.dev.has_copy_queue,
+                               **({"force_devmem": True} if options.force_devmem else {}))
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
@@ -897,6 +903,8 @@ class AMDDevice(Compiled):
     # Scratch setup
     self.max_private_segment_size = 0
     self.pm_bufferize = PatternMatcher([
+      (UPat(Ops.PARAM, tag="cmdbuf_compute_0"), lambda ctx: BufferSpec(uncached=True, cpu_access=True, force_devmem=ctx.is_am())),
+      (UPat(Ops.PARAM, tag="kernargs_compute_0"), lambda ctx: BufferSpec(cpu_access=True, force_devmem=ctx.is_am())),
       (UPat(Ops.PARAM, tag="scratch", name="b"), lambda ctx, b: ctx.scratch_buffer(b.max_numel())),
       (UPat(Ops.PARAM, tag="program", name="b"), lambda ctx, b: ctx.program_buffer(b)),
     ]) + self.pm_bufferize

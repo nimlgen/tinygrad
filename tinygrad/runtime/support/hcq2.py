@@ -517,14 +517,15 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
 
   dev = Device[to_tuple(b.device)[0]]
 
-  # device owns the placeholders it names
-  if (r:=cast(Buffer|None, dev.pm_bufferize.rewrite(b, ctx=dev))) is not None: pass
-  elif not ctx.use_rt:
-    spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile, cpu_access=True)
-    r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
-  else:
-    off = dev.rt_allocator(True, b.arg.volatile).alloc(max(b.max_numel() * b.dtype.itemsize, 1), alignment=256)
-    r = dev.rt_buffer(True, b.arg.volatile).view(b.max_numel(), b.dtype, off).ensure_allocated()
+  # a device can supply either a buffer or allocation options for its placeholders
+  r = cast(Buffer|BufferSpec|None, dev.pm_bufferize.rewrite(b, ctx=dev))
+  if not isinstance(r, Buffer):
+    spec = r if isinstance(r, BufferSpec) else BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile or ctx.use_rt, cpu_access=True)
+    if not ctx.use_rt: r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
+    else:
+      pool = (spec.uncached, spec.host, spec.force_devmem)
+      off = dev.rt_allocator(*pool).alloc(max(b.max_numel() * b.dtype.itemsize, 1), alignment=256)
+      r = dev.rt_buffer(*pool).view(b.max_numel(), b.dtype, off).ensure_allocated()
 
   return UOp.from_buffer(r, HCQ_RUNTIME_DEV.value)
 
