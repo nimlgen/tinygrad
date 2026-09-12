@@ -1,7 +1,7 @@
-import unittest, contextlib, ctypes, gc, struct, numpy as np
+import unittest, contextlib, ctypes, gc, struct, time, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer, Compiled
+from tinygrad.device import Buffer, BufferSpec, Compiled
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context, dedup, partition, unwrap
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
@@ -55,11 +55,14 @@ class TestHCQ2Deps(unittest.TestCase):
     from types import SimpleNamespace
     bufs = [UOp.param(i, dtypes.uint8, 16, device="AMD") for i in range(4)]
     calls = [(src.copy_to_device("AMD").call(dst, src), ("AMD",), f"COPY:{i}") for i, (dst, src) in enumerate(zip(bufs[:2], bufs[2:]))]
-    with patch.object(type(Device), "__getitem__", return_value=SimpleNamespace(pm_batch=None)):
-      batch = hcq2._finalize_batch(hcq2.BatchCtx(calls, False))
-    streams = [s.without_after.src[0] for s in batch.src[0].src]
-    self.assertEqual([s.arg[1] for s in streams], ["COPY:0", "COPY:1", "COMPUTE:0"])
-    self.assertEqual([u.arg[0] for u in streams[-1].src], ["wait", "wait", "store"])
+    for size in (2, 8):
+      with self.subTest(timeline_size=size):
+        dev = SimpleNamespace(pm_batch=None, timeline_size=size, signal_header=bytes(64) if size == 8 else b"")
+        with patch.object(type(Device), "__getitem__", return_value=dev):
+          batch = hcq2._finalize_batch(hcq2.BatchCtx(calls, False))
+        streams = [s.without_after.src[0] for s in batch.src[0].src]
+        self.assertEqual([s.arg[1] for s in streams], ["COPY:0", "COPY:1", "COMPUTE:0"])
+        self.assertEqual([u.arg[0] for u in streams[-1].src], ["wait", "wait", "store"])
 
   def test_disjoint_write_preserves_dependencies(self):
     b = UOp.param(0, dtypes.uint8, 16, device="CPU")
@@ -105,6 +108,53 @@ class TestHCQ2Schedule(unittest.TestCase):
           if u.op is Ops.BUFFER and (buf:=u.buffer).device == dev.device:
             addr = buf._buf
             self.assertFalse(any(addr < end and start < addr + buf.nbytes for start, end in ranges))
+
+  def test_amd_aql_signal_memory(self):
+    dev = Device[Device.DEFAULT]
+    if not dev.device.startswith("AMD") or not dev.signal_header: self.skipTest("AMD AQL barrier-value support required")
+    sig = UOp.placeholder((8,), dtypes.uint64, device=(dev.device,), volatile=True, tag="signal")
+    for use_rt in (False, True):
+      buf = unwrap(hcq2.bufferize_buf(hcq2.LinkCtx({}, use_rt=use_rt), sig)).buffer
+      self.assertEqual(buf.get_buf(dev.device) % 64, 0)
+      self.assertEqual(buf.base is dev.rt_buffer(True, True), use_rt, "eager signals must outlive their temporary link in the runtime pool")
+
+  def test_amd_aql_barrier_value(self):
+    dev = Device[Device.DEFAULT]
+    if not dev.device.startswith("AMD") or not dev.is_aql or dev.xccs < 2: self.skipTest("multiple AMD XCCs required")
+    from tinygrad.runtime.ops_amd import AMDComputeAQLQueue, AMDComputeQueue
+    from tinygrad.runtime.autogen import hsa
+    spec = BufferSpec(host=True, uncached=True, cpu_access=True)
+    signal = Buffer(dev.device, 8, dtypes.uint64, options=spec, initial_value=dev.signal_header).view(2, dtypes.uint64, 8)
+    self.assertEqual((signal.get_buf(dev.device) - 8) % 64, 0)
+    self.assertEqual(bytes(signal.base.host.view(fmt='B')[:64]), bytes(hsa.amd_signal_t(kind=hsa.AMD_SIGNAL_KIND_USER)))
+    gate, done = [Buffer(dev.device, 1, dtypes.uint64, options=spec, initial_value=bytes(8)) for _ in range(2)]
+    sig = UOp.placeholder((8,), dtypes.uint64, device=(dev.device,), volatile=True, tag="signal").shrink(((1, 3),))
+    value = (1 << 32) + 7
+    next_value = value + (1 << 32) # equal low words must still compare the high word
+    q = AMDComputeAQLQueue(hcq2.EncodeCtx((dev.device,)), hcq2.make_submit(devs=dev.device, queue="COMPUTE:0"))
+    with q.pred_exec(xcc_mask=(1 << dev.xccs) - 2): q.wait(UOp.from_buffer(gate), UOp.const(1, dtypes.uint64))
+    signal.host.view(fmt='Q')[0] = value
+    q.wait(sig, UOp.const(value, dtypes.uint64))
+    AMDComputeQueue.signal(q, UOp.from_buffer(done), UOp.const(1, dtypes.uint64)) # test the native wait's own ordering
+    q.wait(sig, UOp.const(next_value, dtypes.uint64))
+    AMDComputeQueue.signal(q, UOp.from_buffer(done), UOp.const(2, dtypes.uint64))
+    call = unwrap(hcq2.lower_call(UOp.sink(hcq2.encode_submit(q), arg=KernelInfo("aql_wait")).call(aux=hcq2.HCQInfo((dev.device,)))))
+    pm = PatternMatcher([(UPat(Ops.PARAM, tag="signal"), lambda signal=signal: signal.base)])
+    with patch.object(dev, "pm_bufferize", pm + dev.pm_bufferize):
+      linked = hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(call,))), allow_cache=False)
+    try:
+      run_linear(linked, jit=True)
+      time.sleep(0.05)
+      gated = done.host.view(fmt='Q')[0]
+      gate.host.view(fmt='Q')[0] = 1
+      time.sleep(0.05)
+      waiting = done.host.view(fmt='Q')[0]
+    finally:
+      gate.host.view(fmt='Q')[0] = 1
+      signal.host.view(fmt='Q')[0] = next_value + 1
+    dev._wait_signal(done.host.view(fmt='Q'), 2)
+    self.assertEqual(gated, 0, "AQL wait passed before all XCCs finished the preceding IB")
+    self.assertEqual(waiting, 1, "AQL wait passed before its condition was satisfied")
 
   def test_small_eager_cached(self):
     _, compiled, inputs = self.compiled(1)
