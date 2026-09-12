@@ -95,6 +95,14 @@ class TestRDMASchedule(unittest.TestCase):
         batches = hcq2.sched_batches(self.prepare([copy(src, dst), copy(buf(2, "AMD:3"), dst)]), False).src
         self.assertEqual([(b.arg.aux.device, b.arg.aux.rdma) for b in batches], [(("AMD:1", "AMD:3"), True), (("AMD:2",), True)])
 
+  def test_mapping_timeout_does_not_fall_back_to_staging(self):
+    src, dst = buf(0, "AMD:1"), buf(1, "AMD:3")
+    mapped = Mock()
+    mapped.get_buf.side_effect = TimeoutError("flush_tlb timeout")
+    with patch.object(hcq2, "_resolve", return_value=SimpleNamespace(buffer=mapped)), patch.object(hcq2, "_staging") as staging:
+      with self.assertRaisesRegex(TimeoutError, "flush_tlb timeout"): hcq2.prepare_copy((), copy(src, dst), dst, src)
+      staging.assert_not_called()
+
 class TestBNXTCopy(unittest.TestCase):
   def test_words_replay(self): # the words of a send and a receive, linked and run: rings and cqs wrap, counters advance
     for recv in (False, True):

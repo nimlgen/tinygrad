@@ -170,6 +170,7 @@ def prepare_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
     return None
+  except TimeoutError: raise
   except (RuntimeError, OSError): pass
   staging = _staging(dev if Device[dev:=to_tuple(device)[0]].remote_peer is not None else "CPU")
   staging.get_buf(device)
