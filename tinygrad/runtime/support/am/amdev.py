@@ -5,7 +5,7 @@ from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am, fw
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
-from tinygrad.runtime.support.system import PCIDevice
+from tinygrad.runtime.support.system import PCIDevice, RemoteMMIOInterface
 from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
@@ -130,6 +130,7 @@ class AMPageTableEntry:
   def entry(self, entry_id:int) -> int: return self.entries[entry_id]
   def valid(self, entry_id:int) -> bool: return (self.entries[entry_id] & am.AMDGPU_PTE_VALID) != 0
   def valid_entries(self, entry_id:int, count:int):
+    if not isinstance(self.entries, RemoteMMIOInterface): return (self.valid(i) for i in range(entry_id, entry_id+count))
     return (bool(x & am.AMDGPU_PTE_VALID) for x in self.entries[entry_id:entry_id+count])
   def address(self, entry_id:int) -> int:
     assert self.entries[entry_id] & am.AMDGPU_PTE_SYSTEM == 0, "should not be system address"
