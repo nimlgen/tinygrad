@@ -129,6 +129,8 @@ class AMPageTableEntry:
 
   def entry(self, entry_id:int) -> int: return self.entries[entry_id]
   def valid(self, entry_id:int) -> bool: return (self.entries[entry_id] & am.AMDGPU_PTE_VALID) != 0
+  def valid_entries(self, entry_id:int, count:int):
+    return (bool(x & am.AMDGPU_PTE_VALID) for x in self.entries[entry_id:entry_id+count])
   def address(self, entry_id:int) -> int:
     assert self.entries[entry_id] & am.AMDGPU_PTE_SYSTEM == 0, "should not be system address"
     return self.adev.xgmi2paddr(self.entries[entry_id] & 0x0000FFFFFFFFF000)
