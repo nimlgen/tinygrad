@@ -46,7 +46,7 @@ class TestRemoteHCQ2(unittest.TestCase):
       from tinygrad import Device
       from tinygrad.device import Buffer, BufferSpec
       from tinygrad.dtype import dtypes
-      # The AQL header precedes the value view; its last word is the host timeline counter.
+      # Negative indices are relative to the view, even when its base starts earlier.
       b = Buffer("AMD", 9, dtypes.uint64, options=BufferSpec(host=True, cpu_access=True),
                  initial_value=struct.pack("<9Q", 1, *([0] * 8)))
       signal = b.view(8, dtypes.uint64, 8).ensure_allocated().host.view(fmt="Q")
