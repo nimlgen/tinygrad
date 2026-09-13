@@ -95,6 +95,19 @@ class TestRDMASchedule(unittest.TestCase):
         batches = hcq2.sched_batches(self.prepare([copy(src, dst), copy(buf(2, "AMD:3"), dst)]), False).src
         self.assertEqual([(b.arg.aux.device, b.arg.aux.rdma) for b in batches], [(("AMD:1", "AMD:3"), True), (("AMD:2",), True)])
 
+  def test_device_completion_waits_for_peer_accesses(self):
+    a, b = buf(0, "AMD:1"), buf(1, "AMD:3")
+    calls = [(kernel(a), ("AMD:1",), "COMPUTE:0"), (kernel(b), ("AMD:3",), "COMPUTE:0"),
+             (copy(a, b), ("AMD:1",), "COPY:0"), (copy(b, a), ("AMD:3",), "COPY:0")]
+    ctx = hcq2.BatchCtx(calls, False)
+    for dev in ("AMD:1", "AMD:3"):
+      self.assertEqual({w.src[1].val for w in hcq2._epilogue(ctx, dev)[:-1]}, {3, 4})
+    self.assertTrue({2, 3} <= ctx.signal_tags)
+    # Reads on a peer also have to finish before the owner may reuse its storage.
+    ctx = hcq2.BatchCtx([(kernel(a), ("AMD:1",), "COMPUTE:0"), (kernel(a, False), ("AMD:3",), "COMPUTE:0")], False)
+    self.assertEqual([w.src[1].val for w in hcq2._epilogue(ctx, "AMD:1")[:-1]], [2])
+    self.assertIn(1, ctx.signal_tags)
+
   def test_sdma_queues_stay_local_and_rdma_posts_stay_ordered(self):
     names = ["AMD" if i == 0 else f"AMD:{i}" for i in range(16)]
     self.devs = {d: SimpleNamespace(device=d, peer_group=i//8, host="CPU", has_copy_queue=True)
