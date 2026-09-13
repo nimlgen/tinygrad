@@ -55,7 +55,7 @@ class TestHCQ2Deps(unittest.TestCase):
     from types import SimpleNamespace
     bufs = [UOp.param(i, dtypes.uint8, 16, device="AMD") for i in range(4)]
     calls = [(src.copy_to_device("AMD").call(dst, src), ("AMD",), f"COPY:{i}") for i, (dst, src) in enumerate(zip(bufs[:2], bufs[2:]))]
-    with patch.object(type(Device), "__getitem__", return_value=SimpleNamespace(pm_batch=None)):
+    with patch.object(type(Device), "__getitem__", return_value=SimpleNamespace(pm_batch=None, timeline_size=2, signal_header=b"")):
       batch = hcq2._finalize_batch(hcq2.BatchCtx(calls, False))
     streams = [s.without_after.src[0] for s in batch.src[0].src]
     self.assertEqual([s.arg[1] for s in streams], ["COPY:0", "COPY:1", "COMPUTE:0"])

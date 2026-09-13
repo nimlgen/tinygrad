@@ -261,7 +261,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     def skey(x): return x.key if isinstance(x, UOp) else x
     arg:Any
     if isinstance(self.arg, ProgramInfo):
-      arg = (self.arg.name, tuple(map(skey, self.arg.global_size)), tuple(map(skey, self.arg.local_size)),
+      arg = (tuple(map(skey, self.arg.global_size)), tuple(map(skey, self.arg.local_size)),
              tuple(x.key for x in self.arg.vars), self.arg.globals, self.arg.outs, self.arg.ins, self.arg.target)
     elif isinstance(self.arg, KernelInfo):
       est = None if self.arg.estimates is None else tuple(skey(x) for x in
