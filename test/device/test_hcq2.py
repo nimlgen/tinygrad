@@ -1,7 +1,7 @@
-import unittest, contextlib, ctypes, gc, struct, numpy as np
+import unittest, contextlib, ctypes, gc, struct, time, numpy as np
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
-from tinygrad.device import Buffer, Compiled
+from tinygrad.device import Buffer, BufferSpec, Compiled
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context, dedup, partition, unwrap
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
@@ -105,6 +105,31 @@ class TestHCQ2Schedule(unittest.TestCase):
           if u.op is Ops.BUFFER and (buf:=u.buffer).device == dev.device:
             addr = buf._buf
             self.assertFalse(any(addr < end and start < addr + buf.nbytes for start, end in ranges))
+
+  def test_amd_aql_store_waits_for_all_xccs(self):
+    dev = Device[Device.DEFAULT]
+    if not dev.device.startswith("AMD") or not dev.is_aql or dev.xccs < 2: self.skipTest("multiple AMD XCCs required")
+    from tinygrad.runtime.ops_amd import AMDComputeAQLQueue
+    spec = BufferSpec(host=True, uncached=True, cpu_access=True)
+    for kind in ("signal", "timestamp"):
+      with self.subTest(kind=kind):
+        gate, done, stamp = [Buffer(dev.device, 2, dtypes.uint64, options=spec, initial_value=bytes(16)) for _ in range(3)]
+        q = AMDComputeAQLQueue(hcq2.EncodeCtx((dev.device,)), hcq2.make_submit(devs=dev.device, queue="COMPUTE:0"))
+        with q.pred_exec(xcc_mask=(1 << dev.xccs) - 2): q.wait(UOp.from_buffer(gate), UOp.const(1, dtypes.uint32))
+        if kind == "timestamp": q.timestamp(UOp.from_buffer(stamp))
+        else: getattr(q, kind)(UOp.from_buffer(done), UOp.const(1, dtypes.uint64))
+        q.close_run(len(q.blob)) # drain all XCCs before freeing buffers, even if the split is missing
+        q.signal(UOp.from_buffer(done), UOp.const(2, dtypes.uint64))
+        call = unwrap(hcq2.lower_call(UOp.sink(hcq2.encode_submit(q), arg=KernelInfo("xcc_store")).call(aux=hcq2.HCQInfo((dev.device,)))))
+        linked = hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(call,))), allow_cache=False)
+        try:
+          run_linear(linked, jit=True)
+          time.sleep(0.1)
+          early = stamp.host.view(fmt='Q')[1] if kind == "timestamp" else done.host.view(fmt='Q')[0]
+        finally: gate.host.view(fmt='Q')[0] = 1
+        dev._wait_signal(done.host.view(fmt='Q'), 2)
+        self.assertEqual(early, 0, "XCC0 stored before the other XCCs passed their wait")
+        if kind == "timestamp": self.assertGreater(stamp.host.view(fmt='Q')[1], 0)
 
   def test_small_eager_cached(self):
     _, compiled, inputs = self.compiled(1)

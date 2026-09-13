@@ -430,6 +430,7 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
     self.cmd_addr = UOp.variable("cmdbuf", 0, 2**48, dtypes.uint64) # the packets point into the cmdbuf, its address binds at submit
     self.pkts:list[UOp] = []
     self.run_start = 0
+    self.run_wait = False
 
   def close_run(self, end:int):
     if end > self.run_start:
@@ -438,6 +439,19 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
             (end - self.run_start) // 4 | self.pm4.INDIRECT_BUFFER_VALID]
       self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w for w in [hdr, *ib, 10, *[0] * 10]]
     self.run_start = end
+    self.run_wait = False
+
+  def wait_reg_mem(self, *args, **kwargs):
+    super().wait_reg_mem(*args, **kwargs)
+    self.run_wait = True
+
+  def timestamp(self, signal:UOp):
+    if self.run_wait: self.close_run(len(self.blob))
+    super().timestamp(signal)
+
+  def signal(self, signal:UOp, value:UOp):
+    if self.run_wait: self.close_run(len(self.blob)) # all XCCs finish their waits before XCC0 publishes a result
+    super().signal(signal, value)
 
   def exec(self, call:UOp, prg:UOp):
     data, lib = amd_build_program(self.dev, prg, self.devs)
