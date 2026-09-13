@@ -145,7 +145,7 @@ class PageTableTraverseContext:
 
   def _try_free_pt(self) -> bool:
     pt, _, _ = self.pt_stack[-1]
-    if self.free_pts and pt != self.dev.mm.root_page_table and all(not pt.valid(i) for i in range(self._pt_pte_cnt(self.pt_stack[-1][0].lv))):
+    if self.free_pts and pt != self.dev.mm.root_page_table and not any(pt.valid_entries(0, self._pt_pte_cnt(pt.lv))):
       self.dev.mm.pfree(pt.paddr, ptable=True)
       parent_pt, parent_pte_idx, _ = self.pt_stack[-2]
       parent_pt.set_entry(parent_pte_idx, 0x0, valid=False)
@@ -212,7 +212,8 @@ class MemoryManager:
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
     for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
-      for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
+      for pte_off, valid in enumerate(pt.valid_entries(pte_idx, pte_cnt)):
+        assert not valid, f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True, boot=boot)
     for paddr, psize in paddrs:
@@ -229,8 +230,8 @@ class MemoryManager:
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, free_pts=True)
     for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
-      for pte_id in range(pte_idx, pte_idx + pte_cnt):
-        assert pt.valid(pte_id), f"PTE not mapped: {pt.entry(pte_id):#x}"
+      for pte_id, valid in zip(range(pte_idx, pte_idx + pte_cnt), pt.valid_entries(pte_idx, pte_cnt)):
+        assert valid, f"PTE not mapped: {pt.entry(pte_id):#x}"
         pt.set_entry(pte_id, paddr=0x0, valid=False)
 
   def on_range_mapped(self): pass

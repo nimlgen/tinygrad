@@ -62,6 +62,8 @@ class NVPageTableEntry:
     if self.is_page(entry_id): return self.read_fields(entry_id)['valid']
     return self.read_fields(entry_id)['aperture_small' if self._is_dual_pde() else 'aperture'] != 0
 
+  def valid_entries(self, entry_id:int, count:int): return (self.valid(i) for i in range(entry_id, entry_id+count))
+
   def address(self, entry_id:int) -> int:
     small, sys = ("_small" if self._is_dual_pde() else ""), "_sys" if self.nvdev.mmu_ver == 2 or self.lv == self.nvdev.mm.level_cnt - 1 else ""
     return self.read_fields(entry_id)[f'address{small}{sys}'] << 12
