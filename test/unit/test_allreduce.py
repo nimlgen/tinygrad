@@ -1,4 +1,4 @@
-import unittest
+import unittest, contextlib
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops
@@ -18,6 +18,24 @@ class TestRingAllReduce(unittest.TestCase):
       if len(pairs) != N*(N-1)*2: raise KernelCountException(N*(N-1)*2, len(pairs))
       # copy topology forms a ring
       self.assertEqual(len(set(pairs)), N)
+
+  def test_schedule_two_nodes(self): # reduce-scatter in each node, one exchange per counterpart pair, all-gather in each node
+    from unittest.mock import patch
+    from tinygrad.device import Device
+    N, M = 4, 1007 # a shape no other test schedules on these devices: the rewrite of the same allreduce uop is cached
+    ds = tuple(f"CPU:{i}" for i in range(N))
+    with Context(ALL2ALL=2, SCACHE=0), contextlib.ExitStack() as stack:
+      for i, d in enumerate(ds): stack.enter_context(patch.object(Device[d], "peer_group", str(i // (N // 2))))
+      x = Tensor.arange(N*M, dtype=dtypes.float).reshape(N, M)
+      t = (x*x).clone().shard(ds, axis=0).realize()
+      linear, var_vals = t.sum(0).contiguous().linear_with_vars()
+      pairs = [(c.src[1].buffer.device, c.src[2].buffer.device) for c in linear.src if c.src[0].op is Ops.COPY]
+      across = [p for p in pairs if Device[p[0]].peer_group != Device[p[1]].peer_group]
+      expect = (("CPU:0", "CPU:2"), ("CPU:2", "CPU:0"), ("CPU:1", "CPU:3"), ("CPU:3", "CPU:1"))
+      self.assertEqual(sorted(across), sorted((Device.canonicalize(a), Device.canonicalize(b)) for a, b in expect))
+      run_linear(linear, var_vals)
+    import numpy as np
+    np.testing.assert_allclose(t.sum(0).numpy(), (x*x).sum(0).numpy())
 
   def test_schedule_all2all(self):
     with Context(ALL2ALL=2):
@@ -42,6 +60,24 @@ class TestRingAllReduce(unittest.TestCase):
       dev_nums = Tensor.arange(1, N+1, dtype=dtypes.float).reshape(N, 1).expand(N, M).shard(ds, axis=0)
       shards = out.reshape(1, M).expand(N, M)+dev_nums
       self.assertListEqual(shards.tolist(), [[x+d+1 for x in expected] for d in range(N)])
+
+  def test_small_two_node_reductions(self):
+    import numpy as np
+    from unittest.mock import patch
+    from tinygrad.device import Device
+    ds = tuple(f"CPU:{i}" for i in range(16))
+    with Context(ALL2ALL=1, SCACHE=0), contextlib.ExitStack() as stack:
+      for i, d in enumerate(ds): stack.enter_context(patch.object(Device[d], "peer_group", str(i // 8)))
+      for size in (1, 7, 17, 4097):
+        data = np.arange(16*size, dtype=np.int32).reshape(16, size) % 13
+        t = Tensor(data).shard(ds, axis=0).realize()
+        out = t.sum(0).contiguous()
+        linear, vals = out.linear_with_vars()
+        pairs = [(c.src[1].buffer.device, c.src[2].buffer.device) for c in linear.src if c.src[0].op is Ops.COPY]
+        across = [(a, b) for a, b in pairs if Device[a].peer_group != Device[b].peer_group]
+        self.assertEqual(len(across), 2*min(size, 8))
+        run_linear(linear, vals)
+        for i in range(16): np.testing.assert_array_equal(Tensor(out.uop.mselect(i)).numpy(), data.sum(0))
 
   @Context(RING=0, ALL2ALL=0)
   def test_schedule_naive(self):
