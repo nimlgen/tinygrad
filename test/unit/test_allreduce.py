@@ -253,6 +253,28 @@ class TestRingAllReduce(unittest.TestCase):
         self.assertEqual(len(across), 2*min(size, 8))
         run_linear(linear, vals)
         for i in range(16): np.testing.assert_array_equal(Tensor(out.uop.mselect(i)).numpy(), data.sum(0))
+
+  def test_two_node_direct_output_replay(self):
+    import numpy as np
+    from unittest.mock import patch
+    from tinygrad import Device, TinyJit
+    devices = tuple(f"CPU:{i}" for i in range(16))
+    node = property(lambda self: int(self.device.split(":")[1] if ":" in self.device else 0) // 8)
+    with Context(ALL2ALL=2, SCACHE=0), patch.object(type(Device["CPU"]), "peer_group", node):
+      for width in (64, 1024):
+        # Write into a packed persistent buffer: untouched neighbors must survive every replay.
+        output = Tensor.full((width+32,), -123., device=devices).contiguous().realize()
+        @TinyJit
+        def reduce(x):
+          output[16:16+width].assign((x*2+1).sum(0)).realize()
+          return output
+        for iteration in range(5):
+          values = np.random.default_rng(iteration).normal(size=(16, width)).astype(np.float32)
+          result = reduce(Tensor(values).shard(devices, axis=0).realize())
+          expected = np.pad((values*2+1).sum(0), (16, 16), constant_values=-123)
+          for rank in range(16):
+            np.testing.assert_allclose(Tensor(result.uop.mselect(rank)).numpy(), expected, rtol=1e-5, atol=1e-5)
+
   def test_correct_all2all_direct_slices(self):
     with Context(ALL2ALL=2):
       N, W = 4, 512

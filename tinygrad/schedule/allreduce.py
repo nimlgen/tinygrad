@@ -110,7 +110,11 @@ def handle_allreduce(buf:UOp, red:UOp, output:UOp|None=None, input_staged:bool=F
     assert isinstance(numel, int)
     n, flat = len(nodes[0]), buf.reshape((numel,))
     chunks = list(itertools.pairwise(itertools.accumulate([numel // n + (i < numel % n) for i in range(n)], initial=0)))
-    owned = {i: functools.reduce(lambda x, y: x.alu(op, y), [flat.mselect(j).shrink((chunks[k],)).copy_to_device(buf.device[i]) for j in node])
+    # Only slice known contiguous storage physically. A custom output may still have a pending cast or view.
+    direct_input = all_same([e-s for s,e in chunks]) and (input_staged or not stable_custom_output)
+    inputs = [_allreduce_chunk(buf, s, e, input_staged) for s,e in chunks] if direct_input else []
+    owned = {i: functools.reduce(lambda x, y: x.alu(op, y),
+             [(inputs[k].mselect(j) if direct_input else flat.mselect(j).shrink((chunks[k],))).copy_to_device(buf.device[i]) for j in node])
              for node in nodes for k, i in enumerate(node)}
     for a, b in zip(*nodes): # the counterparts, linked by their nics
       owned[a], owned[b] = owned[a].alu(op, owned[b].copy_to_device(buf.device[a])), owned[b].alu(op, owned[a].copy_to_device(buf.device[b]))
