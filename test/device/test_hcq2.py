@@ -1,5 +1,5 @@
 import unittest, contextlib, ctypes, gc, struct, time, numpy as np
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer, BufferSpec, Compiled
 from tinygrad.dtype import AddrSpace
@@ -51,6 +51,16 @@ def lower_hcq(body:UOp) -> UOp:
   return unwrap(hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test")).call(aux=hcq2.HCQInfo(("CPU",)))))
 
 class TestHCQ2Deps(unittest.TestCase):
+  def test_mapping_timeout_does_not_fall_back_to_staging(self):
+    src, dst = [UOp.param(i, dtypes.uint8, 16, device=f"AMD:{i}") for i in range(2)]
+    mapped = Mock()
+    mapped.buffer.get_buf.side_effect = TimeoutError("flush_tlb timeout")
+    with patch.object(hcq2, "get_enqueue_devs", return_value="AMD"), patch.object(hcq2, "_resolve", return_value=mapped), \
+         patch.object(hcq2, "_staging") as staging:
+      with self.assertRaisesRegex(TimeoutError, "flush_tlb timeout"):
+        hcq2.stage_copy((), src.copy_to_device(dst.device).call(dst, src), dst, src)
+      staging.assert_not_called()
+
   def test_copy_only_batch_with_multiple_queues(self):
     from types import SimpleNamespace
     bufs = [UOp.param(i, dtypes.uint8, 16, device="AMD") for i in range(4)]

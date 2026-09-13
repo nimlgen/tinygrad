@@ -147,6 +147,7 @@ def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if (device:=get_enqueue_devs(call)) is None: return None
   try:
     for b in (dst, src): cast(Buffer, _resolve(b, ctx).buffer).get_buf(device)
+  except TimeoutError: raise
   except (RuntimeError, OSError):
     (staging:=_staging(Device[device].host)).get_buf(device)
     base, it, copies = UOp.from_buffer(staging), src.dtype.itemsize, []
