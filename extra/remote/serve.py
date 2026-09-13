@@ -36,7 +36,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     if dev_id not in opened_devices:
       if dev_id >= len(discovered_devices): raise RuntimeError(f"device {dev_id} not probed")
       cl, pcibus = discovered_devices[dev_id]
-      opened_devices[dev_id] = cl("SV", pcibus)
+      opened_devices[dev_id] = cl("AM", pcibus)
     pci_dev = opened_devices[dev_id]
 
   if cmd == RemoteCmd.MAP_BAR:
