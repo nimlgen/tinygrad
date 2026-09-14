@@ -51,6 +51,14 @@ def lower_hcq(body:UOp) -> UOp:
   return unwrap(hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test")).call(aux=hcq2.HCQInfo(("CPU",)))))
 
 class TestHCQ2Deps(unittest.TestCase):
+  def test_device_completion_waits_for_peer_accesses(self):
+    a, b = [UOp.param(i, dtypes.float32, 16, device=f"AMD:{i}") for i in range(2)]
+    ctx = hcq2.BatchCtx([(a.copy_to_device(b.device).call(b, a), ("AMD:0",), "COPY:0"),
+                        (b.copy_to_device(a.device).call(a, b), ("AMD:1",), "COPY:0")], False)
+    self.assertEqual([w.src[1].val for w in hcq2._epilogue(ctx, "AMD:0")[:-1]], [2])
+    self.assertEqual([w.src[1].val for w in hcq2._epilogue(ctx, "AMD:1")[:-1]], [1])
+    self.assertEqual(ctx.signal_tags, {0, 1})
+
   def test_mapping_timeout_does_not_fall_back_to_staging(self):
     src, dst = [UOp.param(i, dtypes.uint8, 16, device=f"AMD:{i}") for i in range(2)]
     mapped = Mock()

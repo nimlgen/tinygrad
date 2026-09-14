@@ -188,6 +188,7 @@ class BatchCtx:
   tracker:HCQDepsTracker = field(default_factory=HCQDepsTracker)
   queues:dict[str, list[str]] = field(init=False)
   last:dict[tuple[str, str], int] = field(init=False)
+  completion:dict[str, dict[tuple[str, str], int]] = field(init=False)
   prev:list[int|None] = field(init=False)
   signal_tags:set[int] = field(init=False)
   slots:dict[str, UOp] = field(init=False)
@@ -198,7 +199,15 @@ class BatchCtx:
       if q not in self.queues.setdefault(devs[0], []): self.queues[devs[0]].append(q)
       self.prev.append(self.last.get((devs[0], q)))
       self.last[(devs[0], q)] = tag
-    self.signal_tags = {tag for (dev, q), tag in self.last.items() if q != self.epilogue_queue(dev)}
+    self.completion = {dev: {(d, q): tag for (d, q), tag in self.last.items() if d == dev} for dev in self.queues}
+    # A device's memory can be accessed by another device's queues. Its timeline must cover those accesses too,
+    # even when no final kernel on the owner consumes the result (for example, a direct allreduce gather).
+    for tag, (call, devs, q) in enumerate(self.batch):
+      for b in get_call_arg_uops(call):
+        for owner in to_tuple(b.device):
+          if owner in self.completion and owner != devs[0]: self.completion[owner][(devs[0], q)] = tag
+    self.signal_tags = {tag for owner, deps in self.completion.items() for (dev, q), tag in deps.items()
+                       if (dev, q) != (owner, self.epilogue_queue(owner))}
     # a slot is [signal][timestamp], 16 bytes: the queue signals, the timeline, then two per call if profiling
     self.slots = {dev: UOp.placeholder((2 * (len(qs) + 1 + (2 * len(self.batch) if self.profile else 0)),), dtypes.uint64, device=(dev,),
                                        volatile=True, tag="slots") for dev, qs in self.queues.items()}
@@ -240,16 +249,16 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[tuple[str, ...], str], list[UOp]]:
     if tag in ctx.signal_tags:
       q += [UOp(Ops.INS, arg=("store", dtypes.void), src=(ctx.queue_signal(devices, queue), UOp.const(tag + 1, dtypes.uint64)))]
 
-  # one queue advances the device timeline after all other queues finish
-  for dev in ctx.queues:
-    queue = ctx.epilogue_queue(dev)
-    waits = [UOp(Ops.INS, arg=("wait", dtypes.void), src=(ctx.queue_signal((dev,), q), UOp.const(ctx.last[(dev, q)] + 1, dtypes.uint64)))
-             for q in ctx.queues[dev] if q != queue]
-    bump = UOp(Ops.INS, arg=("store", dtypes.void), src=(timeline((dev,)), timeline_value((dev,)) + UOp.const(1, dtypes.uint64)))
-
-    # multiple copy queues may need a new compute stream
-    queues.setdefault(((dev,), queue), []).extend([*waits, bump])
+  for dev in ctx.queues: queues.setdefault(((dev,), ctx.epilogue_queue(dev)), []).extend(_epilogue(ctx, dev))
   return queues
+
+def _epilogue(ctx:BatchCtx, dev:str) -> list[UOp]:
+  # Signal completion after our work and all peer accesses to our memory. Every dependency is signaled before
+  # any epilogue, so mutually accessing devices do not wait on each other's final timeline values.
+  waits = [UOp(Ops.INS, arg=("wait", dtypes.void), src=(ctx.queue_signal((d,), q), UOp.const(tag + 1, dtypes.uint64)))
+           for (d, q), tag in ctx.completion[dev].items() if (d, q) != (dev, ctx.epilogue_queue(dev))]
+  bump = UOp(Ops.INS, arg=("store", dtypes.void), src=(timeline((dev,)), timeline_value((dev,)) + UOp.const(1, dtypes.uint64)))
+  return [*waits, bump]
 
 def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   queues = _build_queues(ctx)
