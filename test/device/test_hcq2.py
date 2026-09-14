@@ -51,6 +51,17 @@ def lower_hcq(body:UOp) -> UOp:
   return unwrap(hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test")).call(aux=hcq2.HCQInfo(("CPU",)))))
 
 class TestHCQ2Deps(unittest.TestCase):
+  def test_rdma_wire_is_not_a_host_dependency(self):
+    from types import SimpleNamespace
+    gpu = UOp.param(0, dtypes.uint8, 16, device="AMD")
+    with patch.object(type(Device), "__getitem__", return_value=SimpleNamespace(pm_batch=None)):
+      for host, expected in (("RDMA", ()), ("CPU", (("CPU", "AMD"),))):
+        buf = UOp.param(1, dtypes.uint8, 16, device=host)
+        for src, dst in ((buf, gpu), (gpu, buf)):
+          call = src.copy_to_device(dst.device).call(dst, src)
+          batch = hcq2._finalize_batch(hcq2.BatchCtx([(call, ("AMD",), "COPY:0")], False))
+          self.assertEqual(batch.arg.aux.host_deps, expected)
+
   def test_device_completion_waits_for_peer_accesses(self):
     a, b = [UOp.param(i, dtypes.float32, 16, device=f"AMD:{i}") for i in range(2)]
     ctx = hcq2.BatchCtx([(a.copy_to_device(b.device).call(b, a), ("AMD:0",), "COPY:0"),

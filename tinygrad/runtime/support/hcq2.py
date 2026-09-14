@@ -134,7 +134,7 @@ def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if not all(hasattr(Device[d], "iface") for d in devs) or Device[devs[0]].peer_group == Device[devs[1]].peer_group: return None # not 2 nodes
 
   from tinygrad.runtime.ops_rdma import rdma_nic_for
-  if None in (nics:=[rdma_nic_for(Device[d]) for d in devs]): return None
+  if None in (nics:=[rdma_nic_for(Device[d], Device[p]) for d, p in (devs, devs[::-1])]): return None
 
   # wires: a placeholder per nic in place of the far gpu, tagged by it
   wires = [UOp.placeholder(src.max_shape, src.dtype, 0, device=unwrap(nic).device, tag=peer) for nic, peer in zip(nics, devs[::-1])]
@@ -280,7 +280,9 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   profile_keys = [getattr(c.src[0].arg, "profile_key", None) for c, _, _ in ctx.batch]
   kerns:tuple[tuple, ...] = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys))
   written_bufs = tuple(dedup(b for c, _, _ in ctx.batch for b in get_call_written_bufs(c)))
-  host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch for buf in get_call_arg_uops(call)
+  from tinygrad.runtime.ops_rdma import rdma_wire
+  # Wires identify transfers, not host memory: a synchronous timeline read can block before the peer is posted.
+  host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch for buf in get_call_arg_uops(call) if buf is not rdma_wire(call)
                          for host in to_tuple(buf.device) if host not in ctx.queues))
   info = HCQInfo(tuple(ctx.queues), skip_wait=skip_wait, kernels=kerns, written_bufs=written_bufs,
                  estimates=sum(estimates, start=Estimates()).simplify(), host_deps=host_deps)
