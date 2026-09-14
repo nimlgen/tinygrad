@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast
-import functools, struct, operator
+import functools, struct, operator, re
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes, DType
 from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten
@@ -52,10 +52,24 @@ class BNXTAllocator(Allocator):
   def _offset(self, buf, size:int, offset:int): return buf
   def _unmap(self, storage:BufferStorage): self.dev.iface.dev_impl.unregister_mem(storage.meta)
 
-def rdma_nic_for(dev) -> RDMADevice|None:
+@functools.cache
+def node_nics(group) -> tuple[RDMADevice, ...]:
   try: count = len(hcq_filter_visible_devices(System.list_devices(*BNXT_IDS), "RDMA"))
-  except RuntimeError: return None
-  return next((cast(RDMADevice, n) for i in range(count) if (n:=Device[f"RDMA:{i}"]).peer_group == dev.peer_group), None)
+  except RuntimeError: return ()
+  return tuple(cast(RDMADevice, n) for i in range(count) if (n:=Device[f"RDMA:{i}"]).peer_group == group)
+
+def pci_bus(dev) -> int:
+  return int(unwrap(re.search(r"[0-9a-f]{4}:([0-9a-f]{2}):[0-9a-f]{2}\.[0-7]", dev.iface.pci_dev.pcibus))[1], 16)
+
+def rdma_nic_for(dev, peer) -> RDMADevice|None:
+  local, remote = node_nics(dev.peer_group), node_nics(peer.peer_group)
+  if not local or not remote: return None
+  assert len(local) == len(remote), "paired RDMA nodes must have the same number of visible NICs"
+  # Corresponding NIC ranks are cabled together. Both ends choose the same anchor, including broadcasts to a different GPU rank.
+  anchor = min((dev, peer), key=lambda d: d.device)
+  nics = local if anchor is dev else remote
+  rank = min(range(len(nics)), key=lambda i: abs(pci_bus(nics[i]) - pci_bus(anchor)))
+  return local[rank]
 
 class RDMADevice(Compiled):
   ifaces = [BNXTIface]
@@ -70,7 +84,7 @@ class RDMADevice(Compiled):
 @functools.cache
 def rdma_qp(pair:tuple[str, str]) -> dict[str, BNXTQP]:
   # one qp per gpu pair
-  nics = [unwrap(rdma_nic_for(Device[d])) for d in pair]
+  nics = [unwrap(rdma_nic_for(Device[d], Device[p])) for d, p in (pair, pair[::-1])]
   qps = {nic.device: BNXTQP(nic.iface.dev_impl) for nic in nics}
   for nic, q in zip(nics, qps.values()):
     bufs = {name: nic.iface.buffer(getattr(q, name).ring, getattr(q, name).paddrs) for name in ("sq", "rq", "scq", "rcq")}

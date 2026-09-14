@@ -1,0 +1,61 @@
+import unittest
+import numpy as np
+from tinygrad import Device, Tensor, TinyJit, dtypes
+from tinygrad.helpers import getenv
+from examples.mlperf.models.flat_llama import apply_grad
+from examples.mlperf.optim import clip_grads
+
+@unittest.skipUnless(getenv("RDMA"), "requires two eight-GPU AMD nodes")
+class TestRDMATrainingScale(unittest.TestCase):
+  def test_direct_reduction_replay(self):
+    devices = tuple(f"AMD:{i}" for i in range(16))
+    for width, dtype in ((64, dtypes.float32), (512, dtypes.float32), (262144, dtypes.float32),
+                         (64, dtypes.bfloat16), (512, dtypes.bfloat16), (262144, dtypes.bfloat16)):
+      output = Tensor.full((width+32,), -123., dtype=dtype, device=devices).contiguous().realize()
+      @TinyJit
+      def reduce(x):
+        output[16:16+width].assign((x*2+1).sum(0)).realize()
+        return output
+      for iteration in range(5):
+        # Small integers keep every intermediate exactly representable in BF16.
+        values = np.random.default_rng(iteration).integers(-3, 4, size=(16, width)).astype(np.float32)
+        result = reduce(Tensor(values, dtype=dtype).shard(devices, axis=0).realize())
+        expected = np.pad((values*2+1).sum(0), (16, 16), constant_values=-123)
+        for rank in range(16):
+          np.testing.assert_array_equal(Tensor(result.uop.mselect(rank)).float().numpy(), expected,
+                                        err_msg=f"width={width} dtype={dtype} iteration={iteration} rank={rank}")
+
+  def test_fixed_global_batch_gradients(self): self._check_gradients(32, 16)
+
+  def test_large_fixed_global_batch_gradients(self): self._check_gradients(512, 1024)
+
+  def _check_gradients(self, inputs, outputs):
+    devices = tuple(f"AMD:{i}" for i in range(16))
+    self.assertNotEqual(Device[devices[0]].peer_group, Device[devices[8]].peer_group)
+    initial = np.random.default_rng(123).normal(0, 0.1, (inputs, outputs)).astype(np.float32)
+    # Same global batch: eight GPUs accumulate two minibatches; sixteen GPUs use one.
+    for devs, accumulation in ((devices[8:], 2), (devices, 1)):
+      weight = Tensor(initial.copy(), dtype=dtypes.float32).shard(devs).realize()
+      grad = Tensor.zeros(*initial.shape, dtype=dtypes.float32).shard(devs).contiguous().realize()
+
+      @TinyJit
+      def step(xs):
+        grad.assign(0).realize()
+        for x in xs:
+          loss = (x @ weight).square().mean()
+          apply_grad(grad, loss.gradient(weight)[0].uop)
+          grad.realize()
+        norm = clip_grads([grad], accumulation, 1e20)
+        return norm.realize(grad)
+
+      for iteration in range(5):
+        x = np.random.default_rng(1000+iteration).normal(size=(32, inputs)).astype(np.float32)
+        xs = [Tensor(a.copy()).shard(devs, axis=0).realize() for a in np.split(x, accumulation)]
+        norm = step(xs)
+        expected = 2 * x.T @ (x @ initial) / (32*outputs)
+        for rank in range(len(devs)):
+          np.testing.assert_allclose(Tensor(grad.uop.mselect(rank)).numpy(), expected, rtol=3e-4, atol=3e-5)
+        np.testing.assert_allclose(norm.numpy(), np.linalg.norm(expected), rtol=3e-4, atol=3e-5)
+      print(f"verified DP={len(devs)} accumulation={accumulation} GBS=32: all replicas and global gradient norm")
+
+if __name__ == "__main__": unittest.main()
