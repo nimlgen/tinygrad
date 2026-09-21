@@ -3,7 +3,7 @@ from dataclasses import replace
 from itertools import islice
 from tinygrad import Tensor, Device
 from tinygrad.codegen import to_program
-from tinygrad.engine.realize import time_call
+from tinygrad.engine.realize import time_calls
 from tinygrad.helpers import Context, DEBUG
 from tinygrad.nn import Conv2d
 from tinygrad.nn.state import get_parameters
@@ -19,7 +19,7 @@ class TestKernelSpeed(unittest.TestCase):
     self.assertEqual(len(linear.src), 1, "expected a single kernel")
     call = linear.src[0]
     prg = to_program(call.src[0].replace(arg=replace(call.src[0].arg, beam=beam)), Device[out.device].renderer)
-    return min(islice(time_call(call.replace(src=(prg, *call.src[1:])), clear_l2=True), 3, 10))
+    return min(t[0] for t in islice(time_calls([call.replace(src=(prg, *call.src[1:]))], clear_l2=True), 3, 10))
 
   def _compare(self, tm, tflops, gbs, nv_tflops=None, nv_gbs=None, amd_tflops=None, amd_gbs=None):
       if DEBUG >= 1:

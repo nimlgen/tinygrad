@@ -303,13 +303,14 @@ def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequenc
   ctx = ExecContext(var_vals or {}, tuple(inputs), update_stats, jit, wait or DEBUG>=2)
   for call in linear.src: track_stats(ctx, call.without_after, perf_counter_us(), pm_exec.rewrite(call.without_after, ctx))
 
-def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None, clear_l2:bool=False) -> Iterator[float]:
+def time_calls(calls:list[UOp], var_vals:dict[str, int]|None=None, timeout:int|None=None, clear_l2:bool=False) -> Iterator[list[float]]:
   ctx = ExecContext(var_vals or {}, update_stats=False, wait=True, timeout=timeout, cache=False)
-  linear = link_linear(compile_linear(UOp(Ops.LINEAR, src=(call,)), beam=0, profile=True, cache=False), allow_cache=ctx.cache)
+  linear = link_linear(compile_linear(UOp(Ops.LINEAR, src=tuple(calls)), beam=0, profile=True, cache=False), allow_cache=ctx.cache)
   while True:
     if clear_l2:
-      if hasattr(dev:=Device[call.src[1].device], 'invalidate_caches'): dev.invalidate_caches()
+      if hasattr(dev:=Device[calls[0].src[1].device], 'invalidate_caches'): dev.invalidate_caches()
       else:
         from tinygrad.tensor import Tensor
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024, 1024).contiguous().realize(do_update_stats=False)
-    yield max(pm_exec.rewrite(linear.src[0].without_after, ctx) or [0.0])
+    # the kernel times are the last ones: one hcq call reports its host time then a time per kernel, other devices a time per call
+    yield [t or 0.0 for c in linear.src for t in pm_exec.rewrite(c.without_after, ctx) or []][-len(calls):]

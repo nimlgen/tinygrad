@@ -1,4 +1,4 @@
-import math, time, traceback, signal
+import math, time, traceback, signal, itertools
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
@@ -6,7 +6,7 @@ from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str
 from tinygrad.helpers import IGNORE_BEAM_CACHE
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.engine.realize import time_call
+from tinygrad.engine.realize import time_calls
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -32,19 +32,24 @@ def get_test_global_size(global_size, max_global_size, var_vals):
         break
   return test_global_size, input_size / prod(test_global_size)
 
-def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_stop:float|None=None,
-                  allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, name="test", dev_timeout=False) -> list[float]:
-  timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
-  factor = 1
+def _time_programs(prgs:list[UOp], var_vals:dict[str, int], rawbufs:list[Buffer], early_stop:float|None=None,
+                   allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, dev_timeout=False) -> list[list[float]]:
+  timeout = int(early_stop * 1e3 * len(prgs)) if dev_timeout and early_stop is not None and early_stop < math.inf else None
+  factors = [1.0] * len(prgs)
   if allow_test_size and max_global_size is not None:
-    global_size, factor = get_test_global_size(prg.arg.global_size, max_global_size, var_vals)
-    prg = prg.replace(arg=replace(prg.arg, global_size=tuple(global_size)))
-  call = prg.call(*[UOp.from_buffer(b) for b in rawbufs])
-  tms, timer = [], time_call(call, var_vals, timeout=timeout, clear_l2=clear_l2)
-  for _ in range(cnt):
-    try: tms.append(next(timer) * factor)
-    except AssertionError: return [math.inf] * cnt
-    if early_stop is not None and early_stop < min(tms): break
+    sizes = [get_test_global_size(prg.arg.global_size, max_global_size, var_vals) for prg in prgs]
+    prgs, factors = [prg.replace(arg=replace(prg.arg, global_size=tuple(gs))) for prg, (gs, _) in zip(prgs, sizes)], [f for _, f in sizes]
+  tms:list[list[float]] = [[] for _ in prgs]
+  try:
+    timer = time_calls([prg.call(*[UOp.from_buffer(b) for b in rawbufs]) for prg in prgs], var_vals, timeout=timeout, clear_l2=clear_l2)
+    for _ in range(cnt):
+      for tm, t, f in zip(tms, next(timer), factors): tm.append(t * f)
+      if early_stop is not None and early_stop < min(min(tm) for tm in tms): break
+  except AssertionError: return [[math.inf] * cnt for _ in prgs]
+  except RuntimeError: # one of the batch fails to build, time them alone so the others survive
+    if len(prgs) == 1: raise
+    return [[t * f for t in _time_programs([prg], var_vals, rawbufs, early_stop, False, None, clear_l2, cnt, dev_timeout)[0]]
+            for prg, f in zip(prgs, factors)]
   return tms
 
 class TimeoutException(Exception): pass
@@ -101,7 +106,7 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
     except KernelOptError: pass
   return acted
 
-BEAM_DEBUG = getenv("BEAM_DEBUG")
+BEAM_DEBUG, BEAM_BATCH = getenv("BEAM_DEBUG"), getenv("BEAM_BATCH", 32)
 def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True):
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device, "suffix": s.ren.suffix}
   if not IGNORE_BEAM_CACHE and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
@@ -128,32 +133,39 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
       least_compute_ops = math.inf
-      for i, proc in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
-        if proc is None: continue
-        prg, compile_et = proc
-        if (lib:=prg.src[3].arg) in seen_libs: continue
-        # filter out kernels that use 1000x more compute than the smallest
-        estimates = prg.src[0].arg.estimates
-        least_compute_ops = min(this_compute_ops:=sym_infer(estimates.ops if estimates is not None else 0, var_vals), least_compute_ops)
-        if least_compute_ops*1000 < this_compute_ops:
-          if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
-          continue
-        seen_libs.add(lib)
-        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
-                                 allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
-                                 dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
+      def compiled(): # the candidates that build, as they arrive
+        nonlocal least_compute_ops
+        for i, proc in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
+          if proc is None: continue
+          prg, compile_et = proc
+          if (lib:=prg.src[3].arg) in seen_libs: continue
+          # filter out kernels that use 1000x more compute than the smallest
+          estimates = prg.src[0].arg.estimates
+          least_compute_ops = min(this_compute_ops:=sym_infer(estimates.ops if estimates is not None else 0, var_vals), least_compute_ops)
+          if least_compute_ops*1000 < this_compute_ops:
+            if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
+            continue
+          seen_libs.add(lib)
+          yield i, prg, compile_et
+      # time them in batches, one schedule per batch
+      it = compiled()
+      while len(todo:=list(itertools.islice(it, BEAM_BATCH))):
+        try: batch_tms = _time_programs([prg for _, prg, _ in todo], var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
+                                        allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
+                                        dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
         except Exception as e:
-          if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
+          if BEAM_DEBUG: print(f"BEAM failed for opts: {[candidates[i].applied_opts for i, _, _ in todo]}\n{e}")
           if isinstance(e, RuntimeError): continue
           raise
-        timed.append((candidates[i], min(tms)))
-        if BEAM_DEBUG > 1:
-          print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(prg.src[1].src):5d} uops",
-                f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
-                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
-        elif DEBUG >= 2:
-          print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
-                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}\033[K", end="")
+        for (i, prg, compile_et), tms in zip(todo, batch_tms):
+          timed.append((candidates[i], min(tms)))
+          if BEAM_DEBUG > 1:
+            print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(prg.src[1].src):5d} uops",
+                  f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
+                  f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
+          elif DEBUG >= 2:
+            print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
+                  f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}\033[K", end="")
 
       # done
       opts = sorted(timed, key=lambda x: x[1])
