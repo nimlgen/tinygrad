@@ -1,6 +1,6 @@
 import ctypes, time, contextlib, functools
 from typing import Iterable, Literal
-from tinygrad.helpers import to_mv, data64, data64_le, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.helpers import to_mv, data64, data64_le, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits, getenv
 from tinygrad.runtime.autogen.am import am, pm4_soc15 as pm4
 from tinygrad.runtime.support.amd import import_soc
 from tinygrad.runtime.support.memory import AddrSpace
@@ -564,8 +564,10 @@ class AM_SDMA(AM_IP):
                                                           inst=inst)
         self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
 
+      if getenv("AM_SDMA_NO_CTXSW"): print(f"am {self.adev.devfmt}: sdma{inst} cntl was {self.adev.reg(f'regSDMA{pipe}_CNTL').read(inst=inst):#x}")
       self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
-        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}),
+        **({'auto_ctxsw_enable':0} if getenv("AM_SDMA_NO_CTXSW") else {}), inst=inst)
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       for aid_id in self.adev.aids:
