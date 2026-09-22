@@ -275,8 +275,9 @@ class AM_GFX(AM_IP):
 
   def init_hw(self):
     # Wait for RLC autoload to complete
-    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
-              value=True, msg="RLC autoload timeout")
+    if not self.adev.reset_mode: # a hung cp never idles, the reset comes next anyway
+      wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or (hasattr(self.adev, 'regRLC_RLCS_BOOTLOAD_STATUS') and
+                self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0), value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", insts=range(self.xccs))
     if self.adev.partial_boot: return self.reset_mec()

@@ -801,6 +801,9 @@ class PCIIface(PCIIfaceBase):
       except Exception as e: return f"?{str(e)[:12]}"
     for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
       print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{r}={rd(f'{reg}_{r}', inst)}" for r in regs), flush=True)
+    for key in ((True, False), (True, True)):
+      a = self.dev.rt_allocator(*key)
+      print(f"ERRDUMP {self.dev.device} rt pool uncached={key[0]} host={key[1]}: ptr={a.ptr:#x} of {a.size:#x}, wraps={a.wraps}", flush=True)
     queues = list(getattr(self.dev, "sdma_queues", {}).items()) + [("compute", self.dev.__dict__.get("compute_queue"))]
     for idx, q in queues:
       if q is None: continue
