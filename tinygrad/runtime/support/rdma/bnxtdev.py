@@ -142,14 +142,17 @@ class BNXTDev:
     self.bar0[(bnxt.RCFW_COMM_BASE_OFFSET + bnxt.RCFW_PF_VF_COMM_PROD_OFFSET) // 4] = prod
     self.bar0[(bnxt.RCFW_COMM_BASE_OFFSET + bnxt.RCFW_COMM_TRIG_OFFSET) // 4] = bnxt.RCFW_CMDQ_TRIG_VAL
 
-    wait_cond(lambda: (self.creq.read(self.creq.read_idx)[8] & bnxt.CREQ_BASE_V) != (self.creq.read_idx // 256 & 1),
-              timeout_ms=timeout_ms, msg=f"RCFW {name}")
+    while True: # the creq also carries async events (qp/cq error notifications, byte 9 >= 0xc0): not the command's response
+      wait_cond(lambda: (self.creq.read(self.creq.read_idx)[8] & bnxt.CREQ_BASE_V) != (self.creq.read_idx // 256 & 1),
+                timeout_ms=timeout_ms, msg=f"RCFW {name}")
+      raw = self.creq.read(self.creq.read_idx)
+      self.creq.read_idx += 1
 
-    ret = resp_t.from_buffer_copy(self.creq.read(self.creq.read_idx))
-    self.creq.read_idx += 1
-
-    # NQ_ARM also publishes the CREQ consumer index, which is what frees ring space for the next command
-    self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, self.creq.read_idx & 255, (self.creq.read_idx // 256) & 1)
+      # NQ_ARM also publishes the CREQ consumer index, which is what frees ring space for the next command
+      self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, self.creq.read_idx & 255, (self.creq.read_idx // 256) & 1)
+      if (raw[0] & bnxt.CREQ_BASE_TYPE_MASK) == bnxt.CREQ_BASE_TYPE_QP_EVENT and raw[9] < bnxt.CREQ_QP_EVENT_EVENT_QP_ERROR_NOTIFICATION: break
+      print(f"bnxt {self.devfmt}: async creq event type={raw[0]:#x} event={raw[9]:#x} skipped", flush=True)
+    ret = resp_t.from_buffer_copy(raw)
     assert ret.status == 0, f"RCFW {name}: {ret.status}"
 
     if BNXT_DEBUG >= 1: print(f"bnxt {self.devfmt}: rcfw {name} xid={getattr(ret, 'xid', 0):#x}")
