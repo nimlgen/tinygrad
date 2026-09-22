@@ -993,7 +993,7 @@ class AMDDevice(Compiled):
         read_dispatch_id_field_base_byte_offset=getattr(hsa.amd_queue_t, 'read_dispatch_id').offset,
         max_cu_id=(self.cu_cnt * self.xccs) - 1, max_wave_id=self.waves_per_cu - 1)
       if self.scratches: self.aql_scratch()
-      else: self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
+      self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
     cwsr_buffer_size = round_up((ctx_save_restore_size + debug_memory_size) * self.xccs, mmap.PAGESIZE)
     cwsr_buffer = Buffer(self.device, cwsr_buffer_size, dtypes.uint8, preallocate=True, allocator=self.allocator) if ctx_save_restore_size else None
@@ -1075,7 +1075,9 @@ class AMDDevice(Compiled):
     self.aql_desc.scratch_resource_descriptor[:] = [lo32(base), int.from_bytes(rsrc1_t(BASE_ADDRESS_HI=hi32(base), SWIZZLE_ENABLE=1), 'little'),
                                                     lo32(self.scratches[-1].nbytes // self.xccs), int.from_bytes(bytes(rsrc3_t(**rsrc)), 'little')]
     self.aql_desc.compute_tmpring_size = self.tmpring_size(self.max_private_segment_size)
-    self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
+    # only the scratch fields: the live queue's read/write dispatch ids share the descriptor
+    lo, hi = hsa.amd_queue_t.compute_tmpring_size.offset, hsa.amd_queue_t.queue_properties.offset
+    self.aql_gart.host.view(fmt='B')[lo:hi] = bytes(self.aql_desc)[lo:hi]
 
   def _prof_buffer(self, size:int, dtype, host:bool=True) -> Buffer:
     buf = Buffer(self.device, size, dtype, options=BufferSpec(host=host, nolru=True, uncached=host, cpu_access=True), preallocate=True)
