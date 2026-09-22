@@ -10,6 +10,8 @@ def resp(resp0=0, resp1=0, status=0): return struct.pack(REMOTE_RESP, status, re
 def resp_err(msg): return resp(len(err:=msg.encode()), status=1) + err
 
 discovered_devices: list[tuple[type, str]] = []
+device_vendor: dict[str, int] = {}  # the lock prefix must match the local driver's, or a local job and a served one share the gpu
+LOCK_PREFIX = {0x1002: "AM", 0x10de: "NV", 0x14e4: "BN"}
 opened_devices: dict[int, PCIDevice] = {}
 mapped_bars: dict[tuple[int, int], object] = {}
 programs: list = []
@@ -28,6 +30,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     devs = System.list_devices(arg2, tuple([(x, tuple(y)) for x,y in filter_devices.items()]), base_class)
     for p in devs:
       if p not in discovered_devices: discovered_devices.append(p)
+      device_vendor[p[1]] = arg2
     data = "\n".join(f"{p[1]}:{discovered_devices.index(p)}" for p in devs).encode()
     return conn.sendall(resp(len(data), len(devs)) + data)
 
@@ -36,7 +39,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     if dev_id not in opened_devices:
       if dev_id >= len(discovered_devices): raise RuntimeError(f"device {dev_id} not probed")
       cl, pcibus = discovered_devices[dev_id]
-      opened_devices[dev_id] = cl("SV", pcibus)
+      opened_devices[dev_id] = cl(LOCK_PREFIX.get(device_vendor.get(pcibus, 0), "SV"), pcibus)
     pci_dev = opened_devices[dev_id]
 
   if cmd == RemoteCmd.MAP_BAR:
