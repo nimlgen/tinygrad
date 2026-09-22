@@ -3,7 +3,7 @@ from typing import cast
 import functools, struct, operator, re
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes, DType
-from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten
+from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten, getenv
 from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.runtime.autogen import bnxt
 from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
@@ -109,6 +109,7 @@ def ins(name:str, *src:UOp|int) -> UOp:
   return UOp(Ops.INS, arg=(name, dtypes.void), src=tuple(UOp.const(s, dtypes.uint32) if isinstance(s, int) else s for s in src))
 
 def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the ops of each copy of a submit on one queue
+  if getenv("HCQ_RDMA_NOP"): return [[] for _ in calls] # debug: same schedule, no nic ops on the sdma
   (pair, is_recv), nic = queue_of(calls[0]), cast(RDMADevice, Device[unwrap(rdma_wire(calls[0])).device])
   qp = rdma_qp(pair)[nic.device]
   ring, cq = rdma_ring(nic.device, pair, is_recv), rdma_cq(nic.device, pair, is_recv)
