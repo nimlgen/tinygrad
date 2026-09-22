@@ -801,6 +801,18 @@ class PCIIface(PCIIfaceBase):
       except Exception as e: return f"?{str(e)[:12]}"
     for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
       print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{r}={rd(f'{reg}_{r}', inst)}" for r in regs), flush=True)
+      # sdma 4.4.2 engine debug regs, same segment as SDMA_CNTL (0x6d)
+      dbg = {"STATUS":0x25, "STATUS1":0x26, "STATUS2":0x38, "STATUS3":0x4c, "STATUS4":0x63, "UTCL1_RD_STATUS":0x3e, "UTCL1_WR_STATUS":0x3f,
+             "RD_XNACK0":0x43, "RD_XNACK1":0x44, "WR_XNACK0":0x45, "WR_XNACK1":0x46, "UTCL1_PAGE":0x48, "UTCL1_CNTL":0x3c, "ERROR_LOG":0x50,
+             "VM_CNTL":0x10, "VM_CTX_LO":0x11, "VM_CTX_HI":0x12, "F32_CNTL":0x2, "CHICKEN":0x6e, "GFX_CTX_STATUS":0x91,
+             **{f"MIDCMD{k}":0xc0 + k for k in range(10)}, "MIDCMD_CNTL":0xcb, "PAGE_RB_CNTL":0xd8, "PAGE_RB_BASE":0xd9, "PAGE_RB_BASE_HI":0xda,
+             "PAGE_RB_RPTR":0xdb, "PAGE_RB_WPTR":0xdd, "PAGE_CTX_STATUS":0xe9, "PAGE_STATUS":0x100, "RLC0_RB_CNTL":0x130, "RLC0_RB_BASE":0x131,
+             "RLC0_RB_BASE_HI":0x132, "RLC0_RB_RPTR":0x133, "RLC0_RB_WPTR":0x135}
+      try:
+        cntl = self.dev_impl.regSDMA_CNTL.addr[inst]
+        vals = " ".join(f"{n}={self.dev_impl.rreg(cntl - 0x6d + off, inst=inst):#x}" for n, off in dbg.items())
+      except Exception as e: vals = f"failed {e}"
+      print(f"ERRDUMP sdmadbg {self.dev.device} sdma#{i} inst={inst}: {vals}", flush=True)
     try: # every amd device's host pool: what the cpu reads there, and where this device's page tables send it
       from tinygrad.device import Device as _D
       for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
