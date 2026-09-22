@@ -813,6 +813,14 @@ class PCIIface(PCIIfaceBase):
         vals = " ".join(f"{n}={self.dev_impl.rreg(cntl - 0x6d + off, inst=inst):#x}" for n, off in dbg.items())
       except Exception as e: vals = f"failed {e}"
       print(f"ERRDUMP sdmadbg {self.dev.device} sdma#{i} inst={inst}: {vals}", flush=True)
+    try: # every amd device object of the process: two objects on one (node, bus) means two drivers on one gpu
+      from tinygrad.device import Device as _D
+      for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+        dv = _D[d]
+        print(f"ERRDUMP devobj {d}: node={dv.iface.peer_group} bus={dv.iface.pci_dev.pcibus} impl={id(dv.iface.dev_impl):#x} "
+              f"cq_ring={dv.__dict__.get('compute_queue').ring._buf if dv.__dict__.get('compute_queue') else None} "
+              f"sdma0_ring={dv.sdma_queues[0].ring._buf if getattr(dv, 'sdma_queues', {}).get(0) else None}", flush=True)
+    except Exception as e: print(f"ERRDUMP devobj {self.dev.device}: failed {e}", flush=True)
     try: # every amd device's host pool: what the cpu reads there, and where this device's page tables send it
       from tinygrad.device import Device as _D
       for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
