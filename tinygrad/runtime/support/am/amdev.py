@@ -394,7 +394,7 @@ class AMDev:
 
     gc_info = am.struct_gc_info_v1_0.from_address(gc_addr:=ctypes.addressof(self.bhdr) + self.bhdr.table_list[am.GC].offset)
     self.gc_info = getattr(am, f"struct_gc_info_v{gc_info.header.version_major}_{gc_info.header.version_minor}").from_address(gc_addr)
-    self.reserved_vram_size = (384 << 20) if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else (64 << 20)
+    self.reserved_vram_size = getenv("AM_RESERVED_VRAM_MB", 384 if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else 64) << 20
 
   @functools.cached_property
   def hwid_names(self) -> dict[int, str]: return {v:k.removesuffix('_HWID') for k,v in vars(am).items() if k.endswith('_HWID') and isinstance(v, int)}
