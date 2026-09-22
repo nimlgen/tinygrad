@@ -163,7 +163,9 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
         ops += [ins("write", db, ((n + 1) % RING_ENTRIES | ((n + 1) // RING_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | ring_db)]
 
       # waits for the cqe, acks the cq
-      if "wait" in emit:
+      if "fakewait" in emit: # debug: the sdma itself writes the cqe word the wait expects (no nic completes anything on one box)
+        ops += [ins("write", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint32))]
+      if "wait" in emit or "fakewait" in emit:
         ops += [ins("wait_eq", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint16)),
                 ins("write", db, ((n + 1) % CQ_ENTRIES | ((n + 1) // CQ_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | cq_db)]
       n, p = n + 1, p + ceildiv(size, MTU)
