@@ -810,7 +810,7 @@ class PCIIface(PCIIfaceBase):
       try:
         rp, wp = q.read_ptr.host.view(fmt='Q')[0], q.write_ptr.host.view(fmt='Q')[0]
         words = q.ring.host.view(fmt='I') if q.ring.host is not None else None
-        print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host_ring={words is not None}", flush=True)
+        print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host={words is not None}", flush=True)
         if words is None: continue
         n, full = q.ring.nbytes // 4, getenv("AMD_ERR_DUMP_FULL", 0)
         start, rows = (0, min(wp // 4 + 16, 16384)) if full else (((rp // 4) - 96) % n, 128)
@@ -870,6 +870,7 @@ class AMDDevice(Compiled):
   timestamp_divider = 100.0  # AMD GPU clock: ticks/us
   sleep_timeout_ms = 200
   max_scratch_psize = 0
+  scratch:Buffer
   pm_encode = PatternMatcher([
     (UPat(Ops.CUSTOM_FUNCTION, arg="submit_amd_compute", name="submit"), lambda ctx, submit: encode_submit(amd_compute_queue(ctx, submit))),
     (UPat(Ops.CUSTOM_FUNCTION, arg="submit_amd_copy", name="submit"), lambda ctx, submit: encode_submit(AMDSDMAQueue(ctx, submit))),
