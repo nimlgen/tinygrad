@@ -317,10 +317,11 @@ class PCIIfaceBase:
     if should_use_sysmem:
       align = getenv("AM_SYSMEM_VA_ALIGN", mmap.PAGESIZE) if size >= (32 << 20) else mmap.PAGESIZE # debug: big host pools start fresh va regions
       vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=align)
+      junk = []
       while getenv("AM_SYSMEM_VA_NO4G") and vaddr & 0xffffffff == 0: # debug: never put a host pool exactly on a 4gb boundary (poll addr_lo == 0)
         print(f"sysmem pool for {self.dev.device} skips {vaddr:#x}", flush=True)
-        junk, vaddr = vaddr, self.dev_impl.mm.alloc_vaddr(size, align=align)
-        self.dev_impl.mm.va_allocator.free(junk)
+        junk.append(vaddr); vaddr = self.dev_impl.mm.alloc_vaddr(size, align=align)
+      for j in junk: self.dev_impl.mm.va_allocator.free(j)
       if size >= (32 << 20) and (forced:=getenv("AM_SYSMEM_VA_FORCE", "")): # debug: big host pools at these vas, in allocation order
         if not hasattr(PCIIfaceBase, "_forced_vas"): PCIIfaceBase._forced_vas = [int(x, 0) for x in forced.split(",")]
         if PCIIfaceBase._forced_vas: vaddr = PCIIfaceBase._forced_vas.pop(0)
