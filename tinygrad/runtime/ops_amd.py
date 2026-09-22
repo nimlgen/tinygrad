@@ -808,7 +808,8 @@ class PCIIface(PCIIfaceBase):
         print(f"ERRDUMP params {self.dev.device} queue {idx}: ring_va={q.ring._buf:#x} ring_nbytes={q.ring.nbytes:#x} rptr_va={q.read_ptr._buf:#x} "
               f"wptr_va={q.write_ptr._buf:#x} params={[hex(x) if isinstance(x, int) else x for x in q.params]}", flush=True)
       try:
-        rp, wp = q.read_ptr.host.view(fmt='Q')[0], q.write_ptr.host.view(fmt='Q')[0]
+        unit = 64 if idx == "compute" and self.dev.is_aql else 1 # the aql pointers count packets
+        rp, wp = q.read_ptr.host.view(fmt='Q')[0] * unit, q.write_ptr.host.view(fmt='Q')[0] * unit
         words = q.ring.host.view(fmt='I') if q.ring.host is not None else None
         print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host={words is not None}", flush=True)
         if words is None: continue
