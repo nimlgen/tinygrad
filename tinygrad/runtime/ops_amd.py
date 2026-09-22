@@ -823,6 +823,17 @@ class PCIIface(PCIIfaceBase):
           mark = " <- rptr" if start + row <= (rp // 4 - start) % n + start < start + row + 8 else ""
           print(f"ERRDUMP   [{((start + row) % n) * 4:#08x}] " + " ".join(f"{w:08x}" for w in ws) + mark, flush=True)
       except Exception as e: print(f"ERRDUMP {self.dev.device} queue {idx}: failed {e}", flush=True)
+      if idx == "compute" and self.dev.is_aql:
+        try: # the pm4 inside the vendor packets around rptr
+          w = q.ring.host.view(fmt='I')
+          for pk in range(rp // 64 - 6, rp // 64 + 3):
+            base = (pk * 16) % (q.ring.nbytes // 4)
+            if w[base] & 0xff != 0: continue
+            ib, ndw = w[base + 2] | w[base + 3] << 32, w[base + 4] & 0xfffff
+            ws = self.readva(ib, min(ndw, 64))
+            txt = " ".join(f"{x:08x}" for x in ws) if ws else "unreadable"
+            print(f"ERRDUMP ib {self.dev.device} pkt {pk:#x} ib={ib:#x} n={ndw:#x}: {txt}", flush=True)
+        except Exception as e: print(f"ERRDUMP ib {self.dev.device}: failed {e}", flush=True)
       try: # the gpu's view: walk the page tables for the ring page at rptr, the rptr page and the operands of the packet at rptr
         w = q.ring.host.view(fmt='I')
         pk = (rp // 4) % (q.ring.nbytes // 4)
@@ -843,7 +854,8 @@ class PCIIface(PCIIfaceBase):
             "MC_VM_FB_OFFSET", "MC_VM_MX_L1_TLB_CNTL", "VM_L2_CNTL", "VM_L2_CNTL3", "MC_VM_AGP_BOT", "MC_VM_AGP_TOP"]
           print(f"ERRDUMP hub {self.dev.device} {hub}{inst}: " + " ".join(f"{r}={rd(f'reg{hub}{r}', inst)}" for r in ctx), flush=True)
         except Exception: break
-    try: self.ptscan()
+    try:
+      if getenv("AMD_ERR_PTSCAN"): self.ptscan()
     except Exception as e: print(f"ERRDUMP ptscan {self.dev.device}: failed {e}", flush=True)
 
   def ptscan(self): # every page table page of the device: entries whose address or flags cannot be right are corruption
@@ -863,6 +875,19 @@ class PCIIface(PCIIfaceBase):
         elif not page: todo.append((mm.pt_t(mm.dev, self.dev_impl.xgmi2paddr(addr), lv=pt.lv + 1), eva))
     print(f"ERRDUMP ptscan {self.dev.device}: {pages} pt pages, {valid} valid entries, {len(bad)} bad", flush=True)
     for b in bad: print(f"ERRDUMP ptscan   {b}", flush=True)
+
+  def readva(self, va:int, n:int) -> list[int]|None: # n words at a vram-backed va, through the page tables
+    mm = self.dev_impl.mm
+    gva, pt = va - mm.va_base, mm.root_page_table
+    for lv in range(len(mm.pte_covers)):
+      idx = (gva // mm.pte_covers[lv]) % mm.pte_cnt[lv]
+      e = pt.entry(idx)
+      if not pt.valid(idx) or e & am.AMDGPU_PTE_SYSTEM: return None
+      if pt.is_page(idx):
+        pa = self.dev_impl.xgmi2paddr(e & 0x0000FFFFFFFFF000 & ~(mm.pte_covers[lv] - 1)) + gva % mm.pte_covers[lv]
+        return self.dev_impl.vram.view(pa, n * 4, fmt='I')[:]
+      pt = mm.pt_t(mm.dev, pt.address(idx), lv=pt.lv + 1)
+    return None
 
   def walk(self, va:int) -> str:
     mm, out = self.dev_impl.mm, []
