@@ -318,7 +318,8 @@ class PCIIfaceBase:
       align = getenv("AM_SYSMEM_VA_ALIGN", mmap.PAGESIZE) if size >= (32 << 20) else mmap.PAGESIZE # debug: big host pools start fresh va regions
       vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=align)
       if size >= (32 << 20) and (forced:=getenv("AM_SYSMEM_VA_FORCE", "")): # debug: big host pools at these vas, in allocation order
-        if (todo:=PCIIfaceBase.__dict__.setdefault("_forced_vas", [int(x, 0) for x in forced.split(",")])): vaddr = todo.pop(0)
+        if not hasattr(PCIIfaceBase, "_forced_vas"): PCIIfaceBase._forced_vas = [int(x, 0) for x in forced.split(",")]
+        if PCIIfaceBase._forced_vas: vaddr = PCIIfaceBase._forced_vas.pop(0)
         print(f"sysmem pool for {self.dev.device} at {vaddr:#x}", flush=True)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
