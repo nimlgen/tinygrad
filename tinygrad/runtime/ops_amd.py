@@ -791,38 +791,35 @@ class PCIIface(PCIIfaceBase):
       tl = d.timeline.host.view(fmt='Q')
       tl[0] = tl[1]
 
-  def errdump(self):
-    if getenv("AMD_ERR_DUMP", 0) and not getattr(self, "_dumped", False):
-      self._dumped = True
-      for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
-        vals = {}
-        for r in ("RB_BASE", "RB_BASE_HI", "RB_RPTR", "RB_RPTR_HI", "RB_WPTR", "RB_WPTR_HI", "RB_RPTR_ADDR_LO", "RB_RPTR_ADDR_HI", "RB_WPTR_POLL_ADDR_LO", "RB_WPTR_POLL_ADDR_HI", "RB_CNTL", "IB_BASE_LO", "IB_BASE_HI", "IB_OFFSET", "IB_RPTR", "IB_SIZE", "DOORBELL_OFFSET"):
-          try: vals[r] = self.dev_impl.reg(f"{reg}_{r}").read(inst=inst)
-          except Exception as e: vals[r] = f"?{str(e)[:12]}"
-        print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{k}={v:#x}" if isinstance(v, int) else f"{k}={v}" for k, v in vals.items()), flush=True)
-      for idx, q in list(getattr(self.dev, "sdma_queues", {}).items()):
-        print(f"ERRDUMP params {self.dev.device} queue {idx}: ring_va={q.ring._buf:#x} ring_nbytes={q.ring.nbytes:#x} rptr_va={q.read_ptr._buf:#x} wptr_va={q.write_ptr._buf:#x} params={[hex(x) if isinstance(x, int) else x for x in q.params]}", flush=True)
-      for eng in ():
-        for inst in range(4):
-          vals = {}
-          for r in ("RB_BASE", "RB_BASE_HI", "RB_RPTR", "RB_RPTR_HI", "RB_WPTR", "RB_WPTR_HI", "RB_WPTR_POLL_ADDR_LO", "RB_WPTR_POLL_ADDR_HI", "IB_BASE_LO", "IB_BASE_HI", "IB_OFFSET", "IB_RPTR", "IB_SIZE", "RB_RPTR_ADDR_LO", "RB_RPTR_ADDR_HI"):
-            try: vals[r] = self.dev_impl.reg(f"reg{eng}_QUEUE0_{r}").read(inst=inst)
-            except Exception as e: vals[r] = f"?{str(e)[:20]}"
-          print(f"ERRDUMP regs {eng} inst{inst}: " + " ".join(f"{k}={v:#x}" if isinstance(v, int) else f"{k}={v}" for k, v in vals.items()), flush=True)
-      for idx, q in list(getattr(self.dev, "sdma_queues", {}).items()) + [("compute", self.dev.__dict__.get("compute_queue"))]:
-        if q is None: continue
-        try:
-          rp, wp = q.read_ptr.host.view(fmt='Q')[0], q.write_ptr.host.view(fmt='Q')[0]
-          words = q.ring.host.view(fmt='I') if q.ring.host is not None else None
-          print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host_ring={words is not None}", flush=True)
-          if words is None: continue
-          n = q.ring.nbytes // 4; start = 0 if getenv("AMD_ERR_DUMP_FULL", 0) else ((rp // 4) - 96) % n
-          rows = min(wp // 4 + 16, 16384) if getenv("AMD_ERR_DUMP_FULL", 0) else 128
-          for row in range(0, rows, 8):
-            ws = [words[(start + row + k) % n] for k in range(8)]
-            mark = " <- rptr" if start + row <= (rp // 4 - start) % n + start < start + row + 8 else ""
-            print(f"ERRDUMP   [{((start + row) % n) * 4:#08x}] " + " ".join(f"{w:08x}" for w in ws) + mark, flush=True)
-        except Exception as e: print(f"ERRDUMP {self.dev.device} queue {idx}: failed {e}", flush=True)
+  def errdump(self): # AMD_ERR_DUMP=1: sdma hw regs, queue params and the ring words around rptr on an error state or hang
+    if not getenv("AMD_ERR_DUMP", 0) or getattr(self, "_dumped", False): return
+    self._dumped = True
+    regs = ("RB_BASE", "RB_BASE_HI", "RB_RPTR", "RB_RPTR_HI", "RB_WPTR", "RB_WPTR_HI", "RB_RPTR_ADDR_LO", "RB_RPTR_ADDR_HI", "RB_WPTR_POLL_ADDR_LO",
+            "RB_WPTR_POLL_ADDR_HI", "RB_CNTL", "IB_BASE_LO", "IB_BASE_HI", "IB_OFFSET", "IB_RPTR", "IB_SIZE", "DOORBELL_OFFSET")
+    def rd(reg, inst):
+      try: return f"{self.dev_impl.reg(reg).read(inst=inst):#x}"
+      except Exception as e: return f"?{str(e)[:12]}"
+    for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
+      print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{r}={rd(f'{reg}_{r}', inst)}" for r in regs), flush=True)
+    queues = list(getattr(self.dev, "sdma_queues", {}).items()) + [("compute", self.dev.__dict__.get("compute_queue"))]
+    for idx, q in queues:
+      if q is None: continue
+      if q.params is not None:
+        print(f"ERRDUMP params {self.dev.device} queue {idx}: ring_va={q.ring._buf:#x} ring_nbytes={q.ring.nbytes:#x} rptr_va={q.read_ptr._buf:#x} "
+              f"wptr_va={q.write_ptr._buf:#x} params={[hex(x) if isinstance(x, int) else x for x in q.params]}", flush=True)
+      try:
+        rp, wp = q.read_ptr.host.view(fmt='Q')[0], q.write_ptr.host.view(fmt='Q')[0]
+        words = q.ring.host.view(fmt='I') if q.ring.host is not None else None
+        print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host_ring={words is not None}", flush=True)
+        if words is None: continue
+        n, full = q.ring.nbytes // 4, getenv("AMD_ERR_DUMP_FULL", 0)
+        start, rows = (0, min(wp // 4 + 16, 16384)) if full else (((rp // 4) - 96) % n, 128)
+        for row in range(0, rows, 8):
+          ws = [words[(start + row + k) % n] for k in range(8)]
+          mark = " <- rptr" if start + row <= (rp // 4 - start) % n + start < start + row + 8 else ""
+          print(f"ERRDUMP   [{((start + row) % n) * 4:#08x}] " + " ".join(f"{w:08x}" for w in ws) + mark, flush=True)
+      except Exception as e: print(f"ERRDUMP {self.dev.device} queue {idx}: failed {e}", flush=True)
+
   def sleep(self, timeout):
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
       self.pci_dev.irq_fd.read(8 * events_cnt)
@@ -919,7 +916,8 @@ class AMDDevice(Compiled):
     super().__init__(device, allocator, [HIPRenderer, AMDLLVMRenderer, HIPCCRenderer], None, arch=self.arch)
 
     # Scratch setup
-    self.max_private_segment_size, self.scratches = 0, [] # noqa: E702
+    self.max_private_segment_size = 0
+    self.scratches:list[Buffer] = []
     self.pm_bufferize = PatternMatcher([
       (UPat(Ops.PARAM, tag="scratch", name="b"), lambda ctx, b: ctx.scratch_buffer(b.max_numel())),
       (UPat(Ops.PARAM, tag="program", name="b"), lambda ctx, b: ctx.program_buffer(b)),

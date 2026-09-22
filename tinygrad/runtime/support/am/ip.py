@@ -522,9 +522,12 @@ class AM_IH(AM_IP):
               st = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read(inst=inst)
               if st == 0: continue
               bf = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read_bitfields(inst=inst)
-              va = (self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_HI32').read(inst=inst)<<32) | self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_LO32').read(inst=inst)
+              va = (self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_HI32').read(inst=inst)<<32) | \
+                   self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_LO32').read(inst=inst)
               print(f"am {self.adev.devfmt}: {hub}VM_L2_PROTECTION_FAULT_STATUS inst={inst}: {bf} va={va<<12:#x}", flush=True)
-            except Exception as e: print(f"am {self.adev.devfmt}: {hub} inst {inst} fault decode failed: {str(e)[:80]}", flush=True); break
+            except Exception as e:
+              print(f"am {self.adev.devfmt}: {hub} inst {inst} fault decode failed: {str(e)[:80]}", flush=True)
+              break
         self.adev.is_err_state = True
       else: self.adev.is_err_state = True
 
