@@ -801,6 +801,13 @@ class PCIIface(PCIIfaceBase):
       except Exception as e: return f"?{str(e)[:12]}"
     for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
       print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{r}={rd(f'{reg}_{r}', inst)}" for r in regs), flush=True)
+    try: # every amd device's host pool: what the cpu reads there, and where this device's page tables send it
+      from tinygrad.device import Device as _D
+      for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+        pool = _D[d].rt_buffer(True, True)
+        vals = [hex(x) for x in pool.host.view(fmt='Q')[0:4]]
+        print(f"ERRDUMP pool {self.dev.device} sees {d} host pool va={pool._buf:#x} cpu={vals} pte={self.walk(pool._buf).split()[-1]}", flush=True)
+    except Exception as e: print(f"ERRDUMP pool {self.dev.device}: failed {e}", flush=True)
     for key in ((True, False), (True, True)):
       a = self.dev.rt_allocator(*key)
       print(f"ERRDUMP {self.dev.device} rt pool uncached={key[0]} host={key[1]}: ptr={a.ptr:#x} of {a.size:#x}, wraps={a.wraps}", flush=True)
