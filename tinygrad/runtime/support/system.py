@@ -315,17 +315,10 @@ class PCIIfaceBase:
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
 
     if should_use_sysmem:
-      align = getenv("AM_SYSMEM_VA_ALIGN", mmap.PAGESIZE) if size >= (32 << 20) else mmap.PAGESIZE # debug: big host pools start fresh va regions
-      vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=align)
-      junk = []
-      while getenv("AM_SYSMEM_VA_NO4G") and vaddr & 0xffffffff == 0: # debug: never put a host pool exactly on a 4gb boundary (poll addr_lo == 0)
-        print(f"sysmem pool for {self.dev.device} skips {vaddr:#x}", flush=True)
-        junk.append(vaddr); vaddr = self.dev_impl.mm.alloc_vaddr(size, align=align)
-      for j in junk: self.dev_impl.mm.va_allocator.free(j)
-      if size >= (32 << 20) and (forced:=getenv("AM_SYSMEM_VA_FORCE", "")): # debug: big host pools at these vas, in allocation order
-        if not hasattr(PCIIfaceBase, "_forced_vas"): PCIIfaceBase._forced_vas = [int(x, 0) for x in forced.split(",")]
-        if PCIIfaceBase._forced_vas: vaddr = PCIIfaceBase._forced_vas.pop(0)
-        print(f"sysmem pool for {self.dev.device} at {vaddr:#x}", flush=True)
+      vaddr, skipped = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE)), list[int]()
+      # an sdma poll of an address with a zero low dword faults (mi350): host memory never starts at a 4gb boundary
+      while vaddr & 0xffffffff == 0: skipped, vaddr = skipped + [vaddr], self.dev_impl.mm.alloc_vaddr(size)
+      for va in skipped: self.dev_impl.mm.va_allocator.free(va)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
