@@ -46,8 +46,13 @@ class BNXTAllocator(Allocator):
     paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else PCIIfaceBase.p2p_paddrs(iface, mapping.paddrs)[0]
     align = buf._buf | functools.reduce(operator.or_, (p | s for p, s in paddrs)) # every address a multiple of the page: fewer pbl entries
     log_page = max(l for l in (12, 13, 16, 18, 20, 21, 22, 30) if not align & ((1 << l) - 1)) # the page sizes the nic has
-    key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, 1 << log_page)],
-                                              mapping.size, log_page, va=buf._buf)
+    try:
+      key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, 1 << log_page)],
+                                                mapping.size, log_page, va=buf._buf)
+    except AssertionError:
+      print(f"register_mr failed: nic={self.dev.device} buf={buf.device} va={buf._buf:#x} size={mapping.size:#x} log_page={log_page} "
+            f"pages={sum(ceildiv(s, 1 << log_page) for _, s in paddrs)} first={paddrs[0][0]:#x}", flush=True)
+      raise
     return BufferStorage(key, key)
   def _offset(self, buf, size:int, offset:int): return buf
   def _unmap(self, storage:BufferStorage): self.dev.iface.dev_impl.unregister_mem(storage.meta)
@@ -60,8 +65,13 @@ def rdma_nic_for(dev, anchor) -> RDMADevice|None:
   try: nics = [(i, n) for i, (_, n) in enumerate(filter_visible_devices(System.list_devices(*BNXT_IDS), "RDMA")) if node(n) == node(gpu)]
   except RuntimeError: return None # no pcie on this machine
 
+  if not nics: return None
+  if getenv("HCQ_RDMA_NIC_BY_RANK"): # debug: nic k for the k-th gpu of the node (fake nodes on one box have different bus numbers)
+    gpus = sorted(bus(g) for g in {Device[d].iface.pci_dev.pcibus for d in Device._opened_devices if d.startswith("AMD")} if node(g) == node(gpu))
+    return cast(RDMADevice, Device[f"RDMA:{sorted(nics, key=lambda x: bus(x[1]))[gpus.index(bus(gpu))][0]}"])
+
   # the closest nic to the anchor on dev's node
-  return cast(RDMADevice, Device[f"RDMA:{min(nics, key=lambda x: abs(bus(x[1]) - bus(anchor.iface.pci_dev.pcibus)))[0]}"]) if nics else None
+  return cast(RDMADevice, Device[f"RDMA:{min(nics, key=lambda x: abs(bus(x[1]) - bus(anchor.iface.pci_dev.pcibus)))[0]}"])
 
 class RDMADevice(Compiled):
   ifaces = [BNXTIface]
