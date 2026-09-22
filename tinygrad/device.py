@@ -476,7 +476,11 @@ class Compiled:
     st, done = time.perf_counter(), sig[0]
     while done < value:
       if done != (done:=sig[0]): st = time.perf_counter()
-      elif (elapsed:=time.perf_counter() - st) > (timeout or self.wait_timeout_ms) / 1000: raise RuntimeError(f"{self.device} signal wait timed out")
+      elif (elapsed:=time.perf_counter() - st) > (timeout or self.wait_timeout_ms) / 1000:
+        print(f"HANGDUMP {self.device}: waiting for {value:#x}, timeline now {sig[0]:#x}", flush=True)
+        for d in getattr(self, 'pending', {}): print(f"HANGDUMP pending {d.device}: want {self.pending[d]:#x} have {d.timeline.host.view(fmt='Q')[0]:#x}", flush=True)
+        getattr(getattr(self, 'iface', None), 'errdump', lambda: None)()
+        raise RuntimeError(f"{self.device} signal wait timed out")
       elif self.sleep_timeout_ms is not None and elapsed > self.sleep_timeout_ms / 1000: self.on_sleep()
 
   def synchronize(self, timeout:int|None=None):

@@ -514,6 +514,18 @@ class AM_IH(AM_IP):
         print(f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {bf} {va<<12:#x}")
         self.adev.reg('regGCVM_L2_PROTECTION_FAULT_CNTL').update(clear_protection_fault_status_addr=1)
         self.adev.is_err_state = True
+      elif client == am.SOC15_IH_CLIENTID_VMC or src_name == "SDMA_PAGE_FAULT":
+        print(f"am {self.adev.devfmt}: fault ctx decode: va={(ctx[0] << 12) | ((ctx[1] & 0xf) << 44):#x} ctx1={ctx[1]:#x} node={node}", flush=True)
+        for hub in ("MM", "GC"):
+          for inst in range(8):
+            try:
+              st = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read(inst=inst)
+              if st == 0: continue
+              bf = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read_bitfields(inst=inst)
+              va = (self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_HI32').read(inst=inst)<<32) | self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_LO32').read(inst=inst)
+              print(f"am {self.adev.devfmt}: {hub}VM_L2_PROTECTION_FAULT_STATUS inst={inst}: {bf} va={va<<12:#x}", flush=True)
+            except Exception as e: print(f"am {self.adev.devfmt}: {hub} inst {inst} fault decode failed: {str(e)[:80]}", flush=True); break
+        self.adev.is_err_state = True
       else: self.adev.is_err_state = True
 
     self.drain()
