@@ -46,12 +46,16 @@ class BNXTAllocator(Allocator):
     paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else PCIIfaceBase.p2p_paddrs(iface, mapping.paddrs)[0]
     align = buf._buf | functools.reduce(operator.or_, (p | s for p, s in paddrs)) # every address a multiple of the page: fewer pbl entries
     log_page = max(l for l in (12, 13, 16, 18, 20, 21, 22, 30) if not align & ((1 << l) - 1)) # the page sizes the nic has
+    log_page = min(log_page, getenv("BNXT_MR_LOG_PAGE", log_page)) # debug: force smaller mr pages (longer pbls)
     try:
       key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, 1 << log_page)],
                                                 mapping.size, log_page, va=buf._buf)
     except AssertionError:
+      pages = [p + off for p, size in paddrs for off in range(0, size, 1 << log_page)]
       print(f"register_mr failed: nic={self.dev.device} buf={buf.device} va={buf._buf:#x} size={mapping.size:#x} log_page={log_page} "
-            f"pages={sum(ceildiv(s, 1 << log_page) for _, s in paddrs)} first={paddrs[0][0]:#x}", flush=True)
+            f"pages={len(pages)} pieces={len(paddrs)} first={paddrs[0][0]:#x} min={min(pages):#x} max={max(pages):#x} "
+            f"dups={len(pages) - len(set(pages))} unaligned={sum(1 for p in pages if p & ((1 << log_page) - 1))} "
+            f"piece_sizes={sorted({s for _, s in paddrs})[:8]} aspace={mapping.aspace}", flush=True)
       raise
     return BufferStorage(key, key)
   def _offset(self, buf, size:int, offset:int): return buf
