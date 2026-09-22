@@ -564,7 +564,8 @@ def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
   ctx.refs.append(buf) # add to refs
   if _ADDRSCAN is not None and _ADDRSCAN[0] <= (a:=cast(Buffer, buf.buffer).get_buf(to_tuple(g.arg)[0]) + off) < _ADDRSCAN[1]:
     import traceback
-    print(f"ADDRSCAN {a:#x} for {to_tuple(g.arg)[0]}: buf dev={buf.device} nbytes={buf.nbytes():#x} off={off:#x} opts={cast(Buffer, buf.buffer).options}\n"
+    print(f"ADDRSCAN {a:#x} for {to_tuple(g.arg)[0]}: buf dev={buf.device} nbytes={buf.nbytes():#x} off={off:#x} "
+          f"opts={cast(Buffer, buf.buffer).options}\n"
           + "".join(traceback.format_stack(limit=8)[:-1]), flush=True)
   return UOp.const(cast(Buffer, buf.buffer).get_buf(to_tuple(g.arg)[0]) + off, dtypes.uint64)
 

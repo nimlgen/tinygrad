@@ -820,6 +820,32 @@ class PCIIface(PCIIfaceBase):
           mark = " <- rptr" if start + row <= (rp // 4 - start) % n + start < start + row + 8 else ""
           print(f"ERRDUMP   [{((start + row) % n) * 4:#08x}] " + " ".join(f"{w:08x}" for w in ws) + mark, flush=True)
       except Exception as e: print(f"ERRDUMP {self.dev.device} queue {idx}: failed {e}", flush=True)
+      try: # the gpu's view: walk the page tables for the ring page at rptr, the rptr page and the operands of the packet at rptr
+        w = q.ring.host.view(fmt='I')
+        pk = (rp // 4) % (q.ring.nbytes // 4)
+        op = w[pk] & 0xff
+        ops = {1: [("src", 3), ("dst", 5)], 2: [("dst", 1)], 5: [("addr", 1)], 8: [("addr", 1)]}.get(op, [])
+        vas = [("ring@rptr", q.ring._buf + rp), ("rptr", q.read_ptr._buf)] + [(n, w[pk + i] | w[pk + i + 1] << 32) for n, i in ops]
+        for n, va in vas: print(f"ERRDUMP walk {self.dev.device} queue {idx} {n} {va:#x}: {self.walk(va)}", flush=True)
+      except Exception as e: print(f"ERRDUMP walk {self.dev.device} queue {idx}: failed {e}", flush=True)
+    for hub in ("MM", "GC"):
+      for inst in range(8):
+        try:
+          st = self.dev_impl.reg(self.dev_impl.gmc.pf_status_reg(hub)).read(inst=inst)
+          lo, hi = (self.dev_impl.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_{h}32').read(inst=inst) for h in ("LO", "HI"))
+          print(f"ERRDUMP {self.dev.device} {hub} inst {inst}: status={st:#x} addr={(hi << 32 | lo) << 12:#x}", flush=True)
+        except Exception: break
+
+  def walk(self, va:int) -> str:
+    mm, out = self.dev_impl.mm, []
+    gva, pt = va - mm.va_base, mm.root_page_table
+    for lv in range(len(mm.pte_covers)):
+      idx = (gva // mm.pte_covers[lv]) % mm.pte_cnt[lv]
+      e = pt.entry(idx)
+      out.append(f"lv{pt.lv}@{pt.paddr:#x}[{idx:#x}]={e:#x}")
+      if not pt.valid(idx) or pt.is_page(idx): break
+      pt = mm.pt_t(mm.dev, pt.address(idx), lv=pt.lv + 1)
+    return " ".join(out)
 
   def sleep(self, timeout):
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
