@@ -867,7 +867,13 @@ class PCIIface(PCIIfaceBase):
           st = self.dev_impl.reg(self.dev_impl.gmc.pf_status_reg(hub)).read(inst=inst)
           lo, hi = (self.dev_impl.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_{h}32').read(inst=inst) for h in ("LO", "HI"))
           print(f"ERRDUMP {self.dev.device} {hub} inst {inst}: status={st:#x} addr={(hi << 32 | lo) << 12:#x}", flush=True)
-          if st: print(f"ERRDUMP walk {self.dev.device} fault {hub}{inst} {(hi << 32 | lo) << 12:#x}: {self.walk((hi << 32 | lo) << 12)}", flush=True)
+          if st:
+            fva = (hi << 32 | lo) << 12
+            print(f"ERRDUMP walk {self.dev.device} fault {hub}{inst} {fva:#x}: {self.walk(fva)}", flush=True)
+            from tinygrad.device import Device as _D # who maps the fault va: every gpu of the process shares the va allocator
+            for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+              try: print(f"ERRDUMP owner {d} {fva:#x}: {_D[d].iface.walk(fva)}", flush=True)
+              except Exception as e: print(f"ERRDUMP owner {d}: failed {e}", flush=True)
           ctx = [f"VM_CONTEXT0_PAGE_TABLE_{r}_ADDR_{h}32" for r in ("BASE", "START", "END") for h in ("LO", "HI")] + ["VM_CONTEXT0_CNTL",
             "MC_VM_SYSTEM_APERTURE_LOW_ADDR", "MC_VM_SYSTEM_APERTURE_HIGH_ADDR", "MC_VM_FB_LOCATION_BASE", "MC_VM_FB_LOCATION_TOP",
             "MC_VM_FB_OFFSET", "MC_VM_MX_L1_TLB_CNTL", "VM_L2_CNTL", "VM_L2_CNTL3", "MC_VM_AGP_BOT", "MC_VM_AGP_TOP"]
