@@ -207,6 +207,8 @@ class MemoryManager:
 
   def map_range(self, vaddr:int, size:int, paddrs:list[tuple[int, int]], aspace:AddrSpace, uncached=False, snooped=False, boot=False) -> VirtMapping:
     if getenv("MM_DEBUG", 0): print(f"mm {self.dev.devfmt}: mapping {vaddr=:#x} ({size=:#x})")
+    if (sc:=getenv("HCQ2_ADDRSCAN", "")) and int(sc.split("-")[0], 0) <= vaddr + size and vaddr < int(sc.split("-")[1], 0):
+      print(f"ADDRSCAN map {self.dev.devfmt}: {vaddr=:#x} {size=:#x} {aspace} {paddrs[:2]}", flush=True)
 
     assert size == sum(p[1] for p in paddrs), f"Size mismatch {size=} {sum(p[1] for p in paddrs)=}"
 

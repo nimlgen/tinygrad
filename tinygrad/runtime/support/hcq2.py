@@ -557,10 +557,15 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
 
   return UOp.from_buffer(r, HCQ_RUNTIME_DEV.value)
 
+_ADDRSCAN = [int(x, 0) for x in getenv("HCQ2_ADDRSCAN", "").split("-")] if getenv("HCQ2_ADDRSCAN", "") else None
 def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
   buf, off = unwrap_view(g.src[0])
   if buf.op not in {Ops.BUFFER, Ops.MSELECT}: return None
   ctx.refs.append(buf) # add to refs
+  if _ADDRSCAN is not None and _ADDRSCAN[0] <= (a:=cast(Buffer, buf.buffer).get_buf(to_tuple(g.arg)[0]) + off) < _ADDRSCAN[1]:
+    import traceback
+    print(f"ADDRSCAN {a:#x} for {to_tuple(g.arg)[0]}: buf dev={buf.device} nbytes={buf.nbytes():#x} off={off:#x} opts={cast(Buffer, buf.buffer).options}\n"
+          + "".join(traceback.format_stack(limit=8)[:-1]), flush=True)
   return UOp.const(cast(Buffer, buf.buffer).get_buf(to_tuple(g.arg)[0]) + off, dtypes.uint64)
 
 def fold_binary(buf:UOp, blob:UOp) -> UOp:
