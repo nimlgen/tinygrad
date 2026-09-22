@@ -884,7 +884,7 @@ class PCIIface(PCIIfaceBase):
       e = pt.entry(idx)
       if not pt.valid(idx) or e & am.AMDGPU_PTE_SYSTEM: return None
       if pt.is_page(idx):
-        pa = self.dev_impl.xgmi2paddr(e & 0x0000FFFFFFFFF000 & ~(mm.pte_covers[lv] - 1)) + gva % mm.pte_covers[lv]
+        pa = self.dev_impl.xgmi2paddr(e & 0x0000FFFFFFFFF000) + gva % mm.pte_covers[lv]
         return self.dev_impl.vram.view(pa, n * 4, fmt='I')[:]
       pt = mm.pt_t(mm.dev, pt.address(idx), lv=pt.lv + 1)
     return None
