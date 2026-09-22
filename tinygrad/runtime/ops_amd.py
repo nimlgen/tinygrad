@@ -831,13 +831,40 @@ class PCIIface(PCIIfaceBase):
         vas = [("ring@rptr", q.ring._buf + rp), ("rptr", q.read_ptr._buf)] + [(n, w[pk + i] | w[pk + i + 1] << 32) for n, i in ops]
         for n, va in vas: print(f"ERRDUMP walk {self.dev.device} queue {idx} {n} {va:#x}: {self.walk(va)}", flush=True)
       except Exception as e: print(f"ERRDUMP walk {self.dev.device} queue {idx}: failed {e}", flush=True)
+    try: self.ptscan()
+    except Exception as e: print(f"ERRDUMP ptscan {self.dev.device}: failed {e}", flush=True)
     for hub in ("MM", "GC"):
       for inst in range(8):
         try:
           st = self.dev_impl.reg(self.dev_impl.gmc.pf_status_reg(hub)).read(inst=inst)
           lo, hi = (self.dev_impl.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_{h}32').read(inst=inst) for h in ("LO", "HI"))
           print(f"ERRDUMP {self.dev.device} {hub} inst {inst}: status={st:#x} addr={(hi << 32 | lo) << 12:#x}", flush=True)
+          if st: print(f"ERRDUMP walk {self.dev.device} fault {hub}{inst} {(hi << 32 | lo) << 12:#x}: {self.walk((hi << 32 | lo) << 12)}", flush=True)
+          ctx = [f"VM_CONTEXT0_PAGE_TABLE_{r}_ADDR_{h}32" for r in ("BASE", "START", "END") for h in ("LO", "HI")] + ["VM_CONTEXT0_CNTL",
+            "MC_VM_SYSTEM_APERTURE_LOW_ADDR", "MC_VM_SYSTEM_APERTURE_HIGH_ADDR", "MC_VM_FB_LOCATION_BASE", "MC_VM_FB_LOCATION_TOP",
+            "MC_VM_FB_OFFSET", "MC_VM_MX_L1_TLB_CNTL", "VM_L2_CNTL", "VM_L2_CNTL3", "MC_VM_AGP_BOT", "MC_VM_AGP_TOP"]
+          print(f"ERRDUMP hub {self.dev.device} {hub}{inst}: " + " ".join(f"{r}={rd(f'reg{hub}{r}', inst)}" for r in ctx), flush=True)
         except Exception: break
+
+  def ptscan(self): # every page table page of the device: entries whose address or flags cannot be right are corruption
+    mm, bad, pages, valid = self.dev_impl.mm, [], 0, 0
+    vram, base = self.dev_impl.vram_size, self.dev_impl.gmc.paddr_base
+    todo = [(mm.root_page_table, 0)]
+    while todo and len(bad) < 40:
+      pt, va = todo.pop()
+      pages += 1
+      ents = list(pt.entries)
+      for i, e in enumerate(ents):
+        if not e & 1: continue
+        valid += 1
+        addr, sysm, eva = e & 0x0000FFFFFFFFF000, e & 2, va + i * mm.pte_covers[pt.lv]
+        if pt.is_page(i):
+          ok = addr < (1 << 44) if sysm else base <= addr < base + vram
+        else: ok = not sysm and base <= addr < base + vram
+        if not ok: bad.append(f"pt@{pt.paddr:#x} lv{pt.lv}[{i:#x}] va={eva + mm.va_base:#x} entry={e:#x}")
+        elif not pt.is_page(i): todo.append((mm.pt_t(mm.dev, pt.address(i), lv=pt.lv + 1), eva))
+    print(f"ERRDUMP ptscan {self.dev.device}: {pages} pt pages, {valid} valid entries, {len(bad)} bad", flush=True)
+    for b in bad: print(f"ERRDUMP ptscan   {b}", flush=True)
 
   def walk(self, va:int) -> str:
     mm, out = self.dev_impl.mm, []
