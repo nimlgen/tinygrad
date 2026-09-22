@@ -315,7 +315,8 @@ class PCIIfaceBase:
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
 
     if should_use_sysmem:
-      vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE)
+      align = getenv("AM_SYSMEM_VA_ALIGN", mmap.PAGESIZE) if size >= (32 << 20) else mmap.PAGESIZE # debug: big host pools start fresh va regions
+      vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=align)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
