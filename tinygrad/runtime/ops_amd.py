@@ -873,6 +873,15 @@ class PCIIface(PCIIfaceBase):
             "MC_VM_FB_OFFSET", "MC_VM_MX_L1_TLB_CNTL", "VM_L2_CNTL", "VM_L2_CNTL3", "MC_VM_AGP_BOT", "MC_VM_AGP_TOP"]
           print(f"ERRDUMP hub {self.dev.device} {hub}{inst}: " + " ".join(f"{r}={rd(f'reg{hub}{r}', inst)}" for r in ctx), flush=True)
         except Exception: break
+    if getenv("AMD_ERR_FLUSH"): # a stale translation would clear: flush every hub, then see whether the queues move
+      import time
+      before = {idx: q.read_ptr.host.view(fmt='Q')[0] for idx, q in queues if q is not None}
+      for i in range(3):
+        self.dev_impl.gmc.flush_tlb(ip="MM", vmid=0)
+        self.dev_impl.gmc.flush_tlb(ip="GC", vmid=0)
+        time.sleep(2)
+        after = {idx: q.read_ptr.host.view(fmt='Q')[0] for idx, q in queues if q is not None}
+        print(f"ERRDUMP flush#{i} {self.dev.device}: " + " ".join(f"{k}:{before[k]:#x}->{after[k]:#x}" for k in before), flush=True)
     try:
       if getenv("AMD_ERR_PTSCAN"): self.ptscan()
     except Exception as e: print(f"ERRDUMP ptscan {self.dev.device}: failed {e}", flush=True)
