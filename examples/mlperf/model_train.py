@@ -1929,7 +1929,7 @@ def train_gptoss():
         if STEP_GROUP == 1 and i == 1 and train_step.captured is not None: gc.collect()
         if STEP_GROUP > 1 and count == STEP_GROUP and group_calls == 2 and train_group.captured is not None: gc.collect()
         values = [t.item() for t in ret]
-        assert len(values) == 3*count and all(math.isfinite(v) for v in values), "Non-finite GPT-OSS training metrics"
+        assert len(values) == 3*count and (getenv("GPTOSS_ALLOW_NONFINITE") or all(math.isfinite(v) for v in values)), "Non-finite GPT-OSS training metrics" # debug: timing runs with HCQ_RDMA_NOP
         metrics = [values[j:j+3] for j in range(0, len(values), 3)]
         et = time.perf_counter()
 
