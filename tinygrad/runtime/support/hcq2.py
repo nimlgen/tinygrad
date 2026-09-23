@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any, Sequence
-import functools, itertools, weakref, ctypes, importlib
+import functools, itertools, weakref, ctypes, importlib, time
 from dataclasses import replace, dataclass, field
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, ContextVar, Context, panic, partition, getenv, round_up
 from tinygrad.helpers import DEBUG, VIZ, HCQ2, DEV, ALL2ALL
@@ -447,7 +447,10 @@ def bufferize_linear(hq:HWQueue, name:str, device:str|tuple[str, ...]) -> UOp:
   return patch(buf, list(zip([o for o, _ in patches], words)), stream).after(*[b for _, b in bufs])
 
 def encode_submit(hq:HWQueue) -> UOp:
+  st = time.perf_counter()
   for u in hq.lin.src: hq.q_rewrite.rewrite(u, ctx=hq)
+  if getenv("HCQ2_STATS"): print(f"HCQ2STAT encode {hq.queue} {hq.devs[0]}: ins={len(hq.lin.src)} blob={len(hq.blob)} patches={len(hq.patches)} "
+                              f"t={time.perf_counter() - st:.3f}s", flush=True)
   return hq.submit(bufferize_linear(hq, "cmdbuf", hq.devs))
 
 # *****************
@@ -472,6 +475,12 @@ pm_renumber = PatternMatcher([
 
 def lower_call(call:UOp) -> UOp|None:
   if not isinstance(call.arg.aux, HCQInfo) or call.arg.aux.nargs: return None # not an hcq call, or lowered already
+  st = time.perf_counter()
+  ret = _lower_call(call)
+  if getenv("HCQ2_STATS"): print(f"HCQ2STAT lower {call.arg.aux.device}: words={len(ret.toposort())} t={time.perf_counter() - st:.3f}s", flush=True)
+  return ret
+
+def _lower_call(call:UOp) -> UOp:
 
   # encode bodies
   from tinygrad.runtime.ops_rdma import pm_rdma_encode
