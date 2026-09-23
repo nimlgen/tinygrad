@@ -398,12 +398,16 @@ pm_hcq_encode = PatternMatcher([
 
 def _is_input_addr(g:UOp) -> bool: return (base:=unwrap_lane(g.src[0])[0]).op is Ops.PARAM and base.tag is None
 
+_link_patch_memo:weakref.WeakKeyDictionary[UOp, bool] = weakref.WeakKeyDictionary() # word expressions share subtrees
 def _is_link_patch(w:UOp) -> bool:
-  if w.op is Ops.GETADDR: return not _is_input_addr(w)
-  if w.op is Ops.PARAM: return w.tag is not None
-  if w.op is Ops.BUFFER: return w.addrspace is AddrSpace.GLOBAL # a register is written at runtime
-  if w.op in {Ops.LOAD, Ops.AFTER} or w.is_variable: return False
-  return all(_is_link_patch(s) for s in w.src)
+  if (r:=_link_patch_memo.get(w)) is not None: return r
+  if w.op is Ops.GETADDR: r = not _is_input_addr(w)
+  elif w.op is Ops.PARAM: r = w.tag is not None
+  elif w.op is Ops.BUFFER: r = w.addrspace is AddrSpace.GLOBAL # a register is written at runtime
+  elif w.op in {Ops.LOAD, Ops.AFTER} or w.is_variable: r = False
+  else: r = all(_is_link_patch(s) for s in w.src)
+  _link_patch_memo[w] = r
+  return r
 
 def hoist_links(ctx:EncodeCtx, a:UOp) -> UOp|None:
   links, rest = partition(a.src[1:], lambda s: s.op in (Ops.STORE, Ops.END) and _is_link_patch(s))
