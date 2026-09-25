@@ -240,11 +240,20 @@ class PCIDevice:
     else: FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/enable", os.O_RDWR).write("1")
 
     self.cfg_fd = FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/config", os.O_RDWR | os.O_SYNC | os.O_CLOEXEC)
+    self.p2p_direct()
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     return System.alloc_sysmem(size, vaddr, contiguous)
 
   def reset(self): os.system(f"sudo sh -c 'echo 1 > /sys/bus/pci/devices/{self.pcibus}/reset'")
+  def p2p_direct(self):
+    # acs redirect on the switch's downstream ports sends peer traffic up through the root complex and back: a nic's tx and rx then
+    # share the uplink twice. clear request/completion redirect on every port of the switch the device sits under
+    switch = os.path.dirname(os.path.dirname(os.path.realpath(f"/sys/bus/pci/devices/{self.pcibus}")))
+    for port in [p for p in os.listdir(switch) if FileIOInterface.exists(f"{switch}/{p}/config")]:
+      cfg, off = FileIOInterface(f"{switch}/{port}/config", os.O_RDWR | os.O_SYNC | os.O_CLOEXEC), 0x100
+      while off and (hdr:=int.from_bytes(cfg.read(4, binary=True, offset=off), 'little')) & 0xffff != 0xd: off = hdr >> 20 # ACS ext cap
+      if off: cfg.write((int.from_bytes(cfg.read(2, binary=True, offset=off+6), 'little') & ~0xc).to_bytes(2, 'little'), binary=True, offset=off+6)
   def read_config(self, offset:int, size:int): return int.from_bytes(self.cfg_fd.read(size, binary=True, offset=offset), byteorder='little')
   def write_config(self, offset:int, value:int, size:int): self.cfg_fd.write(value.to_bytes(size, byteorder='little'), binary=True, offset=offset)
   def write_config_flush(self, offset:int, value:int, size:int):

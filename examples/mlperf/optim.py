@@ -116,6 +116,8 @@ class GradAccClipAdamW(Optimizer):
     fp8_wT = [tt._wT_q for tt in self.params if hasattr(tt, '_wT_q')] + [tt._wT_e8 for tt in self.params if hasattr(tt, '_wT_e8')]
     fp8_fc1_si = [tt._fc1_packed_si for tt in self.params if hasattr(tt, '_fc1_packed_si')]
     outputs = extra + self.params + self.buffers + (self.master_params or []) + fp8_inv_scales + fp8_next_inv_scales + fp8_wT + fp8_fc1_si
+    if (expert_gather := getattr(self, '_deferred_experts', None)) is not None:
+      outputs = expert_gather.scheduled_outputs(outputs, self)
     return deferred.scheduled_outputs(outputs) if (deferred := getattr(self, '_deferred_lmhead', None)) is not None else outputs
 
   def _fschedule_fused_adam_mxfp8(self, grads:list[Tensor]) -> list[Tensor]:
@@ -180,6 +182,9 @@ class GradAccClipAdamW(Optimizer):
                                      clip_scale=raw_scale if raw_clip else None, compact_q=compact_q)
         m, v, master, q, e8, *si_out = fused_out
         self.m[i], self.v[i], self.master_params[i] = m, v, master  # type: ignore[index]
+        if (expert_gather := getattr(self, '_deferred_experts', None)) is not None and id(tt) in expert_gather.entries:
+          expert_gather.stage(tt, [q, e8, *si_out])
+          continue
         if self.zero:
           gather = _gptoss_gather_owned if compact_q and getenv("GPTOSS_OWNED_EXPERT_GATHER", 0) else self._zero_gather
           if compact_q:

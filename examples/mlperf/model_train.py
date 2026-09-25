@@ -1790,6 +1790,12 @@ def train_gptoss():
 
   from examples.mlperf.gptoss_training import DeferredLMHead, next_group_size, gptoss_model_flops, gptoss_mfu, MI350X_FP8_FLOPS
   deferred_lmhead = DeferredLMHead(optim, model.output) if getenv("DEFERRED_LMHEAD", 0) else None
+  from examples.mlperf.gptoss_gather import DeferredExpertGather
+  deferred_experts = DeferredExpertGather(optim, model) if getenv("GPTOSS_DEFER_EXPERT_GATHER", 0) else None
+  if getenv("GPTOSS_SCHED_FIXER", 0) or getenv("GPTOSS_SCHED_DUMP", "") or getenv("GPTOSS_SCHED_ORDER", ""):
+    from examples.mlperf.gptoss_sched_fixer import install
+    install()
+  model._deferred_experts = deferred_experts
 
   @Context(TRAINING=1)
   def train_math(tokens:Tensor):
@@ -1846,6 +1852,11 @@ def train_gptoss():
     return metrics
 
   train_group = TinyJit(grouped_math)
+  # capture on the first call: the eager warmup update lowers the whole graph once more for nothing
+  if (jit_no_warmup := bool(getenv("GPTOSS_JIT_NO_WARMUP"))):
+    # the warmup's other job: realize lazy state (grad buffers, moments, step counters), else the capture bakes their initial values
+    Tensor.realize(*[t for t in get_parameters([optim, scheduler, grads]) if not t.uop.is_realized])
+    train_step.cnt = train_group.cnt = 1
 
   @TinyJit
   @Context(TRAINING=0)
@@ -1909,7 +1920,7 @@ def train_gptoss():
                                 max_steps=MAX_STEPS, eval_freq=EVAL_FREQ, checkpoint_freq=getenv("CKPT"), benchmark_steps=BENCHMARK)
         # TinyJit's uncaptured first call may have different inputs from capture.
         # Warm one update, then capture STEP_GROUP updates on the second call.
-        if STEP_GROUP > 1 and group_calls == 0: count = min(count, 1)
+        if STEP_GROUP > 1 and group_calls == 0 and not jit_no_warmup: count = min(count, 1)
         batches = tuple(islice(train_iter, count))
         if not batches: break
         count = len(batches)
@@ -1924,10 +1935,11 @@ def train_gptoss():
         else:
           # Eager short groups share persistent state without a second large capture.
           ret = grouped_math(*batches)
+        if deferred_experts is not None: deferred_experts.mark_updated()
         if deferred_lmhead is not None: deferred_lmhead.mark_updated()
         for dev in device: Device[dev].synchronize()
-        if STEP_GROUP == 1 and i == 1 and train_step.captured is not None: gc.collect()
-        if STEP_GROUP > 1 and count == STEP_GROUP and group_calls == 2 and train_group.captured is not None: gc.collect()
+        if STEP_GROUP == 1 and i == 1 - jit_no_warmup and train_step.captured is not None: gc.collect()
+        if STEP_GROUP > 1 and count == STEP_GROUP and group_calls == 2 - jit_no_warmup and train_group.captured is not None: gc.collect()
         values = [t.item() for t in ret]
         assert len(values) == 3*count and (getenv("GPTOSS_ALLOW_NONFINITE") or all(math.isfinite(v) for v in values)), "Non-finite GPT-OSS training metrics" # debug: timing runs with HCQ_RDMA_NOP
         metrics = [values[j:j+3] for j in range(0, len(values), 3)]
@@ -1973,6 +1985,7 @@ def train_gptoss():
             })
 
         if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
+          if deferred_experts is not None: deferred_experts.drain()
           if deferred_lmhead is not None: deferred_lmhead.drain()
           tqdm.write("saving checkpoint")
           if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
@@ -1992,6 +2005,7 @@ def train_gptoss():
                 f"epoch global_mem: {GlobalCounters.global_mem:_}")
 
       if (sequences_seen // EVAL_FREQ != (sequences_seen - BS) // EVAL_FREQ and (i != 1 or EVAL_FREQ == 1)) or (BENCHMARK and i == BENCHMARK):
+        if deferred_experts is not None: deferred_experts.drain()
         if deferred_lmhead is not None: deferred_lmhead.drain()
         if EVAL_BS == 0: return
         tqdm.write(f"evaluating after {sequences_seen} sequences")
@@ -2026,7 +2040,9 @@ def train_gptoss():
           break
 
   finally:
-    if __import__("sys").exc_info()[0] is None and deferred_lmhead is not None: deferred_lmhead.drain()
+    if __import__("sys").exc_info()[0] is None:
+      if deferred_experts is not None: deferred_experts.drain()
+      if deferred_lmhead is not None: deferred_lmhead.drain()
 
 def train_stable_diffusion():
   from extra.models.unet import UNetModel

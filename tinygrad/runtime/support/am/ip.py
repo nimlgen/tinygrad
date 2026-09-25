@@ -489,8 +489,10 @@ class AM_IH(AM_IP):
     wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
     rptr = self.adev.regIH_RB_RPTR.read()
 
-    while rptr != wptr['offset']:
-      entry = [self.ring_view[(rptr + i) % (self.ring_size // 4)] for i in range(8)]
+    # one read of the pending entries (two on wrap): on a remote device every read is a round trip
+    end = wptr['offset']
+    pending = list(self.ring_view[rptr:end]) if rptr <= end else list(self.ring_view[rptr:]) + list(self.ring_view[:end])
+    for entry in [pending[i:i+8] for i in range(0, len(pending), 8)]:
       rptr = (rptr + 8) % (self.ring_size // 4)
 
       client, src, ring_id, vmid, vmid_type, pasid, node = \

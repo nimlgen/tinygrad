@@ -526,6 +526,8 @@ class GPTOSS:
     Tensor.realize(*get_parameters(self))
 
   def __call__(self, tokens:Tensor, save:bool=True, targets:Tensor|None=None):
+    expert_gather = getattr(self, '_deferred_experts', None) if TRAINING else None
+    if expert_gather is not None: expert_gather.prefetch()
     h = self.tok_embeddings(tokens)
     bsz, seqlen = tokens.shape
     freqs_cis = self.freqs_cis.cast(h.dtype)[:, :seqlen, :, :, :]

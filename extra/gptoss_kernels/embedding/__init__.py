@@ -1,8 +1,8 @@
 from __future__ import annotations
 import functools, pathlib
 from tinygrad import Tensor, dtypes, nn
-from tinygrad.helpers import getenv
-from tinygrad.uop.ops import UOp, Ops, KernelInfo, sint
+from tinygrad.helpers import getenv, ALLREDUCE_NODE_NDEVS
+from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, sint
 from tinygrad.renderer import Estimates
 from extra.llama_kernels import alloc_like, compile_hip
 
@@ -65,10 +65,34 @@ def _custom_reduce(out:UOp, grad_emb:UOp, head:UOp, next_idx:UOp, *row_offset:UO
              src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=compile_hip(src, defines))))
 
 @functools.cache
-def _vocab_row_offsets(device:tuple[str, ...], vocab:int) -> Tensor:
-  return Tensor([rank*(vocab//len(device)) for rank in range(len(device))], dtype=dtypes.int32).shard(device, 0).realize()
+def _vocab_row_offsets(device:tuple[str, ...], vocab:int, ranks:tuple[int, ...]) -> Tensor:
+  return Tensor([rank*(vocab//len(device)) for rank in ranks], dtype=dtypes.int32).shard(device, 0).realize()
 
-def embedding_bwd_owner(grad_emb:Tensor, idx:Tensor, vocab:sint, *, shard_output:bool=False) -> Tensor:
+def _shards(t:Tensor) -> UOp: # the raw per-device buffers of an axis-0 sharded tensor, keeping the kernel-write barriers
+  node, barriers = t.uop, []
+  while node.op is not Ops.UNSHARD:
+    if node.op is Ops.AFTER: barriers += node.src[1:]
+    node = node.src[0]
+  return node.src[0].after(*barriers) if barriers else node.src[0]
+
+def _node_gather(t:Tensor, n:int) -> Tensor: # every gpu gets its node's shards along axis 0 (a per-device value), no nic traffic
+  devs, raw = t.device, _shards(t)
+  assert t.uop.axis == 0
+  nodes = [devs[i:i+n] for i in range(0, len(devs), n)]
+  per_dev = [Tensor.cat(*[Tensor(raw.mselect(devs.index(s))).to(d) for s in node]) for node in nodes for d in node]
+  return Tensor(UOp.mstack(*[x.uop for x in per_dev]), device=devs)
+
+def embedding_bwd_two_nodes(grad_emb:Tensor, idx:Tensor, vocab:sint, n:int) -> Tensor:
+  # each node reduces its own tokens for its rows and for its rank peers' rows: 46 MB crosses the nic instead of every token's grad
+  devs = grad_emb.device
+  assert isinstance(devs, tuple) and len(devs) == 2 * n
+  ge, ix = _node_gather(grad_emb, n), _node_gather(idx, n)
+  peer = [(i + n) % len(devs) for i in range(len(devs))]
+  own, theirs = (_shards(embedding_bwd_owner(ge, ix, vocab, shard_output=True, ranks=r)) for r in (tuple(range(len(devs))), tuple(peer)))
+  out = [own.mselect(i).alu(Ops.ADD, theirs.mselect(peer[i]).copy_to_device(devs[i])) for i in range(len(devs))]
+  return Tensor(UOp.mstack(*out).unshard(0, UOp.range(len(devs), -1, AxisType.DEVICE)), device=devs)
+
+def embedding_bwd_owner(grad_emb:Tensor, idx:Tensor, vocab:sint, *, shard_output:bool=False, ranks:tuple[int, ...]|None=None) -> Tensor:
   grad_emb = grad_emb.reshape(idx.numel(), grad_emb.shape[-1])
   device = grad_emb.device
   head = alloc_like((vocab,), dtypes.int32, device)
@@ -76,7 +100,7 @@ def embedding_bwd_owner(grad_emb:Tensor, idx:Tensor, vocab:sint, *, shard_output
   offsets = ()
   if shard_output:
     assert isinstance(device, tuple) and vocab % len(device) == 0
-    offsets = (_vocab_row_offsets(device, vocab),)
+    offsets = (_vocab_row_offsets(device, vocab, ranks or tuple(range(len(device)))),)
   out = alloc_like((vocab, grad_emb.shape[-1]), dtypes.bfloat16, device, 0 if shard_output else None)
   head, *_ = Tensor.custom_kernel(head, fxn=_custom_init_heads)
   next_idx, *_ = Tensor.custom_kernel(next_idx, head, idx.reshape(-1), fxn=_custom_build_links)
@@ -95,6 +119,8 @@ def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
     if not isinstance(device, tuple) or t.uop.axis is None: return t
     return Tensor(t.uop.copy_to_device(device)).contiguous()
   shard_output = isinstance(device, tuple) and getenv("ZERO_OPTIM", 0) and getenv("ZERO2", 0) and getenv("GPTOSS_ZERO2_EMBEDDING", 0)
+  if shard_output and Tensor(grad_emb).uop.axis is not None and 0 < (n:=ALLREDUCE_NODE_NDEVS.value) and len(device) == 2 * n:
+    return embedding_bwd_two_nodes(Tensor(grad_emb, device=device), Tensor(idx, device=device), weight.shape[0], n).uop, None
   return embedding_bwd_owner(gather(grad_emb), gather(idx), weight.shape[0], shard_output=bool(shard_output)).uop, None
 
 class GPTOSSEmbedding(nn.Embedding):

@@ -1,7 +1,7 @@
 import functools, pathlib, warnings
 from tinygrad import Tensor, dtypes
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, ALLREDUCE_NODE_NDEVS
 from tinygrad.renderer import Estimates
 from extra.hipcc import HIPCCCompiler
 from extra.llama_kernels import kernel_grad
@@ -94,6 +94,8 @@ def _finish_expert_wgrad(t:Tensor) -> Tensor:
       isinstance(t.device, tuple) and len(t.device) == 8 and t.uop.axis == 0: return t
   return t.contiguous()
 
+def _sum_uops(xs:list[UOp]) -> UOp: return functools.reduce(lambda a,b: a.alu(Ops.ADD, b), xs)
+
 def reduce_scatter_devaxis(out:Tensor, shard_axis:int=0) -> Tensor:
   # out: multi tensor device-sharded on axis 0 (1 slice/device), logical shape (ndev, *rest); each device holds
   # its partial. Returns sum over the device axis, left SHARDED on `shard_axis` of the *rest result. Clean all2all:
@@ -121,8 +123,11 @@ def reduce_scatter_devaxis(out:Tensor, shard_axis:int=0) -> Tensor:
   shards = []
   for i in range(ndev):
     shr = tuple((0,s) if a != ax else (i*sz,(i+1)*sz) for a,s in enumerate(rest))
-    contribs = [mbuf.mselect(j).reshape(rest).shrink(shr).copy_to_device(devs[i]) for j in range(ndev)]
-    shards.append(functools.reduce(lambda a,b: a.alu(Ops.ADD, b), contribs))
+    # every node sums its contributions on the owner's counterpart in parallel, then one nic hop to the owner
+    n = ALLREDUCE_NODE_NDEVS.value if 0 < ALLREDUCE_NODE_NDEVS.value < ndev and ndev % ALLREDUCE_NODE_NDEVS.value == 0 else ndev
+    partials = [_sum_uops([mbuf.mselect(j).reshape(rest).shrink(shr).copy_to_device(devs[start + i % n]) for j in range(start, start+n)])
+                for start in range(0, ndev, n)]
+    shards.append(_sum_uops([p.copy_to_device(devs[i]) for p in partials]))
   return Tensor(UOp.mstack(*shards).unshard(ax, rng), device=devs)
 
 def _reduce_scatter_expert_chunks(chunks:list[Tensor]) -> Tensor:

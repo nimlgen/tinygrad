@@ -1,129 +1,93 @@
-# Handoff: gpt-oss 2x8 on tinyamd3 + tinyamd4 (MI350X, tinygrad AM driver, hcq2, AQL)
+# Handoff: gpt-oss 20B, 2x8 MI350X (tinyamd3 + tinyamd4), tinygrad AM driver, hcq2, AQL only
 
-Written 2026-09-22 22:30 by the previous agent. Goal: gpt-oss training on two boxes (2x8) fast enough to finish the run in < 71 min.
-Rule from the user: AMD_AQL=1 only (PM4 is not an acceptable workaround). Everything below runs the AM userspace driver (no kfd/amdgpu).
+> **Codex follow-up, 2026-09-23 09:24 PDT:** See `/home/nimlgen/tinygrad/HANDOFF_CLAUDE.md` for the latest measurements and deployment state. The two-node embedding below was found deployed on both machines and failed a fresh control; remote embedding and scheduler are now restored to HEAD, while the local experimental files remain untouched. A model-only deferred expert-reduction prototype showed no clear speedup and was removed. Both machines are idle; reset/preflight before the next run.
+
+Written 2026-09-23 ~09:00 PDT by Claude. Goal: the MLPerf gpt-oss run (24 layers, BS=32, DP=16 over two boxes) converges in < 71 min.
+Rules from the user: `AMD_AQL=1` only, plain O2 for the host compiler, keep it simple, do not hack tinygrad core more than needed.
 
 ## 1. State in one paragraph
 
-The multi-node MM fault that blocked every 2x8 run is root-caused and fixed (section 4). The 2x8 trains correctly (AQL, RDMA on,
-BENCHMARK=40: 37 jitted updates, loss 12.3 -> 7.8, no faults). It is slow: **6.5-6.9 s/update** vs **0.66 s/update on one box**,
-the eager first update takes ~16 min and the two-update JIT compile ~33 min (both dominated by the coordinator's python and one giant
-clang compile). The steady-state step is device-side (GPU/NIC), the coordinator only waits. A PROFILE=1 run was in progress when this was
-written; its trace tells which device op fills the 6.5 s (section 6). The 71-min target needs roughly **1.2 s/update** on 2x8 and a
-JIT compile **< 10 min**.
+Steady state is **0.905 s/update** (24L, BS=32, O2, JITBEAM=3 warm cache), down from 1.25 at the start of the day; startup is
+**117 s init + 729 s two-update JIT capture (~14 min)**, down from 27 min. Losses match the single-box run. One box does the same
+per-GPU work in **0.61 s**, so ~0.3 s is unhidden two-node communication. The 71-min target (196608 sequences = 6144 steps at BS=32,
+minus ~14 min startup and ~6 min of 16 evals) needs **~0.45-0.5 s/step**: hiding all the communication gets to ~0.65-0.7, the rest
+is per-GPU compute (kernels / batch shape). Everything codex had written earlier today was reverted by the user's request; the tree
+now carries only the small changes in section 3.
 
 ## 2. Boxes, trees, helpers
 
 | | tinyamd3 (ta3) | tinyamd4 (ta4) |
 |---|---|---|
-| ssh | `ssh tinyamd3` (192.168.52.209, ProxyJump tinygateway) | `ssh tinyamd4` (192.168.52.153) |
-| IPMI | `ipmitool -I lanplus -H 192.168.52.137 -U ADMIN -P RZLWLOKHKI power reset` | `ipmitool -I lanplus -H 192.168.52.167 -U ADMIN -P WHHUMUXTKS power reset` |
-| venv | `~/rdma16/aql-test-venv` (py-spy binary at `~/py-spy`) | `~/rdma16/wandb-venv` (has py-spy, wandb creds) |
-| tree | `~/tg-gw2` | `~/tg-gw2` (the coordinator runs here) |
+| ssh from tinyr4 | `ssh tinyamd3` (192.168.52.209) | `ssh tinyamd4` (192.168.52.153, the coordinator) |
+| IPMI (last resort) | `ipmitool -I lanplus -H 192.168.52.137 -U ADMIN -P RZLWLOKHKI power reset` | `ipmitool -I lanplus -H 192.168.52.167 -U ADMIN -P WHHUMUXTKS power reset` |
+| venv | `~/rdma16/aql-test-venv` | `~/rdma16/wandb-venv` (py-spy, wandb) |
+| tree | `~/tg-gw2` | `~/tg-gw2` |
 
-- Tree = branch `gptoss_work2_master` (wozeparrot/gptoss_work2 rebased on master 98807603d) + the fixes and debug knobs below.
-  Deployed by scp of single files (`git archive` tarball + `~/gw2_swap.sh` for whole-tree swaps). Both boxes have the same files.
-- `~/gw2_serve.sh` (both boxes): refuses if a coordinator is connected to :6667 or a model_train runs; unbinds+rebinds every BCM57608
-  NIC (revives a NIC left wedged by a killed job), hive reset of all GPUs, starts `extra/remote/serve.py 6667` (log `~/serve_gw2.log`).
-  **Run it on both boxes before every 2x8 run.**
-- `~/gw2_local.sh` (both): for a *local* run on one box: refuses while a coordinator uses the server, else resets and stops serve.py.
-  Never `pkill serve.py` by hand: killing a server under a running coordinator kills the run (happened once).
-- `~/gw2_run2x8.sh <log> ENV=..` (ta4): launches the 2x8 via `examples/mlperf/.../gpt_oss/implementations/tinybox_2x8xMI350X/dev_run.sh`
-  (REMOTE=tinyamd3:6667,127.0.0.1:6667, DP=16 BS=32, ALLREDUCE_NODE_NDEVS=8). Far box first in REMOTE is load-bearing.
-- `~/gw2_run1x8r.sh` (ta4): 1x8 through the local server (REMOTE=127.0.0.1:6667). `~/gw2_run.sh` (ta3): 1x8 local.
-- `~/clang_wrap.sh` (ta4): `CC=~/clang_wrap.sh` saves every C source > 1 MB to `/tmp/cc_src_<pid>.c` and logs compile times to
-  `~/clang_wrap.log`. Not used yet: use it on the next run to get the giant per-node program sources.
-- Launch detached: `ssh -f tinyamd4 'sleep 15; cd ~ && setsid nohup ~/gw2_run2x8.sh x AMD_AQL=1 BENCHMARK=6 JITBEAM=0 AMD_ERR_DUMP=1 > ~/log 2>&1 < /dev/null &'`
-- Progress: the per-step lines are tqdm-buffered; grep the `GPTOSS_CAPTURE` json lines (flushed) or `amortized/update` later.
-- Kill with TERM (finalize releases the NICs). `pkill -f` patterns must not appear literally in the ssh command line (use `[m]odel_train`).
-- NIC wedge symptom: `AssertionError: HWRM ring_alloc: 4` at the first RDMA open. Find the NIC with
-  `REMOTE=tinyamd3:6667,127.0.0.1:6667 DEV=BNXT+RDMA python -c 'from tinygrad import Device; [Device[f"RDMA:{i}"] for i in range(16)]'`
-  (RDMA:0-7 = ta3 NICs, 8-15 = ta4). Ladder: rebind bnxt_en -> PCI bus reset -> **slot power cycle** (`/sys/bus/pci/slots/N/power`,
-  N from `cat /sys/bus/pci/slots/*/address`), which is what fixed ta4 76:00.0 today. Last resort: IPMI power cycle (then `rmmod amdgpu`).
-- Foreign users: check `pgrep -af model_train` and `sudo -n lsof /tmp/am_*.lock` before touching a box.
+- Local source of truth: `/home/nimlgen/tg-gptoss` (branch `gptoss_work2_master`, HEAD bfce4848d + uncommitted section 3). Deploy with
+  `rsync -rc --exclude __pycache__ --exclude '*.pyc' --exclude .git ./tinygrad ./extra ./examples ./test <box>:tg-gw2/` (both boxes are
+  currently identical to it except the two files marked "not deployed" in section 3).
+- No kfd on either box: the AM userspace driver runs the GPUs (`DEV=PCI+AMD`), no amdgpu module may be loaded (`lsmod | grep amdgpu`).
+- **Before every run:** `~/gw2_serve.sh` on both boxes (refuses if a coordinator is connected or a training job runs; rebinds bnxt_en
+  to revive NICs; hive_reset of all 8 GPUs; starts `extra/remote/serve.py 6667`). `/home/nimlgen/gptoss-handoff/launch.sh <script> <log> ENV..`
+  does both resets in parallel, opens all 16 NICs once (catches a wedged NIC before the run), then launches detached on ta4.
+- Launch: `launch.sh '~/gw2_run2x8.sh x' l24-xyz.log AMD_AQL=1 BENCHMARK=12 JITBEAM=3 GPTOSS_JIT_NO_WARMUP=1 HCQ2_STATS=1 PYTHONUNBUFFERED=1 SEED=42`
+  (`~/gw2_run2x8.sh` = the plain `tinybox_2x8xMI350X/dev_run.sh`, REMOTE far box first, DP=16 BS=32 ALLREDUCE_NODE_NDEVS=8). Add
+  `LAYERS=4 BENCHMARK=11 JITBEAM=0` for ~8-min iterations (4L baseline: 0.229-0.231 s/update). Logs land in ta4 `~/gptoss-perf/`.
+- Progress: `grep -v HCQ2STAT log | grep amortized`. Kill with TERM (finalize releases the NICs). NIC wedge = `HWRM ring_alloc: 4` at the
+  first RDMA open: find the NIC (`REMOTE=... DEV=BNXT+RDMA python -c 'from tinygrad import Device; [Device[f"RDMA:{i}"] for i in range(16)]'`,
+  0-7 = ta3, 8-15 = ta4 in PCI order 06,16,66,76,86,96,e6,f6), then slot power cycle: `cat /sys/bus/pci/slots/*/address` to find the slot,
+  `echo 0 > /sys/bus/pci/slots/N/power; sleep 5; echo 1 > ...`, then gw2_serve.sh again. Foreign users: `pgrep -af model_train`, `who`.
+- Analysis scripts (PROFILE=1 pickles): `/home/nimlgen/gptoss-handoff/{timeline,zoom,copyhist,bytes,conc}.py <pkl> "train @ 2" "train @ 4" AMD:1 ...`
+  (run with `cd /home/nimlgen/tg-gptoss && PYTHONPATH=.`). Reference traces there: `l4-1x8-prof.pkl` (one box) vs `l4-rdmaq-prof.pkl` (2x8).
+  PROFILE=1 distorts the 2x8 wall time (host RPC per timestamp) but the GPU timeline is real.
 
-## 3. Measured numbers (AMD_AQL=1 JITBEAM=0, 24-layer gpt-oss, c4 data)
+## 3. Changes in the tree (uncommitted, all small)
 
-| config | update 1 (eager) | updates 2-3 (2-update JIT capture + compile) | steady s/update |
-|---|---|---|---|
-| 1x8 local ta3 | 92 s | 108 s | 0.660 |
-| 1x8 via REMOTE=127.0.0.1 on ta4 | 105 s | 130 s | 0.659 |
-| 2x8 (DP=16 BS=32) before the tracker fix | 1091 s | 3941 s | 6.93 |
-| 2x8 after the tracker fix | 984 s | 1944-2247 s | 6.4-6.9 |
-| 2x8 with PROFILE=1 | 1106 s | ~4200 s | (trace pending) |
+| file | what | measured |
+|---|---|---|
+| `tinygrad/runtime/support/hcq2.py` sched_batches | RDMA sends on `COPY:{num_queues}`, receives on `COPY:{num_queues+1}` (own SDMA engines; separate rings/CQs so the two directions are independent) instead of sharing `COPY:0` with bulk xgmi copies | 4L 0.284 -> 0.241 (queue) -> 0.230 (duplex); 24L 1.25 -> 0.97 |
+| `examples/mlperf/model_train.py` | `GPTOSS_JIT_NO_WARMUP=1`: realize the lazy optimizer/scheduler/grad state, then TinyJit captures on the first call (no eager update). Without the realize the LR schedule bakes into the capture. | 24L startup: eager 512 s gone; capture 842 -> 729 s total |
+| `extra/gemm/moe_gemm.py` reduce_scatter_devaxis | with ALLREDUCE_NODE_NDEVS: each node sums its 8 contributions at the owner's rank peer in parallel, one NIC hop to the owner (was a chain node0 -> node1 -> owner) | 4L 0.241 -> 0.237 |
+| `tinygrad/schedule/multi.py` lower_broadcast_copy | broadcast = one NIC hop to each node's rank peer, then xgmi fan-out. **Required**: the flat broadcast makes cross-rank NIC copies that master stages through the linked GPU -> OOM on AMD:0 at 24L | needed to run at all |
+| `tinygrad/runtime/support/am/ip.py` interrupt_handler | read the pending IH ring entries in one slice (remote devices did one RPC per word) | (codex measured 2x on 2L with the same idea) |
+| `tinygrad/schedule/__init__.py` | `SCHED_RDMA_DELAY=N` (default 0 = off): a kernel made ready by a NIC receive is emitted N kernels later. **Untested**; the generic variant (delay every copy consumer, `SCHED_COPY_DELAY`) was measured and HURT: 4L 0.241 -> 0.256, 24L 0.905 -> 1.05. Delete if the RDMA-only variant does not help either. **Not deployed.** |
+| `extra/gptoss_kernels/embedding/__init__.py` | two-node embedding backward: node-local token gather, owner-reduce for own rows and the rank peer's rows, one 46 MB hop (today: pad each 94 MB token-grad shard to the full 1.5 GB and ALLREDUCE it, i.e. 2x the bytes of one box). **Untested, not deployed.** Test: `launch.sh '~/gptoss-perf/emb_test.sh' emb.log` (compares to the old path and to numpy, prints timings). |
 
-The remote host path costs nothing. Eval on 2x8 runs at ~7 s/batch. Loss curve is healthy.
+Codex's earlier uncommitted work (bulk PTE checks, fold_words runs, mmap dataloader, profile bulk reads, startup logging, tests) was reverted
+on the user's request; the full diff is `/home/nimlgen/gptoss-handoff/tree_full_before_revert.diff` if a piece is wanted back.
 
-## 4. The MM fault (fixed) and the other real fixes
+## 4. Where the time goes (per update, from the 1x8 vs 2x8 4-layer traces; scale backward items by 24/4)
 
-- Symptom: deterministic MMHUB fault at VA 0x389800003000 on the replication source GPU ~90 s into `model.shard`, AQL only, 2x8 only.
-- Cause: the stuck packet was always a `POLL_REGMEM` on a peer's host runtime-pool slot 0 whose VA was an exact 4 GB boundary
-  (0x200500000000; with AM_SYSMEM_VA_ALIGN=1GB it moved to 0x200600000000; polls on non-boundary pools passed; fences and polls at
-  +0x100/+0x110 of a boundary pool were fine). The fault VA is firmware garbage. Only the 16-device layout put a pool there.
-- Fix: `tinygrad/runtime/support/system.py` sysmem path: after `alloc_vaddr`, while `vaddr & 0xffffffff == 0` allocate again and free
-  the skipped ones. Unconditional now (the debug knob AM_SYSMEM_VA_NO4G is gone).
-- Other real bugs fixed on the way: AQL scratch growth rewrote the live `amd_queue_t` dispatch ids (write only the scratch fields);
-  old AQL scratch buffers freed while in use (keep-alive); bnxt `rcfw()` took async CREQ QP-error events as command responses (skip them);
-  PROFILE=1 crashed on MultiBuffer inputs in `track_stats` (getattr).
-- Clean branch for upstream: `mi350_sdma_poll_fix` (worktree `/tmp/claude-30036/-home-nimlgen-tinygrad/d3e7b5b8-4c43-4ecc-84b8-ebf22c936c97/scratchpad/wt_fixes`,
-  5 commits on origin/master, ruff+mypy clean, `test/backend/test_hcq2.py` on mockgpu passes). Not pushed.
-- Main work tree with everything (fixes + debug knobs + HCQ2_STATS + DepsTracker rewrite):
-  `/tmp/claude-30036/-home-nimlgen-tinygrad/feb482fc-5b12-4a5f-a4de-815395a61c00/scratchpad/wt_gw2` (branch gptoss_work2_master).
+- Forward: same as one box (~40 ms at 4L, kernels 100% busy).
+- Backward: 2x8 kernels ~60% busy vs 80-90% on one box. The compute stream is in order; every per-tensor reduce-scatter ends in an ADD
+  of the other node's partial, and that ADD waits for the RDMA receive (transfer 69+36 MB per layer ~2 ms at 48 GB/s, plus ~12 tiny
+  bias/norm grads per layer with their own latencies). ~6 ms/layer profiled, ~4 ms unprofiled -> ~0.1 s at 24L.
+- Extra reduce kernels: 16-way sums are 2-3 kernels per tensor vs 1 fused 8-input add on one box (+20 ms at 4L).
+- Tail (grad-norm barrier -> Adam -> weight all-gather -> next forward): +38 ms vs one box. Vocab/embedding grad chain 26 vs 7 ms
+  (section 3 last row addresses it), then the weight all-gather runs ~12 ms with compute idle, reassembly kernels after it.
+- RDMA is never bandwidth-bound (1.5 GB send + 1 GB recv per GPU per update); it is latency on the critical path.
+- Startup: capture 729 s = python scheduling/lowering of a 2x bigger graph (hcq lower ~70 s per node, sequential), clang -O2 of the
+  ~12 MB host C program per node (~130 s, parallel), link over RPC. It scales with the number of collective copies (~2400 per GPU per update).
 
-## 5. Where the 2x8 time goes (findings so far)
+## 5. What the MLPerf v6.0 submissions do (mlcommons/training_results_v6.0, `*/benchmarks/gpt_oss_20b`)
 
-py-spy profiles and scripts live in `/tmp/claude-30036/-home-nimlgen-tinygrad/d3e7b5b8-4c43-4ecc-84b8-ebf22c936c97/scratchpad/`
-(`pyspy_agg.py` aggregates `py-spy record -f raw` files; `pyspy_2x8_*.txt` are the recordings; `tracker_equiv.py`; `prof_analyze.py`).
+- All configs at <=16 GPUs are pure DP with a distributed (ZeRO) optimizer, like us. NVIDIA GB200 8 GPU: 0.43 s/step at 2 seq/GPU.
+- Reference convergence (rcps_gpt_oss_20b.json): GBS32 -> 234.7k samples (~7.3k steps), LR 8e-4, warmup 4096 samples; GBS16 -> 195k;
+  GBS64 -> 302k. The user counts 196608 sequences (16 evals x 12288) -> 6144 steps at BS=32.
+- Their tricks: **gradient bucketing** (NVIDIA 768M-element buckets; Primus on MI350X 2x8: `ddp_num_buckets 8`) so there are ~8-30
+  collectives per phase instead of ~500; reduce-scatter of each bucket overlapped with backward; **param all-gather overlapped with
+  the next forward, bucket by bucket** (`overlap_param_gather`); bf16 grads averaged in the collective; grad clip from local shard
+  norms + one scalar all-reduce; no aux loss; EP1 with grouped GEMM. Cisco: `Cisco/benchmarks/gpt_oss_20b/primus/config_MI350X_2x8x1_tp1pp1ep1_gbs64.sh`.
 
-**Steady state (6.5 s/update):** in the jitted step the coordinator only waits on the devices (`exec_copy` of the metrics ->
-`synchronize` -> `_wait_signal`/`on_sleep`/`_collect_interrupts` and timeline reads over RPC). So it is GPU/NIC time. Not yet known
-whether it is RDMA transfers, SDMA copies or kernel serialization. Rough bandwidth math says RDMA volume alone should be ~0.1 s.
-Watch out: `HCQ_RDMA_NOP=1` + `GPTOSS_ALLOW_NONFINITE=1` gives the same schedule without NIC ops (metrics go non-finite): if the step
-drops to ~0.7 s the NIC path is the cost, if not it is the schedule.
+## 6. Suggested order
 
-**Eager update 1 (16 min):** coordinator python: scheduler rewrites (~30%), hcq2 encode/lower_call (~30%), hcq_link (~7%, of which
-a good part is RPC round trips to the far box), remote RPC ~5%. The 1x8 profile has the same shape at 1/10 the time: the 16-device
-graph makes every rewrite ~10x slower, not one pathological spot. Largest single lowerings: 1.45M words, 52 s each (HCQ2_STATS).
+1. Run the embedding test (section 3), then 24L with it; expect ~-15 ms.
+2. Try `SCHED_RDMA_DELAY=16` at 4L then 24L; delete the knob if it does not win clearly.
+3. The real fix for the backward stalls is structural: either bucket a layer's gradients into one buffer (one exchange per layer,
+   MLPerf style) or move the cross-node ADD out of backward into the optimizer stage (grads stay node-partial during backward; the
+   NIC copy is issued during backward but consumed only before clipping). Both are model/optimizer-level (`examples/mlperf/optim.py`,
+   `extra/gemm/moe_gemm.py`, the layer backward), not core.
+4. Order the post-Adam all-gather layer-0 first and gate the forward per layer (the tail's 12 ms + reassembly).
+5. Below ~0.65 s the remaining gap is per-GPU compute (same on one box): kernel work or a different per-GPU batch, which changes the recipe.
 
-**JIT compile (33 min without profiling):**
-- `DepsTracker.access_resources` was 38% (per-key range lists scanned/pruned per call, quadratic). Rewritten as an interval map in
-  `tinygrad/device.py` (commit d48c36465 on gptoss_work2_master, randomized equivalence test in the scratchpad): compile 65 -> 33 min.
-- Remaining: hcq2 `lower_call` per node (one call per 8-device node, 3.8M words, ~180 s each; `encode_submit` of the SDMA copy streams
-  and the address `substitute` passes at hcq2.py:488/499/510 dominate), then **one `clang -c -O2` per node of the rendered C program,
-  35+ min at 100% of one core** (`tinygrad/runtime/support/compiler_cpu.py:21`). This clang is the biggest single item. Candidates:
-  -O1/-O0 for huge programs, splitting the per-node program into several functions/objects compiled in parallel, or shrinking it
-  (loops instead of unrolled per-device/per-update code). Use `CC=~/clang_wrap.sh` on ta4 to capture the sources first.
-- `_is_link_patch` recursion was ~8% (memoized with a WeakKeyDictionary, commit on gptoss_work2_master).
-- `HCQ2_STATS=1` prints `HCQ2STAT encode <queue> <dev>: ins= blob= patches= t=` and `HCQ2STAT lower <devices>: words= t=` per call.
-
-## 6. The profiled run (in flight at handoff)
-
-`~/gw2_2x8_prof2.log` on ta4, `AMD_AQL=1 BENCHMARK=6 JITBEAM=0 AMD_ERR_DUMP=1 PROFILE=1 HCQ2_STATS=1`, launched 20:45. Updates 1-6
-done by 22:18; it was in the eval phase at 22:25. At process exit tinygrad writes `/tmp/profile.pkl.nimlgen` on ta4 (must be MBs and
-newer than 21:00; a 1373-byte file there is from a helper process). Analyze with
-`cd wt_gw2 && PYTHONPATH=. python <scratchpad>/prof_analyze.py /path/profile.pkl.nimlgen` (lists the `train @ i` markers), then
-`... <pkl> <marker_lo> <marker_hi>` bracketing updates 4-6: per device busy time by op name, kernels vs copies vs rdma, and the busy/span
-ratio (idle gaps = waiting on peers/NIC). `python -m tinygrad.viz.cli` can also open it. A background waiter of mine may still be
-polling for the exit; ignore it.
-
-## 7. Debug knobs on gptoss_work2_master (all env, default off)
-
-AMD_ERR_DUMP=1 (hw regs, queue params, rings around rptr, page walks, per-hub fault regs, pool dump on error/hang; AMD_ERR_DUMP_FULL=1
-whole rings; AMD_ERR_FLUSH; AMD_ERR_PTSCAN), AM_RESERVE_PTABLE, AM_RESERVED_VRAM_MB, AM_SDMA_NO_CTXSW, HCQ_QUEUE_SHIFT,
-AM_SYSMEM_VA_ALIGN, AM_SYSMEM_VA_FORCE=va,va (big host pools at given VAs in allocation order), HCQ_RDMA_NOP=1, HCQ_RDMA_OPS=wqe,db,wait,fakewait,
-HCQ_RDMA_NIC_BY_RANK=1, BNXT_MR_LOG_PAGE, HCQ2_ADDRSCAN=lo-hi (prints link-time addresses in a range), HCQ2_STATS=1, GPTOSS_ALLOW_NONFINITE=1.
-mypy has attr-defined complaints in the debug code only (ops_rdma.py:74, ops_amd.py errdump); the clean branch has none.
-
-## 8. Suggested order for the profiling round
-
-1. Read the PROFILE trace (section 6). If RDMA waits dominate: look at `ops_rdma.rdma_copies` (a WQE per 1 GB chunk, doorbell, CQE wait,
-   CQ ack per copy; pairs cabled NIC k <-> NIC k, anchor rule `rdma_nic_for`) and the hierarchical allreduce placement. If SDMA copies
-   dominate: copy queue assignment `COPY:{(dst-src-1+shift) % peers % HCQ_NUM_SDMA}` in `hcq2.sched_batches`. If gaps dominate: cross-node
-   dependency chains (`_wait_ins`/`_start_ins` in hcq2.py).
-2. Confirm with HCQ_RDMA_NOP=1 GPTOSS_ALLOW_NONFINITE=1 BENCHMARK=8 (same schedule, no NIC ops).
-3. Compile: capture the per-node C sources with CC=~/clang_wrap.sh, time -O1/-O0 offline, then decide between opt level, splitting and
-   shrinking the program. Then the hcq2 lowering passes (HCQ2_STATS lines give sizes/times per call).
-4. Eager update 1 (16 min) is the last item; it is the same rewrites as 1x8, just on a 2x bigger graph with superlinear cost.
-
-Memory notes of the previous agent (more detail, chronological): `~/.claude/projects/-home-nimlgen-tinygrad/memory/project_mi350_multimachine_state.md`
-and `hcq2-aql-scratch-freed.md` (the fault RCA).
+Memory notes with more history: `~/.claude/projects/-home-nimlgen-tinygrad/memory/gptoss-2x8-step-anatomy.md`, `project_mi350_multimachine_state.md`.
