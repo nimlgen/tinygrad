@@ -385,7 +385,10 @@ def custom_fa_forward(o:UOp, l_vec:UOp, q:UOp, k:UOp, v:UOp, sinks:UOp|None=None
   full_w4 = bool(getenv("GPTOSS_FA_FULL_FWD_W4", 0) and arch == "gfx950" and has_sink and
                  (B, N, H, H_KV, D, window) == (2, 8192, 64, 8, 64, 0))
   full_lean = full_w4 and bool(getenv("GPTOSS_FA_FULL_FWD_LEAN", 0))
-  source_name = "fa_fwd_causal_d64.cpp" if full_w4 else "fa_fwd_causal_d64_window.cpp" if w4 else "fa_fwd_causal.cpp"
+  # SWA128 alternative: one workgroup per (32-query tile, KV group) with its KV tiles resident in LDS (same per-tile math).
+  gqa = w4 and bool(getenv("GPTOSS_FA_FWD_GQA", 0))
+  source_name = "fa_fwd_causal_d64.cpp" if full_w4 else "fa_fwd_causal_d64_window_gqa.cpp" if gqa else \
+                "fa_fwd_causal_d64_window.cpp" if w4 else "fa_fwd_causal.cpp"
   code = (pathlib.Path(__file__).parent / source_name).read_text()
   compile_args = [f"-I{(pathlib.Path(__file__).parent / 'include').as_posix()}", "-std=c++20", "-DKITTENS_CDNA4", "-DHIP_ENABLE_WARP_SYNC_BUILTINS", "-ffast-math",
                   f"-DATTN_B={B}", f"-DATTN_N={N}", f"-DATTN_H={H}", f"-DATTN_H_KV={H_KV}", f"-DATTN_D={D}", f"-DATTN_SINK={int(has_sink)}", f"-DWINDOW={window}"]
@@ -395,7 +398,7 @@ def custom_fa_forward(o:UOp, l_vec:UOp, q:UOp, k:UOp, v:UOp, sinks:UOp|None=None
   Q_BLOCK_SIZE = 32
   NUM_WARPS = 4 if w4 or full_w4 else 8
   NUM_THREADS = 64 * NUM_WARPS
-  gsz = (H, (math.ceil((N // Q_BLOCK_SIZE) / NUM_WARPS)), B)
+  gsz = (H_KV, N // Q_BLOCK_SIZE, B) if gqa else (H, (math.ceil((N // Q_BLOCK_SIZE) / NUM_WARPS)), B)
   lsz = (NUM_THREADS, 1, 1)
   threadIdx_x = UOp.special(lsz[0], "lidx0")
   blockIdx_x, blockIdx_y, blockIdx_z = UOp.special(gsz[0], "gidx0"), UOp.special(gsz[1], "gidx1"), UOp.special(gsz[2], "gidx2")
@@ -407,6 +410,7 @@ def custom_fa_forward(o:UOp, l_vec:UOp, q:UOp, k:UOp, v:UOp, sinks:UOp|None=None
   buf_inputs = (o.base, l_vec.base, q.base, k.base, v.base) + ((sinks.base,) if has_sink else ())
   name = "custom_fa_forward_d64_full_w4" if full_w4 else "custom_fa_forward_d64_window_w4" if w4 else "custom_fa_forward"
   if full_lean: name += "_lean1"
+  if gqa: name += "_gqa"
   sink = UOp.sink(*buf_inputs,
                   threadIdx_x, blockIdx_x, blockIdx_y, blockIdx_z,
                   arg=KernelInfo(name=name, estimates=estimates))
@@ -415,7 +419,7 @@ def custom_fa_forward(o:UOp, l_vec:UOp, q:UOp, k:UOp, v:UOp, sinks:UOp|None=None
   if not getenv("NO_HIPCC"):
     lib = bytearray(lib)
     rodata_off = next(sh.header.sh_offset for sh in elf_loader(bytes(lib))[1] if sh.name == ".rodata")
-    struct.pack_into('<I', lib, rodata_off, 32768 if w4 or full_w4 else 160000)
+    struct.pack_into('<I', lib, rodata_off, 49152 if gqa else 32768 if w4 or full_w4 else 160000)
     lib = bytes(lib)
 
   return UOp(Ops.PROGRAM,

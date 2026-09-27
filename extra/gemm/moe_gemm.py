@@ -91,12 +91,43 @@ def _finish_expert_wgrad(t:Tensor) -> Tensor:
   # The reduced GPT-OSS shard already has the backward boundary's exact layout. Keep apply_grad's owned
   # destination unchanged, but avoid an extra identity copy before returning the reduced gradient.
   if t.shape in ((32, 5888, 3072), (32, 3072, 3072)) and t.dtype == dtypes.bfloat16 and \
-      isinstance(t.device, tuple) and len(t.device) == 8 and t.uop.axis == 0: return t
+      isinstance(t.device, tuple) and len(t.device) in (8, 16) and t.uop.axis == 0: return t
   return t.contiguous()
 
 def _sum_uops(xs:list[UOp]) -> UOp: return functools.reduce(lambda a,b: a.alu(Ops.ADD, b), xs)
 
+@functools.cache
+def _trimmed_reduce_fxn(param:UOp, experts:int, rows:int, cols:int, node_size:int) -> UOp:
+  # only the live rectangle of the zero-padded per-expert gradients moves: node partial sums on the owner's counterpart, one nic hop
+  t = Tensor(param)
+  devs = t.device
+  assert isinstance(devs, tuple) and t.uop.axis == 0 and param.op is Ops.UNSHARD
+  ndev = len(devs)
+  physical_rows, physical_cols = t.shape[1] // experts, t.shape[2]
+  assert t.shape == (ndev, experts*physical_rows, physical_cols) and experts % ndev == 0 and ndev % node_size == 0
+  assert 0 < rows <= physical_rows and 0 < cols <= physical_cols
+  raw, owned = param.src[0], experts // ndev
+  shards = []
+  for i in range(ndev):
+    live = lambda j: raw.mselect(j).reshape((experts, physical_rows, physical_cols)).shrink(((i*owned, (i+1)*owned), (0, rows), (0, cols)))
+    partials = [_sum_uops([live(j).copy_to_device(devs[start + i % node_size]) for j in range(start, start+node_size)]) for start in range(0, ndev, node_size)]
+    reduced = _sum_uops([p.copy_to_device(devs[i]) for p in partials])
+    shards.append(reduced.pad(((0, 0), (0, physical_rows-rows), (0, physical_cols-cols))))
+  return UOp.mstack(*shards).unshard(0, UOp.range(ndev, -1, AxisType.DEVICE)).reshape((experts*physical_rows, physical_cols))
+
+# two-node expert weight grads (16 gpus): (devices, experts*padded rows, cols) -> live rows of the fc1 / down expert gradients
+TRIMMED_EXPERT_GRADS:dict[tuple, int] = {(16, 32*5888, 3072): 5760, (16, 32*3072, 3072): 2880}
+
+def _trimmed_reduce_scatter(out:Tensor, live_rows:int) -> Tensor:
+  assert isinstance(out.device, tuple) and len(out.device) == 16 and getenv("GPTOSS_WGRAD_TAIL") and getenv("GPTOSS_DOWN_WGRAD_TAIL", 1)
+  fxn = _trimmed_reduce_fxn(out.uop.param_like(0), 32, live_rows, 2880, 8)
+  # the fc1 reduce goes through the deferred-gradient boundary (GPTOSS_DEFER_FC1_REDUCE marker), the arithmetic is the same
+  aux = "gptoss_fc1_reduce" if live_rows == 5760 else None
+  return Tensor(fxn.call_with_output(out.uop, name="trimmed_expert_reduce", aux=aux, precompile=False), device=out.device)
+
 def reduce_scatter_devaxis(out:Tensor, shard_axis:int=0) -> Tensor:
+  if (live_rows:=TRIMMED_EXPERT_GRADS.get(out.shape)) and shard_axis == 0 and ALLREDUCE_NODE_NDEVS.value == 8:
+    return _trimmed_reduce_scatter(out, live_rows)
   # out: multi tensor device-sharded on axis 0 (1 slice/device), logical shape (ndev, *rest); each device holds
   # its partial. Returns sum over the device axis, left SHARDED on `shard_axis` of the *rest result. Clean all2all:
   # device i pulls ONLY its shard-rows from every device's physical partial (via mselect, no device-0 hub) and
@@ -143,7 +174,7 @@ def _sum_expert_chunks(chunks:list[Tensor]) -> Tensor:
   # Wgrad writes each destination's four experts into a separate allocation. Peer copies can use that whole
   # allocation directly, avoiding the contiguous staging kernels required by slices of the full expert buffer.
   devs = chunks[0].device
-  assert isinstance(devs, tuple) and len(chunks) == len(devs) == 8
+  assert isinstance(devs, tuple) and len(chunks) == 8 and len(devs) in (8, 16)
   raw = []
   for t in chunks:
     assert t.device == devs and t.uop.axis == 0 and t.shape == chunks[0].shape
@@ -152,11 +183,15 @@ def _sum_expert_chunks(chunks:list[Tensor]) -> Tensor:
       if node.op is Ops.AFTER: barriers.extend(node.src[1:])
       node = node.src[0]
     raw.append(node.src[0].after(*barriers) if barriers else node.src[0])
-  reduced = []
-  for i, device in enumerate(devs):
-    inputs = [raw[i].mselect(j).copy_to_device(device) for j in range(len(devs))]
-    # Preserve reduce_scatter_devaxis's rank order and BF16 rounding after each addition.
-    reduced.append(functools.reduce(lambda a,b: a.alu(Ops.ADD, b), inputs))
+  # Preserve reduce_scatter_devaxis's rank order and BF16 rounding after each addition.
+  if len(devs) == 8: reduced = [_sum_uops([raw[i].mselect(j).copy_to_device(d) for j in range(8)]) for i,d in enumerate(devs)]
+  else:
+    # two nodes of 8: in-node gpu k sums buffer k (shards k and k+8) from its node, then each shard's half takes one nic hop
+    rows = chunks[0].shape[1] // 2
+    def node_half(node:int, k:int, half:int) -> UOp:
+      copies = [raw[k].mselect(j).copy_to_device(devs[node+k]) for j in range(node, node+8)]
+      return _sum_uops([c.shrink(((0, 1), (half*rows, (half+1)*rows), (0, c.shape[2]))) for c in copies])
+    reduced = [_sum_uops([node_half(node, i % 8, i // 8).copy_to_device(d) for node in (0, 8)]) for i,d in enumerate(devs)]
   return Tensor(UOp.mstack(*reduced).unshard(0, UOp.range(len(devs), -1, AxisType.DEVICE)), device=devs)
 
 def custom_hk_grouped_mxfp8_gemm(C:UOp, A:UOp, B:UOp, scale_A:UOp, scale_B:UOp, *extra:UOp, dname:str, n_experts:int,
@@ -1052,7 +1087,7 @@ def _fc1_swiglu_bwd(gradient:UOp, kernel:UOp, *, handoff:tuple[int, bool, bool])
 
 @functools.cache
 def custom_hk_grouped_mxfp8_wgrad(C:UOp, A:UOp, B:UOp, scale_A:UOp, scale_B:UOp, expert_off:UOp, *extra:UOp,
-                                  dname:str, n_experts:int, direct_shards:bool=False) -> UOp:
+                                  dname:str, n_experts:int, direct_shards:int=0) -> UOp:
   N, M = A.shape
   K, M2 = B.shape
   assert M == M2, f"{A.shape} {B.shape}"
@@ -1233,7 +1268,8 @@ def grouped_mx_wgrad(g:Tensor, xg:Tensor|None, expert_off:Tensor, n_experts:int,
   if use_expert_counts:
     assert expert_counts is not None and expert_counts.dtype == dtypes.int32 and expert_counts.shape[-1] == n_experts, \
       f"expert counts must end in ({n_experts},) int32, got {expert_counts.shape} {expert_counts.dtype}"
-  direct_shards = (is_multi and len(g.device) == 8 and ZERO2 and use_expert_counts and not do_bias and
+  node_pairs = is_multi and len(g.device) == 16 and ALLREDUCE_NODE_NDEVS.value == 8
+  direct_shards = (is_multi and (len(g.device) == 8 or node_pairs) and ZERO2 and use_expert_counts and not do_bias and
                    not getenv("FUSED_WGRAD_QUANT", 0) and bool(getenv("GPTOSS_WGRAD_SHARDS", 1)))
   # A fused producer can guarantee a dense row-major output with the exact (M,N) shape this custom kernel reads.
   # Preserve that buffer identity instead of forcing a full bf16 copy before transpose-quantize.
@@ -1262,7 +1298,7 @@ def grouped_mx_wgrad(g:Tensor, xg:Tensor|None, expert_off:Tensor, n_experts:int,
       chunks = [Tensor(Tensor.invalids(1, 4*N, K, dtype=dtypes.bfloat16, device=g.device).uop.unshard(0), device=g.device)
                 for _ in range(8)]
       wys = Tensor.custom_kernel(chunks[0], gT, xT, g_si, x_si, expert_off, expert_counts, *chunks[1:],
-        fxn=functools.partial(custom_hk_grouped_mxfp8_wgrad, dname=dname, n_experts=n_experts, direct_shards=True))
+        fxn=functools.partial(custom_hk_grouped_mxfp8_wgrad, dname=dname, n_experts=n_experts, direct_shards=2 if node_pairs else 1))
       out = _reduce_scatter_expert_chunks([wys[0], *wys[7:14]])
     else:
       wargs = ((out, gT, xT, g_si, x_si, expert_off, bout, g) if do_bias else

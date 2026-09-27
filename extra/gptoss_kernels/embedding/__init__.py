@@ -68,19 +68,38 @@ def _custom_reduce(out:UOp, grad_emb:UOp, head:UOp, next_idx:UOp, *row_offset:UO
 def _vocab_row_offsets(device:tuple[str, ...], vocab:int, ranks:tuple[int, ...]) -> Tensor:
   return Tensor([rank*(vocab//len(device)) for rank in ranks], dtype=dtypes.int32).shard(device, 0).realize()
 
-def _shards(t:Tensor) -> UOp: # the raw per-device buffers of an axis-0 sharded tensor, keeping the kernel-write barriers
-  node, barriers = t.uop, []
-  while node.op is not Ops.UNSHARD:
-    if node.op is Ops.AFTER: barriers += node.src[1:]
-    node = node.src[0]
-  return node.src[0].after(*barriers) if barriers else node.src[0]
+def _shards(t:Tensor) -> UOp:
+  # Keep logical views while removing the distributed axis marker. A token slice may still
+  # reference an 8193-token physical allocation; dropping its SHRINK changes the token count.
+  u = t.uop
+  if u.op is Ops.UNSHARD: return u.src[0]
+  parent = Tensor(u.src[0], device=t.device)
+  raw = _shards(parent)
+  if u.op is Ops.AFTER: return raw.after(*u.src[1:])
+  if u.op is Ops.RESHAPE: return raw.reshape(u.shard_shape)
+  if u.op is Ops.SHRINK:
+    axis = parent.uop.axis
+    assert axis is not None and u.marg[axis] == (0, parent.shape[axis]), "partial sharded-axis slice unsupported"
+    return raw._mop(Ops.SHRINK, tuple((0, raw.shape[i]) if i == axis else v for i,v in enumerate(u.marg)))
+  if u.op is Ops.PERMUTE: return raw.permute(u.marg)
+  if u.op is Ops.CAST: return raw.cast(u.dtype)
+  if u.op is Ops.CONTIGUOUS: return raw.contiguous()
+  raise NotImplementedError(f"unsupported shard view {u.op}")
 
-def _node_gather(t:Tensor, n:int) -> Tensor: # every gpu gets its node's shards along axis 0 (a per-device value), no nic traffic
+@functools.cache
+def _node_gather_fxn(param:UOp, n:int) -> UOp:
+  t = Tensor(param)
   devs, raw = t.device, _shards(t)
   assert t.uop.axis == 0
   nodes = [devs[i:i+n] for i in range(0, len(devs), n)]
   per_dev = [Tensor.cat(*[Tensor(raw.mselect(devs.index(s))).to(d) for s in node]) for node in nodes for d in node]
-  return Tensor(UOp.mstack(*[x.uop for x in per_dev]), device=devs)
+  return UOp.mstack(*[x.uop for x in per_dev])
+
+def _node_gather(t:Tensor, n:int) -> Tensor:
+  # Bind the complete logical view at a call boundary before selecting physical lanes.
+  # Peeling a caller's view directly bypasses its PARAM identity in an enclosing function.
+  out = _node_gather_fxn(t.uop.param_like(0), n)
+  return Tensor(out.call_with_output(t.uop, name="embedding_node_gather", precompile=True), device=t.device)
 
 def embedding_bwd_two_nodes(grad_emb:Tensor, idx:Tensor, vocab:sint, n:int) -> Tensor:
   # each node reduces its own tokens for its rows and for its rank peers' rows: 46 MB crosses the nic instead of every token's grad

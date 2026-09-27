@@ -143,7 +143,10 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
 
   # next slot and psn persist in nic memory. read once per submit and own it
   bumps = [seq.index(0).store(seq.index(0).load() + wqes)] + ([] if is_recv else [psn.index(0).store(psn.index(0).load() + packets)])
-  n, p = seq.after(*bumps).index(0).load() - wqes, psn.after(*bumps).index(0).load() - packets
+  n0, p0 = seq.after(*bumps).index(0).load() - wqes, psn.after(*bumps).index(0).load() - packets
+  # words are templates over the wqe and psn offsets: the host program patches them in one loop per template
+  wqe_v, psn_v, next_psn_v = (UOp.variable(f"rdma_{x}", 0, 0xffffffff, dtypes.uint64) for x in ("wqe", "psn", "next_psn"))
+  j, pj = 0, 0
 
   ring_addr, cq_addr = ring.getaddr(devs), cq.getaddr(devs)
   db = rdma_db(nic.device, pair).getaddr(devs) + (nic.iface.dev_impl.db_off & 0xfff)
@@ -155,6 +158,7 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
     ops:list[UOp] = []
     for off in range(0, buf.nbytes(), RDMA_CHUNK): # a wqe per chunk, each completed
       size = min(RDMA_CHUNK, buf.nbytes() - off)
+      n, p, p_next = n0 + wqe_v.bind(j), p0 + psn_v.bind(pj), p0 + next_psn_v.bind(pj + ceildiv(size, MTU))
 
       # sdma fills in the wqe
       hdr, key = struct.unpack("<8I", (recv_wqe if is_recv else send_wqe)(0, 0, size)[:32]), unwrap_view(buf)[0].getaddr(nic.device)
@@ -163,7 +167,7 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
 
         # a send also fills in its msn entry: the slot, the psn after it (a psn per packet), its first psn
         if not is_recv: ops += [ins("write", ring_addr + RING_ENTRIES * WQE_SIZE + (n % RING_ENTRIES) * 8,
-                                    ((n % RING_ENTRIES) << 48) | (((p + ceildiv(size, MTU)) & 0xffffff) << 24) | (p & 0xffffff))]
+                                    ((n % RING_ENTRIES) << 48) | ((p_next & 0xffffff) << 24) | (p & 0xffffff))]
 
       # rings the doorbell: the slot after the wqe and the epoch of its pass
       if "db" in emit:
@@ -175,7 +179,7 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
       if "wait" in emit or "fakewait" in emit:
         ops += [ins("wait_eq", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint16)),
                 ins("write", db, ((n + 1) % CQ_ENTRIES | ((n + 1) // CQ_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | cq_db)]
-      n, p = n + 1, p + ceildiv(size, MTU)
+      j, pj = j + 1, pj + ceildiv(size, MTU)
 
     # and invalidate the gpu caches on recv
     copies.append(ops + ([ins("barrier")] if is_recv and phase != "post" else []))

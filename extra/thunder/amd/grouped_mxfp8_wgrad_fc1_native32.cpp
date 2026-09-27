@@ -663,13 +663,19 @@ __global__ __launch_bounds__(512, 2) void grouped_mxfp8_wgrad_kernel(bf16 *C_ptr
     #undef PACK_B_SCALES
 #if GPTOSS_WGRAD_SHARDS
     static_assert(E == 32 && !FUSED_WGRAD_DBIAS);
+#if GPTOSS_WGRAD_SHARDS == 2
+    // two nodes of 8: buffer k holds shards k and k+8 (two experts each), both reduced first by in-node gpu k
+    const int shard_buf = (e % 16) / 2, shard_slot = (e / 16) * 2 + e % 2;
+#else
+    const int shard_buf = e / 4, shard_slot = e % 4;
+#endif
     bf16 *dst = C_ptr;
-    switch (e / 4) {
+    switch (shard_buf) {
       case 1: dst=C1; break; case 2: dst=C2; break; case 3: dst=C3; break;
       case 4: dst=C4; break; case 5: dst=C5; break; case 6: dst=C6; break; case 7: dst=C7; break;
     }
     kittens::gl<bf16, 1, 1, (E/8) * N, K> C{dst, nullptr, nullptr, nullptr, nullptr};
-    const int crow_base = (e % 4) * (N / REG_M);
+    const int crow_base = shard_slot * (N / REG_M);
 #else
     const int crow_base = e * (N / REG_M);   // grad_w rows are experts stacked; store coord is in REG_M units
 #endif

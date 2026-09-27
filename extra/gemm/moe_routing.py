@@ -13,6 +13,7 @@ FUSED_DISPATCH_COLW = getenv("FUSED_DISPATCH_COLW", 0)
 GPTOSS_DISPATCH_THREADS = getenv("GPTOSS_DISPATCH_THREADS", 128)
 assert GPTOSS_DISPATCH_THREADS in (128, 256), "GPTOSS_DISPATCH_THREADS must be 128 or 256"
 GGATHER_SUM_HIP = getenv("GGATHER_SUM_HIP", 0)
+ROUTE_META_HIP = getenv("ROUTE_META_HIP", 0)
 GGATHER_SUM_THREADS = getenv("GGATHER_SUM_THREADS", 64)
 assert GGATHER_SUM_THREADS in (64, 128, 192, 256), "GGATHER_SUM_THREADS must be 64, 128, 192, or 256"
 # BEAM_GLUE=1 -> custom glue kernels use opts_to_apply=None (beam-searches them toward hw max) instead of () (naive).
@@ -456,9 +457,27 @@ def route(logits:Tensor, experts_per_tok:int, n_experts:int, topk_out:tuple[Tens
     weights = topv.softmax(-1)
   return route_topk(weights, topi, n_experts)
 
+@functools.cache
+def _route_meta_kernel(counts:UOp, off:UOp, dest_row:UOp, topi:UOp, *, dname:str) -> UOp:
+  G, Mk = dest_row.shape
+  E = counts.shape[1]
+  assert topi.shape == (G, Mk) and off.shape == (G, E + 1)
+  zero = UOp.const(0, dtypes.int32)
+  accesses = tuple(x.index(zero).store(zero) for x in (counts, off, dest_row)) + (topi.index(zero).load(),)
+  sink = UOp.sink(counts.base, off.base, dest_row.base, topi.base, *accesses, UOp.special(256, "lidx0"), UOp.special(G, "gidx0"),
+                  arg=KernelInfo(f"moe_route_meta_{Mk}_{E}", estimates=Estimates(ops=G*Mk*2, mem=G*Mk*8)))
+  src = (pathlib.Path(__file__).parent.parent/"thunder"/"amd"/"moe_route_meta.cpp").read_text()
+  lib = HIPCCCompiler("gfx950", ["-std=c++20", f"-DMK_DIM={Mk}", f"-DE_DIM={E}", f"-DBLOCK_ROW={BLOCK_ROW}", "-DTHREADS=256"]).compile_cached(src)
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)))
+
 def route_topk(weights:Tensor, topi:Tensor, n_experts:int) -> Routing:
   G, T_l, k = weights.shape
   E, m_l = n_experts, m_max_for(T_l, k, n_experts)
+  if ROUTE_META_HIP:
+    outs = [_sharded_invalids(shape, dtypes.int32, topi.device) for shape in ((G, E), (G, E + 1), (G, T_l * k))]
+    counts, off, dest_row = Tensor.custom_kernel(*outs, topi.reshape(G, T_l * k).cast(dtypes.int32),
+      fxn=functools.partial(_route_meta_kernel, dname=str(topi.device)))[:3]
+    return Routing(weights, dest_row, off, m_l, G, T_l, topi=topi, counts=counts)
   m = topi.reshape(G, T_l * k).cast(dtypes.int32).one_hot(E).cast(dtypes.int32)
 
   counts = m.sum(1)

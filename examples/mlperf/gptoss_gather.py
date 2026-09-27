@@ -4,12 +4,15 @@ from tinygrad.helpers import getenv
 
 class DeferredExpertGather:
   # Transient coordination must not enter the model/optimizer checkpoint state.
-  __slots__ = ('entries', 'dirty')
+  __slots__ = ('entries', 'dirty', 'stage_now', 'prefetch_now')
 
   def __init__(self, optimizer, model):
     from examples.mlperf import optim as implementation
     assert implementation.FUSED_ADAM_MXFP8 and implementation.MXFP8 and not implementation.PRESTORE_WT
     self.entries, self.dirty = {}, False
+    # GPTOSS_DEFER_EXPERT_GATHER=2 flips these per update of a captured group: only the group's last update stages its shards and only
+    # the first forward gathers them, so the end-of-graph expert gather runs at the next graph's start under its forward
+    self.stage_now = self.prefetch_now = True
     for weights in zip(model.w_gate_up, model.w_down):
       for parameter in weights:
         matches = [o for o in optimizer.optimizers if any(p is parameter for p in o.params)]

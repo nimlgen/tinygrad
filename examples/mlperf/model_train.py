@@ -1,4 +1,4 @@
-import os, time, math, functools, random, contextlib
+import os, time, math, functools, random, contextlib, signal
 from pathlib import Path
 import multiprocessing
 
@@ -1649,6 +1649,8 @@ def train_gptoss():
   from examples.mlperf.optim import GradAccClipAdamW, GradAccClipAdamWGroup, clip_grads_lazy
 
   BENCHMARK = getenv("BENCHMARK")
+  # training batch readers, spawned before any device is opened (a fork would share its DMA memory); they read nothing until run_start
+  data_pool = multiprocessing.get_context("spawn").Pool(getenv("GPTOSS_DATA_WORKERS", 8)) if not getenv("FAKEDATA", 0) else None
 
   config = {}
   STEP_GROUP = config["GPTOSS_STEP_GROUP"] = getenv("GPTOSS_STEP_GROUP", 1)
@@ -1684,6 +1686,27 @@ def train_gptoss():
 
   Tensor.manual_seed(SEED)  # seed for weight initialization
 
+  # ** mlperf logging **: INITMLPERF marks the untimed setup (dev_beam), RUNMLPERF the timed run (dev_run)
+  INITMLPERF, RUNMLPERF, MLLOGGER = getenv("INITMLPERF"), getenv("RUNMLPERF"), None
+  if getenv("LOGMLPERF"):
+    from mlperf_logging import mllog
+    import mlperf_logging.mllog.constants as mllog_constants
+    mllog.config(filename=f"result_gptoss_{SEED}.log")
+    mllog.config(root_dir=Path(__file__).resolve().parents[2].as_posix())  # __file__ is relative under runpy
+    MLLOGGER = mllog.get_mllogger()
+    MLLOGGER.logger.propagate = False
+    if INITMLPERF:
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_ORG, value="tinycorp")
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_PLATFORM, value=getenv("SUBMISSION_PLATFORM", "tinybox"))
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_DIVISION, value=mllog_constants.CLOSED)
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_STATUS, value=mllog_constants.ONPREM)
+      MLLOGGER.event(key=mllog_constants.SUBMISSION_BENCHMARK, value="gpt_oss_20b")
+      # a multi-stage setup clears the cache and starts the init clock only in its first stage
+      if not getenv("INIT_RESUME"):
+        diskcache_clear()
+        MLLOGGER.event(key=mllog_constants.CACHE_CLEAR, value=True)
+        MLLOGGER.start(key=mllog_constants.INIT_START, value=None)
+
   # ** init wandb **
   WANDB = getenv("WANDB")
   if WANDB:
@@ -1716,8 +1739,13 @@ def train_gptoss():
   is_offload_optim = bool(getenv("OFFLOAD_OPTIM"))
   is_fake_offload = Device.DEFAULT == "NULL"
   optim_device = ("CPU" if not is_fake_offload else "NULL:99") if is_offload_optim else None
-  params_wd = [p for p in params if p.ndim >= 3]
-  params_no_wd = [p for p in params if p.ndim < 3]
+  if getenv("GPTOSS_REF_WD", 0):
+    # reference weight decay: every weight matrix (embedding and lm head too), no biases, norms or attention sinks
+    no_wd = {id(v) for k, v in get_state_dict(model).items() if any(x in k for x in ("bias", "norm", "sinks"))}
+    params_wd, params_no_wd = [p for p in params if id(p) not in no_wd], [p for p in params if id(p) in no_wd]
+  else:
+    params_wd = [p for p in params if p.ndim >= 3]
+    params_no_wd = [p for p in params if p.ndim < 3]
   optim = GradAccClipAdamWGroup(
     GradAccClipAdamW(params_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=opt_adamw_weight_decay, grad_acc=grad_acc, device=optim_device),
     GradAccClipAdamW(params_no_wd, lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2, eps=opt_adamw_epsilon, weight_decay=0.0, grad_acc=grad_acc, device=optim_device),
@@ -1842,7 +1870,9 @@ def train_gptoss():
     inputs = tuple(t.to(None).contiguous() for t in batches)
     Tensor.realize(*inputs)
     saved = []
-    for tokens in inputs:
+    for j, tokens in enumerate(inputs):
+      if deferred_experts is not None and getenv("GPTOSS_DEFER_EXPERT_GATHER", 0) == 2:
+        deferred_experts.prefetch_now, deferred_experts.stage_now = j == 0, j == len(inputs) - 1
       loss_gpu, grad_norm = train_math(tokens)
       lr_saved, grad_norm_saved = optim.lr.float().clone(), grad_norm.float().clone()
       Tensor.realize(loss_gpu, lr_saved, grad_norm_saved, *grads, *fp8_inv_scales)
@@ -1852,11 +1882,37 @@ def train_gptoss():
     return metrics
 
   train_group = TinyJit(grouped_math)
+  def realize_lazy_state():
+    # grad buffers, moments, step counters. a ZeRO-sharded one realizes through its full replicated source: realized together, those
+    # transients alone exceed a 1x8 gpu (DP=8 BS=16), so GPTOSS_LAZY_REALIZE_GB caps each batch by logical size (0: one batch)
+    lazy, budget = [t for t in get_parameters([optim, scheduler, grads]) if not t.uop.is_realized], getenv("GPTOSS_LAZY_REALIZE_GB", 0) * 1e9
+    batch, size = [], 0
+    for t in lazy:
+      batch, size = batch + [t], size + t.nbytes()
+      if budget and size >= budget: Tensor.realize(*batch); batch, size = [], 0
+    if batch: Tensor.realize(*batch)
   # capture on the first call: the eager warmup update lowers the whole graph once more for nothing
   if (jit_no_warmup := bool(getenv("GPTOSS_JIT_NO_WARMUP"))):
     # the warmup's other job: realize lazy state (grad buffers, moments, step counters), else the capture bakes their initial values
-    Tensor.realize(*[t for t in get_parameters([optim, scheduler, grads]) if not t.uop.is_realized])
+    realize_lazy_state()
     train_step.cnt = train_group.cnt = 1
+
+  # GPTOSS_JIT_SAVE: pickle the captured training jit (in dev_beam, untimed); GPTOSS_JIT_LOAD: run the pickled one instead of capturing
+  from examples.mlperf.gptoss_jitcache import save_jit, load_jit
+  def jit_state() -> dict[str, Tensor]:
+    return {**{f"model.{k}": v for k, v in get_state_dict(model).items()}, **{f"optim.{k}": v for k, v in get_state_dict(optim).items()},
+            **{f"sched.{k}": v for k, v in get_state_dict(scheduler).items()}, **{f"grads.{i}": g for i, g in enumerate(grads)},
+            # slotted helpers get_state_dict can't see: their mailboxes carry state from one update to the next
+            **({"lmhead.mailbox": deferred_lmhead.mailbox} if deferred_lmhead is not None else {}),
+            **({f"experts.{i}.{j}": m for i, (_, ms, _, _) in enumerate(deferred_experts.entries.values()) for j, m in enumerate(ms)}
+               if deferred_experts is not None else {})}
+  if getenv("GPTOSS_JIT_DEBUG"):
+    from examples.mlperf.gptoss_jitcache import named_buffers
+    _pre_capture_bufs = {n: id(b) for n, b in named_buffers(jit_state()).items()}
+  if (jit_load := getenv("GPTOSS_JIT_LOAD", "")):
+    assert STEP_GROUP > 1 and jit_no_warmup, "GPTOSS_JIT_LOAD replays the grouped capture"
+    realize_lazy_state()
+    train_group = load_jit(jit_state(), jit_load)
 
   @TinyJit
   @Context(TRAINING=0)
@@ -1866,6 +1922,30 @@ def train_gptoss():
     logits:Tensor = model(tokens[:, :-1])
     loss = logits.sparse_categorical_crossentropy(tokens[:, 1:])
     return loss.flatten().float().contiguous().to("CPU")
+  jit_save_eval, jit_load_eval = getenv("GPTOSS_JIT_SAVE_EVAL", ""), getenv("GPTOSS_JIT_LOAD_EVAL", jit_load + ".eval")
+  if jit_load and EVAL_BS and not jit_save_eval and os.path.exists(jit_load_eval): eval_step = load_jit(jit_state(), jit_load_eval)
+
+  # GPTOSS_DRAIN_JIT: the deferred gathers' drain before every eval as one captured graph (saved next to the eval graph as <pkl>.drain).
+  # eager, the expert drain lowers and launches ~24k calls one by one: 89 s per eval on 2x8
+  def drain_math():
+    if deferred_experts is not None: deferred_experts.prefetch()
+    if deferred_lmhead is not None: deferred_lmhead.prefetch()
+    Tensor.realize(*[t for targets, _, _, _ in (deferred_experts.entries.values() if deferred_experts is not None else []) for t in targets],
+                   *([deferred_lmhead.parameter] if deferred_lmhead is not None else []))
+  drain_jit = TinyJit(drain_math) if deferred_experts is not None and getenv("GPTOSS_DRAIN_JIT", 1) else None
+  # captured on its first call like the training graph (GPTOSS_DRAIN_JIT_WARMUP=1: one eager call first, like the eval graph)
+  if drain_jit is not None and not getenv("GPTOSS_DRAIN_JIT_WARMUP", 0): drain_jit.cnt = 1
+  if drain_jit is not None and jit_load and os.path.exists(jit_load + ".drain"): drain_jit = load_jit(jit_state(), jit_load + ".drain")
+  def drain_deferred():
+    if drain_jit is None or not ((deferred_experts is not None and deferred_experts.dirty) or (deferred_lmhead is not None and deferred_lmhead.dirty)):
+      if deferred_experts is not None: deferred_experts.drain()
+      if deferred_lmhead is not None: deferred_lmhead.drain()
+      return
+    while True:
+      drain_jit()
+      if drain_jit.captured is not None: break
+    for d in (deferred_experts, deferred_lmhead):
+      if d is not None: d.dirty = False
 
   # ** data iters **
   def fake_data(bs, samples):
@@ -1875,13 +1955,79 @@ def train_gptoss():
       fake_data_np = np.random.randint(0, real_vocab_size, size=(bs, SEQLEN + 1), dtype=np.int32)
       yield Tensor(fake_data_np, device="NPY")
 
+  if jit_save_eval:
+    # eval-only capture (dev_beam, fake batch) against the loaded training state
+    if deferred_experts is not None: deferred_experts.drain()
+    if deferred_lmhead is not None: deferred_lmhead.drain()
+    fake_eval = next(fake_data(EVAL_BS, EVAL_BS))
+    for _ in range(2): eval_step(fake_eval)  # warmup + capture (a first-call capture hangs its first replay)
+    save_jit(eval_step, jit_state(), jit_save_eval)
+    st = time.perf_counter()
+    for _ in range(4): losses = eval_step(fake_eval).numpy()
+    # fake_data rows are one seeded stream: the first 16 sequences match across EVAL_BS
+    print(f"eval check: {(time.perf_counter()-st)/4*1000:.1f} ms/batch of {EVAL_BS}, first 16 seq mean loss {losses[:16*SEQLEN].mean():.6f}")
+    return
+
   def get_train_iter():
     if getenv("FAKEDATA", 0):
       return fake_data(BS, SAMPLES)
     else:
-      from examples.mlperf.dataloader import batch_load_llama3
-      return batch_load_llama3(BS, SAMPLES, SEQLEN, BASEDIR, seed=DATA_SEED, val=bool(TRAIN_ON_VAL), small=True)
+      from examples.mlperf.dataloader import batch_load_llama3_pool
+      assert data_pool is not None and not TRAIN_ON_VAL
+      return batch_load_llama3_pool(data_pool, BS, SAMPLES, SEQLEN, BASEDIR, DATA_SEED, small=True)
 
+  if (capture_first:=getenv("GPTOSS_CAPTURE_FIRST", 0)):
+    # setup and timed run in one process (no gap for another job to take the gpus): capture the training and eval graphs on fake
+    # batches before the dataset is touched, then put back the initial state the captured updates changed
+    assert STEP_GROUP > 1 and jit_no_warmup and not jit_load and EVAL_BS
+    capture_st = time.perf_counter()
+    initial = {n: t.clone() for n, t in jit_state().items() if t.device is not None}  # device-less state (freqs_cis) is a constant
+    Tensor.realize(*initial.values())
+    train_group(*[next(fake_data(BS, BS)) for _ in range(STEP_GROUP)])
+    if deferred_experts is not None: deferred_experts.drain()
+    if deferred_lmhead is not None: deferred_lmhead.drain()
+    Tensor.realize(*[t.assign(initial[n]) for n, t in jit_state().items() if n in initial])
+    del initial  # before the eval capture: its activations don't fit next to a second copy of the state
+    for _ in range(2): eval_step(next(fake_data(EVAL_BS, EVAL_BS)))  # warmup + capture (a first-call capture hangs its first replay)
+    for dev in device: Device[dev].synchronize()
+    print(f"gptoss: captured and restored in {time.perf_counter()-capture_st:.1f}s", flush=True)
+
+  # MLPerf run_start: model init (and graph capture or load + link) is done, the dataset is touched from here on
+  run_start = time.time()
+  print(f"run_start {time.strftime('%Y-%m-%dT%H:%M:%S')}", flush=True)
+  if MLLOGGER and RUNMLPERF:
+    # init spans the setup process (init_start there) and this one's graph load + link, up to here
+    MLLOGGER.end(key=mllog_constants.INIT_STOP, value=None)
+    MLLOGGER.start(key=mllog_constants.RUN_START, value=None)
+    MLLOGGER.event(key=mllog_constants.SEED, value=SEED)
+    MLLOGGER.event(key=mllog_constants.GLOBAL_BATCH_SIZE, value=GBS)
+    MLLOGGER.event(key=mllog_constants.MAX_SEQUENCE_LENGTH, value=SEQLEN)
+    MLLOGGER.event(key=mllog_constants.MAX_STEPS, value=MAX_STEPS)
+    MLLOGGER.event(key=mllog_constants.GRADIENT_ACCUMULATION_STEPS, value=grad_acc)
+    MLLOGGER.event(key=mllog_constants.EVAL_SAMPLES, value=EVAL_SAMPLES)
+    MLLOGGER.event(key=mllog_constants.TRAIN_SAMPLES, value=SAMPLES)
+    MLLOGGER.event(key=mllog_constants.OPT_NAME, value=mllog_constants.ADAMW)
+    MLLOGGER.event(key=mllog_constants.OPT_BASE_LR, value=LR)
+    MLLOGGER.event(key=mllog_constants.OPT_END_LR, value=END_LR)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_BETA_1, value=opt_adamw_beta_1)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_BETA_2, value=opt_adamw_beta_2)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_EPSILON, value=opt_adamw_epsilon)
+    MLLOGGER.event(key=mllog_constants.OPT_ADAMW_WEIGHT_DECAY, value=opt_adamw_weight_decay)
+    MLLOGGER.event(key=mllog_constants.OPT_LR_WARMUP_STEPS, value=WARMUP_STEPS)
+    MLLOGGER.event(key=mllog_constants.NUM_WARMUP_STEPS, value=WARMUP_STEPS)
+    MLLOGGER.event(key=mllog_constants.OPT_LR_DECAY_STEPS, value=MAX_STEPS - WARMUP_STEPS)
+    MLLOGGER.event(key=mllog_constants.OPT_LR_DECAY_SCHEDULE, value="cosine with linear warmup")
+    MLLOGGER.event(key=mllog_constants.OPT_GRADIENT_CLIP_NORM, value=1.0)
+    # v6.1 system description: mxfp8 gemms, bf16 attention core, fp8 weight all-gather; pure data parallel, 2 sequences per gpu
+    MLLOGGER.event(key=mllog_constants.LOWEST_NUMERICAL_PRECISION_IN_LINEAR, value="fp8")
+    MLLOGGER.event(key=mllog_constants.LOWEST_NUMERICAL_PRECISION_IN_ATTN, value="bfloat16")
+    MLLOGGER.event(key=mllog_constants.LOWEST_NUMERICAL_PRECISION_IN_COMM, value="fp8")
+    for k in (mllog_constants.TENSOR_PARALLELISM, mllog_constants.PIPELINE_PARALLELISM, mllog_constants.CONTEXT_PARALLELISM,
+              mllog_constants.EXPERT_PARALLELISM): MLLOGGER.event(key=k, value=1)
+    MLLOGGER.event(key=mllog_constants.MICRO_BATCH_SIZE, value=BS // len(device))
+    MLLOGGER.event(key=mllog_constants.CONFIG_FILENAME, value=getenv("CONFIG_FILENAME", "tinybox_2x8xMI350X/common.sh"))
+    MLLOGGER.start(key=mllog_constants.EPOCH_START, metadata={mllog_constants.SAMPLES_COUNT: 0})
+    MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: 0})
   if getenv("FAKEDATA", 0):
     eval_dataset = None
   else:
@@ -1906,7 +2052,7 @@ def train_gptoss():
   train_iter = get_train_iter()
   i, sequences_seen = 0, 0
   step_times = []
-  group_calls = 0
+  group_calls = 1 if jit_load or capture_first else 0
 
   try:
     while i < MAX_STEPS:
@@ -1932,12 +2078,37 @@ def train_gptoss():
         elif count == STEP_GROUP or group_calls == 0:
           ret = train_group(*batches)
           group_calls += 1
+          if (jit_save := getenv("GPTOSS_JIT_SAVE", "")) and group_calls == 1 and not jit_load:
+            if getenv("GPTOSS_JIT_DEBUG"):
+              post = {n: id(b) for n, b in named_buffers(jit_state()).items()}
+              print("gptoss_jitcache: names whose buffer changed during capture:", [n for n in post if _pre_capture_bufs.get(n) != post[n]][:20])
+            save_jit(train_group, jit_state(), jit_save)
+            if drain_jit is not None:
+              dst = time.perf_counter()
+              for d in (deferred_experts, deferred_lmhead):
+                if d is not None: d.mark_updated()  # the captured updates just ran; the loop marks them only after this block
+              drain_deferred()
+              print(f"gptoss_jitcache: drain captured in {time.perf_counter()-dst:.1f}s", flush=True)
+              save_jit(drain_jit, jit_state(), jit_save + ".drain")
+            if EVAL_BS:
+              # the eval jit too, captured on a fake batch: dev_beam must not touch the dataset
+              drain_deferred()
+              fake_eval = next(fake_data(EVAL_BS, EVAL_BS))
+              # warmup + capture: a graph captured on its first call hangs its first replay (2026-09-25); the warmup is eager, far box launches are slow
+              est = time.perf_counter()
+              for _ in range(2): eval_step(fake_eval)
+              print(f"gptoss_jitcache: eval warmed up and captured in {time.perf_counter()-est:.1f}s", flush=True)
+              save_jit(eval_step, jit_state(), jit_save + ".eval")
+            if getenv("GPTOSS_JIT_SAVE_EXIT", 0): break
         else:
           # Eager short groups share persistent state without a second large capture.
           ret = grouped_math(*batches)
         if deferred_experts is not None: deferred_experts.mark_updated()
         if deferred_lmhead is not None: deferred_lmhead.mark_updated()
-        for dev in device: Device[dev].synchronize()
+        # GPTOSS_STEP_SYNC=0: the metrics' CPU copies close the graph and their .item() waits for them; polling all 16 timelines
+        # (8 over the remote link) after every graph only delays the next launch
+        if getenv("GPTOSS_STEP_SYNC", 1):
+          for dev in device: Device[dev].synchronize()
         if STEP_GROUP == 1 and i == 1 - jit_no_warmup and train_step.captured is not None: gc.collect()
         if STEP_GROUP > 1 and count == STEP_GROUP and group_calls == 2 - jit_no_warmup and train_group.captured is not None: gc.collect()
         values = [t.item() for t in ret]
@@ -1985,8 +2156,7 @@ def train_gptoss():
             })
 
         if (ckpt_freq := getenv("CKPT")) and (i % ckpt_freq == 0 and (i != 1 or ckpt_freq == 1)):
-          if deferred_experts is not None: deferred_experts.drain()
-          if deferred_lmhead is not None: deferred_lmhead.drain()
+          drain_deferred()
           tqdm.write("saving checkpoint")
           if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
           fn = f"{ckpt_dir}/gptoss_{i}.safe"
@@ -2005,10 +2175,14 @@ def train_gptoss():
                 f"epoch global_mem: {GlobalCounters.global_mem:_}")
 
       if (sequences_seen // EVAL_FREQ != (sequences_seen - BS) // EVAL_FREQ and (i != 1 or EVAL_FREQ == 1)) or (BENCHMARK and i == BENCHMARK):
-        if deferred_experts is not None: deferred_experts.drain()
-        if deferred_lmhead is not None: deferred_lmhead.drain()
+        dst = time.perf_counter()
+        drain_deferred()
+        tqdm.write(f"deferred gathers drained in {time.perf_counter()-dst:.3f}s")
         if EVAL_BS == 0: return
         tqdm.write(f"evaluating after {sequences_seen} sequences")
+        if MLLOGGER and RUNMLPERF:
+          MLLOGGER.end(key=mllog_constants.BLOCK_STOP, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
+          MLLOGGER.start(key=mllog_constants.EVAL_START, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
         profile_marker(f"eval @ {i}")
 
         # run eval
@@ -2018,7 +2192,8 @@ def train_gptoss():
 
         for j,tokens in tqdm(enumerate(eval_iter), total=EVAL_SAMPLES//EVAL_BS):
           eval_loss = eval_step(tokens)
-          for dev in device: Device[dev].synchronize()
+          if getenv("GPTOSS_STEP_SYNC", 1):
+            for dev in device: Device[dev].synchronize()
           eval_losses += eval_loss.tolist()
 
           if BENCHMARK and (j+1) == min(BENCHMARK, EVAL_SAMPLES//EVAL_BS):
@@ -2027,22 +2202,28 @@ def train_gptoss():
         log_perplexity = sum(eval_losses) / len(eval_losses)
 
         tqdm.write(f"eval log perplexity: {log_perplexity:.4f}")
+        if MLLOGGER and RUNMLPERF:
+          MLLOGGER.event(key=mllog_constants.EVAL_ACCURACY, value=log_perplexity, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
+          MLLOGGER.end(key=mllog_constants.EVAL_STOP, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
 
         if WANDB:
           wandb.log({"eval/log_perplexity": log_perplexity, "eval/sequences_seen": sequences_seen})
 
         if log_perplexity < EVAL_TARGET:
           tqdm.write(f"target achieved after {sequences_seen} sequences")
+          tqdm.write(f"run_stop {time.strftime('%Y-%m-%dT%H:%M:%S')}: {(time.time()-run_start)/60:.2f} min from run_start")
+          if MLLOGGER and RUNMLPERF:
+            MLLOGGER.end(key=mllog_constants.EPOCH_STOP, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
+            MLLOGGER.end(key=mllog_constants.RUN_STOP, metadata={mllog_constants.STATUS: mllog_constants.SUCCESS})
           if getenv("CKPT"):
             if not os.path.exists(ckpt_dir := "./ckpts"): os.mkdir(ckpt_dir)
             fn = f"{ckpt_dir}/gptoss.safe"
             safe_save(get_state_dict(model), fn)
           break
+        if MLLOGGER and RUNMLPERF: MLLOGGER.start(key=mllog_constants.BLOCK_START, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
 
   finally:
-    if __import__("sys").exc_info()[0] is None:
-      if deferred_experts is not None: deferred_experts.drain()
-      if deferred_lmhead is not None: deferred_lmhead.drain()
+    if __import__("sys").exc_info()[0] is None: drain_deferred()
 
 def train_stable_diffusion():
   from extra.models.unet import UNetModel
@@ -2184,6 +2365,8 @@ def train_stable_diffusion():
 
 if __name__ == "__main__":
   multiprocessing.set_start_method('spawn')
+  # background launches (`cmd &` in a script) start with SIGINT ignored: restore it so a run can always be stopped cleanly
+  signal.signal(signal.SIGINT, signal.default_int_handler)
 
   if getenv("INITMLPERF"): bench_log_manager = WallTimeEvent(BenchEvent.MLPERF_INIT)
   elif getenv("RUNMLPERF"): bench_log_manager = WallTimeEvent(BenchEvent.MLPERF_RUN)

@@ -289,9 +289,18 @@ def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequenc
   ctx = ExecContext(var_vals or {}, tuple(inputs), update_stats, jit, wait or DEBUG>=2)
   for call in linear.src: track_stats(ctx, call.without_after, perf_counter_us(), pm_exec.rewrite(call.without_after, ctx))
 
+timing_linears:dict[tuple|None, UOp] = {} # the timing template of the kernel being searched, it holds the timed buffers
+
 def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None, clear_l2:bool=False) -> Iterator[float]:
-  ctx = ExecContext(var_vals or {}, update_stats=False, wait=True, timeout=timeout, cache=False)
-  linear = link_linear(compile_linear(UOp(Ops.LINEAR, src=(call,)), beam=0, profile=True, cache=False), allow_cache=ctx.cache)
+  # with a timing template every candidate of a kernel launches from one linked linear, the program binds through variables
+  key, var_vals = None, var_vals or {}
+  if (tmpl:=Device[call.src[1].device].timing_template(call, var_vals)) is not None:
+    call, key, var_vals = tmpl[0], tmpl[1], {**var_vals, **tmpl[2]}
+  if (linear:=timing_linears.get(key)) is None:
+    timing_linears.clear()
+    linear = link_linear(compile_linear(UOp(Ops.LINEAR, src=(call,)), beam=0, profile=True, cache=False), allow_cache=False)
+    if key is not None: timing_linears[key] = linear
+  ctx = ExecContext(var_vals, update_stats=False, wait=True, timeout=timeout, cache=key is not None)
   while True:
     if clear_l2:
       if hasattr(dev:=Device[call.src[1].device], 'invalidate_caches'): dev.invalidate_caches()
