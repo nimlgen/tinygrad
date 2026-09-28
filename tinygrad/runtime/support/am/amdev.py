@@ -141,10 +141,6 @@ class AMMemoryManager(MemoryManager):
     self.dev.gmc.flush_tlb(ip='GC', vmid=0)
     self.dev.gmc.flush_tlb(ip='MM', vmid=0)
 
-  def unmap_range(self, vaddr:int, size:int): # stale translations of a freed range must not outlive it
-    super().unmap_range(vaddr, size)
-    self.on_range_mapped()
-
 class AMDev:
   Version = 0xA000000D
 
