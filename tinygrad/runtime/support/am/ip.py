@@ -1,6 +1,6 @@
 import ctypes, time, contextlib, functools
 from typing import Iterable, Literal
-from tinygrad.helpers import to_mv, data64, data64_le, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.helpers import to_mv, data64, data64_le, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits, getenv
 from tinygrad.runtime.autogen.am import am, pm4_soc15 as pm4
 from tinygrad.runtime.support.amd import import_soc
 from tinygrad.runtime.support.memory import AddrSpace
@@ -275,8 +275,9 @@ class AM_GFX(AM_IP):
 
   def init_hw(self):
     # Wait for RLC autoload to complete
-    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
-              value=True, msg="RLC autoload timeout")
+    if not self.adev.reset_mode: # a hung cp never idles, the reset comes next anyway
+      wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or (hasattr(self.adev, 'regRLC_RLCS_BOOTLOAD_STATUS') and
+                self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0), value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", insts=range(self.xccs))
     if self.adev.partial_boot: return self.reset_mec()
@@ -488,8 +489,10 @@ class AM_IH(AM_IP):
     wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
     rptr = self.adev.regIH_RB_RPTR.read()
 
-    while rptr != wptr['offset']:
-      entry = [self.ring_view[(rptr + i) % (self.ring_size // 4)] for i in range(8)]
+    # one read of the pending entries (two on wrap): on a remote device every read is a round trip
+    end = wptr['offset']
+    pending = list(self.ring_view[rptr:end]) if rptr <= end else list(self.ring_view[rptr:]) + list(self.ring_view[:end])
+    for entry in [pending[i:i+8] for i in range(0, len(pending), 8)]:
       rptr = (rptr + 8) % (self.ring_size // 4)
 
       client, src, ring_id, vmid, vmid_type, pasid, node = \
@@ -513,6 +516,21 @@ class AM_IH(AM_IP):
         va = (self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_HI32').read()<<32) | self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_LO32').read()
         print(f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {bf} {va<<12:#x}")
         self.adev.reg('regGCVM_L2_PROTECTION_FAULT_CNTL').update(clear_protection_fault_status_addr=1)
+        self.adev.is_err_state = True
+      elif client == am.SOC15_IH_CLIENTID_VMC or src_name == "SDMA_PAGE_FAULT":
+        print(f"am {self.adev.devfmt}: fault ctx decode: va={(ctx[0] << 12) | ((ctx[1] & 0xf) << 44):#x} ctx1={ctx[1]:#x} node={node}", flush=True)
+        for hub in ("MM", "GC"):
+          for inst in range(8):
+            try:
+              st = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read(inst=inst)
+              if st == 0: continue
+              bf = self.adev.reg(self.adev.gmc.pf_status_reg(hub)).read_bitfields(inst=inst)
+              va = (self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_HI32').read(inst=inst)<<32) | \
+                   self.adev.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_LO32').read(inst=inst)
+              print(f"am {self.adev.devfmt}: {hub}VM_L2_PROTECTION_FAULT_STATUS inst={inst}: {bf} va={va<<12:#x}", flush=True)
+            except Exception as e:
+              print(f"am {self.adev.devfmt}: {hub} inst {inst} fault decode failed: {str(e)[:80]}", flush=True)
+              break
         self.adev.is_err_state = True
       else: self.adev.is_err_state = True
 
@@ -548,8 +566,10 @@ class AM_SDMA(AM_IP):
                                                           inst=inst)
         self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
 
+      if getenv("AM_SDMA_NO_CTXSW"): print(f"am {self.adev.devfmt}: sdma{inst} cntl was {self.adev.reg(f'regSDMA{pipe}_CNTL').read(inst=inst):#x}")
       self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
-        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}),
+        **({'auto_ctxsw_enable':0} if getenv("AM_SDMA_NO_CTXSW") else {}), inst=inst)
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       for aid_id in self.adev.aids:

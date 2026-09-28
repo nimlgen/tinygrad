@@ -1240,8 +1240,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     """call a body with the given args: a plain CallInfo CALL. all inputs must be ready (buffers/params), this never
     creates ALLOCs: use call_with_outputs for calls that produce values"""
     assert self.op in OPAQUE_CALL_BODIES, f"cannot call a {self.op} body, use call_with_outputs for value-producing bodies"
-    # calls are launched per device, so an open DEVICE range is allowed to cross the call boundary
-    assert all(r.axis_type is AxisType.DEVICE for r in self.ranges), \
+    # calls are launched per device, so an open DEVICE range is allowed to cross the call boundary. a compiled PROGRAM closed its ranges
+    assert self.op is Ops.PROGRAM or all(r.axis_type is AxisType.DEVICE for r in self.ranges), \
       f"ranges {self.ranges} are leaking out of the call in {self.pyrender()}"
     # the (possibly void) return dtype lives in the CallInfo; an external C call is a CALL on a CUSTOM_FUNCTION
     # body holding the callee (a function pointer), rendered as an indirect call
@@ -1295,6 +1295,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # one-line convenience for the single-output case: self is the value
   def call_with_output(self, *srcs:UOp, **kwargs) -> UOp: return UOp.call_with_outputs((self,), *srcs, **kwargs)[0]
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
+    # OWNED_KERNEL_OUTPUTS: a fresh invalids() output becomes owned storage (a clone storing Invalid, no kernel), so a
+    # precompiled function returning it binds the kernel's buffer directly instead of copying it into a return buffer
+    if OWNED_KERNEL_OUTPUTS: srcs = tuple(s.clone() if _is_fresh_invalids(s) else s for s in srcs)
     placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in srcs]
@@ -1308,6 +1311,15 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     sig = tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
           tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
     return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, sig, self.key)
+
+OWNED_KERNEL_OUTPUTS = ContextVar("OWNED_KERNEL_OUTPUTS", 0)
+def _is_fresh_invalids(u:UOp) -> bool:
+  # Tensor.invalids() (optionally reshaped/unsharded): AFTER(alloc, STORE(alloc, CONST(Invalid))) not yet cloned into owned storage
+  while u.op in (Ops.RESHAPE, Ops.UNSHARD): u = u.src[0]
+  if u.op is Ops.MSTACK: return all(_is_fresh_invalids(x) for x in u.src)
+  if u.op is not Ops.AFTER or len(u.src) != 2 or u.src[1].op is not Ops.STORE: return False
+  buf = u.src[0].src[0] if u.src[0].op is Ops.RESHAPE else u.src[0]
+  return buf.op is Ops.ALLOC and buf.arg.bind_on_realize and u.src[1].src[1].base.is_invalid
 
 @dataclass(frozen=True)
 class KernelInfo:

@@ -141,6 +141,10 @@ class AMMemoryManager(MemoryManager):
     self.dev.gmc.flush_tlb(ip='GC', vmid=0)
     self.dev.gmc.flush_tlb(ip='MM', vmid=0)
 
+  def unmap_range(self, vaddr:int, size:int): # stale translations of a freed range must not outlive it
+    super().unmap_range(vaddr, size)
+    self.on_range_mapped()
+
 class AMDev:
   Version = 0xA000000D
 
@@ -155,6 +159,7 @@ class AMDev:
 
   def __init__(self, pci_dev:PCIDevice, reset_mode=False):
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    self.reset_mode = reset_mode
     self._disable_aspm()
     self.vram, self.doorbell64, self.mmio = self.pci_dev.map_bar(0), self.pci_dev.map_bar(2, fmt='Q'), self.pci_dev.map_bar(5, fmt='I')
 
@@ -223,7 +228,8 @@ class AMDev:
 
     # Memory manager & firmware
     self.mm = AMMemoryManager(self, self.vram_size - self.reserved_vram_size, boot_size=(3 << 20), pt_t=AMPageTableEntry, va_shifts=[12, 21, 30, 39],
-      va_bits=48, first_lv=am.AMDGPU_VM_PDB2, va_base=MemoryManager.va_allocator.base, reserve_ptable=not self.large_bar,
+      va_bits=48, first_lv=am.AMDGPU_VM_PDB2, va_base=MemoryManager.va_allocator.base,
+      reserve_ptable=not self.large_bar or bool(getenv("AM_RESERVE_PTABLE")),
       palloc_ranges=[(1 << (i + 12), (2 << 20) if i >= 9 else 0x1000) for i in range(9 * (3 - am.AMDGPU_VM_PDB2), -1, -1)])
     self.fw = AMFirmware(self)
 
@@ -388,7 +394,7 @@ class AMDev:
 
     gc_info = am.struct_gc_info_v1_0.from_address(gc_addr:=ctypes.addressof(self.bhdr) + self.bhdr.table_list[am.GC].offset)
     self.gc_info = getattr(am, f"struct_gc_info_v{gc_info.header.version_major}_{gc_info.header.version_minor}").from_address(gc_addr)
-    self.reserved_vram_size = (384 << 20) if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else (64 << 20)
+    self.reserved_vram_size = getenv("AM_RESERVED_VRAM_MB", 384 if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else 64) << 20
 
   @functools.cached_property
   def hwid_names(self) -> dict[int, str]: return {v:k.removesuffix('_HWID') for k,v in vars(am).items() if k.endswith('_HWID') and isinstance(v, int)}

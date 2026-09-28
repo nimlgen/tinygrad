@@ -1,5 +1,5 @@
 from typing import Iterator
-import functools, itertools
+import functools, itertools, operator
 from dataclasses import dataclass, field, replace
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, graph_rewrite, sint, AxisType, rewrite_group, broadcast_axes
@@ -12,6 +12,9 @@ class IndexingContext:
   realize_map: dict[UOp, None|list[int]] = field(default_factory=dict)
   non_removable: dict[UOp, None] = field(default_factory=dict)
   range_map: dict[UOp, tuple[tuple[UOp, ...], tuple[UOp, ...]]] = field(default_factory=dict)
+  # bitmask of the stored-to bases each UOp reaches, not entering CALL bodies
+  base_bit: dict[UOp, int] = field(default_factory=dict)
+  reach: dict[UOp, int] = field(default_factory=dict)
 
   # create ranges
   range_idx: Iterator[int] = field(default_factory=itertools.count)
@@ -33,7 +36,7 @@ def realize_srcs(ctx:IndexingContext, rb:UOp) -> None:
 
 def realize_store_after_src(ctx:IndexingContext, dest:UOp, src:UOp):
   # you don't usually have to do this for assign unless there's a WAR hazard like TestAssign.test_assign_double_diamond_reduce
-  if dest.base in src.toposort(enter_calls=False): ctx.realize_map[src] = None
+  if ctx.reach[src] & ctx.base_bit[dest.base]: ctx.realize_map[src] = None
 
 def realize_custom_kernel_srcs(ctx:IndexingContext, c:UOp) -> None:
   for s in c.src[1:]:
@@ -189,6 +192,11 @@ def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
   rctx = IndexingContext()
 
   # get ops to realize
+  topo = tsink.toposort(enter_calls=False)
+  rctx.base_bit = {b:1<<i for i,b in enumerate(dict.fromkeys(u.src[0].base for u in topo if u.op is Ops.STORE))}
+  for u in topo:
+    srcs = u.src[1:] if u.op is Ops.CALL else u.src
+    rctx.reach[u] = functools.reduce(operator.or_, [rctx.reach[s] for s in srcs], rctx.base_bit.get(u, 0))
   graph_rewrite(tsink, pm_generate_realize_map, ctx=rctx, name="get realize")
 
   # get the consumer map

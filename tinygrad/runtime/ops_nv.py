@@ -297,7 +297,7 @@ def nv_build_program(dev:NVDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[NVPro
 
 class NVAllocator(Allocator['NVDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
-    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, zero=options.zero)
+    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, zero=options.zero or options.cpu_access)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
@@ -611,7 +611,8 @@ class NVDevice(Compiled):
 
   @functools.cached_property
   def fifos(self) -> dict[str, GPFifo]:
-    mem = self.iface.alloc(3<<20, contiguous=True, cpu_access=True, force_devmem=True, map_flags=nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23)
+    mem = self.iface.alloc(3<<20, contiguous=True, cpu_access=True, force_devmem=True, zero=True,
+                           map_flags=nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23)
     self.gpfifo_buf = Buffer(self.device, 3<<20, dtypes.uint8, opaque=mem)
 
     compute = self._new_gpu_fifo("COMPUTE:0", self.ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)

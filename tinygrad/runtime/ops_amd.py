@@ -58,13 +58,21 @@ def _queue_args(hq:HWQueue, q) -> list[UOp]: # the ring and its pointers, tagged
 
 def _dw(vals) -> int: return sum(2 if isinstance(x, UOp) and x.dtype.itemsize == 8 else 1 for x in vals)
 
-def dispatch_packet(data:AMDProgramData, info:ProgramInfo, kernel_object:UOp=UOp.const(0, dtypes.uint64),
-                    kernarg_address:UOp=UOp.const(0, dtypes.uint64)) -> list: # as words: the grid may be symbolic
-  pkt = bytes(hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
+def aql_packet(data:AMDProgramData, local_size:tuple[int, ...], grid:tuple[int, ...]=(0, 0, 0), kernel_object:int=0) -> bytes:
+  return bytes(hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
     setup=3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=data.private_segment_size,
-    group_segment_size=data.group_segment_size, **{f"workgroup_size_{d}": l for d, l in zip("xyz", info.local_size)}))
-  grid = [(g * l).cast(dtypes.uint32) if isinstance(g, UOp) else g * l for g, l in zip(cast(tuple[Any, ...], info.global_size), info.local_size)]
+    group_segment_size=data.group_segment_size, kernel_object=kernel_object, **{f"workgroup_size_{d}": l for d, l in zip("xyz", local_size)},
+    **{f"grid_size_{d}": g for d, g in zip("xyz", grid)}))
+
+def dispatch_packet(data:AMDProgramData, info:ProgramInfo, kernel_object:UOp=UOp.const(0, dtypes.uint64),
+                    kernarg_address:UOp=UOp.const(0, dtypes.uint64)) -> list[UOp]: # as words: the grid may be symbolic
+  pkt = aql_packet(data, info.local_size)
+  grid = [(g * l).cast(dtypes.uint32) if isinstance(g, UOp) else UOp.const(g * l, dtypes.uint32)
+          for g, l in zip(cast(tuple[Any, ...], info.global_size), info.local_size)]
   return [UOp(Ops.BINARY, arg=pkt[:12]), *grid, UOp(Ops.BINARY, arg=pkt[24:32]), kernel_object, kernarg_address, UOp(Ops.BINARY, arg=pkt[48:])]
+
+# a timing launch takes its packet up to the kernargs from variables: one linked launch times every candidate of a kernel
+TIMING_PKT = tuple(UOp.variable(f"timing_pkt{i}", 0, 2**64-1, dtypes.uint64, param=True) for i in range(5))
 
 class AMDComputeQueue(HWQueue):
   dev:AMDDevice
@@ -452,8 +460,8 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
     slot = self.prof_start(data, prg.arg, lib)
     self.close_run(len(self.blob))
     kernarg_address = UOp(Ops.LINEAR, src=tuple(self.kernargs(call, prg, data)), arg="kernargs").getaddr(self.devs)
-    self.pkts += [UOp.const(w, dtypes.uint32) if isinstance(w, int) else w
-                  for w in dispatch_packet(data, prg.arg, lib.getaddr(self.devs) + data.desc_offset, kernarg_address)]
+    self.pkts += [*TIMING_PKT, kernarg_address, UOp(Ops.BINARY, arg=bytes(16))] if prg.tag == "timing" else \
+      dispatch_packet(data, prg.arg, lib.getaddr(self.devs) + data.desc_offset, kernarg_address)
     self.run_start = len(self.blob)
     self.prof_stop(slot)
 
@@ -791,14 +799,168 @@ class PCIIface(PCIIfaceBase):
       tl = d.timeline.host.view(fmt='Q')
       tl[0] = tl[1]
 
+  def errdump(self): # AMD_ERR_DUMP=1: sdma hw regs, queue params and the ring words around rptr on an error state or hang
+    if not getenv("AMD_ERR_DUMP", 0) or getattr(self, "_dumped", False): return
+    self._dumped = True
+    regs = ("RB_BASE", "RB_BASE_HI", "RB_RPTR", "RB_RPTR_HI", "RB_WPTR", "RB_WPTR_HI", "RB_RPTR_ADDR_LO", "RB_RPTR_ADDR_HI", "RB_WPTR_POLL_ADDR_LO",
+            "RB_WPTR_POLL_ADDR_HI", "RB_CNTL", "IB_BASE_LO", "IB_BASE_HI", "IB_OFFSET", "IB_RPTR", "IB_SIZE", "DOORBELL_OFFSET")
+    def rd(reg, inst):
+      try: return f"{self.dev_impl.reg(reg).read(inst=inst):#x}"
+      except Exception as e: return f"?{str(e)[:12]}"
+    for i, (reg, inst) in enumerate(self.dev_impl.sdma.sdma_reginst):
+      print(f"ERRDUMP hwregs {self.dev.device} sdma#{i} {reg} inst={inst}: " + " ".join(f"{r}={rd(f'{reg}_{r}', inst)}" for r in regs), flush=True)
+      # sdma 4.4.2 engine debug regs, same segment as SDMA_CNTL (0x6d)
+      dbg = {"STATUS":0x25, "STATUS1":0x26, "STATUS2":0x38, "STATUS3":0x4c, "STATUS4":0x63, "UTCL1_RD_STATUS":0x3e, "UTCL1_WR_STATUS":0x3f,
+             "RD_XNACK0":0x43, "RD_XNACK1":0x44, "WR_XNACK0":0x45, "WR_XNACK1":0x46, "UTCL1_PAGE":0x48, "UTCL1_CNTL":0x3c, "ERROR_LOG":0x50,
+             "VM_CNTL":0x10, "VM_CTX_LO":0x11, "VM_CTX_HI":0x12, "F32_CNTL":0x2, "CHICKEN":0x6e, "GFX_CTX_STATUS":0x91,
+             **{f"MIDCMD{k}":0xc0 + k for k in range(10)}, "MIDCMD_CNTL":0xcb, "PAGE_RB_CNTL":0xd8, "PAGE_RB_BASE":0xd9, "PAGE_RB_BASE_HI":0xda,
+             "PAGE_RB_RPTR":0xdb, "PAGE_RB_WPTR":0xdd, "PAGE_CTX_STATUS":0xe9, "PAGE_STATUS":0x100, "RLC0_RB_CNTL":0x130, "RLC0_RB_BASE":0x131,
+             "RLC0_RB_BASE_HI":0x132, "RLC0_RB_RPTR":0x133, "RLC0_RB_WPTR":0x135}
+      try:
+        cntl = self.dev_impl.regSDMA_CNTL.addr[inst]
+        vals = " ".join(f"{n}={self.dev_impl.rreg(cntl - 0x6d + off, inst=inst):#x}" for n, off in dbg.items())
+      except Exception as e: vals = f"failed {e}"
+      print(f"ERRDUMP sdmadbg {self.dev.device} sdma#{i} inst={inst}: {vals}", flush=True)
+    try: # every amd device object of the process: two objects on one (node, bus) means two drivers on one gpu
+      from tinygrad.device import Device as _D
+      for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+        dv = _D[d]
+        print(f"ERRDUMP devobj {d}: node={dv.iface.peer_group} bus={dv.iface.pci_dev.pcibus} impl={id(dv.iface.dev_impl):#x} "
+              f"cq_ring={dv.__dict__.get('compute_queue').ring._buf if dv.__dict__.get('compute_queue') else None} "
+              f"sdma0_ring={dv.sdma_queues[0].ring._buf if getattr(dv, 'sdma_queues', {}).get(0) else None}", flush=True)
+    except Exception as e: print(f"ERRDUMP devobj {self.dev.device}: failed {e}", flush=True)
+    try: # every amd device's host pool: what the cpu reads there, and where this device's page tables send it
+      from tinygrad.device import Device as _D
+      for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+        pool = _D[d].rt_buffer(True, True)
+        vals = [hex(x) for x in pool.host.view(fmt='Q')[0:4]]
+        print(f"ERRDUMP pool {self.dev.device} sees {d} host pool va={pool._buf:#x} cpu={vals} pte={self.walk(pool._buf).split()[-1]}", flush=True)
+    except Exception as e: print(f"ERRDUMP pool {self.dev.device}: failed {e}", flush=True)
+    for key in ((True, False), (True, True)):
+      a = self.dev.rt_allocator(*key)
+      print(f"ERRDUMP {self.dev.device} rt pool uncached={key[0]} host={key[1]}: ptr={a.ptr:#x} of {a.size:#x}, wraps={a.wraps}", flush=True)
+    queues = list(getattr(self.dev, "sdma_queues", {}).items()) + [("compute", self.dev.__dict__.get("compute_queue"))]
+    for idx, q in queues:
+      if q is None: continue
+      if q.params is not None:
+        print(f"ERRDUMP params {self.dev.device} queue {idx}: ring_va={q.ring._buf:#x} ring_nbytes={q.ring.nbytes:#x} rptr_va={q.read_ptr._buf:#x} "
+              f"wptr_va={q.write_ptr._buf:#x} params={[hex(x) if isinstance(x, int) else x for x in q.params]}", flush=True)
+      try:
+        unit = 64 if idx == "compute" and self.dev.is_aql else 1 # the aql pointers count packets
+        rp, wp = q.read_ptr.host.view(fmt='Q')[0] * unit, q.write_ptr.host.view(fmt='Q')[0] * unit
+        words = q.ring.host.view(fmt='I') if q.ring.host is not None else None
+        print(f"ERRDUMP {self.dev.device} queue {idx}: ring {q.ring.nbytes:#x} bytes rptr={rp:#x} wptr={wp:#x} host={words is not None}", flush=True)
+        if words is None: continue
+        n, full = q.ring.nbytes // 4, getenv("AMD_ERR_DUMP_FULL", 0)
+        start, rows = (0, min(wp // 4 + 16, 16384)) if full else (((rp // 4) - 96) % n, 128)
+        for row in range(0, rows, 8):
+          ws = [words[(start + row + k) % n] for k in range(8)]
+          mark = " <- rptr" if start + row <= (rp // 4 - start) % n + start < start + row + 8 else ""
+          print(f"ERRDUMP   [{((start + row) % n) * 4:#08x}] " + " ".join(f"{w:08x}" for w in ws) + mark, flush=True)
+      except Exception as e: print(f"ERRDUMP {self.dev.device} queue {idx}: failed {e}", flush=True)
+      if idx == "compute" and self.dev.is_aql:
+        try: # the pm4 inside the vendor packets around rptr
+          w = q.ring.host.view(fmt='I')
+          for pk in range(rp // 64 - 6, rp // 64 + 3):
+            base = (pk * 16) % (q.ring.nbytes // 4)
+            if w[base] & 0xff != 0: continue
+            ib, ndw = w[base + 2] | w[base + 3] << 32, w[base + 4] & 0xfffff
+            ws = self.readva(ib, min(ndw, 64))
+            txt = " ".join(f"{x:08x}" for x in ws) if ws else "unreadable"
+            print(f"ERRDUMP ib {self.dev.device} pkt {pk:#x} ib={ib:#x} n={ndw:#x}: {txt}", flush=True)
+        except Exception as e: print(f"ERRDUMP ib {self.dev.device}: failed {e}", flush=True)
+      try: # the gpu's view: walk the page tables for the ring page at rptr, the rptr page and the operands of the packet at rptr
+        w = q.ring.host.view(fmt='I')
+        pk = (rp // 4) % (q.ring.nbytes // 4)
+        op = w[pk] & 0xff
+        ops = {1: [("src", 3), ("dst", 5)], 2: [("dst", 1)], 5: [("addr", 1)], 8: [("addr", 1)]}.get(op, [])
+        vas = [("ring@rptr", q.ring._buf + rp), ("rptr", q.read_ptr._buf)] + [(n, w[pk + i] | w[pk + i + 1] << 32) for n, i in ops]
+        for n, va in vas: print(f"ERRDUMP walk {self.dev.device} queue {idx} {n} {va:#x}: {self.walk(va)}", flush=True)
+      except Exception as e: print(f"ERRDUMP walk {self.dev.device} queue {idx}: failed {e}", flush=True)
+    for hub in ("MM", "GC"):
+      for inst in range(8):
+        try:
+          st = self.dev_impl.reg(self.dev_impl.gmc.pf_status_reg(hub)).read(inst=inst)
+          lo, hi = (self.dev_impl.reg(f'reg{hub}VM_L2_PROTECTION_FAULT_ADDR_{h}32').read(inst=inst) for h in ("LO", "HI"))
+          print(f"ERRDUMP {self.dev.device} {hub} inst {inst}: status={st:#x} addr={(hi << 32 | lo) << 12:#x}", flush=True)
+          if st:
+            fva = (hi << 32 | lo) << 12
+            print(f"ERRDUMP walk {self.dev.device} fault {hub}{inst} {fva:#x}: {self.walk(fva)}", flush=True)
+            from tinygrad.device import Device as _D # who maps the fault va: every gpu of the process shares the va allocator
+            for d in [x for x in _D._opened_devices if x.startswith("AMD")]:
+              try: print(f"ERRDUMP owner {d} {fva:#x}: {_D[d].iface.walk(fva)}", flush=True)
+              except Exception as e: print(f"ERRDUMP owner {d}: failed {e}", flush=True)
+          ctx = [f"VM_CONTEXT0_PAGE_TABLE_{r}_ADDR_{h}32" for r in ("BASE", "START", "END") for h in ("LO", "HI")] + ["VM_CONTEXT0_CNTL",
+            "MC_VM_SYSTEM_APERTURE_LOW_ADDR", "MC_VM_SYSTEM_APERTURE_HIGH_ADDR", "MC_VM_FB_LOCATION_BASE", "MC_VM_FB_LOCATION_TOP",
+            "MC_VM_FB_OFFSET", "MC_VM_MX_L1_TLB_CNTL", "VM_L2_CNTL", "VM_L2_CNTL3", "MC_VM_AGP_BOT", "MC_VM_AGP_TOP"]
+          print(f"ERRDUMP hub {self.dev.device} {hub}{inst}: " + " ".join(f"{r}={rd(f'reg{hub}{r}', inst)}" for r in ctx), flush=True)
+        except Exception: break
+    if getenv("AMD_ERR_FLUSH"): # a stale translation would clear: flush every hub, then see whether the queues move
+      import time
+      before = {idx: q.read_ptr.host.view(fmt='Q')[0] for idx, q in queues if q is not None}
+      for i in range(3):
+        self.dev_impl.gmc.flush_tlb(ip="MM", vmid=0)
+        self.dev_impl.gmc.flush_tlb(ip="GC", vmid=0)
+        time.sleep(2)
+        after = {idx: q.read_ptr.host.view(fmt='Q')[0] for idx, q in queues if q is not None}
+        print(f"ERRDUMP flush#{i} {self.dev.device}: " + " ".join(f"{k}:{before[k]:#x}->{after[k]:#x}" for k in before), flush=True)
+    try:
+      if getenv("AMD_ERR_PTSCAN"): self.ptscan()
+    except Exception as e: print(f"ERRDUMP ptscan {self.dev.device}: failed {e}", flush=True)
+
+  def ptscan(self): # every page table page of the device: entries whose address or flags cannot be right are corruption
+    mm, bad, pages, valid = self.dev_impl.mm, [], 0, 0
+    vram, base = self.dev_impl.vram_size, self.dev_impl.gmc.paddr_base
+    todo = [(mm.root_page_table, 0)]
+    while todo and len(bad) < 40:
+      pt, va = todo.pop()
+      pages += 1
+      for i, e in enumerate(pt.entries[:]): # one read per page, not per entry
+        if not e & 1: continue
+        valid += 1
+        addr, sysm, eva = e & 0x0000FFFFFFFFF000, e & 2, va + i * mm.pte_covers[pt.lv]
+        page = pt.lv == am.AMDGPU_VM_PTB or self.dev_impl.gmc.is_pte_huge_page(pt.lv, e)
+        ok = (addr < (1 << 44) if sysm else base <= addr < base + vram) if page else (not sysm and base <= addr < base + vram)
+        if not ok: bad.append(f"pt@{pt.paddr:#x} lv{pt.lv}[{i:#x}] va={eva + mm.va_base:#x} entry={e:#x}")
+        elif not page: todo.append((mm.pt_t(mm.dev, self.dev_impl.xgmi2paddr(addr), lv=pt.lv + 1), eva))
+    print(f"ERRDUMP ptscan {self.dev.device}: {pages} pt pages, {valid} valid entries, {len(bad)} bad", flush=True)
+    for b in bad: print(f"ERRDUMP ptscan   {b}", flush=True)
+
+  def readva(self, va:int, n:int) -> list[int]|None: # n words at a vram-backed va, through the page tables
+    mm = self.dev_impl.mm
+    gva, pt = va - mm.va_base, mm.root_page_table
+    for lv in range(len(mm.pte_covers)):
+      idx = (gva // mm.pte_covers[lv]) % mm.pte_cnt[lv]
+      e = pt.entry(idx)
+      if not pt.valid(idx) or e & am.AMDGPU_PTE_SYSTEM: return None
+      if pt.is_page(idx):
+        pa = self.dev_impl.xgmi2paddr(e & 0x0000FFFFFFFFF000) + gva % mm.pte_covers[lv]
+        return self.dev_impl.vram.view(pa, n * 4, fmt='I')[:]
+      pt = mm.pt_t(mm.dev, pt.address(idx), lv=pt.lv + 1)
+    return None
+
+  def walk(self, va:int) -> str:
+    mm, out = self.dev_impl.mm, []
+    gva, pt = va - mm.va_base, mm.root_page_table
+    for lv in range(len(mm.pte_covers)):
+      idx = (gva // mm.pte_covers[lv]) % mm.pte_cnt[lv]
+      e = pt.entry(idx)
+      out.append(f"lv{pt.lv}@{pt.paddr:#x}[{idx:#x}]={e:#x}")
+      if not pt.valid(idx) or pt.is_page(idx): break
+      pt = mm.pt_t(mm.dev, pt.address(idx), lv=pt.lv + 1)
+    return " ".join(out)
+
   def sleep(self, timeout):
     if hasattr(self.pci_dev, 'irq_poller') and self.pci_dev.irq_poller is not None and (events_cnt:=len(self.pci_dev.irq_poller.poll(timeout))):
       self.pci_dev.irq_fd.read(8 * events_cnt)
     self._collect_interrupts()
-    if self.dev_impl.is_err_state: raise RuntimeError("Device is in error state")
+    if self.dev_impl.is_err_state:
+      self.errdump()
+      raise RuntimeError("Device is in error state")
 
   def on_device_hang(self):
     self._collect_interrupts(reset=self.dev.can_recover)
+    self.errdump()
     raise RuntimeError("Device hang detected")
 
   def device_fini(self): self.dev_impl.fini()
@@ -885,6 +1047,7 @@ class AMDDevice(Compiled):
 
     # Scratch setup
     self.max_private_segment_size = 0
+    self.scratches:list[Buffer] = []
     self.pm_bufferize = PatternMatcher([
       (UPat(Ops.PARAM, tag="scratch", name="b"), lambda ctx, b: ctx.scratch_buffer(b.max_numel())),
       (UPat(Ops.PARAM, tag="program", name="b"), lambda ctx, b: ctx.program_buffer(b)),
@@ -929,8 +1092,8 @@ class AMDDevice(Compiled):
       self.aql_desc = hsa.amd_queue_t(queue_properties=hsa.AMD_QUEUE_PROPERTIES_IS_PTR64 | hsa.AMD_QUEUE_PROPERTIES_ENABLE_PROFILING,
         read_dispatch_id_field_base_byte_offset=getattr(hsa.amd_queue_t, 'read_dispatch_id').offset,
         max_cu_id=(self.cu_cnt * self.xccs) - 1, max_wave_id=self.waves_per_cu - 1)
-      if hasattr(self, 'scratch'): self.aql_scratch()
-      else: self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
+      if self.scratches: self.aql_scratch()
+      self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
     cwsr_buffer_size = round_up((ctx_save_restore_size + debug_memory_size) * self.xccs, mmap.PAGESIZE)
     cwsr_buffer = Buffer(self.device, cwsr_buffer_size, dtypes.uint8, preallocate=True, allocator=self.allocator) if ctx_save_restore_size else None
@@ -993,10 +1156,11 @@ class AMDDevice(Compiled):
       mem_alignment_size = 256 if self.target[0] != 9 else 1024
       size_per_thread = round_up(private_segment_size, mem_alignment_size // lanes_per_wave)
       size_per_xcc = size_per_thread * lanes_per_wave * self.iface.props['max_slots_scratch_cu'] * self.cu_cnt
-      self.scratch = Buffer(self.device, size_per_xcc * self.xccs, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+      # older scratches stay alive: queued and running dispatches still use them
+      self.scratches.append(Buffer(self.device, size_per_xcc * self.xccs, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True))
       self.max_private_segment_size = private_segment_size
       if hasattr(self, 'aql_desc'): self.aql_scratch()
-    return self.scratch
+    return self.scratches[-1]
 
   def aql_scratch(self):
     gfx9_rsrc = {'NUM_FORMAT':hsa.BUF_NUM_FORMAT_UINT, 'DATA_FORMAT':hsa.BUF_DATA_FORMAT_32, 'ELEMENT_SIZE':1, 'INDEX_STRIDE':3}
@@ -1005,13 +1169,15 @@ class AMDDevice(Compiled):
     rsrc1_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD1{"_GFX11" if self.target[0] != 9 else ""}_bitfields')
     rsrc3_t = getattr(hsa, f'union_SQ_BUF_RSRC_WORD3{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
 
-    base = self.scratch._buf
+    base = self.scratches[-1]._buf
     self.aql_desc.scratch_backing_memory_location = base
     self.aql_desc.scratch_wave64_lane_byte_size = self.max_private_segment_size
     self.aql_desc.scratch_resource_descriptor[:] = [lo32(base), int.from_bytes(rsrc1_t(BASE_ADDRESS_HI=hi32(base), SWIZZLE_ENABLE=1), 'little'),
-                                                    lo32(self.scratch.nbytes // self.xccs), int.from_bytes(bytes(rsrc3_t(**rsrc)), 'little')]
+                                                    lo32(self.scratches[-1].nbytes // self.xccs), int.from_bytes(bytes(rsrc3_t(**rsrc)), 'little')]
     self.aql_desc.compute_tmpring_size = self.tmpring_size(self.max_private_segment_size)
-    self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
+    # only the scratch fields: the live queue's read/write dispatch ids share the descriptor
+    lo, hi = hsa.amd_queue_t.compute_tmpring_size.offset, hsa.amd_queue_t.queue_properties.offset
+    self.aql_gart.host.view(fmt='B')[lo:hi] = bytes(self.aql_desc)[lo:hi]
 
   def _prof_buffer(self, size:int, dtype, host:bool=True) -> Buffer:
     buf = Buffer(self.device, size, dtype, options=BufferSpec(host=host, nolru=True, uncached=host, cpu_access=True), preallocate=True)
@@ -1036,6 +1202,18 @@ class AMDDevice(Compiled):
         name, lib, key = _amd_program_prof[b]
         Compiled.profile_events.append(ProfileProgramEvent(self.device, name, lib, buf._buf, b.arg.slot, key))
     return self.prog_bufs[b]
+
+  def timing_template(self, call:UOp, var_vals:dict[str, int]) -> tuple[UOp, tuple, dict[str, int]]|None:
+    if not self.is_aql: return None
+    data, image = _amd_program_image(self, (prg:=call.body).src[3].arg)
+    self.scratch_buffer(data.private_segment_size)
+    # the image goes to a ring in vram: each launch waits, and its batch starts with an icache invalidate
+    off = self.rt_allocator(False, False).alloc(len(image), alignment=0x1000)
+    (buf:=self.rt_buffer(False, False)).host.view(fmt='B')[off:off + len(image)] = image
+    global_size, local_size = prg.arg.launch_dims(var_vals)
+    pkt = aql_packet(data, local_size, tuple(g * l for g, l in zip(global_size, local_size)), buf.get_buf(self.device) + off + data.desc_offset)
+    key = (call.src[1:], prg.arg.globals, prg.arg.vars, data.kernargs_segment_size, data.enable_dispatch_ptr)
+    return call.replace(src=(prg.rtag("timing"), *call.src[1:])), key, {v.expr: x for v, x in zip(TIMING_PKT, struct.unpack("<5Q", pkt[:40]))}
 
   def sqtt_trace(self, slot:int, se:int) -> bytes:
     off = (se * self.prof_slots + slot) * self.sqtt_win

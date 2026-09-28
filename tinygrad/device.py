@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace, field
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
+import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics, bisect
 from tinygrad.helpers import mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up, is_numpy_ndarray
@@ -330,35 +330,47 @@ class HostAllocator(Allocator):
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 class DepsTracker:
-  def __init__(self):
-    # tracks (offset, end, dep) ranges per base buffer id to handle suballocated buffers correctly.
-    self.w_dependency_map: dict[int, list[tuple[int, int, Any]]] = defaultdict(list)
-    self.r_dependency_map: dict[int, list[tuple[int, int, Any]]] = defaultdict(list)
+  # per base buffer id an interval map: sorted segment starts and, per segment, [end, last write dep, reads since that write]
+  def __init__(self): self.segs:dict[Any, tuple[list[int], list[list]]] = defaultdict(lambda: ([], []))
 
   @staticmethod
   def _key(buf:Any) -> tuple[Any, int, int]: return id(buf.base), buf.offset, buf.offset + buf.nbytes
+
+  def _split(self, key:Any, x:int):
+    starts, segs = self.segs[key]
+    if (i:=bisect.bisect_right(starts, x) - 1) >= 0 and starts[i] < x < segs[i][0]:
+      starts.insert(i + 1, x)
+      segs.insert(i + 1, [segs[i][0], segs[i][1], list(segs[i][2])])
+      segs[i][0] = x
+
+  def _covered(self, key:Any, s:int, e:int) -> tuple[int, int]: # the segment index range of [s, e) after splitting at s and e and filling the gaps
+    self._split(key, s)
+    self._split(key, e)
+    starts, segs = self.segs[key]
+    i, j = bisect.bisect_left(starts, s), bisect.bisect_left(starts, e)
+    gaps = [(a, b) for a, b in zip([s] + [seg[0] for seg in segs[i:j]], starts[i:j] + [e]) if a < b]
+    for a, b in reversed(gaps): # back to front so the indices hold
+      k = bisect.bisect_left(starts, a)
+      starts.insert(k, a)
+      segs.insert(k, [b, None, []])
+    return i, bisect.bisect_left(starts, e)
 
   def access_resources(self, bufs:list[Any], write:list[int], new_dependency:Any):
     wait_nodes = []
     for i,buf in enumerate(bufs):
       key, s, e = self._key(buf)
-      wait_nodes += [dep for st,en,dep in self.w_dependency_map[key] if st < e and s < en]
-      if i in write: wait_nodes += [dep for st,en,dep in self.r_dependency_map[key] if st < e and s < en]
+      starts, segs = self.segs[key]
+      for k in range(max(bisect.bisect_right(starts, s) - 1, 0), bisect.bisect_left(starts, e)):
+        if segs[k][0] <= s: continue
+        if segs[k][1] is not None: wait_nodes.append(segs[k][1])
+        if i in write: wait_nodes += segs[k][2]
     for i,buf in enumerate(bufs):
       key, s, e = self._key(buf)
-      if i in write:
-        for dmap in [self.w_dependency_map, self.r_dependency_map]:
-          kept = []
-          for entry in dmap[key]:
-            st, en, dep = entry
-            if st == en: continue
-            if en <= s or e <= st: kept.append(entry)
-            else:
-              if st < s: kept.append((st, s, dep))
-              if e < en: kept.append((e, en, dep))
-          dmap[key] = kept
-        self.w_dependency_map[key].append((s, e, new_dependency))
-      else: self.r_dependency_map[key].append((s, e, new_dependency))
+      a, b = self._covered(key, s, e)
+      starts, segs = self.segs[key]
+      if i in write: starts[a:b], segs[a:b] = [s], [[e, new_dependency, []]]
+      else:
+        for seg in segs[a:b]: seg[2].append(new_dependency)
     return list({id(x):x for x in wait_nodes}.values())
 
 # **************** for Compiled Devices ****************
@@ -476,7 +488,12 @@ class Compiled:
     st, done = time.perf_counter(), sig[0]
     while done < value:
       if done != (done:=sig[0]): st = time.perf_counter()
-      elif (elapsed:=time.perf_counter() - st) > (timeout or self.wait_timeout_ms) / 1000: raise RuntimeError(f"{self.device} signal wait timed out")
+      elif (elapsed:=time.perf_counter() - st) > (timeout or self.wait_timeout_ms) / 1000:
+        print(f"HANGDUMP {self.device}: waiting for {value:#x}, timeline now {sig[0]:#x}", flush=True)
+        for d in getattr(self, 'pending', {}):
+          print(f"HANGDUMP pending {d.device}: want {self.pending[d]:#x} have {d.timeline.host.view(fmt='Q')[0]:#x}", flush=True)
+        getattr(getattr(self, 'iface', None), 'errdump', lambda: None)()
+        raise RuntimeError(f"{self.device} signal wait timed out")
       elif self.sleep_timeout_ms is not None and elapsed > self.sleep_timeout_ms / 1000: self.on_sleep()
 
   def synchronize(self, timeout:int|None=None):
@@ -495,6 +512,9 @@ class Compiled:
     return self.iface.count if hasattr(self, 'iface') else 1
 
   def on_device_hang(self): raise RuntimeError(f"{self.device} hang detected")
+
+  # beam timing: a call that launches every candidate of its kernel, its key and the candidate's variables
+  def timing_template(self, call:UOp, var_vals:dict[str, int]) -> tuple[UOp, tuple, dict[str, int]]|None: return None
 
   def on_sleep(self):
     if (iface:=getattr(self, "iface", None)) is not None and hasattr(iface, "sleep"): iface.sleep(self.sleep_timeout_ms)

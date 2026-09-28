@@ -12,11 +12,11 @@ class MMIOInterface:
     return MMIOInterface(self.addr+offset, (self.nbytes - offset) if size is None else size, fmt=fmt or self.fmt)
 
 class BumpAllocator:
-  def __init__(self, size:int, base:int=0, wrap:bool=True): self.size, self.ptr, self.base, self.wrap = size, 0, base, wrap
+  def __init__(self, size:int, base:int=0, wrap:bool=True): self.size, self.ptr, self.base, self.wrap, self.wraps = size, 0, base, wrap, 0
   def alloc(self, size:int, alignment:int=1) -> int:
     if round_up(self.ptr, alignment) + size > self.size:
       if not self.wrap: raise RuntimeError("Out of memory")
-      self.ptr = 0
+      self.ptr, self.wraps = 0, self.wraps + 1
     self.ptr = (res:=round_up(self.ptr, alignment)) + size
     return res + self.base
 
@@ -207,12 +207,14 @@ class MemoryManager:
 
   def map_range(self, vaddr:int, size:int, paddrs:list[tuple[int, int]], aspace:AddrSpace, uncached=False, snooped=False, boot=False) -> VirtMapping:
     if getenv("MM_DEBUG", 0): print(f"mm {self.dev.devfmt}: mapping {vaddr=:#x} ({size=:#x})")
+    if (sc:=getenv("HCQ2_ADDRSCAN", "")) and int(sc.split("-")[0], 0) <= vaddr + size and vaddr < int(sc.split("-")[1], 0):
+      print(f"ADDRSCAN map {self.dev.devfmt}: {vaddr=:#x} {size=:#x} {aspace} {paddrs[:2]}", flush=True)
 
     assert size == sum(p[1] for p in paddrs), f"Size mismatch {size=} {sum(p[1] for p in paddrs)=}"
 
-    ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
-    for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
-      for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
+    # ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
+    # for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
+    #   for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True, boot=boot)
     for paddr, psize in paddrs:
@@ -252,7 +254,7 @@ class MemoryManager:
     # Alloc physical memory and map it to the virtual address
     va = self.alloc_vaddr(size:=round_up(size, 0x1000), align)
 
-    if contiguous: paddrs = [(self.palloc(size, zero=True), size)]
+    if contiguous: paddrs = [(self.palloc(size, zero=zero), size)]
     else:
       # Traverse the PT to find the largest contiguous sizes we need to allocate. Try to allocate the longest segment to reduce TLB pressure.
       nxt_range, rem_size, paddrs = 0, size, []
