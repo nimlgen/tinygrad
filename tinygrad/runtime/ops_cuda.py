@@ -3,7 +3,7 @@ import ctypes, functools, mmap, struct, time
 from tinygrad.helpers import DEBUG, DEV, getenv, unwrap
 from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface, HCQ_RUNTIME_DEV
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
 from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.renderer.ptx import PTXRenderer
@@ -30,12 +30,14 @@ class CUDAQueue(HWQueue):
   def __init__(self, submit:UOp):
     super().__init__(submit)
     self.rt_vars = UOp.placeholder((4,), dtypes.uint64, 0, device=self.devs, tag="cuda") # [context, compute stream, copy stream, status]
-    self.kernargs = UOp.placeholder((8,), dtypes.uint8, device=self.devs)
-    self.h = ccall(cuda.cuCtxSetCurrent, self.rt_vars.after(self.kernargs).index(0).load())
+    self.cmdbuf = UOp.placeholder((8,), dtypes.uint8, device=self.devs) # stands for the cmdbuf until it's encoded
+    self.h = ccall(cuda.cuCtxSetCurrent, self.rt_vars.after(self.cmdbuf).index(0).load())
 
   @property
   def stream(self) -> UOp: return self.rt_vars.after(self.h).index(2 if self.queue.startswith("COPY") else 1).load() # read after the last call
   def extern(self, tag) -> UOp: return UOp.placeholder((1,), dtypes.uint64, 0, device=self.devs, tag=tag).getaddr(self.dev.host)
+  def w(self, x:UOp|int) -> UOp|int: # a value goes in the cmdbuf
+    return self.cmdbuf.bitcast(dtypes.uint64).index(self.q(x.cast(dtypes.uint64)) // 8 - 1).load() if isinstance(x, UOp) else x
 
   def launch(self, func:UOp, global_size, local_size, args:list[UOp]):
     rows = layout_args(args, 8)
@@ -44,7 +46,8 @@ class CUDAQueue(HWQueue):
 
     # use .q() to stack kernargs descs
     extra = self.q(UOp.const(1, dtypes.uint64), addr + 8, UOp.const(2, dtypes.uint64), addr, UOp.const(0, dtypes.uint64)) - 40
-    self.h = ccall(cuda.cuLaunchKernel, func, *global_size, *local_size, 0, self.stream, UOp.const(0, dtypes.uint64), self.kernargs.index(extra))
+    sizes = [self.w(x) for x in (*global_size, *local_size)]
+    self.h = ccall(cuda.cuLaunchKernel, self.w(func), *sizes, 0, self.stream, UOp.const(0, dtypes.uint64), self.cmdbuf.index(extra))
 
   def exec(self, call:UOp, prg:UOp):
     obj, bufs, vals = prg.to_elf(), get_call_arg_uops(call), get_call_var_uops(call, prg)
@@ -52,18 +55,20 @@ class CUDAQueue(HWQueue):
                 [bufs[i].getaddr(self.devs) for i in prg.arg.globals] + [v.ccast(var.dtype) for v, var in zip(vals, prg.arg.vars)])
 
   def copy(self, dst:UOp, src:UOp, sz:int):
-    self.h = ccall(cuda.cuMemcpyAsync, dst.getaddr(self.devs), src.getaddr(self.devs), UOp.const(sz, dtypes.uint64), self.stream)
+    self.h = ccall(cuda.cuMemcpyAsync, self.w(dst.getaddr(self.devs)), self.w(src.getaddr(self.devs)), UOp.const(sz, dtypes.uint64), self.stream)
 
   def wait(self, signal:UOp, value:UOp):
-    self.h = ccall(cuda.cuStreamWaitValue64_v2, self.stream, signal.getaddr(self.devs), value, cuda.CU_STREAM_WAIT_VALUE_GEQ)
+    self.h = ccall(cuda.cuStreamWaitValue64_v2, self.stream, self.w(signal.getaddr(self.devs)), self.w(value), cuda.CU_STREAM_WAIT_VALUE_GEQ)
 
   def signal(self, signal:UOp, value:UOp):
-    self.h = ccall(cuda.cuStreamWriteValue64_v2, self.stream, signal.getaddr(self.devs), value, cuda.CU_STREAM_WRITE_VALUE_DEFAULT)
+    self.h = ccall(cuda.cuStreamWriteValue64_v2, self.stream, self.w(signal.getaddr(self.devs)), self.w(value), cuda.CU_STREAM_WRITE_VALUE_DEFAULT)
 
   def timestamp(self, signal:UOp): # a slot is [signal][timestamp]
-    self.h = ccall(cuda.cuLaunchHostFunc, self.stream, self.extern("stamp"), signal[1:2].getaddr(self.devs))
+    self.h = ccall(cuda.cuLaunchHostFunc, self.stream, self.w(self.extern("stamp")), self.w(signal[1:2].getaddr(self.devs)))
 
-  def submit(self, ka:UOp) -> UOp: return self.rt_vars.after(self.h).index(3).store(self.h.cast(dtypes.uint64)).substitute({self.kernargs: ka})
+  @uopfunc
+  def submit(self, cmdbuf:UOp) -> UOp: # the calls read their values from the cmdbuf
+    return self.rt_vars.after(self.h).index(3).store(self.h.cast(dtypes.uint64)).substitute({self.cmdbuf: cmdbuf}).sink()
 
 # *****************
 # device
