@@ -1,4 +1,12 @@
 typedef __bf16 hip_bfloat16;
+#ifndef STATE_BF16
+#define STATE_BF16 1
+#endif
+#if STATE_BF16
+typedef hip_bfloat16 state_t;
+#else
+typedef float state_t;
+#endif
 extern "C" __attribute__((device, const)) float __ocml_sqrt_f32(float);
 
 #ifndef N_ELEMS
@@ -39,7 +47,7 @@ __attribute__((device, always_inline)) float adam_clip_bf16(float value, float s
 // in the master pass. Do the three updates together. The input gradient already
 // has the same BF16 clipping boundary as the lazy optimizer expression.
 extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(256, 256))) fused_adam_bf16_vocab(
-    hip_bfloat16 *__restrict__ m, hip_bfloat16 *__restrict__ v,
+    state_t *__restrict__ m, state_t *__restrict__ v,
     float *__restrict__ master, const hip_bfloat16 *__restrict__ grad,
 #if GPTOSS_ADAM_BF16_RAW_CLIP
     const float *__restrict__ clip_scale,
@@ -88,10 +96,15 @@ extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_si
   #pragma unroll
   for (int j = 0; j < ELEMS_PER_THREAD; j++) {
     const long long idx = base + j * THREADS;
+#if GPTOSS_ADAM_BF16_WD
+    const float old_w = master[idx];
+    const float new_w = old_w - lr_v * (m_new[j] * inv_b1 * (1.0f / (__ocml_sqrt_f32(v_new[j] * inv_b2) + EPS)) + WEIGHT_DECAY * old_w);
+#else
     const float new_w = master[idx] -
       (lr_v * m_new[j] * inv_b1 * (1.0f / (__ocml_sqrt_f32(v_new[j] * inv_b2) + EPS)));
-    m[idx] = (hip_bfloat16)m_new[j];
-    v[idx] = (hip_bfloat16)v_new[j];
+#endif
+    m[idx] = (state_t)m_new[j];
+    v[idx] = (state_t)v_new[j];
     master[idx] = new_w;
   }
 }

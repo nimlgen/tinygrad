@@ -3,11 +3,11 @@ from typing import cast
 import functools, struct, operator, re
 from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
 from tinygrad.dtype import dtypes, DType
-from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten
+from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten, getenv
 from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.runtime.autogen import bnxt
 from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
-from tinygrad.runtime.support.hcq2 import unwrap_view, to_name
+from tinygrad.runtime.support.hcq2 import unwrap_view, to_name, rdma_phase
 from tinygrad.runtime.support.memory import AddrSpace, MMIOInterface, VirtMapping, MemoryManager
 from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta, System
 from tinygrad.runtime.support.system import filter_visible_devices
@@ -74,45 +74,51 @@ class RDMADevice(Compiled):
 # UOps implementation
 
 @functools.cache
-def rdma_qp(pair:tuple[str, str]) -> dict[str, BNXTQP]:
+def rdma_qp(pair:tuple[str, ...]) -> dict[str, BNXTQP]:
   # one qp per gpu pair
-  nics = [unwrap(rdma_nic_for(Device[d], Device[min(pair)])) for d in pair]
+  nics = [unwrap(rdma_nic_for(Device[d], Device[min(pair[:2])])) for d in pair[:2]]
   qps = {nic.device: BNXTQP(nic.iface.dev_impl) for nic in nics}
   for nic, q in zip(nics, qps.values()):
     bufs = {name: nic.iface.buffer(getattr(q, name).ring, getattr(q, name).paddrs) for name in ("sq", "rq", "scq", "rcq")}
-    bufs |= {name: Buffer(nic.device, 1, dtypes.uint64, initial_value=bytes(8)) for name in ("sq_seq", "rq_seq", "psn")} | {"db": nic.iface.doorbell}
+    bufs |= {name: Buffer(nic.device, 1, dtypes.uint64, initial_value=bytes(8)) for name in ("sq_seq", "rq_seq", "rq_done", "psn")}
+    bufs |= {"db": nic.iface.doorbell}
     rules = [(UPat(Ops.PARAM, tag=to_name("rdma", *pair, n)), lambda ctx, b=b: b) for n, b in bufs.items()]
     nic.pm_bufferize = PatternMatcher(rules) + nic.pm_bufferize
   for a, b in (nics, nics[::-1]): qps[a.device].connect(qps[b.device].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
   return qps
 
-def rdma_mem(nic:str, pair:tuple[str, str], name:str, size:int, dtype:DType=dtypes.uint8) -> UOp:
+def rdma_mem(nic:str, pair:tuple[str, ...], name:str, size:int, dtype:DType=dtypes.uint8) -> UOp:
   return UOp.placeholder((size,), dtype, 0, device=nic, volatile=True, tag=to_name("rdma", *pair, name))
-def rdma_ring(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp:
+def rdma_ring(nic:str, pair:tuple[str, ...], is_recv:bool) -> UOp:
   return rdma_mem(nic, pair, "rq" if is_recv else "sq", RING_ENTRIES * (WQE_SIZE if is_recv else WQE_SIZE + 8))
-def rdma_cq(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp: return rdma_mem(nic, pair, "rcq" if is_recv else "scq", CQ_ENTRIES * 32)
-def rdma_seq(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp: return rdma_mem(nic, pair, "rq_seq" if is_recv else "sq_seq", 1, dtypes.uint64)
-def rdma_psn(nic:str, pair:tuple[str, str]) -> UOp: return rdma_mem(nic, pair, "psn", 1, dtypes.uint64) # the next psn of the sends
-def rdma_db(nic:str, pair:tuple[str, str]) -> UOp: return rdma_mem(nic, pair, "db", 0x1000)
+def rdma_cq(nic:str, pair:tuple[str, ...], is_recv:bool) -> UOp: return rdma_mem(nic, pair, "rcq" if is_recv else "scq", CQ_ENTRIES * 32)
+def rdma_seq(nic:str, pair:tuple[str, ...], is_recv:bool, phase:str="") -> UOp: # the slot counters: the posted and, split, the completed receives
+  return rdma_mem(nic, pair, "rq_done" if phase == "wait" else "rq_seq" if is_recv else "sq_seq", 1, dtypes.uint64)
+def rdma_psn(nic:str, pair:tuple[str, ...]) -> UOp: return rdma_mem(nic, pair, "psn", 1, dtypes.uint64) # the next psn of the sends
+def rdma_db(nic:str, pair:tuple[str, ...]) -> UOp: return rdma_mem(nic, pair, "db", 0x1000)
 
 def rdma_wire(call:UOp) -> UOp|None:
   if call.op is not Ops.CALL or call.src[0].op is not Ops.STORE: return None
   return next((b for b in get_call_arg_uops(call) if to_tuple(b.device)[0].startswith("RDMA")), None)
 def is_rdma(call:UOp) -> bool: return rdma_wire(call) is not None
 
-def queue_of(call:UOp) -> tuple[tuple[str, str], bool]:
+def queue_of(call:UOp) -> tuple[tuple[str, ...], bool, str]: # the qp's pair, receive or send, and a split receive's phase (post, wait)
   (dst, src), wire = get_call_arg_uops(call), unwrap(rdma_wire(call))
   gpu = to_tuple((dst if wire is src else src).device)[0]
-  return (min(gpu, wire.tag), max(gpu, wire.tag)), wire is src
+  peer = wire.tag[0] if isinstance(wire.tag, tuple) else wire.tag
+  # RDMA_DUPLEX>=2: a qp per direction, keyed by the sending gpu
+  qkey = (min(gpu, peer), max(gpu, peer)) + ((peer if wire is src else gpu,) if getenv("RDMA_DUPLEX", 0) >= 2 else ())
+  return qkey, wire is src, rdma_phase(wire)
 
 def ins(name:str, *src:UOp|int) -> UOp:
   return UOp(Ops.INS, arg=(name, dtypes.void), src=tuple(UOp.const(s, dtypes.uint32) if isinstance(s, int) else s for s in src))
 
 def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the ops of each copy of a submit on one queue
-  (pair, is_recv), nic = queue_of(calls[0]), cast(RDMADevice, Device[unwrap(rdma_wire(calls[0])).device])
+  (pair, is_recv, phase), nic = queue_of(calls[0]), cast(RDMADevice, Device[unwrap(rdma_wire(calls[0])).device])
   qp = rdma_qp(pair)[nic.device]
   ring, cq = rdma_ring(nic.device, pair, is_recv), rdma_cq(nic.device, pair, is_recv)
-  seq, psn = rdma_seq(nic.device, pair, is_recv), rdma_psn(nic.device, pair)
+  seq, psn = rdma_seq(nic.device, pair, is_recv, phase), rdma_psn(nic.device, pair)
+  posts, polls = phase != "wait", phase != "post" # a split receive: the posting queue never polls, the polling queue never posts
   bufs = [get_call_arg_uops(c)[0 if is_recv else 1] for c in calls]
   wqes, packets = sum(ceildiv(b.nbytes(), RDMA_CHUNK) for b in bufs), sum(ceildiv(b.nbytes(), MTU) for b in bufs)
 
@@ -120,7 +126,10 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
 
   # next slot and psn persist in nic memory. read once per submit and own it
   bumps = [seq.index(0).store(seq.index(0).load() + wqes)] + ([] if is_recv else [psn.index(0).store(psn.index(0).load() + packets)])
-  n, p = seq.after(*bumps).index(0).load() - wqes, psn.after(*bumps).index(0).load() - packets
+  n0, p0 = seq.after(*bumps).index(0).load() - wqes, psn.after(*bumps).index(0).load() - packets
+  # words are templates over the wqe and psn offsets: the host program patches them in one loop per template
+  wqe_v, psn_v, next_psn_v = (UOp.variable(f"rdma_{x}", 0, 0xffffffff, dtypes.uint64) for x in ("wqe", "psn", "next_psn"))
+  j, pj = 0, 0
 
   ring_addr, cq_addr = ring.getaddr(devs), cq.getaddr(devs)
   db = rdma_db(nic.device, pair).getaddr(devs) + (nic.iface.dev_impl.db_off & 0xfff)
@@ -132,25 +141,29 @@ def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the
     ops:list[UOp] = []
     for off in range(0, buf.nbytes(), RDMA_CHUNK): # a wqe per chunk, each completed
       size = min(RDMA_CHUNK, buf.nbytes() - off)
+      n, p, p_next = n0 + wqe_v.bind(j), p0 + psn_v.bind(pj), p0 + next_psn_v.bind(pj + ceildiv(size, MTU))
 
       # sdma fills in the wqe
       hdr, key = struct.unpack("<8I", (recv_wqe if is_recv else send_wqe)(0, 0, size)[:32]), unwrap_view(buf)[0].getaddr(nic.device)
-      ops += [ins("write", ring_addr + (n % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(devs) + off, key.cast(dtypes.uint32), size)]
+      if posts:
+        ops += [ins("write", ring_addr + (n % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(devs) + off, key.cast(dtypes.uint32), size)]
 
-      # a send also fills in its msn entry: the slot, the psn after it (a psn per packet), its first psn
-      if not is_recv: ops += [ins("write", ring_addr + RING_ENTRIES * WQE_SIZE + (n % RING_ENTRIES) * 8,
-                                  ((n % RING_ENTRIES) << 48) | (((p + ceildiv(size, MTU)) & 0xffffff) << 24) | (p & 0xffffff))]
+        # a send also fills in its msn entry: the slot, the psn after it (a psn per packet), its first psn
+        if not is_recv: ops += [ins("write", ring_addr + RING_ENTRIES * WQE_SIZE + (n % RING_ENTRIES) * 8,
+                                    ((n % RING_ENTRIES) << 48) | ((p_next & 0xffffff) << 24) | (p & 0xffffff))]
 
       # rings the doorbell: the slot after the wqe and the epoch of its pass
-      ops += [ins("write", db, ((n + 1) % RING_ENTRIES | ((n + 1) // RING_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | ring_db)]
+      if posts:
+        ops += [ins("write", db, ((n + 1) % RING_ENTRIES | ((n + 1) // RING_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | ring_db)]
 
       # waits for the cqe, acks the cq
-      ops += [ins("wait_eq", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint16)),
-              ins("write", db, ((n + 1) % CQ_ENTRIES | ((n + 1) // CQ_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | cq_db)]
-      n, p = n + 1, p + ceildiv(size, MTU)
+      if polls:
+        ops += [ins("wait_eq", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint16)),
+                ins("write", db, ((n + 1) % CQ_ENTRIES | ((n + 1) // CQ_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | cq_db)]
+      j, pj = j + 1, pj + ceildiv(size, MTU)
 
     # and invalidate the gpu caches on recv
-    copies.append(ops + ([ins("barrier")] if is_recv else []))
+    copies.append(ops + ([ins("barrier")] if is_recv and phase != "post" else []))
   return copies
 
 # *****************

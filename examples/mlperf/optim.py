@@ -1,3 +1,4 @@
+import functools
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.nn.optim import Optimizer, OptimizerGroup
@@ -10,19 +11,21 @@ ZERO_OPTIM = getenv("ZERO_OPTIM", 0)
 MXFP8 = getenv("MXFP8", 0)
 PRESTORE_WT = getenv("PRESTORE_WT", 0)  # pre-store transposed mxfp8 weight (W^T) so the dgrad skips dequant+transpose+requant
 FUSED_ADAM_MXFP8 = getenv("FUSED_ADAM_MXFP8", 0)
+GPTOSS_REF_WD = getenv("GPTOSS_REF_WD", 0)
+GPTOSS_ADAM_FP32 = getenv("GPTOSS_ADAM_FP32", 0)
+
+@functools.cache
+def _owned_gather_body(param:UOp) -> UOp:
+  assert param.op is Ops.UNSHARD and param.axis == 0 and isinstance(param.device, tuple)
+  local = param.src[0].reshape(param.shard_shape)
+  return Tensor.cat(*(Tensor(local.mselect(i).copy_to_device(param.device)) for i in range(len(param.device))), dim=0).uop
 
 def _gptoss_gather_owned(t:Tensor) -> Tensor:
-  """Gather native Adam's owned expert shards without a local staging copy."""
-  assert isinstance(t.device, tuple) and t.uop.axis == 0 and t.uop.has_buffer_identity(after_ok=True)
-  node, deps = t.uop, []
-  while node.op in (Ops.AFTER, Ops.RESHAPE, Ops.UNSHARD):
-    if node.op is Ops.AFTER: deps.extend(node.src[1:])
-    node = node.src[0]
-  assert node is t.uop.storage_base
-  # Preserve both FC1 writers (main and tail), exposing only their physical local
-  # output view. Logical shard slicing would introduce a copy before each send.
-  local = node.reshape(t.uop.shard_shape).after(*deps)
-  return Tensor.cat(*(Tensor(local.mselect(i).copy_to_device(t.device)) for i in range(len(t.device))), dim=0)
+  """Gather native Adam's owned expert shards without a staging copy: the shard's physical buffer is the send source, bound
+  through an explicit parameter so the caller's dependencies survive."""
+  assert isinstance(t.device, tuple) and t.uop.axis == 0
+  t = t.contiguous()
+  return Tensor(_owned_gather_body(t.uop.param_like(0)).call_with_output(t.uop, name="owned_weight_gather", precompile=False), device=t.device)
 
 def stochastic_round_bf16(x:Tensor) -> Tensor:
   bits = x.bitcast(dtypes.uint32)
@@ -79,6 +82,8 @@ def clip_grads_lazy(grads:list[Tensor], grad_acc, clip_norm) -> tuple[list[Tenso
 class GradAccClipAdamW(Optimizer):
   def __init__(self, params:list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-6, weight_decay=0.0, grad_acc=1, clip_norm=1.0, device=None, fused=FUSE_OPTIM):
     super().__init__(params, lr, device, fused)
+    # GPTOSS_ADAM_FP32: fp32 moments like the reference (OPTIM_DTYPE is pinned to bf16 by the launch script)
+    if GPTOSS_ADAM_FP32: self.param_dtype = dtypes.float32
     self.b1, self.b2, self.eps, self.wd = b1, b2, eps, weight_decay
     self.b1_t, self.b2_t = (Tensor.ones((1,), dtype=dtypes.float32, device=self.device) for _ in [b1, b2])
     self.zero = bool(ZERO_OPTIM) and isinstance(self.device, tuple) and not self.fused
@@ -116,6 +121,8 @@ class GradAccClipAdamW(Optimizer):
     fp8_wT = [tt._wT_q for tt in self.params if hasattr(tt, '_wT_q')] + [tt._wT_e8 for tt in self.params if hasattr(tt, '_wT_e8')]
     fp8_fc1_si = [tt._fc1_packed_si for tt in self.params if hasattr(tt, '_fc1_packed_si')]
     outputs = extra + self.params + self.buffers + (self.master_params or []) + fp8_inv_scales + fp8_next_inv_scales + fp8_wT + fp8_fc1_si
+    if (expert_gather := getattr(self, '_deferred_experts', None)) is not None and expert_gather.stage_now:
+      outputs = expert_gather.scheduled_outputs(outputs, self)
     return deferred.scheduled_outputs(outputs) if (deferred := getattr(self, '_deferred_lmhead', None)) is not None else outputs
 
   def _fschedule_fused_adam_mxfp8(self, grads:list[Tensor]) -> list[Tensor]:
@@ -148,7 +155,7 @@ class GradAccClipAdamW(Optimizer):
           g = g.shard_like(master)
         self.m[i], self.v[i], self.master_params[i] = fused_adam_bf16_vocab(
           self.m[i], self.v[i], master, g, self.lr, self.b1_t, self.b2_t,
-          b1=self.b1, b2=self.b2, eps=self.eps, clip_scale=raw_scale if raw_vocab_clip else None)
+          b1=self.b1, b2=self.b2, eps=self.eps, clip_scale=raw_scale if raw_vocab_clip else None, weight_decay=self._wd(tt))
         # Replicas consume BF16 weights, not the FP32 master. Round each local shard before transferring it.
         new_w = self.master_params[i].cast(tt.dtype)  # type: ignore[index]
         tt.assign(self._zero_gather(new_w) if self.zero else new_w)
@@ -175,11 +182,14 @@ class GradAccClipAdamW(Optimizer):
         compact_q = self.zero and bool(getenv("GPTOSS_COMPACT_Q_GATHER", 0)) and (has_fc1_si or gptoss_down_shape)
         fused_out = fused_adam_mxfp8(self.m[i], self.v[i], master, g, self.lr, self.b1_t, self.b2_t,
                                      b1=self.b1, b2=self.b2, eps=self.eps,
-                                     weight_decay=self.wd if tt.ndim >= 3 else 0.0,
+                                     weight_decay=self._wd(tt),
                                      experts=tt.shape[0] if has_fc1_si else 1, out_si=direct_si,
                                      clip_scale=raw_scale if raw_clip else None, compact_q=compact_q)
         m, v, master, q, e8, *si_out = fused_out
         self.m[i], self.v[i], self.master_params[i] = m, v, master  # type: ignore[index]
+        if (expert_gather := getattr(self, '_deferred_experts', None)) is not None and expert_gather.stage_now and id(tt) in expert_gather.entries:
+          expert_gather.stage(tt, [q, e8, *si_out])
+          continue
         if self.zero:
           gather = _gptoss_gather_owned if compact_q and getenv("GPTOSS_OWNED_EXPERT_GATHER", 0) else self._zero_gather
           if compact_q:
@@ -226,9 +236,12 @@ class GradAccClipAdamW(Optimizer):
       ret.append(self.lr * up)
     return ret, [self.b1_t, self.b2_t] + self.m + self.v
 
+  # GPTOSS_REF_WD: the caller's parameter groups decide (reference: every weight matrix, no biases/norms/sinks); else only >=3-D weights
+  def _wd(self, t:Tensor) -> float: return self.wd if GPTOSS_REF_WD or t.ndim >= 3 else 0.0
+
   def _apply_update(self, t:Tensor, up:Tensor, master:Tensor|None=None) -> Tensor:
     w = master if master is not None else t
-    wd = self.wd if t.ndim >= 3 else 0.0
+    wd = self._wd(t)
     up = up.float().shard_like(w) + self.lr.to(w.device) * wd * w.detach()
     new_w = w.detach() - up
     if master is not None: master.assign(new_w)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast, Any, Sequence
-import functools, itertools, weakref, ctypes, importlib
+import functools, itertools, weakref, ctypes, importlib, struct
 from dataclasses import replace, dataclass, field
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, ContextVar, Context, panic, partition, getenv, round_up
 from tinygrad.helpers import DEBUG, VIZ, HCQ2, DEV, ALL2ALL
@@ -132,6 +132,12 @@ STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) <
 @functools.cache
 def _staging(device:str) -> Buffer: return Buffer(device, STAGING_SIZE, dtypes.uint8, preallocate=True)
 
+RDMA_DUPLEX = getenv("RDMA_DUPLEX", 0)
+# a receive that posts its wqe and then polls for the completion holds the ring to one posted wqe: a send arriving earlier gets an rnr nak
+# and the nic retries it a millisecond later. split it: one sdma queue posts every receive as soon as its buffer is free, another polls
+RDMA_POST_AHEAD = getenv("RDMA_POST_AHEAD", 1)
+def rdma_phase(wire:UOp) -> str: return wire.tag[2] if isinstance(wire.tag, tuple) else ""
+
 def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   devs = [to_tuple(b.device)[0] for b in (dst, src)]
   if not all(hasattr(Device[d], "iface") for d in devs) or Device[devs[0]].peer_group == Device[devs[1]].peer_group: return None # not 2 nodes
@@ -140,9 +146,12 @@ def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if None in (nics:=[rdma_nic_for(Device[d], Device[min(devs)]) for d in devs]): return None
 
   # wires: a placeholder per nic in place of the far gpu, tagged by it
-  wires = [UOp.placeholder(src.max_shape, src.dtype, 0, device=unwrap(nic).device, tag=peer) for nic, peer in zip(nics, devs[::-1])]
-  send = call.replace(src=wires[1].store_call(src).src)
-  return UOp(Ops.LINEAR, src=(send, call.replace(src=dst.store_call(wires[0]).src)))
+  # RDMA_DUPLEX: a wire per direction, so a send doesn't order behind the opposite receive on the same nic
+  def wire(nic, peer, is_recv, phase=""):
+    return UOp.placeholder(src.max_shape, src.dtype, 0, device=unwrap(nic).device, tag=(peer, is_recv and bool(RDMA_DUPLEX), phase))
+  send = call.replace(src=wire(nics[1], devs[0], False).store_call(src).src)
+  recvs = [call.replace(src=dst.store_call(wire(nics[0], devs[1], True, phase)).src) for phase in (("post", "wait") if RDMA_POST_AHEAD else ("",))]
+  return UOp(Ops.LINEAR, src=(send, *recvs))
 
 def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if any(to_tuple(b.device)[0].startswith("RDMA") for b in (dst, src)): return None # over the nic
@@ -289,11 +298,22 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   # assign to queues
   peers = sorted({Device.canonicalize(d) for c in l.src if c.op is Ops.CALL and c.body.op is Ops.STORE
                   for b in get_call_arg_uops(c) for d in to_tuple(b.device) if d.split(":")[0] == "AMD"})
+  # Index peers within their node: a global lexical order aliases local links once device ids reach two digits.
+  peer_groups:dict[str, list[str]] = {}
+  for d in peers: peer_groups.setdefault(Device[d].peer_group, []).append(d)
+  peer_index = {d: (i, len(group)) for group in peer_groups.values() for i,d in enumerate(group)}
   num_queues = max(1, getenv("HCQ_NUM_SDMA", min(len(peers), 8) if ALL2ALL >= 1 else 1))
   queues = ["COMPUTE:0" if c.op is Ops.CALL and c.body.op is Ops.PROGRAM else "COPY:0" for c in l.src]
   for i, c in enumerate(l.src):
     if c.op is Ops.CALL and c.body.op is Ops.STORE and all(b.device in peers for b in get_call_arg_uops(c)):
-      queues[i] = f"COPY:{(peers.index(c.src[1].device) - peers.index(c.src[2].device) - 1) % len(peers) % num_queues}"
+      dst, (src, count) = peer_index[c.src[1].device][0], peer_index[c.src[2].device]
+      queues[i] = f"COPY:{(dst - src - 1) % count % num_queues}"
+    # nic sends, receive posts and receive completions get their own engines: queued behind a bulk xgmi copy or behind each other,
+    # a cross-node transfer stalls its consumer and the nic runs half duplex
+    elif num_queues > 1 and c.op is Ops.CALL and c.body.op is Ops.STORE and \
+        any(str(d).startswith("RDMA") for b in get_call_arg_uops(c) for d in to_tuple(b.device)):
+      is_recv = str(to_tuple(c.src[2].device)[0]).startswith('RDMA')
+      queues[i] = f"COPY:{num_queues + is_recv + (rdma_phase(c.src[2]) == 'wait')}"
 
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs, queues), key=lambda e: bool(e[1])):
@@ -413,17 +433,31 @@ def hoist_links(ctx:EncodeCtx, a:UOp) -> UOp|None:
 
 pm_patches = PatternMatcher([(UPat(Ops.AFTER, name="a"), hoist_links)])
 
+def rows_loop(view:UOp, tmpl:UOp, rows:list[tuple[int, dict[UOp, int]]]) -> UOp: # stores the template at each row's offset with its values
+  cols = len(rows[0][1]) + 1
+  table = UOp.placeholder((len(rows) * cols,), dtypes.uint32, device=Device[to_tuple(view.device)[0]].host, tag="rows")
+  table = patch(table, [], struct.pack(f"<{len(rows) * cols}I", *[x for o, vals in rows for x in (o, *vals.values())]))
+  r = UOp.range(len(rows), 0, dtype=dtypes.int, src=(table,))
+  off, *cells = [table.index(r * cols + c).load() for c in range(cols)]
+  return view.index(off).store(tmpl.substitute({v: x.cast(v.dtype) for v, x in zip(rows[0][1], cells)})).end(r)
+
 def patch(buf:UOp, rows:Sequence[tuple[int|UOp, UOp]], blob:bytes|None=None) -> UOp:
-  # group into stacks based on dtype, alignment, is_link (rt/lt can't share a store) and ranges (a ranged offset is a loop)
-  keys = [(w.dtype, (o if isinstance(o, int) else o.vmin) % w.dtype.itemsize, _is_link_patch(w), tuple(getattr(o, "ranges", ()))) for o, w in rows]
+  # group into stacks based on dtype, alignment, is_link (rt/lt can't share a store), ranges (a ranged offset is a loop) and template (a rows loop)
+  unbound = {w: w.unbind_all() for o, w in rows if isinstance(o, int) and not _is_link_patch(w)} # words over bound variables share a template
+  tmpls = {w: t for w, (t, vals) in unbound.items() if vals}
+  keys = [(w.dtype, (o if isinstance(o, int) else o.vmin) % w.dtype.itemsize, _is_link_patch(w), tuple(getattr(o, "ranges", ())), tmpls.get(w))
+          for o, w in rows]
   groups = [(key, [row for row, k in zip(rows, keys) if k == key]) for key in dedup(keys)]
 
   dep = [buf.store(UOp(Ops.BINARY, arg=blob).bitcast(buf.dtype))] if blob is not None else []
   base, stores = buf.after(*dep), [] # keep buf.after to be sure that link applies patches after the blob
-  for (dt, phase, _, rngs), grp in groups:
+  for (dt, phase, _, rngs, tmpl), grp in groups:
     view = base[phase:phase + (buf.max_numel() - phase) // dt.itemsize * dt.itemsize].bitcast(dt)
-    offs = [UOp.const(i) if isinstance(i:=(o - phase) // dt.itemsize, int) else i for o, _ in grp]
-    stores.append(view.index(UOp.stack(*offs)).store(UOp.stack(*[w for _, w in grp])).end(*rngs))
+    if tmpl is not None and len(grp) > 1: stores.append(rows_loop(view, tmpl, [((o - phase) // dt.itemsize, unbound[w][1]) for o, w in grp]))
+    else: # no one-trip loops: the linearizer misplaces their loads
+      offs = [UOp.const(i) if isinstance(i:=(o - phase) // dt.itemsize, int) else i for o, _ in grp]
+      ws = [w if tmpl is None else tmpl.substitute({v: UOp.const(x, v.dtype) for v, x in unbound[w][1].items()}) for _, w in grp]
+      stores.append(view.index(UOp.stack(*offs)).store(UOp.stack(*ws)).end(*rngs))
   return buf.after(*dep, *stores)
 
 def bufferize_linear(hq:HWQueue, name:str, device:str|tuple[str, ...]) -> UOp:

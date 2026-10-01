@@ -1,4 +1,4 @@
-from tinygrad.helpers import all_same, prod, getenv, ALLREDUCE_CAST
+from tinygrad.helpers import all_same, prod, getenv, ALLREDUCE_CAST, ALLREDUCE_NODE_NDEVS
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp, AxisType, graph_rewrite, broadcast_axes, _broadcast_shape, sint_to_uop
 from tinygrad.uop.ops import sint, ssimplify
 from tinygrad.dtype import dtypes
@@ -24,6 +24,10 @@ def mstack_early_shrink(ms:UOp, shrink:UOp):
 def lower_broadcast_copy(c:UOp, x:UOp):
   if not (isinstance(c.device, tuple) and isinstance(x.device, str)): return None
   if (sx:=x.simplify()).device is None: return UOp(Ops.MSTACK, src=(sx,)*len(c.device))
+  # nodes cabled gpu k <-> gpu k: one nic hop to the rank peer of each node, then the node fans out over xgmi
+  if 0 < (n:=ALLREDUCE_NODE_NDEVS.value) < len(c.device) and len(c.device) % n == 0 and x.device in c.device:
+    nodes = [c.device[i:i+n] for i in range(0, len(c.device), n)]
+    return UOp(Ops.MSTACK, src=tuple(x.copy_to_device(node[c.device.index(x.device) % n]).copy_to_device(d) for node in nodes for d in node))
   return UOp(Ops.MSTACK, src=tuple(x.copy_to_device(d) for d in c.device))
 
 replace_allreduce = PatternMatcher([

@@ -2,7 +2,7 @@ import time, inspect
 from collections import deque
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, rewrite_group, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup, getenv
 
 # **** schedule linearizer
 
@@ -62,9 +62,11 @@ def create_schedule(sched_sink:UOp) -> UOp:
 
   with cpu_profile(TracingKey("linearize schedule")):
     queue: deque[UOp] = deque(k for k,v in in_degree.items() if v == 0)
+    # a kernel made ready by a nic receive waits for the other node on an in-order queue: emit it after `delay` more kernels
+    delay, delayed = getenv("SCHED_RDMA_DELAY", 0), deque[tuple[int, UOp]]()
     linearized: list[UOp] = []
-    while len(queue):
-      rk = queue.popleft()
+    while len(queue) or len(delayed):
+      rk = delayed.popleft()[1] if len(delayed) and (not len(queue) or delayed[0][0] <= len(linearized)) else queue.popleft()
       if rk.op is Ops.LINEAR:
         linearized.extend(rk.src)
       else:
@@ -72,9 +74,12 @@ def create_schedule(sched_sink:UOp) -> UOp:
         assert k.op is Ops.CALL, f"unexpected op in queue: {k.op}"
         buf_uops = tuple(_unwrap_src(s).buf_uop for s in k.src[1:] if not s.is_bound_var)
         linearized.append(k.replace(src=(k.body, *buf_uops)))
+      is_recv = delay and rk.op is Ops.CALL and any("RDMA" in str(s.device) for s in rk.src[1:])
       for x in children.get(rk, []):
         in_degree[x] -= 1
-        if in_degree[x] == 0: queue.append(x)
+        if in_degree[x] == 0:
+          if is_recv: delayed.append((len(linearized) + delay, x))
+          else: queue.append(x)
     if any(in_degree.values()): raise RuntimeError("cycle detected in assign graph")
   return UOp(Ops.LINEAR, src=tuple(linearized))
 

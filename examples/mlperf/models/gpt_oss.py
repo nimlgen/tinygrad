@@ -86,6 +86,7 @@ FP8_MAX = 448.0
 INIT_STD = 0.02
 ASM_GEMM = getenv("ASM_GEMM", 0)
 PRESTORE_WT = getenv("PRESTORE_WT", 0)
+PAD_ATTN_W = getenv("GPTOSS_PAD_ATTN_W", 0)
 
 def _quant_dequant_fwd(x:Tensor) -> Tensor:
   # x (2d bf16) -> bf16 value after an mxfp8 round-trip (1x32 block scaling on the last axis)
@@ -157,7 +158,7 @@ def matmul_mx(x:Tensor|tuple[Tensor, Tensor], w_q:Tensor, w_scale:Tensor) -> Ten
       wq = wq.pad(((0, npad), (0, 0)))
       ws = ws.pad(((0, npad), (0, 0)), value=127).cast(dtypes.uint8)
     local_rows = x2.shape[0] // len(x2.device) if isinstance(x2.device, tuple) and x2.uop.axis == 0 else x2.shape[0]
-    if getenv("FUSED_ATTN_QE8", 0) and (local_rows, x2.shape[1]) == (16384, 4096) and w_q.shape == (2880, 4096):
+    if getenv("FUSED_ATTN_QE8", 0) and (local_rows, x2.shape[1]) == (16384, 4096) and w_q.shape in ((2880, 4096), (3072, 4096)):
       from extra.gptoss_kernels.quantize_mxfp8 import quantize_mxfp8_fused_qe8
       x_q, x_e8 = quantize_mxfp8_fused_qe8(x2)
       x_si = mx_pack(x_e8)
@@ -212,10 +213,11 @@ class GPTOSS:
     scaled_std = INIT_STD / math.sqrt(2 * n_layers)
     q_dim, qkv_dim = n_heads * head_dim, head_dim * (n_heads + 2 * n_kv_heads)
 
-    # attn
-    self.wqkv, self.wqkv_scale = self._quant_weight(n_layers, qkv_dim, dim)
+    # attn: GPTOSS_PAD_ATTN_W stores the hidden axis at its physical 3072 (zero padding) like the moe weights, so matmul_mx
+    # doesn't pad the weight and its scales in every forward and backward
+    self.wqkv, self.wqkv_scale = self._quant_weight(n_layers, qkv_dim, dim, pad=_pad_cols if PAD_ATTN_W else None)
     self.wqkv_bias = Tensor.zeros(n_layers, qkv_dim, dtype=dtypes.bfloat16).contiguous()
-    self.wo, self.wo_scale = self._quant_weight(n_layers, dim, q_dim, std=scaled_std)
+    self.wo, self.wo_scale = self._quant_weight(n_layers, dim, q_dim, std=scaled_std, pad=_pad_rows if PAD_ATTN_W else None)
     self.wo_bias = Tensor.zeros(n_layers, dim, dtype=dtypes.bfloat16).contiguous()
     self.sinks = Tensor.zeros(n_layers, n_heads, dtype=dtypes.bfloat16).contiguous()
     self.attention_norm = Tensor.ones(n_layers, dim).contiguous()
@@ -240,10 +242,10 @@ class GPTOSS:
     self.output = Tensor.normal(vocab_size, dim, mean=0.0, std=INIT_STD, dtype=dtypes.bfloat16)
     self.freqs_cis = precompute_freqs_cis(head_dim, max_context * 2, rope_theta).contiguous().is_param_(False)
 
-  def _quant_weight(self, *shape:int, std:float=INIT_STD, moe:bool=False):
+  def _quant_weight(self, *shape:int, std:float=INIT_STD, moe:bool=False, pad=None):
     def _one(*s:int):
       w = Tensor.zeros(*s) if getenv("ZEROS") else Tensor.normal(*s, mean=0.0, std=std)
-      w_q, w_e8, _ = quantize_mxfp8(_pad_cols(_pad_rows(w)) if moe else w)
+      w_q, w_e8, _ = quantize_mxfp8(_pad_cols(_pad_rows(w)) if moe else pad(w) if pad is not None else w)
       return w_q, w_e8.is_param_(False)
     if moe:
       qs = [_one(*shape[1:]) for _ in range(shape[0])]
@@ -335,7 +337,7 @@ class GPTOSS:
       w = (e / (e.sum(-1, keepdim=True) + (sink - m).exp())).cast(dtypes.bfloat16)
       attn = (w @ xvm).permute(0, 3, 1, 2, 4).reshape(bsz, seqlen, self.n_heads * self.head_dim)
 
-    out = dense_bias_add(matmul_mx(attn, wo, wo_scale), wo_bias)
+    out = dense_bias_add(matmul_mx(attn, wo, wo_scale)[..., :self.dim], wo_bias)
     return out, [*norm_saves, attn] + fa_saves
 
   def feed_forward(self, x:Tensor, *, ffn_norm:Tensor, gate:Tensor, gate_bias:Tensor,
@@ -511,7 +513,11 @@ class GPTOSS:
     ffn, ffn_saves = self.feed_forward(h, **ffn_kwargs)
     # Preserve the exact norm input UOp so backward can reuse it without rematerializing WO.
     if save and getenv("GPTOSS_SAVE_FFN_INPUT", 0): ffn_saves.append(saved_h)
-    if getenv("GPTOSS_RESIDUAL_HIP", 0) and x.shape[-1] == 2880 and x.dtype == dtypes.bfloat16:
+    if getenv("GPTOSS_RESID_FROM_SAVED", 0) and saved_h is not h:
+      # the fused norm already wrote the exact bf16(x + bf16(proj + bias)): add the MoE output to it instead of
+      # re-reading x/proj/bias; its gradient joins the norm's in one dense-bias backward (see _gptoss_residual_mul_fwd_bwd)
+      h = saved_h + ffn
+    elif getenv("GPTOSS_RESIDUAL_HIP", 0) and x.shape[-1] == 2880 and x.dtype == dtypes.bfloat16:
       from extra.llama_kernels.gptoss_residual import gptoss_residual_join
       h = gptoss_residual_join(x, attn, ffn)
     else:
@@ -526,6 +532,8 @@ class GPTOSS:
     Tensor.realize(*get_parameters(self))
 
   def __call__(self, tokens:Tensor, save:bool=True, targets:Tensor|None=None):
+    expert_gather = getattr(self, '_deferred_experts', None) if TRAINING else None
+    if expert_gather is not None and expert_gather.prefetch_now: expert_gather.prefetch()
     h = self.tok_embeddings(tokens)
     bsz, seqlen = tokens.shape
     freqs_cis = self.freqs_cis.cast(h.dtype)[:, :seqlen, :, :, :]

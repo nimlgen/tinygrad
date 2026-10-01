@@ -62,7 +62,9 @@ def _custom_rmsnorm_mul_quantize_mxfp8_fwd(q:UOp, e8:UOp, rrms:UOp, x:UOp, weigh
   *lead, hidden = x.shape
   rows, padded = math.prod(lead), q.shape[-1]
   coop_epilogue = COOP_EPILOGUE and (rows, hidden, padded) == (16384, 2880, 3072)
-  num_wg = min(NUM_WG, rows)
+  # GPTOSS_RMSNORM_MX_FWD_WG: the persistent 1024-workgroup launch keeps only ~4 rows in flight per CU (0.8 TB/s on MI350X);
+  # more workgroups raise memory-level parallelism. Per-row arithmetic (and so every output bit) is unchanged.
+  num_wg = min(getenv("GPTOSS_RMSNORM_MX_FWD_WG", NUM_WG), rows)
   threads, workgroups = UOp.special(THREADS_PER_WG, "lidx0"), UOp.special(num_wg, "gidx0")
   sink = UOp.sink(q.base, e8.base, rrms.base, x.base, weight.base, threads, workgroups,
                   arg=KernelInfo(f"rmsnorm_mul_quantize_mxfp8_{rows}_{hidden}_{padded}_ep8{int(coop_epilogue)}",
@@ -245,10 +247,14 @@ def _custom_gptoss_residual_mul_fwd(out:UOp, rrms:UOp, saved_h:UOp, x:UOp, proj:
   return UOp(Ops.PROGRAM,src=(sink,UOp(Ops.LINEAR,src=(*sink.src,sink)),UOp(Ops.SOURCE,arg=source),UOp(Ops.BINARY,arg=lib)))
 
 
-def _gptoss_residual_mul_fwd_bwd(grad:UOp, call:UOp) -> tuple:
+def _gptoss_residual_mul_fwd_bwd(*grads:UOp, call:UOp|None=None) -> tuple:
+  # grads: dy, plus the saved residual's gradient when GPTOSS_RESID_FROM_SAVED also consumes it in the forward
   from extra.llama_kernels.dense_bias import dense_bias_backward
+  if call is None: *grads, call = grads
+  assert len(grads) in (1, 2), f"expected dy[, dsaved_h], got {len(grads)} gradients"
   _,rrms,h,x,proj,bias,weight = call.src[1:]
-  dh,dweight = _rmsnorm_mul_bwd_inputs(grad,h.after(call),weight,rrms.after(call))
+  dh,dweight = _rmsnorm_mul_bwd_inputs(grads[0],h.after(call),weight,rrms.after(call))
+  if len(grads) == 2: dh = (Tensor(dh) + Tensor(grads[1], device=Tensor(dh).device)).uop
   # Preserve the existing dense-bias backward and its transpose-quantization mailbox for the WO GEMM.
   proj_view = Tensor(proj)[:,:2880].reshape(x.shape)
   dproj,dbias = dense_bias_backward(dh,proj_view.uop,bias)
@@ -311,6 +317,15 @@ def _const_tuple(u:UOp) -> tuple[int, ...]|None:
   return tuple(x.arg for x in u.src)
 
 
+def _padw_proj_phys(proj:UOp, shape:tuple, rows:int) -> UOp|None:
+  # SHRINK(RESHAPE(phys[rows,3072] -> [*lead,3072]), [..., 0:2880]) -> phys
+  if proj.op is not Ops.SHRINK or (rs := proj.src[0]).op is not Ops.RESHAPE: return None
+  lead, nd = tuple(shape[:-1]), len(shape)
+  if rs.shape != (*lead, 3072) or rs.src[0].shape != (rows, 3072) or rs.src[0].dtype != dtypes.bfloat16: return None
+  if _const_tuple(proj.src[1]) != (0,)*nd or _const_tuple(proj.src[2]) != (*lead, 2880): return None
+  return rs.src[0]
+
+
 def _gptoss_residual_inputs(x_u:UOp) -> tuple[Tensor, Tensor, Tensor]|None:
   # Match only bf16(residual + dense_bias(padded_projection[:,:2880], bias)). The logical projection
   # remains in x_u's autograd graph; the HIP callback receives its physical 3072-wide parent instead.
@@ -332,6 +347,12 @@ def _gptoss_residual_inputs(x_u:UOp) -> tuple[Tensor, Tensor, Tensor]|None:
     # matmul_mx returns reshape(shrink([rows,3072], [0:rows,0:2880])). Reject any other view instead
     # of guessing a pitch from max_numel: that was unsafe when a generic SHRINK was compacted.
     rows = math.prod(x_u.shape[:-1])
+    # GPTOSS_PAD_ATTN_W stores wo with 3072 physical output rows: matmul_mx returns reshape([rows,3072]) and the caller
+    # slices [..., :2880] after the reshape. Peel that SHRINK(RESHAPE) into the same physical parent.
+    if getenv("GPTOSS_RESID_PADW_MATCH", getenv("GPTOSS_RESID_FROM_SAVED", 0)) and (phys := _padw_proj_phys(proj.uop, x_u.shape, rows)) is not None:
+      if phys.device != residual.uop.device or bias.device != residual.device: continue
+      return residual, Tensor(phys), bias
+    if getenv("GPTOSS_RESID_MATCH_DEBUG", 0): print("residual match miss:", proj.uop.op, [u.op for u in proj.uop.toposort()][-6:])
     proj_2d = proj.uop.src[0] if proj.uop.op is Ops.RESHAPE and proj.uop.src[0].shape == (rows, 2880) else proj.uop
     if proj_2d.op is not Ops.SHRINK or proj_2d.shape != (rows, 2880): continue
     if _const_tuple(proj_2d.src[1]) != (0, 0) or _const_tuple(proj_2d.src[2]) != (rows, 2880): continue

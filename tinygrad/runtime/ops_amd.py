@@ -58,14 +58,21 @@ def _queue_args(hq:HWQueue, q) -> list[UOp]: # the ring and its pointers, tagged
 
 def _dw(vals) -> int: return sum(2 if isinstance(x, UOp) and x.dtype.itemsize == 8 else 1 for x in vals)
 
+def aql_packet(data:AMDProgramData, local_size:tuple[int, ...], grid:tuple[int, ...]=(0, 0, 0), kernel_object:int=0) -> bytes:
+  return bytes(hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
+    setup=3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=data.private_segment_size,
+    group_segment_size=data.group_segment_size, kernel_object=kernel_object, **{f"workgroup_size_{d}": l for d, l in zip("xyz", local_size)},
+    **{f"grid_size_{d}": g for d, g in zip("xyz", grid)}))
+
 def dispatch_packet(data:AMDProgramData, info:ProgramInfo, kernel_object:UOp=UOp.const(0, dtypes.uint64),
                     kernarg_address:UOp=UOp.const(0, dtypes.uint64)) -> list[UOp]: # as words: the grid may be symbolic
-  pkt = bytes(hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),
-    setup=3 << hsa.HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS, private_segment_size=data.private_segment_size,
-    group_segment_size=data.group_segment_size, **{f"workgroup_size_{d}": l for d, l in zip("xyz", info.local_size)}))
+  pkt = aql_packet(data, info.local_size)
   grid = [(g * l).cast(dtypes.uint32) if isinstance(g, UOp) else UOp.const(g * l, dtypes.uint32)
           for g, l in zip(cast(tuple[Any, ...], info.global_size), info.local_size)]
   return [UOp(Ops.BINARY, arg=pkt[:12]), *grid, UOp(Ops.BINARY, arg=pkt[24:32]), kernel_object, kernarg_address, UOp(Ops.BINARY, arg=pkt[48:])]
+
+# a timing launch takes its packet up to the kernargs from variables: one linked launch times every candidate of a kernel
+TIMING_PKT = tuple(UOp.variable(f"timing_pkt{i}", 0, 2**64-1, dtypes.uint64, param=True) for i in range(5))
 
 class AMDComputeQueue(HWQueue):
   dev:AMDDevice
@@ -453,7 +460,8 @@ class AMDComputeAQLQueue(AMDComputeQueue): # the ring holds 64 byte aql packets:
     slot = self.prof_start(data, prg.arg, lib)
     self.close_run(len(self.blob))
     kernarg_address = UOp(Ops.LINEAR, src=tuple(self.kernargs(call, prg, data)), arg="kernargs").getaddr(self.devs)
-    self.pkts += dispatch_packet(data, prg.arg, lib.getaddr(self.devs) + data.desc_offset, kernarg_address)
+    self.pkts += [*TIMING_PKT, kernarg_address, UOp(Ops.BINARY, arg=bytes(16))] if prg.tag == "timing" else \
+      dispatch_packet(data, prg.arg, lib.getaddr(self.devs) + data.desc_offset, kernarg_address)
     self.run_start = len(self.blob)
     self.prof_stop(slot)
 
@@ -1036,6 +1044,18 @@ class AMDDevice(Compiled):
         name, lib, key = _amd_program_prof[b]
         Compiled.profile_events.append(ProfileProgramEvent(self.device, name, lib, buf._buf, b.arg.slot, key))
     return self.prog_bufs[b]
+
+  def timing_template(self, call:UOp, var_vals:dict[str, int]) -> tuple[UOp, tuple, dict[str, int]]|None:
+    if not self.is_aql: return None
+    data, image = _amd_program_image(self, (prg:=call.body).src[3].arg)
+    self.scratch_buffer(data.private_segment_size)
+    # the image goes to a ring in vram: each launch waits, and its batch starts with an icache invalidate
+    off = self.rt_allocator(False, False).alloc(len(image), alignment=0x1000)
+    (buf:=self.rt_buffer(False, False)).host.view(fmt='B')[off:off + len(image)] = image
+    global_size, local_size = prg.arg.launch_dims(var_vals)
+    pkt = aql_packet(data, local_size, tuple(g * l for g, l in zip(global_size, local_size)), buf.get_buf(self.device) + off + data.desc_offset)
+    key = (call.src[1:], prg.arg.globals, prg.arg.vars, data.kernargs_segment_size, data.enable_dispatch_ptr)
+    return call.replace(src=(prg.rtag("timing"), *call.src[1:])), key, {v.expr: x for v, x in zip(TIMING_PKT, struct.unpack("<5Q", pkt[:40]))}
 
   def sqtt_trace(self, slot:int, se:int) -> bytes:
     off = (se * self.prof_slots + slot) * self.sqtt_win

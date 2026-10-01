@@ -9,7 +9,7 @@ BNXT_DEBUG = getenv("BNXT_DEBUG", 0)
 BNXT_ACCESS, BNXT_INIT_MASK, BNXT_RTR_MASK, BNXT_RTS_MASK = 3, 0xd, 0x41515ad, 0xae005
 BNXT_CHIMP_COMM, BNXT_CHIMP_COMM_TRIGGER = 0x0, 0x100
 BNXT_BACKING_STORE = ((0, 64), (1, 0), (2, 128), (3, 0), (4, 2), (5, 0), (6, 0), (14, 1024), (15, 0))
-WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU = 128, 1024, 1024, 4096
+WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU = 128, 4096, 4096, 4096
 def db_value(xid, typ, index, epoch):
   return (xid & bnxt.DBC_DBC_XID_MASK | bnxt.DBC_DBC_PATH_ROCE | typ | bnxt.BNXT_QPLIB_DBR_VALID) << 32 | \
          index & bnxt.DBC_DBC_INDEX_MASK | epoch << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT
@@ -128,9 +128,12 @@ class BNXTDev:
       page_size=12, page_tbl_depth=nq.pbl_level, length=16, logical_id=1, int_mode=bnxt.RING_ALLOC_REQ_INT_MODE_MSIX).ring_id
 
   def rcfw(self, name, timeout_ms=20000, **fields):
-    req_t, resp_t = getattr(bnxt, f"struct_cmdq_{name}"), getattr(bnxt, f"struct_creq_{name}_resp")
-    data = bytes(req_t(opcode=getattr(bnxt, f"CMDQ_BASE_OPCODE_{name.upper()}"),
-                       cmd_size=(slots := ceildiv(ctypes.sizeof(req_t), 16)), **fields)).ljust(slots * 16, b'\0')
+    req_t = getattr(bnxt, f"struct_cmdq_{name}")
+    data = bytes(req_t(opcode=getattr(bnxt, f"CMDQ_BASE_OPCODE_{name.upper()}"), cmd_size=ceildiv(ctypes.sizeof(req_t), 16), **fields))
+    return self.rcfw_raw(name, data, getattr(bnxt, f"struct_creq_{name}_resp"), timeout_ms)
+
+  def rcfw_raw(self, name, data:bytes, resp_t, timeout_ms=20000):
+    data = data.ljust((slots := ceildiv(len(data), 16)) * 16, b'\0')
     for i in range(slots): self.cmdq.write(self.cmdq.write_idx + i, data[i * 16:(i + 1) * 16])
 
     self.cmdq.write_idx += slots
@@ -158,7 +161,16 @@ class BNXTDev:
     if BNXT_DEBUG >= 1: print(f"bnxt {self.devfmt}: rcfw {name} xid={getattr(ret, 'xid', 0):#x}")
     return ret
 
-  def fini(self): self.hwrm("func_drv_unrgtr")
+  def fini(self):
+    if getenv("BNXT_STATS", 0): print(f"bnxt {self.pci_dev.pcibus} roce stats: {self.roce_stats()}", flush=True)
+    self.hwrm("func_drv_unrgtr")
+
+  def roce_stats(self) -> dict[str, int]: # the nic's retransmit counters since init: an rnr nak is a send that beat its receive
+    mem, paddrs = self.pci_dev.alloc_sysmem(0x1000)
+    # cmdq_query_roce_stats (not in the autogen): base header with the response buffer, then collection and function ids
+    self.rcfw_raw("query_roce_stats", struct.pack("<BBHHBBQII", bnxt.CMDQ_BASE_OPCODE_QUERY_ROCE_STATS, 2, 0, 0, 32, 0, paddrs[0], 0, 0),
+                  bnxt.struct_creq_query_version_resp) # any creq response: type, status, cookie
+    return dict(zip(["to_retransmits", "seq_err_naks", "max_retry", "rnr_naks", "missing_resp", "unrecov"], struct.unpack("<6Q", bytes(mem[16:64]))))
 
   def doorbell(self, xid, typ, index, epoch):
     System.memory_barrier()

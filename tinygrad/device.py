@@ -496,6 +496,9 @@ class Compiled:
 
   def on_device_hang(self): raise RuntimeError(f"{self.device} hang detected")
 
+  # beam timing: a call that launches every candidate of its kernel, its key and the candidate's variables
+  def timing_template(self, call:UOp, var_vals:dict[str, int]) -> tuple[UOp, tuple, dict[str, int]]|None: return None
+
   def on_sleep(self):
     if (iface:=getattr(self, "iface", None)) is not None and hasattr(iface, "sleep"): iface.sleep(self.sleep_timeout_ms)
 

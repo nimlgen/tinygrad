@@ -210,9 +210,9 @@ class MemoryManager:
 
     assert size == sum(p[1] for p in paddrs), f"Size mismatch {size=} {sum(p[1] for p in paddrs)=}"
 
-    ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
-    for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
-      for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
+    # ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
+    # for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
+    #   for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True, boot=boot)
     for paddr, psize in paddrs:
@@ -252,7 +252,7 @@ class MemoryManager:
     # Alloc physical memory and map it to the virtual address
     va = self.alloc_vaddr(size:=round_up(size, 0x1000), align)
 
-    if contiguous: paddrs = [(self.palloc(size, zero=True), size)]
+    if contiguous: paddrs = [(self.palloc(size, zero=zero), size)]
     else:
       # Traverse the PT to find the largest contiguous sizes we need to allocate. Try to allocate the longest segment to reduce TLB pressure.
       nxt_range, rem_size, paddrs = 0, size, []

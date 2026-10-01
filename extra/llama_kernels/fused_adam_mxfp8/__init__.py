@@ -15,12 +15,12 @@ def _float_define(x:float) -> str: return f"{x:.9g}f"
 
 @functools.cache
 def _custom_fused_adam_bf16_vocab(m:UOp, v:UOp, master:UOp, grad:UOp, *args:UOp, dname:str,
-                                  b1:float, b2:float, eps:float, raw_clip:bool=False) -> UOp:
+                                  b1:float, b2:float, eps:float, raw_clip:bool=False, weight_decay:float=0.0) -> UOp:
   clip_scale = args[0] if raw_clip else None
   lr, b1_t, b2_t = args[1:] if raw_clip else args
   n = math.prod(master.shape)
   assert m.shape == v.shape == master.shape == grad.shape and n % 1024 == 0
-  assert m.dtype == v.dtype == grad.dtype == dtypes.bfloat16 and master.dtype == dtypes.float32
+  assert m.dtype == v.dtype and m.dtype in (dtypes.bfloat16, dtypes.float32) and grad.dtype == dtypes.bfloat16 and master.dtype == dtypes.float32
   assert lr.shape == b1_t.shape == b2_t.shape == (1,)
   if clip_scale is not None: assert clip_scale.shape in ((), (1,)) and clip_scale.dtype == dtypes.float32
   threads, groups = UOp.special(256, "lidx0"), UOp.special(n // 1024, "gidx0")
@@ -36,13 +36,15 @@ def _custom_fused_adam_bf16_vocab(m:UOp, v:UOp, master:UOp, grad:UOp, *args:UOp,
   # compiler expression contraction behavior aligned with the byte-exact baseline.
   defines = "\n".join((f"#define N_ELEMS {n}", f"#define B1 {_float_define(b1)}", f"#define B2 {_float_define(b2)}",
                         f"#define OMB1 {_float_define(1.0-b1)}", f"#define OMB2 {_float_define(1.0-b2)}",
-                        f"#define EPS {_float_define(eps)}", f"#define GPTOSS_ADAM_BF16_RAW_CLIP {int(raw_clip)}"))
+                        f"#define EPS {_float_define(eps)}", f"#define GPTOSS_ADAM_BF16_RAW_CLIP {int(raw_clip)}",
+                        f"#define GPTOSS_ADAM_BF16_WD {int(weight_decay != 0.0)}", f"#define WEIGHT_DECAY {_float_define(weight_decay)}",
+                        f"#define STATE_BF16 {int(m.dtype == dtypes.bfloat16)}"))
   lib = HIPCompiler("gfx950").compile_cached(defines+"\n"+src)
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)), UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=lib)))
 
 def fused_adam_bf16_vocab(m:Tensor, v:Tensor, master:Tensor, grad:Tensor,
                           lr:Tensor, b1_t:Tensor, b2_t:Tensor, *, b1:float, b2:float, eps:float,
-                          clip_scale:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
+                          clip_scale:Tensor|None=None, weight_decay:float=0.0) -> tuple[Tensor, Tensor, Tensor]:
   """Update GPT-OSS' BF16 vocabulary optimizer state and FP32 master in one pass."""
   assert m.shape == v.shape == master.shape == grad.shape
   assert m.device == v.device == master.device == grad.device
@@ -51,7 +53,7 @@ def fused_adam_bf16_vocab(m:Tensor, v:Tensor, master:Tensor, grad:Tensor,
   m, v, master = m.contiguous(), v.contiguous(), master.contiguous()
   outs = Tensor.custom_kernel(m, v, master, grad, *((clip_scale,) if clip_scale is not None else ()), lr, b1_t, b2_t,
     fxn=functools.partial(_custom_fused_adam_bf16_vocab, dname=dname_of(master.device), b1=b1, b2=b2, eps=eps,
-                          raw_clip=clip_scale is not None))
+                          raw_clip=clip_scale is not None, weight_decay=weight_decay))
   return outs[0], outs[1], outs[2]
 
 @functools.cache
@@ -78,11 +80,11 @@ def _custom_fused_adam_mxfp8(m:UOp, v:UOp, master:UOp, q:UOp, e8:UOp, *args:UOp,
   # Restrict this specialization to the single-gradient BF16-state production path; generic and FC1 Adam are unchanged.
   gptoss_down_shape = len(master.shape) == 3 and master.shape[-2:] == (3072, 3072)
   gptoss_down_logical = bool(getenv("GPTOSS_ADAM_DOWN_LOGICAL", 1)) and gptoss_down_shape and si is None and \
-    len(grads) == 1 and m.dtype == dtypes.bfloat16
+    len(grads) == 1 and m.dtype in (dtypes.bfloat16, dtypes.float32)
   gptoss_down_pipeline = bool(getenv("GPTOSS_ADAM_DOWN_PIPELINE", 0)) and gptoss_down_logical
   gptoss_fc1_pipeline = bool(getenv("GPTOSS_ADAM_FC1_PIPELINE", 1)) and si is not None
   gptoss_fc1_row_skip = bool(getenv("GPTOSS_ADAM_FC1_ROW_SKIP", 1)) and gptoss_fc1_pipeline and \
-    master.shape[-2:] == (5888, 3072) and len(grads) == 1 and m.dtype == dtypes.bfloat16
+    master.shape[-2:] == (5888, 3072) and len(grads) == 1 and m.dtype in (dtypes.bfloat16, dtypes.float32)
   if compact_q: assert gptoss_down_logical or (gptoss_fc1_row_skip and fc1_split_part is not None)
   assert fc1_split_part in (None, "main", "tail")
   if fc1_split_part is not None:
@@ -159,7 +161,7 @@ def fused_adam_mxfp8(m:Tensor, v:Tensor, master:Tensor, grad:Tensor, lr:Tensor, 
   # GPT-OSS FC1 has eleven complete 256-column blocks and one 64-value tail per live row. Splitting the rare tail
   # keeps the hot binary branch-free and also omits all persistent-state work for the physical padding rectangle.
   fc1_split = bool(getenv("GPTOSS_ADAM_FC1_SPLIT", 0)) and out_si is not None and \
-    clip_scale is not None and m.dtype == dtypes.bfloat16 and master.ndim == 3 and master.shape[-2:] == (5888, 3072)
+    clip_scale is not None and m.dtype in (dtypes.bfloat16, dtypes.float32) and master.ndim == 3 and master.shape[-2:] == (5888, 3072)
   if fc1_split:
     # Only newly allocated quantized outputs need return-buffer binding. State and caller-owned SI stay in place.
     q, e8 = owned_empty(q), owned_empty(e8)
