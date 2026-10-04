@@ -280,7 +280,7 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   fence = UOp.custom_function("hcq_fence").call(*timelines, *signals)
   for (devs, queue), cmds in queues.items(): submits.append(make_submit(*cmds, devs=devs, queue=queue, deps=(fence, *submits[-1:])))
   sink = UOp.sink(*submits, arg=KernelInfo("hcq_submit", estimates=Estimates()), tag=1)
-  for pm in [Device[d].pm_batch for d in ctx.queues if Device[d].pm_batch is not None]: # a device adds its own work to the batch
+  for pm in [Device[d].pm_batch for d in ctx.queues]: # a device adds its own work to the batch
     if (r:=pm.rewrite(sink)) is not None: sink = r
 
   # per call metadata
@@ -402,12 +402,12 @@ def patch(buf:UOp, rows:Sequence[tuple[int|UOp, UOp]], blob:bytes|None=None) -> 
   return buf.after(*dep, *stores)
 
 @uopfunc
-def hcq_fence(slots:UOp, tl:UOp, tv:UOp, last:int) -> UOp: # wait for the previous run of this schedule, then announce and record this one
+def hcq_fence(slots:UOp, tl:UOp, tv:UOp, err:UOp, last:int) -> UOp: # wait for the previous run of this schedule, then announce and record this one
   tl = tl.replace(arg=replace(tl.arg, volatile=True)) # make it volatile, since it's polled
 
   # TODO: timeout?
   done = tl.after(target:=slots.index(last).load(), loop:=UOp.loop(0)).index(0).load()
-  bumped = tl.after(done.backedge(loop, done < target)).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
+  bumped = tl.after(done.backedge(loop, (done < target) & err.index(0).load().eq(0))).index(1).store(nxt:=tv + UOp.const(1, dtypes.uint64))
   return slots.after(bumped).index(last).store(nxt).sink()
 
 def encode_fence(f:UOp) -> UOp:
@@ -418,7 +418,7 @@ def encode_fence(f:UOp) -> UOp:
   # wait for prev schedule to not collide, the slots are zeroed at link
   for dev, (slots, off) in zip(devs, map(unwrap_view, lasts)):
     slots = patch(slots, [], bytes(slots.nbytes())).after(*last)
-    last = (hcq_fence(slots, timeline((dev,)), timeline_value((dev,)), off // slots.dtype.itemsize),)
+    last = (hcq_fence(slots, timeline((dev,)), timeline_value((dev,)), UOp.from_buffer(Device[dev].error_state), off // slots.dtype.itemsize),)
 
   # re-arm the signals
   for slots, off in map(unwrap_view, sigs): last = (slots.after(*last).index(off // slots.dtype.itemsize).store(0),)
@@ -502,9 +502,9 @@ def lower_call(call:UOp) -> UOp|None:
   # encode bodies
   from tinygrad.runtime.ops_rdma import pm_rdma_encode
   devs = [Device[d] for d in dedup([d.split(":")[0] for d in call.arg.aux.device])]
-  body = graph_rewrite(call.body, pm_rdma_encode + sum([d.pm_encode for d in devs if d.pm_encode is not None], PatternMatcher([])) + pm_hcq_encode,
+  body = graph_rewrite(call.body, pm_rdma_encode + sum([d.pm_encode for d in devs], PatternMatcher([])) + pm_hcq_encode,
                        ctx=(lt_patches:=list[UOp]()), bpm=pm_hoist_links, name="encode")
-  body = graph_rewrite(body, sum([d.pm_lower for d in devs if d.pm_lower is not None], PatternMatcher([])),
+  body = graph_rewrite(body, sum([d.pm_lower for d in devs], PatternMatcher([])),
                        ctx=lt_patches, bpm=pm_hoist_links, enter_calls=True, name="lower")
   body = graph_rewrite(body, pm_lift, walk=True, enter_calls=True, name="lift")
 
@@ -538,6 +538,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False
 # *****************
 # 5. link
 
+Compiled.pm_batch = Compiled.pm_encode = Compiled.pm_lower = PatternMatcher([]) # a device adds its own rules
 Compiled.pm_bufferize = PatternMatcher([(UPat(Ops.ALLOC, tag="timeline", name="b"), lambda b: Device[b.device].timeline),
                                         (UPat(Ops.ALLOC, tag="program", name="b"), lambda b: Device[b.device].program_buffer(b))])
 
