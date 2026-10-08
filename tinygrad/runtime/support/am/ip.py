@@ -280,8 +280,9 @@ class AM_GFX(AM_IP):
 
   def init_hw(self):
     # Wait for RLC autoload to complete
-    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
-              value=True, msg="RLC autoload timeout")
+    if not self.adev.reset_mode: # a hung cp never idles, the reset comes next anyway
+      wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or (hasattr(self.adev, 'regRLC_RLCS_BOOTLOAD_STATUS') and
+                self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0), value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", insts=range(self.xccs))
     if self.adev.partial_boot: return self.reset_mec()
@@ -524,7 +525,11 @@ class AM_IH(AM_IP):
         print(f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {bf} {va<<12:#x}")
         self.adev.reg('regGCVM_L2_PROTECTION_FAULT_CNTL').update(clear_protection_fault_status_addr=1)
         self.adev.is_err_state = True
-      else: self.adev.is_err_state = True
+      else:
+        # gfx9 mmhub (vmc) faults carry the faulting page in the context
+        if self.adev.ip_ver[am.GC_HWIP][0] == 9 and client in (am.SOC15_IH_CLIENTID_VMC, am.SOC15_IH_CLIENTID_VMC1):
+          print(f"am {self.adev.devfmt}: VMC fault va={(ctx[0] << 12) | ((ctx[1] & 0xf) << 44):#x}")
+        self.adev.is_err_state = True
 
     self.drain()
 

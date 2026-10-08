@@ -1291,6 +1291,10 @@ def train_llama3():
   RUNMLPERF = getenv("RUNMLPERF")
   LOGMLPERF = getenv("LOGMLPERF")
   BENCHMARK = getenv("BENCHMARK")
+  PRE_RUN_CAPTURE = getenv("PRE_RUN_CAPTURE")
+  if getenv("LLAMA_SCHED_FIXER", 0) or getenv("LLAMA_SCHED_INSPECT", 0):
+    from examples.mlperf.llama_sched_fixer import install
+    install()
 
   config = {}
   BASEDIR            = config["BASEDIR"]                = Path(getenv("BASEDIR", "/raid/datasets/c4/"))
@@ -1324,7 +1328,7 @@ def train_llama3():
     LLAMA_BENCHMARK = mllog_constants.LLAMA31_405B if getenv("LLAMA3_SIZE", "8B") == "405B" else mllog_constants.LLAMA31_8B
 
     if INITMLPERF:
-      assert BENCHMARK, "BENCHMARK must be set for INITMLPERF"
+      assert BENCHMARK or (RUNMLPERF and PRE_RUN_CAPTURE), "INITMLPERF: a BENCHMARK init process, or the init of a PRE_RUN_CAPTURE run"
       MLLOGGER.event(key=mllog_constants.SUBMISSION_ORG, value="tinycorp")
       MLLOGGER.event(key=mllog_constants.SUBMISSION_PLATFORM, value=getenv("SUBMISSION_PLATFORM", "tinybox"))
       MLLOGGER.event(key=mllog_constants.SUBMISSION_DIVISION, value=mllog_constants.CLOSED)
@@ -1336,7 +1340,8 @@ def train_llama3():
       MLLOGGER.event(key=mllog_constants.CACHE_CLEAR, value=True)
       MLLOGGER.start(key=mllog_constants.INIT_START, value=None)
 
-    if RUNMLPERF:
+    def log_run_start():
+      if INITMLPERF: MLLOGGER.end(key=mllog_constants.INIT_STOP, value=None) # one process: init (compile, capture) then the run
       MLLOGGER.start(key=mllog_constants.RUN_START, value=None)
       MLLOGGER.event(key=mllog_constants.SEED, value=SEED)
 
@@ -1359,6 +1364,8 @@ def train_llama3():
       MLLOGGER.event(key=mllog_constants.OPT_LR_DECAY_STEPS, value=MAX_STEPS - WARMUP_STEPS)
       MLLOGGER.event(key=mllog_constants.OPT_LR_DECAY_SCHEDULE, value="cosine with linear warmup")
       MLLOGGER.event(key=mllog_constants.OPT_GRADIENT_CLIP_NORM, value=1.0)
+    # PRE_RUN_CAPTURE: the jits compile before run_start (on fake batches), log it once they did
+    if RUNMLPERF and not PRE_RUN_CAPTURE: log_run_start()
   else:
     MLLOGGER = None
 
@@ -1452,7 +1459,7 @@ def train_llama3():
   if mxfp4_weights is not None: Tensor.realize(*[x for layers in mxfp4_weights.values() for outputs in layers for x in outputs])
 
   def minibatch_impl(tokens:Tensor, accumulate:bool):
-    if is_dp: tokens = tokens.to(None).shard(device, 0)
+    if is_dp and not isinstance(tokens.device, tuple): tokens = tokens.to(None).shard(device, 0)
     if is_mp: tokens = tokens.shard(device)
     if not is_sharding: tokens = tokens.to(None)
     logits:Tensor = model(tokens[:, :-1], save=bool(SMALL), mxfp4_weights=mxfp4_weights)
@@ -1472,8 +1479,7 @@ def train_llama3():
   def minibatches(tokens:list[Tensor]):
     for grad_acc_idx, batch_tokens in enumerate(tokens): minibatch_impl(batch_tokens, grad_acc_idx != 0)
 
-  @TinyJit
-  def optim_step():
+  def optim_step_impl():
     grad_norm, clip_coeff = clip_grads(grads, grad_acc, 1.0, clip_coeff_buf)
     optim.fstep(grads, grad_norm, clip_coeff)
     scheduler.step()
@@ -1488,16 +1494,34 @@ def train_llama3():
                    *updated_mxfp4)
 
     return lr_cpu, grad_norm_cpu, loss_cpu
+  optim_step = TinyJit(optim_step_impl)
+
+  # LLAMA_STEP_GROUP: updates per captured graph. one launch and one sync per group (each launch reaches the far node over rpc)
+  STEP_GROUP = getenv("LLAMA_STEP_GROUP", 1)
+  assert EVAL_FREQ % (GBS * STEP_GROUP) == 0 and BENCHMARK % STEP_GROUP == 0, "evals and benchmark ends fall on group boundaries"
+  @TinyJit
+  def train_group(tokens:list[Tensor]):
+    rets:list[Tensor] = []
+    for s in range(STEP_GROUP):
+      for k, t in enumerate(tokens[s*grad_acc:(s+1)*grad_acc]): minibatch_impl(t, k != 0)
+      rets.extend(optim_step_impl())
+    return tuple(rets)
 
   @TinyJit
   @Context(TRAINING=0)
   def eval_step(tokens:Tensor):
-    if is_dp: tokens = tokens.to(None).shard(device, 0)
+    if is_dp and not isinstance(tokens.device, tuple): tokens = tokens.to(None).shard(device, 0)
     if is_mp: tokens = tokens.shard(device)
     if not is_sharding: tokens = tokens.to(None)
     logits:Tensor = model(tokens[:, :-1], mxfp4_weights=mxfp4_weights)
     loss = vocab_mask.where(-1e9, logits).sparse_categorical_crossentropy(tokens[:, 1:])
     return loss.flatten().float().to("CPU")
+
+  # LLAMA_INPUT_ON_DEV: the batch moves before the jit call, 1: to the first gpu, 2 (dp): sharded to every gpu (slower: the far node's shards
+  # are synchronous rpc writes, +100 ms a step on 2x8)
+  def on_dev(ts:list[Tensor]) -> list[Tensor]:
+    if (mode:=getenv("LLAMA_INPUT_ON_DEV", 1)) == 2 and is_dp: return [t.shard(device, 0).realize() for t in ts]
+    return [t.to(None).realize() for t in ts] if mode else ts
 
   # ** data iters **
   def fake_data(bs, samples):
@@ -1511,7 +1535,43 @@ def train_llama3():
       return fake_data(BS, SAMPLES)
     else:
       from examples.mlperf.dataloader import iterate_llama3_dataset
-      return iterate_llama3_dataset(train_dataset, BS)
+      return iterate_llama3_dataset(train_dataset, BS, process=bool(getenv("LLAMA_LOADER_PROC", 1)))
+
+  if PRE_RUN_CAPTURE:
+    # compile before run_start, no training data: the jits capture on fake batches (eager, capture, replay), then the initial state comes back
+    init_params, init_amax = [p.clone().realize() for p in optim.params], [t.clone().realize() for t in (*fa_bwd_amax, *next_fa_bwd_amax)]
+    # LLAMA_JIT_NO_WARMUP: the training graph captures on its first call (no eager update). the warmup's other job: lazy state
+    # (the grad buffers, adam's bias correction powers, the scheduler's counter) is realized first, else the capture bakes it in
+    if (no_warmup:=getenv("LLAMA_JIT_NO_WARMUP", 0)):
+      Tensor.realize(*grads, scheduler.epoch_counter, optim.lr, *[x for o in optim.optimizers for x in (o.b1_t, o.b2_t)])
+      train_group.cnt = minibatches.cnt = optim_step.cnt = 1
+    fake = fake_data(BS, BS * grad_acc * STEP_GROUP * 3)
+    for k in range(3 - no_warmup):
+      cst = time.perf_counter()
+      if STEP_GROUP > 1: train_group(on_dev([next(fake) for _ in range(grad_acc * STEP_GROUP)]))
+      else:
+        minibatches(on_dev([next(fake) for _ in range(grad_acc)]))
+        optim_step()
+      tqdm.write(f"pre-run training call {k}: {time.perf_counter()-cst:.1f}s")
+    if EVAL_BS:
+      for k, tokens in enumerate(fake_data(EVAL_BS, EVAL_BS * 3)):
+        cst = time.perf_counter()
+        eval_step(on_dev([tokens])[0])
+        tqdm.write(f"pre-run eval call {k}: {time.perf_counter()-cst:.1f}s")
+    Tensor.realize(*[p.assign(x) for p, x in zip(optim.params, init_params)], *[t.assign(x) for t, x in zip((*fa_bwd_amax, *next_fa_bwd_amax), init_amax)])
+    del init_params, init_amax
+    for o in optim.optimizers:
+      assert not o.zero, "PRE_RUN_CAPTURE restores unsharded optimizer state"
+      Tensor.realize(o.b1_t.assign(o.b1_t.ones_like()), o.b2_t.assign(o.b2_t.ones_like()), *[x.assign(x.zeros_like()) for x in o.m + o.v],
+                     *[m.assign(p.float()) for m, p in zip(o.master_params or [], o.params)])
+    Tensor.realize(scheduler.epoch_counter.assign(0), loss_acc.assign(0), *[g.assign(0) for g in grads])
+    Tensor.realize(optim.lr.assign(scheduler.get_lr()))
+    if mxfp4_weights is not None: # the caches follow the restored weights
+      from extra.llama_kernels.quantize_mxfp4 import quantize_mxfp4
+      Tensor.realize(*[x for name, layers in mxfp4_weights.items() for w, out in zip(getattr(model, name), layers)
+                       for x in quantize_mxfp4(w, shuffle_row=True, shuffle_col=True, out=out)])
+    if MLLOGGER and RUNMLPERF: log_run_start()
+    tqdm.write("jits captured before run_start, initial state restored")
 
   train_dataset = eval_dataset = None
   if not getenv("FAKEDATA", 0):
@@ -1529,6 +1589,7 @@ def train_llama3():
   train_iter = get_train_iter()
   i, sequences_seen = resume_ckpt, 0
   step_times = []
+  group_metrics:list[list[float]] = [] # the rest of the current group's updates
 
   if MLLOGGER and RUNMLPERF:
     MLLOGGER.start(key=mllog_constants.EPOCH_START, metadata={mllog_constants.SAMPLES_COUNT: sequences_seen})
@@ -1543,30 +1604,33 @@ def train_llama3():
 
       stopped = False
       data_time, dev_time = 0, 0
-      batch_tokens = []
-      for _ in range(grad_acc):
-        ist = time.perf_counter()
-        try: tokens = next(train_iter)
-        except StopIteration:
-          stopped = True
-          break
+      if STEP_GROUP == 1 or not group_metrics:
+        batch_tokens = []
+        for _ in range(grad_acc * STEP_GROUP):
+          ist = time.perf_counter()
+          try: tokens = next(train_iter)
+          except StopIteration:
+            stopped = True
+            break
+          mst = time.perf_counter()
+          data_time += mst - ist
+          batch_tokens.append(tokens)
+        if stopped: break
         mst = time.perf_counter()
-        data_time += mst - ist
-        batch_tokens.append(tokens)
-      if stopped: break
-      mst = time.perf_counter()
-      minibatches(batch_tokens)
-      dev_time += time.perf_counter() - mst
+        batch_tokens = on_dev(batch_tokens)
+        if STEP_GROUP == 1: minibatches(batch_tokens)
+        dev_time += time.perf_counter() - mst
 
-      gt = time.perf_counter()
-      ret = optim_step()
-      lr, grad_norm, loss = ret[0].item(), ret[1].item(), ret[2].item() / grad_acc
-      et = time.perf_counter()
-
-      optim_time = et - gt
-      dev_time += optim_time
-      step_time = et - st
-      gbs_time = gt - st
+        gt = time.perf_counter()
+        ret = optim_step() if STEP_GROUP == 1 else train_group(batch_tokens)
+        values = [t.item() for t in ret]
+        group_metrics = [values[k:k+3] for k in range(0, len(values), 3)]
+        et = time.perf_counter()
+        # a group's times are amortized over its updates
+        group_times = [(x / STEP_GROUP) for x in (et - gt, et - st, gt - st, data_time, dev_time + et - gt)]
+      lr, grad_norm, loss = group_metrics.pop(0)
+      loss /= grad_acc
+      optim_time, step_time, gbs_time, data_time, dev_time = group_times
       if BENCHMARK: step_times.append(step_time)
 
       i += 1
@@ -1629,7 +1693,7 @@ def train_llama3():
       tqdm.write(f"evaluating {EVAL_SAMPLES//EVAL_BS} batches of {EVAL_BS} sequences")
 
       for j,tokens in tqdm(enumerate(eval_iter), total=EVAL_SAMPLES//EVAL_BS):
-        eval_losses += eval_step(tokens).tolist()
+        eval_losses += eval_step(on_dev([tokens])[0]).tolist()
 
         if BENCHMARK and (j+1) == min(BENCHMARK, EVAL_SAMPLES//EVAL_BS):
           if getenv("BENCHMARK_EVAL_LOSS", 0):

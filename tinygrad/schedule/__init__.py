@@ -6,7 +6,7 @@ from collections import deque
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, graph_rewrite, gate_kernel_sink, KernelInfo, CallInfo, GroupOp, resolve, resolve_returned_after
 from tinygrad.uop.ops import AxisType
 from tinygrad.uop.spec import type_verify, spec_tensor
-from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, SCACHE, BASEDIR, partition, dedup, all_int, VIZ
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, SCACHE, BASEDIR, partition, dedup, all_int, VIZ, getenv, to_tuple
 from tinygrad.helpers import diskcache_get, diskcache_put, colored
 from tinygrad.schedule.allreduce import is_allreduce_linear_output
 
@@ -59,6 +59,10 @@ def _call_overwrite_outputs(call:UOp) -> tuple[UOp, ...]:
     return tuple(x for i,x in enumerate(call.src[1:]) if is_allreduce_linear_output(call.body, i))
   return ()
 
+def _crosses_nodes(bufs:tuple[UOp, ...]) -> bool:
+  from tinygrad.device import Device
+  return len({Device[d].peer_group for b in bufs if b.device is not None for d in to_tuple(b.device)}) > 1
+
 def create_schedule(sched_sink:UOp) -> UOp:
   with cpu_profile(TracingKey("toposort sched_sink")):
     # build kernel dependency graph: edges from producer kernel to consumer kernels
@@ -102,15 +106,20 @@ def create_schedule(sched_sink:UOp) -> UOp:
   with cpu_profile(TracingKey("linearize schedule")):
     queue: deque[UOp] = deque(k for k,v in in_degree.items() if v == 0)
     linearized: list[UOp] = []
-    while len(queue):
-      rk = queue.popleft()
+    # SCHED_RDMA_DELAY: a kernel made ready by a copy between nodes waits for the nic on an in-order queue, emit it `delay` kernels later
+    delay, delayed = getenv("SCHED_RDMA_DELAY", 0), deque[tuple[int, UOp]]()
+    while len(queue) or len(delayed):
+      rk = delayed.popleft()[1] if len(delayed) and (not len(queue) or delayed[0][0] <= len(linearized)) else queue.popleft()
       k = rk.src[0] if rk.op is Ops.END else rk
       assert k.op is Ops.CALL, f"unexpected op in queue: {k.op}"
       buf_uops = tuple(_call_buf_uop(s) for s in k.src[1:] if not s.is_bound_var)
       linearized.append(k.replace(src=(k.body, *buf_uops)))
+      far = delay and k.body.op is Ops.STORE and _crosses_nodes(buf_uops)
       for x in children.get(rk, []):
         in_degree[x] -= 1
-        if in_degree[x] == 0: queue.append(x)
+        if in_degree[x] == 0:
+          if far: delayed.append((len(linearized) + delay, x))
+          else: queue.append(x)
     if any(in_degree.values()): raise RuntimeError("cycle detected in assign graph")
   return UOp(Ops.LINEAR, src=tuple(linearized))
 

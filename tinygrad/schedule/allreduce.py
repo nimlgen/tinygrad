@@ -102,8 +102,26 @@ def handle_allreduce(buf:UOp, red:UOp, output:UOp|None=None, input_staged:bool=F
   if concrete and (hdev:=ALLREDUCE_NODE_NDEVS.value) > 0 and ndev % hdev == 0:
     d, flat, fold = buf.device, buf.reshape((numel,)), functools.partial(functools.reduce, lambda x, y: x.alu(op, y))
     boxes, cs = [range(b, b + hdev) for b in range(0, ndev, hdev)], [(numel * k // hdev, numel * (k + 1) // hdev) for k in range(hdev)]
+    if getenv("ALLREDUCE_NODE_LEADER", 0) and numel <= getenv("RING_ALLREDUCE_THRESHOLD", 256_000):
+      # Small messages do not repay hdev separate exchanges and a chunk-reassembly kernel on every GPU.
+      local = [fold([flat.mselect(j).copy_to_device(d[box[0]]) for j in box]) for box in boxes]
+      total = [fold([local[i], *(part.copy_to_device(d[box[0]]) for k, part in enumerate(local) if k != i)])
+               for i, box in enumerate(boxes)]
+      return UOp.mstack(*(total[i].copy_to_device(d[j]) for i, box in enumerate(boxes) for j in box)).reshape(shape)
     owned = {i: fold([flat.mselect(j).shrink((cs[k],)).copy_to_device(d[i]) for j in box]) for box in boxes for k, i in enumerate(box)}
     summed = {i: fold([owned[i], *(owned[j].copy_to_device(d[i]) for j in rank if j != i)]) for rank in zip(*boxes) for i in rank}
+    if getenv("ALLREDUCE_NODE_DIRECT", 1) and not isinstance(device, str):
+      # every gpu stores its summed chunk into its view of the output and copies it to the gpus of its node: no full-size reassembly kernel
+      if output is None:
+        output = UOp(Ops.ALLOC, src=UOp.device_range_src(device),
+                     arg=ParamArg(next(UOp.unique_num), buf.dtype, red.max_numel(), device=device)).reshape(shape)
+      states = [[_allreduce_view(output.mselect(j).buf_uop, s, e) for s, e in cs] for j in range(ndev)]
+      for box in boxes:
+        for k, i in enumerate(box):
+          states[i][k] = source = states[i][k].after(states[i][k].store(summed[i].cast(output.dtype)))
+          for j in box:
+            if j != i: states[j][k] = states[j][k].after(states[j][k].store(source.copy_to_device(d[j])))
+      return output.after(*itertools.chain.from_iterable(states))
     gathered = [UOp.mstack(*(summed[box[k]].copy_to_device(d[j]) for box in boxes for j in box)) for k in range(hdev)]
     return UOp.usum(*[c.pad(((s, numel - e),)) for (s, e), c in zip(cs, gathered)]).reshape(shape)
 

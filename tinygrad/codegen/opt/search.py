@@ -109,6 +109,10 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
     return ret
+  if getenv("BEAM_CACHE_ONLY"): # only what an earlier search found, never search here (e.g. through a remote device)
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    print(f"BEAM_CACHE_ONLY miss: {s.colored_shape()}", flush=True)
+    return hand_coded_optimizations(s)
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
@@ -125,6 +129,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     rawbufs = _ensure_buffer_alloc(rawbufs)
     exiting, st = False, time.perf_counter()
     dev = Device[s.ren.target.device]
+    stop = getenv("BEAM_STOP_US", 0) * 1e-6 # a candidate this fast is at the launch floor: take it, further timings only measure noise
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
@@ -148,6 +153,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
           if isinstance(e, RuntimeError): continue
           raise
         timed.append((candidates[i], min(tms)))
+        if timed[-1][1] < stop: break
         if BEAM_DEBUG > 1:
           print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(prg.src[1].src):5d} uops",
                 f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
@@ -158,7 +164,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
 
       # done
       opts = sorted(timed, key=lambda x: x[1])
-      exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
+      exiting = len(opts) == 0 or (opts[0][1] < max(min_progress, stop)) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
       if not exiting: beam = opts[:amt]
       elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
       if DEBUG >= 2:

@@ -1,5 +1,5 @@
 from collections import defaultdict
-from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up
+from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up, getenv
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.support.memory import TLSFAllocator
@@ -26,12 +26,15 @@ def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
   first_appearance:dict[UOp, int] = {}
   last_appearance:dict[UOp, int] = {}
   copy_bufs: set[UOp] = set()
+  copy_dsts: set[UOp] = set()
   for i, si in enumerate(linear.src):
     si_bufs = [b for src in si.src[1:] for b in _collect_bufs(src) if _can_plan(b, held_bufs)]
     for b in si_bufs:
       if b not in first_appearance: first_appearance[b] = i
       last_appearance[b] = i
-    if si.src[0].op is Ops.STORE: copy_bufs.update(si_bufs)
+    if si.src[0].op is Ops.STORE:
+      copy_bufs.update(si_bufs)
+      copy_dsts.update(_collect_bufs(si.src[1]))
   if not first_appearance: return linear
 
   # separate copy and compute buffers into different lanes to avoid introducing dependencies (copy->compute->copy)
@@ -41,7 +44,10 @@ def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
   # suballocation: build sorted open/close events, then alloc/free in order
   block_size = 256
   nbytes = {b: round_up(b.max_numel() * b.dtype.itemsize, block_size) for b in first_appearance}
-  events = sorted([(first_appearance[b], True, b) for b in first_appearance] +
+  # a copy engine runs ahead of the linear: its destination must not take bytes freed within the last COPY_PREHOLD calls, or the
+  # copy waits for the compute that last read them
+  pre = {b: getenv("COPY_PREHOLD", 0) for b in first_appearance if b in copy_dsts}
+  events = sorted([(first_appearance[b] - pre.get(b, 0), True, b) for b in first_appearance] +
                   [(last_appearance[b] + 1 + buf_hold.get(b, 0), False, b) for b in first_appearance], key=lambda x: (x[0], x[1]))
   total_memory = sum(nbytes.values()) * 2
 

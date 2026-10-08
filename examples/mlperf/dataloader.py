@@ -1,4 +1,4 @@
-import os, random, pickle, queue, struct, math, functools, hashlib, time, tempfile
+import os, random, pickle, queue, struct, math, functools, hashlib, time, tempfile, threading, multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from typing import List
 from pathlib import Path
@@ -541,9 +541,10 @@ class BinIdxDataset:
     self.dtype = {1:np.dtype(np.uint8), 2:np.dtype(np.int8), 3:np.dtype(np.int16), 4:np.dtype(np.int32), 5:np.dtype(np.int64),
                   6:np.dtype(np.float64), 7:np.dtype(np.double), 8:np.dtype(np.uint16)}[dtype_code]
     offset = 34
-    self.sizes = np.frombuffer(self.idx, dtype="<i4", count=self.count, offset=offset)
+    # sizes and pointers in ram: a cold random lookup per document is a page fault on the index file
+    self.sizes = np.frombuffer(self.idx, dtype="<i4", count=self.count, offset=offset).copy()
     offset += self.count * 4
-    self.pointers = np.frombuffer(self.idx, dtype="<i8", count=self.count, offset=offset)
+    self.pointers = np.frombuffer(self.idx, dtype="<i8", count=self.count, offset=offset).copy()
     offset += self.count * 8
     self.doc_idx = np.frombuffer(self.idx, dtype="<i8", count=doc_count, offset=offset)
     self.bin_t = np.memmap(base_path.with_name(f"{base_path.name}.bin"), mode="r", dtype=np.uint8)
@@ -575,7 +576,7 @@ def _load_llama3_cache(cache_path:Path, names:tuple[str, ...], build):
           f.close()
           tmp.replace(path)
         finally: tmp.unlink(missing_ok=True)
-  return tuple(np.load(path, mmap_mode="r", allow_pickle=False) for path in paths)
+  return tuple(np.load(path, allow_pickle=False) for path in paths) # in ram: the samples look them up at random
 
 # https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/datasets.html
 class GPTDataset:
@@ -747,16 +748,13 @@ class BlendedGPTDataset:
 
 def get_llama3_dataset(samples:int, seqlen:int, base_dir:Path, seed:int=0, val:bool=True, small:bool=False) -> BlendedGPTDataset:
   if small:
-    if val:
-      return BlendedGPTDataset(
-        [base_dir / "c4-validation-91205-samples.en_text_document"], [1.0], samples, seqlen, seed, shuffle=False)
-    return BlendedGPTDataset(
-      [base_dir / "c4-train.en_6_text_document"], [1.0], samples, seqlen, seed, shuffle=True)
-  if val:
-    return BlendedGPTDataset(
-      [base_dir / "validation" / "c4-validationn-91205-samples.en_text_document"], [1.0], samples, seqlen, seed, shuffle=False)
-  return BlendedGPTDataset(
-    [base_dir / "c4-train.en_6_text_document", base_dir / "c4-train.en_7_text_document"], [1.0, 1.0], samples, seqlen, seed, shuffle=True)
+    paths = [base_dir / ("c4-validation-91205-samples.en_text_document" if val else "c4-train.en_6_text_document")]
+  else:
+    paths = [base_dir/"validation"/"c4-validationn-91205-samples.en_text_document"] if val else \
+            [base_dir/"c4-train.en_6_text_document", base_dir/"c4-train.en_7_text_document"]
+  ret = BlendedGPTDataset(paths, [1.0] * len(paths), samples, seqlen, seed, shuffle=not val)
+  ret.recipe = (samples, seqlen, base_dir, seed, val, small) # a loader process builds the same dataset from it
+  return ret
 
 def get_llama3_datasets(samples:int, eval_samples:int, seqlen:int, base_dir:Path, seed:int=0, train_on_val:bool=False, small:bool=False):
   with ThreadPoolExecutor(max_workers=2) as pool:
@@ -764,11 +762,30 @@ def get_llama3_datasets(samples:int, eval_samples:int, seqlen:int, base_dir:Path
     evaluation = pool.submit(get_llama3_dataset, eval_samples, seqlen, base_dir, 0, True, small)
     return train.result(), evaluation.result()
 
-def iterate_llama3_dataset(dataset:BlendedGPTDataset, bs:int):
-  for b in range(math.ceil(dataset.samples / bs)):
-    batch = [dataset.get(b * bs + i) for i in range(bs)]
-    stacked = np.stack(batch, axis=0)
-    yield Tensor(stacked, device="NPY")
+def _llama3_batches(dataset:BlendedGPTDataset, bs:int):
+  return (np.stack([dataset.get(b * bs + i) for i in range(bs)], axis=0) for b in range(math.ceil(dataset.samples / bs)))
+
+def _llama3_loader(recipe:tuple, bs:int, q):
+  for x in _llama3_batches(get_llama3_dataset(*recipe), bs): q.put(x)
+  q.put(None)
+
+def iterate_llama3_dataset(dataset:BlendedGPTDataset, bs:int, prefetch:int=getenv("LLAMA_PREFETCH", 4), process:bool=False):
+  if not prefetch:
+    for x in _llama3_batches(dataset, bs): yield Tensor(x, device="NPY")
+    return
+  # the next batches load while the gpus run the step (a sample is stitched from many short documents). a thread shares the gil with the
+  # step's wait loop; a spawned process (no fork: the parent holds pinned dma memory) rebuilds the dataset from its cached indices
+  if process:
+    ctx = multiprocessing.get_context("spawn")
+    q = ctx.Queue(prefetch)
+    ctx.Process(target=_llama3_loader, args=(dataset.recipe, bs, q), daemon=True).start()
+  else:
+    q = queue.Queue(prefetch)
+    def fill():
+      for x in _llama3_batches(dataset, bs): q.put(x)
+      q.put(None)
+    threading.Thread(target=fill, daemon=True).start()
+  while (x:=q.get()) is not None: yield Tensor(x, device="NPY")
 
 def batch_load_llama3(bs:int, samples:int, seqlen:int, base_dir:Path, seed:int=0, val:bool=True, small:bool=False):
   return iterate_llama3_dataset(get_llama3_dataset(samples, seqlen, base_dir, seed, val, small), bs)

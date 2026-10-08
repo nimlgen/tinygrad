@@ -5,14 +5,25 @@ from tinygrad.runtime.support.am.amdev import AMMemoryManager
 from tinygrad.runtime.support.system import FileIOInterface
 from tinygrad.device import Device, TinyELF
 from tinygrad.helpers import DEBUG, Target, to_mv
+from tinygrad.runtime.autogen import pci
 
 def resp(resp0=0, resp1=0, status=0): return struct.pack(REMOTE_RESP, status, resp0, resp1)
 def resp_err(msg): return resp(len(err:=msg.encode()), status=1) + err
 
 discovered_devices: list[tuple[type, str]] = []
+device_vendor: dict[str, int] = {}  # the lock prefix must match the local driver's, or a local job and a served one share the gpu
+LOCK_PREFIX = {0x1002: "AM", 0x10de: "NV", 0x14e4: "BN"}
 opened_devices: dict[int, PCIDevice] = {}
 mapped_bars: dict[tuple[int, int], object] = {}
 programs: list = []
+# host memory goes back to the kernel only once no device can dma into it: a hung client frees buffers its gpus/nics still write
+deferred_unmaps: list[tuple[int, int]] = []
+
+def quiesce():
+  # stop every opened device's dma (the next client's init turns bus mastering back on), then release the deferred host memory
+  for d in opened_devices.values(): d.write_config(pci.PCI_COMMAND, d.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+  for addr, size in deferred_unmaps: FileIOInterface.munmap(addr, size)
+  deferred_unmaps.clear()
 
 def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
   if cmd == RemoteCmd.PING:
@@ -28,6 +39,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     devs = System.list_devices(arg2, tuple([(x, tuple(y)) for x,y in filter_devices.items()]), base_class)
     for p in devs:
       if p not in discovered_devices: discovered_devices.append(p)
+      device_vendor[p[1]] = arg2
     data = "\n".join(f"{p[1]}:{discovered_devices.index(p)}" for p in devs).encode()
     return conn.sendall(resp(len(data), len(devs)) + data)
 
@@ -36,7 +48,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
     if dev_id not in opened_devices:
       if dev_id >= len(discovered_devices): raise RuntimeError(f"device {dev_id} not probed")
       cl, pcibus = discovered_devices[dev_id]
-      opened_devices[dev_id] = cl("SV", pcibus)
+      opened_devices[dev_id] = cl(LOCK_PREFIX.get(device_vendor.get(pcibus, 0), "SV"), pcibus)
     pci_dev = opened_devices[dev_id]
 
   if cmd == RemoteCmd.MAP_BAR:
@@ -73,7 +85,7 @@ def handle(conn, cmd, dev_id, bar, arg0, arg1, arg2):
   elif cmd == RemoteCmd.SYSMEM_WRITE:
     to_mv(arg0, arg1)[:] = conn.recv(arg1, socket.MSG_WAITALL)
   elif cmd == RemoteCmd.UNMAP_SYSMEM:
-    FileIOInterface.munmap(arg0, arg1)
+    deferred_unmaps.append((arg0, arg1))
     conn.sendall(resp())
   elif cmd == RemoteCmd.LOAD_PROG:
     programs.append(Device["CPU"].runtime(TinyELF(conn.recv(arg0, socket.MSG_WAITALL), "hcq_submit", Target("CPU"), ())))
@@ -100,7 +112,7 @@ def serve(conn:socket.socket):
       conn.sendall(resp_err(str(e)))
 
 if __name__ == "__main__":
-  signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+  signal.signal(signal.SIGTERM, lambda *_: (quiesce(), sys.exit(0)))
   System.reserve_va(AMMemoryManager.va_allocator.base, AMMemoryManager.va_allocator.size)
   port = int(sys.argv[1]) if len(sys.argv) > 1 else 6667
   server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -117,4 +129,6 @@ if __name__ == "__main__":
     for bt in [socket.SO_SNDBUF, socket.SO_RCVBUF]: conn.setsockopt(socket.SOL_SOCKET, bt, 64 << 20)
     try: serve(conn)
     except ConnectionError: print("disconnected")
-    finally: conn.close()
+    finally:
+      conn.close()
+      quiesce()

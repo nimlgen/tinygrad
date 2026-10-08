@@ -2,7 +2,7 @@ from __future__ import annotations
 import math, functools
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, make_tuple, flatten, USE_ATOMICS, TRAINING
+from tinygrad.helpers import prod, make_tuple, flatten, USE_ATOMICS, TRAINING, getenv
 from tinygrad.nn import optim, state, datasets  # noqa: F401
 
 class BatchNorm:
@@ -307,8 +307,16 @@ from tinygrad.uop.ops import UOp, KernelInfo, Ops, AxisType
 def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
   weight, idx = (a for a in call.src[1:] if (b:=a.unsharded_base).op is not Ops.ALLOC or b.arg.bind_on_realize)
   is_vocab_sharded = isinstance(weight.device, tuple) and weight.axis == 0
+  # data parallel (replicated weight, tokens sharded): every device scatters its own tokens into a partial table and the tables are
+  # allreduced, instead of gathering every device's tokens (a padded allreduce of the whole batch) and scattering all of them everywhere
+  local = isinstance(weight.device, tuple) and weight.axis is None and bool(getenv("EMBEDDING_BWD_LOCAL", 1)) \
+    and grad_emb.device == idx.device == weight.device and (ax:=grad_emb.axis) is not None and ax == idx.axis
+  if local:
+    assert ax is not None
+    rng = UOp.range(len(weight.device), 0, AxisType.DEVICE)
+    grad_emb, idx = grad_emb._shard(ax, rng), idx._shard(ax, rng)
   # for multi-device: replicate grad_emb and idx on all devices
-  if isinstance(weight.device, tuple):
+  elif isinstance(weight.device, tuple):
     assert weight.axis is None or weight.axis == 0, "only vocab (axis=0) sharding supported on Embedding with USE_ATOMICS"
     def replicate(x:UOp) -> UOp:
       if x.device != weight.device or x.axis is None: return x.copy_to_device(weight.device)
@@ -373,6 +381,7 @@ def _embedding_bwd(grad_emb:UOp, call:UOp) -> tuple:
 
   grad_weight_uop = grad_weight_uop.custom_kernel(grad_emb, idx, fxn=_embedding_bwd_kernel)[0]
 
+  if local: return (grad_weight_uop.cast(weight.dtype).allreduce(Ops.ADD, weight.device), None)
   return (grad_weight_uop.cast(weight.dtype), None)
 
 def _embedding_fwd(weight:Tensor, idx:Tensor) -> Tensor:

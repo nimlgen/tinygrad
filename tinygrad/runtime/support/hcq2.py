@@ -120,6 +120,12 @@ STAGING_SIZE, STAGING_SLOTS = (4 if DEV.interface.startswith("MOCK") else 128) <
 @functools.cache
 def _staging(device:str) -> Buffer: return Buffer(device, STAGING_SIZE, dtypes.uint8, preallocate=True)
 
+RDMA_DUPLEX = getenv("RDMA_DUPLEX", 0)
+# a receive that posts its wqe and then polls for the completion holds the ring to one posted wqe: a send arriving earlier gets an rnr nak
+# and the nic retries it a millisecond later. split it: one sdma queue posts every receive as soon as its buffer is free, another polls
+RDMA_POST_AHEAD = getenv("RDMA_POST_AHEAD", 1)
+def rdma_phase(wire:UOp) -> str: return wire.tag[2] if isinstance(wire.tag, tuple) else ""
+
 def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   devs = [to_tuple(b.device)[0] for b in (dst, src)]
   if not all(hasattr(Device[d], "iface") for d in devs) or Device[devs[0]].peer_group == Device[devs[1]].peer_group: return None # not 2 nodes
@@ -128,9 +134,12 @@ def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if None in (nics:=[rdma_nic_for(Device[d], Device[min(devs)]) for d in devs]): return None
 
   # wires: a placeholder per nic in place of the far gpu, tagged by it
-  wires = [UOp.placeholder(src.max_shape, src.dtype, 0, device=unwrap(nic).device, tag=peer) for nic, peer in zip(nics, devs[::-1])]
-  send = call.replace(src=wires[1].store_call(src).src)
-  return UOp(Ops.LINEAR, src=(send, call.replace(src=dst.store_call(wires[0]).src)))
+  # RDMA_DUPLEX: a wire per direction, so a send doesn't order behind the opposite receive on the same nic
+  def wire(nic, peer, is_recv, phase=""):
+    return UOp.placeholder(src.max_shape, src.dtype, 0, device=unwrap(nic).device, tag=(peer, is_recv and bool(RDMA_DUPLEX), phase))
+  send = call.replace(src=wire(nics[1], devs[0], False).store_call(src).src)
+  recvs = [call.replace(src=dst.store_call(wire(nics[0], devs[1], True, phase)).src) for phase in (("post", "wait") if RDMA_POST_AHEAD else ("",))]
+  return UOp(Ops.LINEAR, src=(send, *recvs))
 
 def stage_copy(ctx:tuple[UOp, ...], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if any(to_tuple(b.device)[0].startswith("RDMA") for b in (dst, src)): return None # over the nic
@@ -305,12 +314,23 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   # assign to queues
   peers = sorted({Device.canonicalize(d) for c in l.src if c.op is Ops.CALL and c.body.op is Ops.STORE
                   for b in get_call_arg_uops(c) for d in to_tuple(b.device) if d.split(":")[0] == "AMD"})
+  # Index peers within their node: a global lexical order aliases local links once device ids reach two digits.
+  peer_groups:dict[str, list[str]] = {}
+  for d in peers: peer_groups.setdefault(Device[d].peer_group, []).append(d)
+  peer_index = {d: (i, len(group)) for group in peer_groups.values() for i,d in enumerate(group)}
   num_queues = max(1, getenv("HCQ_NUM_SDMA", min(len(peers), 8) if ALL2ALL >= 1 else 1))
   queues = ["COMPUTE:0" if c.op is Ops.CALL and c.body.op is Ops.PROGRAM else "COPY:0" for c in l.src]
   for i, c in enumerate(l.src):
     if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION and c.body.arg.name == "encdec": queues[i] = "ENCDEC:0"
     if c.op is Ops.CALL and c.body.op is Ops.STORE and all(b.device in peers for b in get_call_arg_uops(c)):
-      queues[i] = f"COPY:{(peers.index(c.src[1].device) - peers.index(c.src[2].device) - 1) % len(peers) % num_queues}"
+      dst, (src, count) = peer_index[c.src[1].device][0], peer_index[c.src[2].device]
+      queues[i] = f"COPY:{(dst - src - 1) % count % num_queues}"
+    # nic sends, receive posts and receive completions get their own engines: queued behind a bulk xgmi copy or behind each other,
+    # a cross-node transfer stalls its consumer and the nic runs half duplex
+    elif num_queues > 1 and c.op is Ops.CALL and c.body.op is Ops.STORE and \
+        any(str(d).startswith("RDMA") for b in get_call_arg_uops(c) for d in to_tuple(b.device)):
+      is_recv = str(to_tuple(c.src[2].device)[0]).startswith('RDMA')
+      queues[i] = f"COPY:{num_queues + is_recv + (is_recv and rdma_phase(c.src[2]) == 'wait')}"
 
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs, queues), key=lambda e: bool(e[1])):
@@ -558,7 +578,7 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
   # a device owns the placeholders it names, the rest are allocated where they live
   if (r:=cast(Buffer|None, Compiled.pm_bufferize.rewrite(b))) is not None: pass
   elif not ctx.use_rt:
-    spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile or b.tag.startswith("cmdbuf"), cpu_access=True)
+    spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile or str(b.tag).startswith("cmdbuf"), cpu_access=True)
     r = Buffer(dev.device, max(b.max_numel(), 1), b.dtype, options=spec, preallocate=True)
   else:
     off = dev.rt_allocator(True, b.arg.volatile).alloc(max(b.max_numel() * b.dtype.itemsize, 1), alignment=256)
