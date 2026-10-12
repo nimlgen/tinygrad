@@ -89,13 +89,13 @@ from tinygrad.uop.ops import PatternMatcher, UPat
 def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
   if (ret:=ctx[0].get(b, None)) is None:
     device = b.device if b.device is not None else next(a.device for a in ctx[1] if a.device is not None)
-    ctx[0][b] = ret = UOp.new_buffer(device, b.max_numel(), b.dtype)
+    ctx[0][b] = ret = UOp.alloc((b.max_numel(),), b.dtype, device=device)
   return ret
 
 pm_post_sched_cache = PatternMatcher([
   # Resolve positional arguments outside kernel bodies; free Variables have slot -1.
   (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg.slot] if x.arg.slot >= 0 else None),
-  # bind ALLOCs to fresh BUFFERs for this invocation
+  # fresh ALLOCs for this invocation
   (UPat(Ops.ALLOC, name="b"), create_new_buffer),
 ])
 
@@ -294,5 +294,4 @@ def create_linear_with_vars(big_sink:UOp) -> tuple[UOp, dict[str, int]]:
     capturing[0].add_linear(linear)
     return UOp(Ops.LINEAR, src=()), var_vals
 
-  held_bufs = {b for b in linear_call.src[1:] if b.op is Ops.BUFFER}
-  return memory_plan_rewrite(linear, held_bufs), var_vals
+  return memory_plan_rewrite(linear), var_vals

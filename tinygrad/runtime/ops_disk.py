@@ -125,7 +125,7 @@ def disk_copy_rewriter(s:UOp) -> UOp|None:
 
   # [mmap address, bytes] per copy in a table: an arg each would hit ctypes' 1024 limit
   words = flatten((c.src[2].getaddr(HCQ_RUNTIME_DEV.device), UOp.const(c.src[2].nbytes(), dtypes.uint64)) for c in copies)
-  table = UOp.alloc((8 * len(words),), dtypes.uint8, device=HCQ_RUNTIME_DEV.device)
+  table = UOp.alloc((8 * len(words),), dtypes.uint8, device=HCQ_RUNTIME_DEV.device).rtag("disk_table")
   srcs = patch(table, [(8 * i, w) for i, w in enumerate(words)]).bitcast(dtypes.uint64)
 
   # per gpu: [chunks read, chunks copied] at the start of its stage

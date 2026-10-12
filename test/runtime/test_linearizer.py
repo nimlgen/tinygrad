@@ -5,7 +5,7 @@ from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.uop.ops import UOp, Ops, GroupOp, AxisType, KernelInfo
 from tinygrad.device import Device, Buffer
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.engine.realize import run_linear
+from tinygrad.engine.realize import run_linear, link_linear
 from tinygrad.codegen import to_program
 from tinygrad.helpers import Context, dedup, TC_SELECT, TC_OPT, DEV
 from tinygrad.dtype import dtypes, AddrSpace
@@ -290,6 +290,7 @@ class TestLinearizer(unittest.TestCase):
 def helper_realized_ast(r:Tensor|list[Tensor]) -> tuple[UOp, list[Buffer]]:
   if isinstance(r, Tensor): r = [r]
   linear, var_vals = Tensor.linear_with_vars(*r)
+  linear = link_linear(linear, allow_cache=False) # gives it real storage
   run_linear(UOp(Ops.LINEAR, src=linear.src[:-1]), var_vals)  # run all kernels except the last one
   last_call = linear.src[-1]
   ast = last_call.src[0]

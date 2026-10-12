@@ -113,10 +113,11 @@ def cstruct(struct_t, **fields:UOp|int) -> UOp:
 
 def replace_buffer(ctx:tuple[bool, list[UOp], dict[UOp, int]], b:UOp) -> UOp:
   use_rt, bufs, slots = ctx
-  if slots.setdefault(b, len(bufs)) == len(bufs): bufs.append(b)
+  # schedule memory (an untagged ALLOC) is an input too, with fresh storage each run
+  if slots.setdefault(b, len(bufs)) == len(bufs): bufs.append(b if b.op is Ops.BUFFER else UOp.new_buffer(b.device, b.max_numel(), b.dtype))
   param = UOp.param(slots[b], b.dtype, b.max_numel(), b.device)
   return param if use_rt else param.replace(tag="lt_input")
-pm_replace_buffers = PatternMatcher([(UPat(Ops.BUFFER, name="b"), lambda ctx, b: replace_buffer(ctx, b))])
+pm_replace_buffers = PatternMatcher([(UPat((Ops.BUFFER, Ops.ALLOC), name="b"), replace_buffer)])
 
 # *****************
 # 1.1. prep: unwrap multi
@@ -561,6 +562,7 @@ Compiled.pm_bufferize = PatternMatcher([(UPat(Ops.ALLOC, tag="timeline", name="b
 class LinkCtx: inputs:dict[UOp, UOp]; use_rt:bool; refs:list[UOp] = field(default_factory=list) # noqa: E702
 
 def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp: # ctx: a kept link (the jit's) owns the linear's buffers, a one-shot borrows ring slots
+  if b.tag is None: return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
   dev, spec = Device[b.device], b.arg.spec or BufferSpec(cpu_access=True) # data the device reads, unless the alloc says otherwise
 
   # a device owns the placeholders it names, the rest are allocated where they live

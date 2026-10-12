@@ -2,7 +2,6 @@ from typing import TypeVar, Generic, Callable, Any, overload
 import functools
 from tinygrad.tensor import Tensor, all_tensors
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, pluralize, VIZ, disable_gc
-from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.dtype import DType
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, Ops, rewrite_group, graph_rewrite
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear
@@ -19,21 +18,25 @@ def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
       kept.append(si)
       needed |= si_bufs
     else: onetime.append(si)
-  return linear.replace(src=tuple(kept)), linear.replace(src=tuple(onetime))
+
+  # what the one-time part leaves for the kept part outlives its run, so it gets real storage
+  kept_allocs = {u for si in kept for s in si.src[1:] for u in s.toposort() if u.op is Ops.ALLOC}
+  onetime_allocs = {u for si in onetime for s in si.src[1:] for u in s.toposort() if u.op is Ops.ALLOC}
+  persist = {u:UOp.new_buffer(u.device, u.max_numel(), u.dtype) for u in kept_allocs & onetime_allocs}
+  return linear.replace(src=tuple(kept)).substitute(persist, walk=True), linear.replace(src=tuple(onetime)).substitute(persist, walk=True)
 
 def _copy_input(u:UOp) -> UOp:
   if u.on_disk(): raise JitError("cannot make an independent copy of a written DISK input")
   run_linear(UOp(Ops.LINEAR, src=((new:=UOp.new_buffer(u.device, u.max_numel(), u.dtype)).store_call(u),)))
   return new
 
-@rewrite_group(lambda linear,held_bufs,input_uops,ret=(): f"JIT {pluralize('call', len(linear.src))}")
-def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp]) -> UOp:
+@rewrite_group(lambda linear,input_uops,ret=(): f"JIT {pluralize('call', len(linear.src))}")
+def jit_lower(linear:UOp, input_uops:list[UOp]) -> UOp:
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View captured linear")
 
   # parametrize input buffers: map each input buffer UOp to a PARAM with the correct slot index
   linear = linear.substitute({u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}, walk=True)
-  linear = memory_plan_rewrite(linear, held_bufs)
-  linear = linear.substitute({u: u.rtag("scratch") for u in linear.toposort() if u.op is Ops.BUFFER and u not in held_bufs}, walk=True)
+  linear = memory_plan_rewrite(linear)
   linear = compile_linear(linear, beam=getenv("JITBEAM", BEAM.value), input_uops=input_uops, cache=False)
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View compiled linear")
   return linear
@@ -74,11 +77,7 @@ class CapturedJit(Generic[ReturnType]):
     for t,u,vals in self._symbolic_ret: t.uop = u.substitute({v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, walk=True)
     return self.ret
 
-  def free_intermediates(self):
-    bufs = [u.arg.buffer for u in self._jit_bufs if u.tag == "scratch"]
-    if not (freed:=[b for b in flatten(b.bufs if isinstance(b, MultiBuffer) else [b] for b in bufs) if b.is_allocated()]): return
-    for b in freed: b.deallocate()
-    self.__dict__.pop("linear", None) # should be relinked
+  def free_intermediates(self): self.__dict__.pop("linear", None)
 
 def _prepare_jit_inputs(args, kwargs):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
@@ -154,15 +153,12 @@ class _TinyJit(Generic[ReturnType]):
         run_linear(onetime_linear, var_vals)
         del onetime_linear
 
-      # hold all buffers with real storage reachable from live Tensors (e.g. lazy .grad created during capture) and all buffers with
-      # allocated storage in the captured linear (e.g. constants baked in by copies): the memory planner can't suballocate those
-      def _buf_or_none(u:UOp) -> Buffer|MultiBuffer|None: return u.arg.buffer if u.op is Ops.BUFFER else None
-      held_bufs = {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if _buf_or_none(u) is not None}
-      held_bufs |= {u for u in big_linear.toposort() if (b:=_buf_or_none(u)) is not None and b.is_allocated()}
-      linear = jit_lower(big_linear, held_bufs, input_buf_uops)
-      # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
-      # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec
-      del big_linear, held_bufs
+      # intermediates no Tensor holds become ALLOCs
+      live = {u for tref in list(all_tensors) if (t:=tref()) is not None for u in t.uop.toposort() if u.op is Ops.BUFFER}
+      big_linear = big_linear.substitute({u:UOp.alloc((u.max_numel(),), u.dtype, device=u.device) for u in big_linear.toposort()
+                                          if u.op is Ops.BUFFER and u not in live and not u.buffer.is_allocated()}, walk=True)
+      linear = jit_lower(big_linear, input_buf_uops)
+      del big_linear
       self.captured = CapturedJit(ret, linear, names, expected_input_info)
       ret = self.captured(input_buf_uops, var_vals)
     elif self.cnt >= 2:
