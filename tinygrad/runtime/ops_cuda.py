@@ -42,11 +42,11 @@ class CUDAQueue(HWQueue):
   def extern(self, tag) -> UOp: return UOp.alloc((1,), dtypes.uint64, 0, device=self.devs[0]).rtag(tag).getaddr(self.dev.host)
 
   def exec(self, call:UOp, prg:UOp):
-    obj, rows = prg.to_elf(), layout_args(get_call_kernel_args(call, prg, self.devs), 8)
+    rows = layout_args(get_call_kernel_args(call, prg, self.devs), 8)
     size = max([o + w.dtype.itemsize for o, w in rows], default=8) - 8
     addr = UOp(Ops.LINEAR, src=tuple(pack_args([(0, UOp.const(size, dtypes.uint64))] + rows, 8 + size)), arg="kernargs").getaddr(self.devs)
     # extra: [buffer pointer, &args, buffer size, &size, end]
-    self.call(cuda.cuLaunchKernel, self.extern((self.dev.tag("function"), obj.lib, obj.name)), *prg.arg.global_size, *prg.arg.local_size, 0, None, 0,
+    self.call(cuda.cuLaunchKernel, prg.getaddr(self.devs[0]), *prg.arg.global_size, *prg.arg.local_size, 0, None, 0,
               (self.q(*[UOp.const(v, dtypes.uint64) if isinstance(v, int) else v for v in (1, addr + 8, 2, addr, self.dev.launch_end)]) - 40,))
 
   def copy(self, dst:UOp, src:UOp, sz:int): self.call(cuda.cuMemcpyAsync, dst.getaddr(self.devs), src.getaddr(self.devs), sz, None)
@@ -105,8 +105,10 @@ class CUDADevice(Compiled):
     super().__init__(device, CUDAAllocator(self), self.renderers, None, arch=self.get_arch(device_id))
     Compiled.pm_bufferize += PatternMatcher([
       (UPat(Ops.ALLOC, tag=self.tag("cuda")), lambda d=self: d.handles),
-      (UPat(Ops.ALLOC, tag=self.tag("stamp")), lambda d=self: d.stamp),
-      (UPat(Ops.ALLOC, name="b"), lambda b, d=self: d.function(*b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == d.tag("function") else None)])
+      (UPat(Ops.ALLOC, tag=self.tag("stamp")), lambda d=self: d.stamp)])
+    Compiled.pm_link += PatternMatcher([
+      (UPat(Ops.PROGRAM, name="prg").f(Ops.GETADDR, name="g"),
+       lambda prg, g, d=self: UOp.const(d.function((o:=prg.to_elf()).lib, o.name), dtypes.uint64) if g.arg == d.device else None)])
 
   def get_arch(self, device_id:int) -> str:
     check(cuda.cuDeviceComputeCapability(ctypes.byref(major:=ctypes.c_int()), ctypes.byref(minor:=ctypes.c_int()), device_id))
@@ -120,12 +122,12 @@ class CUDADevice(Compiled):
   def stamp(self) -> Buffer: return extern(as_int(fn:=cuda.CUhostFn(host_stamp)), fn)
 
   @functools.cache
-  def function(self, lib:bytes, name:str) -> Buffer:
+  def function(self, lib:bytes, name:str) -> int:
     if DEBUG >= 5 and self.api is cuda: print("\n".join([f"{i+1:>3} {line}" for i, line in enumerate(pretty_ptx(lib.decode()).split("\n"))]))
     check(self.api.cuCtxSetCurrent(self.context))
     check(self.api.cuModuleLoadData(ctypes.byref(module:=self.api.CUmodule()), lib))
     check(self.api.cuModuleGetFunction(ctypes.byref(func:=self.api.CUfunction()), module, name.encode()))
-    return extern(as_int(func))
+    return as_int(func)
 
   def count(self) -> int: return init_c_var(ctypes.c_int, lambda x: check(self.api.cuDeviceGetCount(ctypes.byref(x)))).value
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import subprocess, pathlib, struct, ctypes, tempfile, functools, platform, weakref, threading, array, sys
+from typing import cast
 from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple
 import tinygrad.runtime.support.objc as objc
 from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, Compiler, CompileError, MMIOInterface
@@ -111,7 +112,7 @@ def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, q:MetalQueu
 
   # before apple9 the encoder must use the pipelines
   if not dev.arch.startswith("Apple") or int(dev.arch[5:]) < 9:
-    r = UOp.range(len(dedup(c[:2] for c in cmds)), next(UOp.unique_num), dtype=dtypes.uint64)
+    r = UOp.range(len(dedup(p for p, _ in cmds)), next(UOp.unique_num), dtype=dtypes.uint64)
     c = mtl_msg(enc.after(c), "setComputePipelineState:", icb.bitcast(dtypes.uint64).index(hdr // 8 + 1 + len(cmds) + r).load())
     c = mtl_msg(enc.after(c), "dispatchThreadgroups:threadsPerThreadgroup:", icb.index(hdr - 24), icb.index(hdr - 24)).end(r)
 
@@ -132,7 +133,7 @@ class MetalQueue(HWQueue):
     self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[tuple](), list[tuple[int, int]](), list[UOp](), 0
 
   def exec(self, call:UOp, prg:UOp):
-    args, obj = get_call_kernel_args(call, prg, self.devs), prg.to_elf()
+    args = get_call_kernel_args(call, prg, self.devs)
     self.rows += (rows:=layout_args(args, off:=round_up(self.nbytes, 256)))
     self.nbytes = max([o + w.dtype.itemsize for o, w in rows], default=off + 8)
 
@@ -142,17 +143,20 @@ class MetalQueue(HWQueue):
       self.sizes.append((len(self.cmds), at:=round_up(self.nbytes, 8)))
       self.rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at)
       self.nbytes = at + 48
-    self.cmds.append((obj.lib, obj.name, tuple(1 if isinstance(d, UOp) else int(d) for d in dims), off))
+    self.cmds.append((prg, off))
 
   def wait(self, dst:UOp, val:UOp, eq=False): pass # the fence orders the queue
   def timestamp(self, dst:UOp): self.stamps.append(dst)
   def signal(self, dst:UOp, val:UOp): self.value = val
 
   def submit(self, cmdbuf:UOp) -> UOp:
-    n, zero, pipes = len(self.cmds), round_up(self.nbytes, 8), dedup(c[:2] for c in self.cmds)
-    tag = (self.dev.tag("mtl_icb"), tuple(self.cmds), zero + 24)
-    buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs[0]).rtag(tag).after(*self.deps)
+    n, zero, pipes = len(self.cmds), round_up(self.nbytes, 8), dedup(p for p, _ in self.cmds)
+    buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs[0]).after(*self.deps)
     icb = patch(buf, self.rows + [(zero + 8 * i, UOp.const(0, dtypes.uint64)) for i in range(3)])
+
+    # the icb is made at link time from (program, kernargs offset) per command: its handle, commands and pipelines go after the header
+    cmds = UOp(Ops.LINEAR, src=tuple(u for p, off in self.cmds for u in (p.getaddr(self.devs[0]), UOp.const(off, dtypes.uint32))), arg="icb")
+    icb = icb.after(buf.without_after.bitcast(dtypes.uint64).index(zero // 8 + 3).store(cmds))
 
     # symbolic sizes
     for ci, off in self.sizes:
@@ -216,9 +220,9 @@ class MetalDevice(Compiled):
     Compiled.pm_bufferize += PatternMatcher([
       (UPat(Ops.ALLOC, tag=self.tag("handles")), lambda d=self: d.handles),
       (UPat(Ops.ALLOC, tag="slots", name="b"), # with stamps
-       lambda b, d=self: d.new_slots(b.max_numel()) if b.device == d.device and b.max_numel() > 4 else None),
-      (UPat(Ops.ALLOC, name="b"), lambda ctx, b, d=self:
-       d.new_icb(bufferize_buf(ctx, b.rtag(None)).buffer, *b.tag[1:]) if isinstance(b.tag, tuple) and b.tag[0] == d.tag("mtl_icb") else None)])
+       lambda b, d=self: d.new_slots(b.max_numel()) if b.device == d.device and b.max_numel() > 4 else None)])
+    Compiled.pm_link += PatternMatcher([(UPat(name="table").index(UPat.cvar("hdr")).store(UPat(Ops.LINEAR, arg="icb", name="cmds")),
+      lambda ctx, table, hdr, cmds, d=self: d.new_icb(bufferize_buf(ctx, table.src[0]), hdr.val, cmds.src) if table.device == d.device else None)])
 
   @functools.cached_property
   def handles(self) -> Buffer:
@@ -248,23 +252,25 @@ class MetalDevice(Compiled):
     descriptor.setSupportIndirectCommandBuffers(True)
     return checked(self.sysdevice.newComputePipelineStateWithDescriptor_options_reflection_error, descriptor, metal.MTLPipelineOptionNone, None)
 
-  def new_icb(self, buf:Buffer, cmds:tuple[tuple[bytes, str, tuple[int, ...], int], ...], header:int) -> Buffer:
-    pipes = dedup(c[:2] for c in cmds)
+  def new_icb(self, table:UOp, hdr:int, cmds:tuple[UOp, ...]) -> UOp: # (program address, kernargs offset) per command, the words go at table[hdr:]
+    buf, prgs = cast(Buffer, table.buffer), [(g.src[0], off.val) for g, off in zip(cmds[::2], cmds[1::2])]
+    pipes = {p: self.pipeline((obj:=p.to_elf()).lib, obj.name) for p in dedup(p for p, _ in prgs)}
     desc = metal.MTLIndirectCommandBufferDescriptor.new()
     desc.setCommandTypes(metal.MTLIndirectCommandTypeConcurrentDispatch)
     desc.setMaxKernelBufferBindCount(1)
-    icb = self.sysdevice.newIndirectCommandBufferWithDescriptor_maxCommandCount_options(desc, max(len(cmds), 1), 0)
+    icb = self.sysdevice.newIndirectCommandBufferWithDescriptor_maxCommandCount_options(desc, max(len(prgs), 1), 0)
     if icb.value is None: raise RuntimeError("create indirect command buffer failed, does your system support this?")
-    commands = [icb.indirectComputeCommandAtIndex(i).own() for i in range(len(cmds))]
-    for cmd, (lib, name, dims, off) in zip(commands, cmds):
-      cmd.setComputePipelineState(state:=self.pipeline(lib, name))
+    commands = [icb.indirectComputeCommandAtIndex(i).own() for i in range(len(prgs))]
+    for cmd, (prg, off) in zip(commands, prgs):
+      dims = [1 if isinstance(d, UOp) else int(d) for d in (*prg.arg.global_size, *prg.arg.local_size)] # symbolic ones are set at run time
+      cmd.setComputePipelineState(state:=pipes[prg])
       if prod(dims[3:]) > (mx:=state.maxTotalThreadsPerThreadgroup()): raise RuntimeError(f"local size {dims[3:]} bigger than {mx}")
       cmd.setKernelBuffer_offset_atIndex(buf.meta, buf.offset + off, 0)
       cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(metal.MTLSize(*dims[:3]), metal.MTLSize(*dims[3:]))
       cmd.setBarrier()
-    buf.host.view(fmt='Q')[header // 8:] = array.array('Q', [icb.value, *[c.value for c in commands], *[self.pipeline(*p).value for p in pipes]])
+    buf.host.view(fmt='Q')[hdr:] = array.array('Q', [icb.value, *[c.value for c in commands], *[p.value for p in pipes.values()]])
     self.icbs[buf] = (icb, commands)
-    return buf
+    return UOp(Ops.NOOP)
 
   def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
     if sys.is_finalizing(): return # the event doesn't wake at exit

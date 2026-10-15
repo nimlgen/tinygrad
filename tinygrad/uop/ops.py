@@ -818,7 +818,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   def getaddr(self, device=None) -> UOp:
     if self.without_after.op not in {Ops.BUFFER, Ops.ALLOC, Ops.SHRINK, Ops.BITCAST, Ops.BINARY,
-                                    Ops.MSTACK, Ops.MSELECT, Ops.PARAM, Ops.LINEAR}: return self
+                                    Ops.MSTACK, Ops.MSELECT, Ops.PARAM, Ops.LINEAR, Ops.PROGRAM}: return self
     return UOp(Ops.GETADDR, src=(self,), arg=device or to_tuple(self.device)[0])
   @staticmethod
   def device_range_src(device:str|tuple[str, ...]|None) -> tuple[UOp, ...]:

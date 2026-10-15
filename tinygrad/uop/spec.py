@@ -228,7 +228,7 @@ spec_program = PatternMatcher([
 
 spec_hcq = PatternMatcher([
   (UPat(Ops.GETADDR, dtypes.uint64, name="x",
-        src=(UPat((Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.SHRINK, Ops.BITCAST, Ops.MSTACK, Ops.MSELECT, Ops.LINEAR)).or_after(),)),
+        src=(UPat((Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.SHRINK, Ops.BITCAST, Ops.MSTACK, Ops.MSELECT, Ops.LINEAR, Ops.PROGRAM)).or_after(),)),
    lambda x: is_device(x.arg)),
   (UPat(Ops.PROGRAM, dtypes.void, src=(UPat((Ops.BUFFER, Ops.PARAM)).or_after(),)), lambda: True),
 ])+spec_shared
