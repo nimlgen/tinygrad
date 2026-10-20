@@ -250,13 +250,14 @@ class Allocator(Generic[DeviceType]):
   def __init__(self, dev:DeviceType):
     self.dev: DeviceType = dev
     self.default_buffer_spec: BufferSpec = BufferSpec()
-    self.cache:dict[tuple[int, BufferSpec|None], list[BufferStorage]] = defaultdict(list)
+    self.cache:dict[tuple[int, BufferSpec|None], list[tuple[BufferStorage, list[tuple[Compiled, int]]]]] = defaultdict(list)
 
   def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
     assert size > 0, f"alloc size must be positive, getting {size}"
     if len(c:=self.cache[(size, options)]):
-      for dev in (strg:=c.pop()).maps: dev.synchronize()
-      return strg
+      storage, fences = c.pop() # fences: the timeline values of mapped devices when it was freed
+      for dev, value in fences: dev._wait_signal(dev.timeline.host.view(fmt='Q'), value)
+      return storage
     spec = options if options is not None else self.default_buffer_spec
     try: return self._alloc(size, spec)
     except (RuntimeError, MemoryError): self.free_cache()
@@ -266,12 +267,12 @@ class Allocator(Generic[DeviceType]):
 
   def free(self, storage:BufferStorage, size:int, options:BufferSpec|None=None):
     spec = options if options is not None else self.default_buffer_spec
-    if LRU and self.lru and not spec.nolru and spec.external_ptr is None: self.cache[(size, options)].append(storage)
-    else: self.do_free(storage, spec)
+    if not LRU or not self.lru or spec.nolru or spec.external_ptr is not None: self.do_free(storage, spec)
+    else: self.cache[(size, options)].append((storage, [(dev, dev.timeline.host.view(fmt='Q')[1]) for dev in storage.maps]))
 
   def free_cache(self):
     for (_, options), storages in self.cache.items():
-      for storage in storages: self.do_free(storage, options if options is not None else self.default_buffer_spec)
+      for storage, _ in storages: self.do_free(storage, options if options is not None else self.default_buffer_spec)
       storages.clear()
 
   def do_free(self, storage:BufferStorage, options:BufferSpec):
