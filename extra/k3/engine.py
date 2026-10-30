@@ -414,16 +414,23 @@ static int64_t queue_layer(io_t *s, int64_t lj) {
   return 0;
 }
 
-// the completions reaped, the pending reads (in order) on the demand queues while every drive of the next has room, rung. -1 a read failed
+// the completions reaped, the pending reads (in order) on a queue of their drives with room for them (the demand ones first, else the
+// guess ones: a drive's commands over both), every queue that moved rung. -1 a read failed
 static int64_t drain(io_t *s) {
   if (reap(s) < 0) return -1;
   for (; pend_at < npend; pend_at++) {
-    int64_t c = pend[pend_at % NPEND], sl = s->slot_of[c], r = s->ptr[c];
-    while (r < s->ptr[c + 1] && s->inflight[s->drive[r]] < s->entries - 8) r++;
-    if (r < s->ptr[c + 1]) break;
-    submit(s, 1, &c, &sl, 0, 1);
+    int64_t c = pend[pend_at % NPEND], sl = s->slot_of[c], q = -1;
+    for (int64_t k = 0; k < 2 && q < 0; k++) {
+      int64_t r = s->ptr[c];
+      while (r < s->ptr[c + 1] && s->inflight[s->drive[r] + k * s->nd] < s->entries - 8) r++;
+      if (r == s->ptr[c + 1]) q = k;
+    }
+    if (q < 0) break;
+    submit(s, 1, &c, &sl, q, 1);
   }
-  ring(s);
+  __sync_synchronize();
+  for (int64_t q = 0; q < 2 * s->nd; q++)
+    if (s->tails[q] != s->db_tails[q]) *(volatile uint32_t *)s->db[q] = (uint32_t)(s->db_tails[q] = s->tails[q]);
   return 0;
 }
 
