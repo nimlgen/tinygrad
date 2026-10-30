@@ -21,22 +21,3 @@ for S, T, masked in ((200, 1, False), (201, 2, False), (3000, 2, True), (3999, 4
   got = mla_decode_attention(Tensor(q), t_cache, valid, DV, SCALE, Tensor(mask) if masked else None).numpy()
   np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
   print(f"{S} keys, {T} tokens{', masked' if masked else ''}: ok, max |d| {np.abs(got - want).max():.2e}")
-
-# amd.mla_prefill_attention: a chunk of T tokens at start_pos (causal, the cache holding its keys), 16 heads, against numpy; start_pos
-# a bound variable in a jit (two calls of other values), else an int
-from tinygrad import TinyJit
-from tinygrad.llm.kernels.amd import mla_prefill_attention
-H, SCALE = 16, D ** -0.5
-jits:dict[int, TinyJit] = {}
-for T, S, sym in ((1, 0, False), (7, 100, False), (64, 0, True), (64, 31, True), (300, 4096, True), (512, 3000, False), (100, 131072 - 100, False)):
-  q = rng.standard_normal((1, H, T, D)).astype(np.float16)
-  s = (q.astype(np.float32) @ cache[0, 0, :S + T].T) * SCALE
-  mask = np.triu(np.full((T, S + T), -np.inf, np.float32), S + 1)
-  p = np.exp(s + mask - (s + mask).max(-1, keepdims=True))
-  want = (p / p.sum(-1, keepdims=True)) @ cache[0, 0, :S + T, :DV]
-  if sym:
-    jit = jits.setdefault(T, TinyJit(lambda q, sp: mla_prefill_attention(q, t_cache, sp, DV, SCALE).realize()))
-    got = jit(Tensor(q), UOp.variable("start_pos", 0, N - 512).bind(S)).numpy()
-  else: got = mla_prefill_attention(Tensor(q), t_cache, S, DV, SCALE).numpy()
-  np.testing.assert_allclose(got, want, rtol=1e-3, atol=2e-3)
-  print(f"prefill {T} tokens at {S}{' (jit)' if sym else ''}: ok, max |d| {np.abs(got - want).max():.2e}")
