@@ -622,7 +622,7 @@ def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, la
 def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups):
   # RDNA4 and CDNA (kgroups > 1) own consecutive rows per lane group, matching tokens directly.
   if kgroups > 1:
-    return [out[token, output].store(acc.after(update)[i].load()) for output,output_accs in zip(outputs, accs)
+    return [out[token, output].store(acc.after(update)[i].load().cast(out.dtype)) for output,output_accs in zip(outputs, accs)
             for tile_tokens,acc in zip(tokens, output_accs) for i,token in enumerate(tile_tokens)]
   # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
   flat_accs = [acc for output_accs in accs for acc in output_accs]
@@ -635,7 +635,7 @@ def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, k
     low = (lane // 16).eq(0)
     return tuple(low.where(own[i], peer[i+4]) if j == 0 else low.where(peer[i], own[i+4]) for i in range(4) for j in range(2))
   tt = len(tokens)
-  return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
+  return [out[token, output].store(value.cast(out.dtype)) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
           for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
 
 def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes):
@@ -783,6 +783,161 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
   fxn = functools.partial(_quant_decode_kernel, ggml_type=ggml_type, out_features=out_features, in_features=in_features, gather=(stride, offset),
                           tokens=tokens, weighted=w is not None, summed=summed, bias=bias is not None)
   return Tensor.custom_kernel(out, pool, *q8_quantize(x, rows, in_features), slots, *[t for t in (w, bias) if t is not None], *extra, fxn=fxn)[0]
+
+# ******** grouped expert gemm: the prefill's routed experts, WMMA ********
+
+@functools.cache
+def _iq3_half_tables(device:str|tuple[str, ...]|None) -> Tensor:
+  """the grouped gemm's IQ3_XXS lookup tables, 1024 words: the grid as halves 1024 + magnitude (2 words an entry, bytes 0-1 then 2-3), then
+  for every 7 bit sign pattern (the 8th its parity) the sign bits of its two words' halves (4 words)"""
+  from tinygrad.runtime.autogen.ggml_common import iq3xxs_grid
+  def halves(v:int) -> int: return (0x6400 | (v & 255)) | (0x6400 | (v >> 8 & 255)) << 16
+  grid = [halves(g >> (16*i) & 0xffff) for g in iq3xxs_grid for i in range(2)]
+  even = [p | (bin(p).count("1") & 1) << 7 for p in range(128)]
+  signs = [(e >> (2*i) & 1) << 15 | (e >> (2*i+1) & 1) << 31 for e in even for i in range(4)]
+  with Context(ALLOW_DEVICE_USAGE=1): return Tensor.const(tuple(grid + signs), dtypes.uint32).to(device, force=True).realize()
+
+def _pk_fma_f16(a:UOp, b:UOp, c:UOp) -> UOp:  # a*b+c of the half pairs in words, one rounding
+  return UOp(Ops.CUSTOM, src=(a, b, c), arg=("({{ typedef _Float16 __h2 __attribute__((ext_vector_type(2))); __builtin_bit_cast(unsigned int, "
+    "__builtin_elementwise_fma(__builtin_bit_cast(__h2, {0}), __builtin_bit_cast(__h2, {1}), __builtin_bit_cast(__h2, {2}))); }})", dtypes.uint32))
+
+@functools.cache
+def _expert_gemm_kernel(out:UOp, raw:UOp, x:UOp, tslot:UOp, ntiles:UOp, *rest:UOp, out_features:int, in_features:int, stride:int,
+                        offset:int, gather:bool, rdna4:bool, G:int=4, OT:int=2, W:int=4, QH:int=8, SPLIT:int=1,
+                        ORDER:int=1) -> UOp:
+  """out[p] = W[tslot[p//16]] @ x[rows[p]] (rows = rest[0] if gather, else p) for the tiles p//16 < ntiles[0]. a workgroup a chunk of up to
+  G tiles of a slot (it starts at a tile i of a slot's run or of i % G 0, its tiles to the next of those: the others' workgroups exit) and
+  its W waves' OT output tiles each, a loop over the weights' 256 blocks: a weight fragment dequantized once for the chunk's tiles (QH k
+  steps of them at a time in registers, the WMMA of a tile past the chunk's skipped: a loop of 0 or 1 rounds). the IQ3_XXS weights to
+  half fragments by tables in LDS: a grid word's halves 1024 + magnitude, fma'd by the scale less 1024 times it (exact: the product
+  rounded once), the signs xor'd in. the k slots are permuted (the same in x): k step q of a block is its grid word pairs q and 16+q (8
+  neighboring input features each, the same signs), on RDNA4 a half wave each: a lane's grid indices, scales and x of a block are neighbors"""
+  rows, tables = (rest[0], rest[1]) if gather else (None, rest[0])
+  P, nblocks, bw = int(out.shape[0]), in_features // 256, QUANT_SIZES[IQ3_XXS]//2
+  while out_features % (16*OT*W): W //= 2
+  G = min(G, P//16)
+  assert W and in_features % 256 == 0 and P % 16 == 0 and 16 % QH == 0
+  # (64 bit offsets only for a pool past 2**31 words)
+  itype = dtypes.int64 if int(raw.numel()) >= 2**31 else dtypes.int32
+  # (ORDER 0: the tiles the fastest, a slot's chunks at once: its weights read from memory once; 1: the output blocks, a tile's x once)
+  oblock, tile = UOp.range(out_features//(16*OT*W), ORDER, AxisType.GLOBAL), UOp.range(P//16, 1-ORDER, AxisType.GLOBAL)
+  wave, lane = UOp.range(W, 2, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  col, h = lane % 16, lane // 16
+  nt, slot = ntiles[0].load(), tslot[tile].load()
+  start = (tile % G).eq(0) | slot.ne(tslot[(tile - 1).maximum(0)].load()) if G > 1 else UOp.const(True, dtypes.bool)
+  lives = [start & (tile < nt)]
+  for j in range(1, G):
+    tj = (tile + j).minimum(P//16 - 1)
+    lives.append(lives[-1] & ((tile % G) + j < G) & (tile + j < nt) & tslot[tj].load().eq(slot))
+  lut = UOp.alloc((1024,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  tid, threads = wave*WARP_SIZE + lane, W*WARP_SIZE
+  lut = lut.after(UOp.group(*(lut[tid+i*threads].store(tables[tid+i*threads]) for i in range(1024//threads))).barrier())
+  slot_base = slot.cast(itype)*stride + offset
+  tiles = [(tile + j).minimum(P//16 - 1) for j in range(G)]
+  xrows = [rows[t*16 + col].load() if rows is not None else t*16 + col for t in tiles]
+  outputs = [(oblock*W + wave)*(16*OT) + t*16 + col for t in range(OT)]
+  accs = [[_reg((8,), 0) for _ in range(OT)] for _ in range(G)]
+  blk = UOp.range(lives[0].where(nblocks, 0), 3, AxisType.LOOP)
+  vals = [acc.after(blk) for acc in accs[0]]
+  curs = [[acc.after(blk) for acc in accs_j] for accs_j in accs[1:]]
+  ends = []
+  # a lane's grid word pairs of k step q: (pair, its index among the lane's subgroups' scales)
+  lane_pairs = [[(h*16 + q, q//4)] if rdna4 else [(q, q//4), (16+q, 4 + q//4)] for q in range(16)]
+  subs = [h*4 + i for i in range(4)] if rdna4 else list(range(8))
+  xbases = [xr.cast(itype)*in_features + blk*256 for xr in xrows]
+  wq = []
+  for o in outputs:
+    base = slot_base + (o*nblocks + blk).cast(itype)*bw
+    d = _half(raw[base])
+    idx = {p: raw[base + 1 + p].cast(dtypes.uint32) for q in range(16) for p, _ in lane_pairs[q]}
+    auxs, scales = [], []
+    for sub in subs:
+      aux = _load_u32(raw, base, 66 + sub*4)
+      s16 = (d * ((aux >> 28).float()*0.5 + 0.25)).cast(dtypes.half)
+      s2 = s16.bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001
+      auxs.append(aux)
+      scales.append((s2, (s16 * -1024).bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001))
+    wq.append((idx, auxs, scales))
+  def bfrag(q:int, t:int) -> UOp:
+    idx, auxs, scales = wq[t]
+    words = []
+    for p, si in lane_pairs[q]:
+      s2, o2 = scales[si]
+      sign = ((auxs[si] >> (7*(q % 4))) & 127) * 4 + 512
+      for w, gi in enumerate((idx[p] & 255, idx[p] >> 8)):
+        for hw in range(2):
+          words.append(_pk_fma_f16(lut[(gi*2 + hw).cast(dtypes.weakint)].load(), s2, o2) ^ lut[(sign + w*2 + hw).cast(dtypes.weakint)].load())
+    return UOp.stack(*((w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for w in words for i in range(2)))
+  def afrag(j:int, q:int) -> UOp: return UOp.stack(*(e for p, _ in lane_pairs[q] for e in _vec_halves(x, xbases[j] + p*8)))
+  zero = UOp.stack(*[UOp.const(0, dtypes.float)]*8)
+  def chains(start:list[UOp], j:int, qs:range, bf:dict) -> list[UOp]:
+    # (SPLIT chains of WMMAs an accumulator, k step q on chain q % SPLIT, added at the end: independent WMMAs in flight)
+    cs = [[v] + [zero]*(SPLIT-1) for v in start]
+    for q in qs:
+      a = afrag(j, q)
+      for t in range(OT): cs[t][q % SPLIT] = UOp.wmma(a, bf[q, t], cs[t][q % SPLIT], *WMMA_ARG)
+    return [functools.reduce(UOp.__add__, c) for c in cs]
+  for qh in range(16 // QH):
+    qs = range(qh*QH, (qh+1)*QH)
+    bf = {(q, t): bfrag(q, t) for q in qs for t in range(OT)}
+    vals = chains(vals, 0, qs, bf)
+    for j in range(1, G):  # (the chunk's other tiles: a round if live)
+      r = UOp.range(lives[j].where(1, 0), 10 + qh*G + j, AxisType.LOOP)
+      cv = chains([cur.after(r) for cur in curs[j-1]], j, qs, bf)
+      e = UOp.group(*(cur.store(v) for cur, v in zip(curs[j-1], cv))).end(r)
+      curs[j-1] = [acc.after(e) for acc in accs[j]]
+      ends.append(e)
+  update = UOp.group(*(acc.store(v) for acc, v in zip(accs[0], vals)), *ends).end(blk)
+  stores = []
+  for j in range(G):
+    tokens = (tuple((tiles[j]*16 + h*8 + i).valid(lives[j]) for i in range(8)),)
+    stores += _wmma_stores(out, outputs, tokens, [[acc] for acc in accs[j]], update, lane, wave, W, 2 if rdna4 else 1)
+  return UOp.group(*stores).end(oblock, tile, wave, lane).sink(arg=KernelInfo(name="expert_gemm_iq3_xxs", opts_to_apply=()))
+
+def _vec_halves(x:UOp, idx:UOp) -> list[UOp]:  # 8 neighboring halves, one load
+  v = _amd_load(x[idx], 8)
+  return [v[i] for i in range(8)]
+
+EG_OPTS = {"G": 4, "OT": 2, "W": 4, "QH": 8, "SPLIT": 1, "ORDER": 1}  # (the gemm's knobs, EG_<knob> to override)
+
+def expert_gemm(pool:Tensor, x:Tensor, tslot:Tensor, ntiles:Tensor, out_features:int, in_features:int, stride:int, offset:int=0,
+                rows:Tensor|None=None, dtype=dtypes.float32) -> Tensor:
+  """the grouped gemm of the routed experts' IQ3_XXS weights in the slots of a cache pool: out[p] = W[tslot[p//16]] @ x[rows[p]] (rows
+  None: x[p]), (P, out_features) of dtype (float or half; the sums float), for the 16 row tiles p//16 < ntiles[0] (P static: the rows of
+  the tiles past them not written). pool holds raw gguf blocks as uint16 words, a slot starts every stride words, W at offset in it
+  (expert_linear's). x is cast to half"""
+  P = int(rows.shape[0]) if rows is not None else int(x.shape[0])
+  out = Tensor.empty(P, out_features, dtype=dtype, device=x.device)
+  fxn = functools.partial(_expert_gemm_kernel, out_features=out_features, in_features=in_features, stride=stride, offset=offset,
+                          gather=rows is not None, rdna4=_is_rdna4(x.device), **{k: getenv(f"EG_{k}", v) for k, v in EG_OPTS.items()})
+  srcs = (pool, x.cast(dtypes.float16).reshape(-1).contiguous(), tslot, ntiles, *([rows] if rows is not None else []), _iq3_half_tables(x.device))
+  return Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
+
+@functools.cache
+def _expert_combine_kernel(out:UOp, y:UOp, dest:UOp, w:UOp, K:int) -> UOp:
+  # a workgroup a token, a thread 4 neighboring columns of every 512: the sum of its K rows of y in order (deterministic)
+  T, D = cast(tuple[int, int], out.shape)
+  P = int(y.shape[0])
+  assert D % 4 == 0
+  tok, tid = UOp.range(T, 0, AxisType.GLOBAL), UOp.range(128, 1, AxisType.LOCAL)
+  ents = [(dest[tok*K + k].load().cast(dtypes.int64)*D, w[tok*K + k].load()) for k in range(K)]
+  stores = []
+  for c in range(-(-D // 512)):
+    col = (c*512 + tid*4)
+    ok = col < D if D % 512 else None
+    colc = col.minimum(D - 4) if ok is not None else col
+    acc = [UOp.const(0, dtypes.float)]*4
+    for base, wk in ents:
+      v = _amd_load(y.reshape(P*D)[base + colc], 4)
+      acc = [a + wk*v[i].float() for i, a in enumerate(acc)]
+    stores += [out[tok, (colc + i) if ok is None else (colc + i).valid(ok)].store(a) for i, a in enumerate(acc)]
+  return UOp.group(*stores).end(tok, tid).sink(arg=KernelInfo(name="expert_combine", opts_to_apply=()))
+
+def expert_combine(y:Tensor, dest:Tensor, w:Tensor, T:int, K:int) -> Tensor:
+  """the routed experts' weighted sum of a token: out[t] = sum over k (in order) of w[t*K+k] * y[dest[t*K+k]], y (P, D) float or half (the
+  down gemm's output in pair order), dest int32 and w float (T*K,): (T, D) float. a gather of K rows a token (not a one-hot)"""
+  out = Tensor.empty(T, int(y.shape[1]), dtype=dtypes.float32, device=y.device)
+  return Tensor.custom_kernel(out, y, dest, w.float(), fxn=functools.partial(_expert_combine_kernel, K=K))[0]
 
 # ******** mla absorb matmuls, a few tokens ********
 

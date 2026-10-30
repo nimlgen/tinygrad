@@ -3,7 +3,7 @@
 # of gpu g is one contiguous, 4k aligned part of that disk at EXPERTS + index * part_size[g]. the trunk gguf is stored raw on disk 0.
 import itertools, json, os, zlib
 import numpy as np
-from tinygrad.runtime.support.nvme import NVMeDev, PRPList, OP_READ, OP_WRITE, PAGE
+from tinygrad.runtime.support.nvme import NVMeDev, PRPList, OP_READ, OP_WRITE
 from tinygrad.runtime.support.system import PCIDevice
 from tinygrad.helpers import round_up
 

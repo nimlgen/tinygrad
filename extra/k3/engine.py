@@ -7,13 +7,13 @@ import ctypes, functools, os, sys, time
 os.environ.setdefault("BEAM", "2")  # the generic kernels searched (cached after the first launch)
 from typing import Callable, cast
 import numpy as np
-from tinygrad import Tensor, Device, dtypes, nn
+from tinygrad import Tensor, Device, Context, dtypes, nn
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
 from tinygrad.helpers import getenv, prod, round_up
 from tinygrad.uop.ops import UOp
 from tinygrad.llm import model as llm_model
 from tinygrad.llm.model import Transformer, gated_activation
-from tinygrad.llm.kernels.amd import Linear, expert_linear, partial_sum, p2p_allreduce, q8_act, QUANT_NAMES
+from tinygrad.llm.kernels.amd import Linear, expert_linear, expert_gemm, expert_combine, partial_sum, p2p_allreduce, q8_act, QUANT_NAMES
 from tinygrad.runtime.support.nvme import PRPList, OP_READ, OP_WRITE, PAGE
 from extra.k3.store import open_store, host_io, read_manifest, write_manifest, STRIPE, EXPERTS
 from extra.k3.draft import q8_0_linear
@@ -33,6 +33,10 @@ VICTIMS = 32  # slots picked for the next layer's misses while the gpu works
 # K1: the experts of a layer in two parts, the first K1 of them in the order they're ready (cached first) and the rest: the gpu works on
 # the first while the misses are read
 K1 = 8
+# CHUNKS: a prompt fed in chunks of these sizes (multiples of 16, the largest that fits first: a graph a size), the rest a token a step. a
+# chunk reads every expert of a layer in (a layer ahead: a chunk's tokens route to nearly all of them) and routes exactly. CHUNK_BEAM: the
+# search of the generic kernels of a chunk's graph (0: none)
+CHUNKS, CHUNK_BEAM = [int(c) for c in getenv("CHUNKS", "1024,256").split(",") if c], getenv("CHUNK_BEAM", 0)
 STORE = getenv("STORE", 512 << 30)  # the disk 0 offset of the store's manifest (the experts split evenly over the gpus)
 
 def host_tensor(dev:str, shape:tuple[int, ...], dtype) -> tuple[Tensor, np.ndarray]:
@@ -132,6 +136,7 @@ def load_trunk(model:Transformer, disks:list, devs:tuple[str, ...], index:dict):
 # type, a pointer is an address), the gpus' buffers of a layer (BUFS) in a table of every layer's
 IO = [*((n, "int64_t") for n in "layers E ngpu k kmin rows tokens k1 nd entries slots victims_n nvict pf fill".split()),
       ("tau", "float"), ("tauc", "float"), ("beta", "float"), ("decay", "float"), ("bufs", "const uint64_t *"), ("bias", "const float **"),
+      ("cbufs", "const uint64_t *"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"),
       ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"), ("mask", "uint8_t *"), ("victims", "int64_t *"),
       ("owner", "int64_t *"), ("ptr", "const int64_t *"), ("drive", "const int32_t *"), ("lba", "const int64_t *"), ("nlb", "const uint32_t *"),
@@ -140,10 +145,11 @@ IO = [*((n, "int64_t") for n in "layers E ngpu k kmin rows tokens k1 nd entries 
       *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills".split()),
       *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split())]
 BUFS = ["tag", "ready", "ready1", "scores", "slots", "ws", "slots2", "ws2"]
+CBUFS = ["scores", "tslot", "ntiles", "rows", "dest", "w"]  # (a prompt's chunk: a layer's buffers of each gpu, cbufs)
 CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float": ctypes.c_float, "double": ctypes.c_double}
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
 HOST_C = "#include <stdint.h>\ntypedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
-  ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\n" + r"""
+  ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\nenum { " + ", ".join(f"C_{b.upper()}" for b in CBUFS) + ", NCB };\n" + r"""
 #include <time.h>
 typedef struct { uint32_t cdw0, nsid; uint64_t rsvd, mptr, prp1, prp2; uint32_t cdw10, cdw11, cdw12, pad[3]; } sqe_t;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -388,6 +394,129 @@ static int64_t layer(io_t *s, int64_t li) {
   return 0;
 }
 
+// *** a prompt's chunk (many tokens a step): the host reads every expert of a layer into a slot while the gpus work on the layer before,
+// routes the chunk exactly on the gpus' logits and gives them the grouped gemm's tables: a 16 row tile a slot (the rows of its tokens,
+// padded with the first's), the tiles' count, every token's rows of the down gemm's output and weights (entry t*k + j its j-th)
+
+// the codes of the reads not queued yet (a drive's queues hold `entries` commands), a ring: npend and pend_at count every one of the
+// step's, at most two layers' are pending
+#define NPEND 8192
+static int64_t pend[NPEND], npend, pend_at;
+
+// the pending reads while every drive of the next has room on a queue (the demand one, else the guess one): owned, flying counts them
+static void drain(io_t *s) {
+  for (; pend_at < npend; pend_at++) {
+    int64_t c = pend[pend_at % NPEND], sl = s->slot_of[c], q = -1;
+    for (int64_t k = 0; k < 2 && q < 0; k++) {
+      int64_t ok = 1;
+      for (int64_t r = s->ptr[c]; r < s->ptr[c + 1]; r++) ok &= s->inflight[s->drive[r] + k * s->nd] < s->entries - 8;
+      if (ok) q = k;
+    }
+    if (q < 0) return;
+    submit(s, 1, &c, &sl, q, 1);
+  }
+}
+
+static int64_t poll_reads(io_t *s) {
+  if (reap(s) < 0) return -1;
+  drain(s);
+  __sync_synchronize();
+  for (int64_t q = 0; q < 2 * s->nd; q++)
+    if (s->tails[q] != s->db_tails[q]) *(volatile uint32_t *)s->db[q] = (uint32_t)(s->db_tails[q] = s->tails[q]);
+  return 0;
+}
+
+// layer lj's experts not cached into the least used free slots, not of layer lj or li (-1: none), their reads pending. -3: too few slots
+static int64_t queue_layer(io_t *s, int64_t lj, int64_t li) {
+  int64_t E = s->E, n = 0, v = 0;
+  static int64_t vs[1 << 16]; static float vf[1 << 16];
+  for (int64_t e = 0; e < E; e++) {
+    if (s->slot_of[lj * E + e] >= 0) s->mask[s->slot_of[lj * E + e]] = 1;
+    if (li >= 0 && s->slot_of[li * E + e] >= 0) s->mask[s->slot_of[li * E + e]] = 1;
+  }
+  for (int64_t sl = 0; sl < s->slots; sl++) if (free_slot(s, sl)) vf[n] = s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : -1, vs[n++] = sl;
+  for (int64_t sl = 0; sl < s->slots; sl++) s->mask[sl] = 0;
+  for (int64_t e = 0; e < E; e++) {
+    int64_t c = lj * E + e;
+    if (s->slot_of[c] >= 0) continue;
+    int64_t best = -1;  // (the least used left: a scan, E of them a layer)
+    for (int64_t i = v; i < n; i++) if (best < 0 || vf[i] < vf[best]) best = i;
+    if (best < 0) return -3;
+    int64_t sl = vs[best]; vs[best] = vs[v], vf[best] = vf[v], v++;
+    if (s->expert_in[sl] >= 0) s->slot_of[s->expert_in[sl]] = -1;
+    s->expert_in[sl] = c, s->slot_of[c] = (int32_t)sl;
+    if (npend - pend_at >= NPEND) return -3;
+    pend[npend++ % NPEND] = c;
+    s->misses++;
+  }
+  return 0;
+}
+
+// every layer of a chunk's step. 0, -1 a read failed, -2 a timeout, -3 no slots
+int64_t chunk_io(io_t *s) {
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, nr = E / ng, r;
+  static int64_t sel[8192 * 16], cnt[4096], at[4096]; static float w[8192 * 16];
+  float logits[4096], sig[4096];
+  io_t ex = *s;  // (exact routing: the top k)
+  ex.tau = ex.tauc = ex.beta = 0, ex.kmin = K;
+  if (T > 8192 || E > 4096 || 2 * E > NPEND || s->slots > 1 << 16) return -3;
+  npend = pend_at = 0;
+  if ((r = queue_layer(s, 0, -1))) return r;
+  for (int64_t li = 0; li < s->layers; li++) {
+    const uint64_t *b = s->bufs + li * NB * ng, *cb = s->cbufs + li * NCB * ng;
+    #define CB(kind, g, type) ((type *)cb[(kind) * ng + (g)])
+    double t0 = now();
+    for (int64_t g = 0; g < ng; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {
+      if (poll_reads(s) < 0) return -1;
+      if (now() - t0 > 300) return -2;
+    }
+    double t1 = now();
+    int64_t lend = npend;  // (li's reads are those pending before)
+    if (li + 1 < s->layers && (r = queue_layer(s, li + 1, li))) return r;
+    poll_reads(s);
+    int32_t *so = s->slot_of + li * E;
+    for (int64_t e = 0; e < E; e++) cnt[e] = 0;
+    for (int64_t t = 0; t < T; t++) {
+      for (int64_t g = 0; g < ng; g++) for (int64_t i = 0; i < nr; i++) logits[g * nr + i] = CB(C_SCORES, g, const float)[t * nr + i];
+      route(&ex, logits, s->bias[li], so, 0, sel + t * K, w + t * K, sig, 0, 0);
+      for (int64_t j = 0; j < K; j++) cnt[sel[t * K + j]]++;
+    }
+    int32_t *tslot = CB(C_TSLOT, 0, int32_t), *rows = CB(C_ROWS, 0, int32_t), *dest = CB(C_DEST, 0, int32_t);
+    int64_t tiles = 0, used = 0;
+    for (int64_t e = 0; e < E; e++) {
+      at[e] = tiles * 16;
+      for (int64_t i = 0; i < (cnt[e] + 15) / 16; i++) tslot[tiles++] = so[e];
+      used += cnt[e] > 0;
+    }
+    for (int64_t t = 0; t < T * K; t++) rows[at[sel[t]]] = (int32_t)(t / K), dest[t] = (int32_t)at[sel[t]]++;
+    for (int64_t e = 0; e < E; e++) if (cnt[e]) {  // (at is past each expert's rows now: its tile's padding the first's token)
+      int64_t first = at[e] - cnt[e];
+      for (int64_t p = at[e]; p < first + (cnt[e] + 15) / 16 * 16; p++) rows[p] = rows[first];
+    }
+    *CB(C_NTILES, 0, int32_t) = (int32_t)tiles;
+    for (int64_t t = 0; t < T * K; t++) CB(C_W, 0, float)[t] = w[t];
+    for (int64_t g = 1; g < ng; g++) for (int64_t kind = C_TSLOT; kind < NCB; kind++) {  // (every gpu the same tables)
+      int64_t n = kind == C_TSLOT ? tiles : kind == C_NTILES ? 1 : kind == C_ROWS ? tiles * 16 : T * K;
+      for (int64_t i = 0; i < n; i++) ((int32_t *)cb[kind * ng + g])[i] = ((int32_t *)cb[kind * ng])[i];
+    }
+    double t2 = now();
+    for (int64_t busy = 1; busy;) {
+      if (poll_reads(s) < 0) return -1;
+      busy = pend_at < lend;
+      for (int64_t e = 0; e < E && !busy; e++) busy = s->flying[li * E + e] > 0;
+      if (now() - t0 > 60) return -2;
+    }
+    __sync_synchronize();
+    for (int64_t g = 0; g < ng; g++) *BUF(B_READY, g, volatile uint32_t) = 1;
+    float *f = s->freq + li * E;
+    for (int64_t e = 0; e < E; e++) f[e] = f[e] * s->decay + (cnt[e] > 0), s->guess[li * E + e] = 0;
+    s->refs += used;
+    s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += now() - t2;
+  }
+  pick(s, s->victims_n);
+  return 0;
+}
+
 // every layer's ready flags (the first parts' too) set to value, with 0 the router tags cleared too
 void flags(io_t *s, uint32_t value) {
   for (int64_t li = 0; li < s->layers; li++) for (int64_t g = 0, ng = s->ngpu; g < ng; g++) {
@@ -419,6 +548,7 @@ def host_c():
                    input=HOST_C.encode(), check=True)
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
+  lib.chunk_io.restype, lib.chunk_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib
 
@@ -503,6 +633,10 @@ class Streamer:
     self.after:Callable[[int, UOp], Tensor]|None = None  # (slowest: each step's slowest layer)
     self.tok = host_tensor(Device.DEFAULT, (1, 1), dtypes.int32)
     if self.T: self.tok_t = host_tensor(Device.DEFAULT, (1, self.T), dtypes.int32)
+    # (a prompt's chunks) a size's tokens, every layer's buffers and their table, the graph of a chunk (the engine's main sets it)
+    self.chunk_toks:dict[int, tuple[Tensor, np.ndarray]] = {}
+    self.chunks:dict[int, tuple[list, np.ndarray]] = {}
+    self.chunk_model:Callable[..., Tensor] = model
     # the p2p allreduce mailboxes now: made during a step (the graph's first use) its synchronize waits for a gpu that waits for this host
     p2p_allreduce(devs)
     for li, b in enumerate(self.blocks): b.routed_experts = functools.partial(self.experts, li)
@@ -512,6 +646,7 @@ class Streamer:
   def experts(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """the experts of a step of T tokens in two parts, every token its own"""
     T, outs, x = int(x.shape[1]), [], x.half()  # (an mselect of the mix kernel's output has no shape, of its half it does)
+    if T > 8: return self.chunk_experts(li, x, h)
     for g, gpu in enumerate(self.gpus):
       xg, hg = Tensor(x.uop.mselect(g)).reshape(T, -1), Tensor(h.uop.mselect(g)).reshape(T, self.lat).float()
       # a fresh tensor of the buffer: an assign to the kept one would chain every token's graph onto it
@@ -522,6 +657,35 @@ class Streamer:
       out = self.part(li, gpu, hg, gpu.slots2[T][li][0], gpu.w2[T][li][0], gpu.ready[li][0].uop.after(out.uop), out)
       outs.append(out.reshape(1, T * self.lat))
     # every gpu has the partial sums of its units: the sum over the gpus is the allreduce
+    return partial_sum(Tensor(UOp.mstack(*[o.uop for o in outs]).unshard(0))).reshape(1, T, self.lat)
+
+  def chunk_bufs(self, C:int) -> list:
+    """(a prompt's chunk of C tokens) every layer's host buffers of each gpu (CBUFS): its router logits, the grouped gemm's tiles (a slot
+    each, their count, a token a row: C*K rows, padded to 16 an expert) and every token's experts (its rows of the output, weights)"""
+    if C not in self.chunks:
+      P, n = C * K + 16 * self.E, self.E // len(self.gpus)
+      specs = [((C, n), dtypes.float32), ((P // 16,), dtypes.int32), ((1,), dtypes.int32), ((P,), dtypes.int32), ((C * K,), dtypes.int32),
+               ((C * K,), dtypes.float32)]
+      bufs = [[[host_tensor(g.dev, shape, dt) for shape, dt in specs] for g in self.gpus] for _ in self.blocks]
+      self.chunks[C] = (bufs, np.ascontiguousarray(np.array([[[b[1].ctypes.data for b in gb] for gb in lb] for lb in bufs], np.uint64)
+                                                    .transpose(0, 2, 1)))
+    return self.chunks[C][0]
+
+  def chunk_experts(self, li:int, x:Tensor, h:Tensor) -> Tensor:
+    """the experts of a prompt's chunk: the router logits to the host (it routes, exact: chunk_io), the grouped gemms of the tables it gives"""
+    T, outs, n = int(x.shape[1]), [], self.E // len(self.gpus)
+    for g, (gpu, bufs) in enumerate(zip(self.gpus, self.chunk_bufs(T)[li])):
+      xg, hg = Tensor(x.uop.mselect(g)).reshape(T, -1), Tensor(h.uop.mselect(g)).reshape(T, self.lat)
+      sc, *tabs = (b[0] for b in bufs)
+      scores = Tensor(sc.uop).assign(self.scorers[li][g](xg)[:, :n])
+      signal = UOp.custom_function("hostsignal").call(gpu.tag[li][0].uop, scores.uop)
+      wait = UOp.custom_function("hostwait").call(gpu.ready[li][0].uop.after(signal), *[t.uop for t in tabs])
+      tslot, ntiles, rows, dest, w = (Tensor(t.uop.after(wait)).contiguous() for t in tabs)
+      u, cfg, stride = gpu.units, self.blocks[li].config, gpu.part // 2
+      gu = expert_gemm(gpu.pool, hg, tslot, ntiles, 2 * u, self.lat, stride, rows=rows).reshape(-1, 2, u)
+      act = gated_activation(gu[:, 0], gu[:, 1], limit=cfg.swiglu_limit, situ=cfg.situ)
+      y = expert_gemm(gpu.pool, act, tslot, ntiles, self.lat, u, stride, 2 * u * self.row_up // 2, dtype=dtypes.half)
+      outs.append(expert_combine(y, dest, w, T, K).reshape(1, T * self.lat))
     return partial_sum(Tensor(UOp.mstack(*[o.uop for o in outs]).unshard(0))).reshape(1, T, self.lat)
 
   def part(self, li:int, gpu:Gpu, hg:Tensor, slots:Tensor, w:Tensor, ready:UOp, bias:Tensor|None=None) -> Tensor:
@@ -557,6 +721,30 @@ class Streamer:
   def flags(self, value:int): host_c().flags(ctypes.byref(self.io), value)
 
   def step(self, tok:int, pos:int, v_pos:UOp, temp:Tensor) -> int: return self.steps([tok], pos, v_pos, temp)[0]
+
+  def chunk(self, toks:list[int], pos:int, v_pos:UOp, temp:Tensor):
+    """a step of a prompt's chunk at positions pos..: the gpus run its graph (chunk_model), the host reads every layer's experts in and
+    routes it (chunk_io)"""
+    io, T = self.io, len(toks)
+    self.chunk_bufs(T)
+    io.tokens, io.bufs, io.cbufs, io.victims_n = T, self.bufs[1].ctypes.data, self.chunks[T][1].ctypes.data, VICTIMS
+    self.flags(0)
+    if T not in self.chunk_toks: self.chunk_toks[T] = host_tensor(Device.DEFAULT, (1, T), dtypes.int32)
+    buf, arr = self.chunk_toks[T]
+    arr[0, :] = toks
+    if getenv("CHUNK_DEBUG"):  # (the host's part in a thread from the start: the graph's kernels can run one at a time, DEBUG=2)
+      import threading
+      th = threading.Thread(target=lambda: setattr(self, "chunk_err", host_c().chunk_io(ctypes.byref(io))))
+      th.start()
+    with Context(BEAM=CHUNK_BEAM):  # (the generic kernels of a size's graph compiled when it's captured: a search is minutes)
+      out = self.chunk_model(buf, v_pos.bind(pos), temp)
+    if getenv("CHUNK_DEBUG"): th.join()
+    if (err:=self.chunk_err if getenv("CHUNK_DEBUG") else host_c().chunk_io(ctypes.byref(io))):
+      self.flags(1)
+      raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no slots left"}[err])
+    with Context(BEAM=CHUNK_BEAM): more = self.after(T, v_pos.bind(pos)) if self.after is not None else None
+    for o in (out, more):
+      if o is not None: o.numpy()
 
   def steps(self, toks:list[int], pos:int, v_pos:UOp, temp:Tensor) -> list[int]:
     """a step of tokens at positions pos.. (more than one: a verify step, VERIFY=T): the gpus run the graph, the host every layer's
@@ -605,6 +793,20 @@ if __name__ == "__main__":
     save_trunk(model, names, disks, devs, sys.argv[1])
   print(f"trunk in {time.perf_counter() - st:.0f} s", flush=True)
   streamer = Streamer(model, disks, m)
+  from tinygrad import TinyJit
+  def cjit(f:Callable):  # (captured on its first call)
+    j = TinyJit(f)
+    j.cnt = 1
+    return j
+  def forward_last(tokens:Tensor, *a) -> Tensor:  # (not a verify: the next token after the last only)
+    verify, model.verify = model.verify, False
+    out, model.verify = model.forward(tokens, *a), verify
+    return out
+  chunk_jits:dict[int, Callable[..., Tensor]] = {}
+  def plain_chunk(tokens:Tensor, *a) -> Tensor:  # (a jit a chunk size)
+    if (T:=int(tokens.shape[1])) not in chunk_jits: chunk_jits[T] = cjit(forward_last)
+    return chunk_jits[T](tokens, *a)
+  streamer.chunk_model = plain_chunk
   # EVAL=corpus.jsonl[:nseq[:max_out]]: production completions teacher forced, each from position 0: per output token the production
   # token's logprob, top-1 agreement with production and KL(production top-5 + the rest || ours)
   if (eval_spec:=getenv("EVAL", "")):
@@ -640,7 +842,11 @@ if __name__ == "__main__":
     for r in [json.loads(line) for line in open(path)][:int(nseq)]:
       ids, outs = r["prompt_ids"], r["output_ids"][:int(max_out)]
       seq = ids + outs
-      for pos0 in range(0, len(seq) - 1, T):
+      i = 0  # (CHUNKS: the prompt but its last token in chunks)
+      while (C:=next((c for c in CHUNKS if len(ids) - 1 - i >= c), 0)):
+        streamer.chunk(ids[i:i + C], i, v_pos, temp)
+        i += C
+      for pos0 in range(i, len(seq) - 1, T):
         if (steps:=steps + 1) == 2: c0 = streamer.counters()
         logits.clear()
         streamer.steps(toks:=seq[pos0:min(pos0 + T, len(seq) - 1)], pos0, v_pos, temp)
@@ -660,6 +866,7 @@ if __name__ == "__main__":
       streamer.report(f"tau {TAU} prefetch {PREFETCH}", c0, steps - 1)
     sys.exit(0)
   ids = ([tok.bos_id] if tok.bos_id is not None else []) + tok.encode(sys.argv[2] if len(sys.argv) > 2 else "The capital of France is")
+  chunk_prep = cast(Callable[[int], None], lambda C: None)
   if (draft_dir:=getenv("DRAFT", "")):
     # DRAFT=dir: speculative decoding of N tokens (VERIFY=2, SLOTS 6700 by default). the draft guesses the token after the next from the
     # target's hidden states after blocks 1, 45, 89, in the step's graph: a verify step of [next, guess] gives the target's token after
@@ -686,15 +893,39 @@ if __name__ == "__main__":
       dtoks = toks_out[T] if T > 1 else (given[0] >= 0).where(given[0], toks_out[T])
       return draft(dtoks, hidden[T], p).to(Device.DEFAULT).argmax(-1).cast(dtypes.int32)
     drafts = {T: TinyJit(functools.partial(guesses, T)) for T in (1, 2)}
+    # a prompt's chunk: the target's hidden states of every token (not verify: the next token after the last only), the draft's cache of
+    # the chunk's positions on the prompt's tokens after them (given_c)
+    given_c:dict[int, tuple[Tensor, np.ndarray]] = {}
+    def draft_chunk(C:int):
+      if C in given_c: return
+      given_c[C], hidden[C] = host_tensor(Device.DEFAULT, (1, C), dtypes.int32), Tensor.empty(1, C, 3, model.config.dim, device=devs).realize()
+      def tapped_chunk(tokens:Tensor, *a) -> Tensor:
+        out = forward_last(tokens, *a)
+        Tensor.realize(Tensor(hidden[C].uop).assign(Tensor.stack(*[model.hidden[i][:, :, -1] for i in model.keep_hidden], dim=2).float()))
+        return out
+      target[C], drafts[C] = cjit(tapped_chunk), cjit(lambda p: draft(given_c[C][0], hidden[C], p, head=False))
+    streamer.chunk_model, chunk_prep = lambda tokens, *a: target[tokens.shape[1]](tokens, *a), draft_chunk  # type: ignore[assignment]
     streamer.after = lambda T, p: drafts[T](p)
   def decode(ids:list[int], pos:int, n:int, emit:Callable[[int], None]=lambda t: None) -> tuple[list[int], int, list, tuple]:
     """the greedy tokens after ids (fed from position pos, a token a step), up to n or an end token (not fed), each to emit as it comes:
     them, the position after the last fed, each step's (right, step, rollback) times and (counters, tokens, steps) once every jit's captured"""
-    for i, t in enumerate(ids):
+    tp, i = time.perf_counter(), 0
+    while (C:=next((c for c in CHUNKS if len(ids) - 1 - i >= c), 0)):  # (the prompt but its last token in chunks)
+      chunk_prep(C)
+      if draft_dir: given_c[C][1][0, :] = ids[i + 1:i + C + 1]
+      c0 = streamer.counters()
+      streamer.chunk(ids[i:i + C], pos + i, v_pos, temp)
+      i += C
+      if getenv("VPROMPT"):
+        dt, gb, *_, tg, tr, tio, _, _, _ = streamer.counters() - c0
+        print(f"chunk of {C} at {pos + i - C}: {dt:.2f} s, {gb / 1e9:.0f} GB read, waiting on the gpus {tg:.2f} s, routing {tr:.2f} s, "
+              f"on reads {tio:.2f} s", flush=True)
+    for i, t in enumerate(ids[i:], i):
       t0 = time.perf_counter()
       if draft_dir: given[1][0, 0] = ids[i + 1] if i + 1 < len(ids) else -1
       nxt, *g = streamer.steps([t], pos + i, v_pos, temp)
       if pos + i == 0: print(f"first step in {time.perf_counter() - t0:.0f} s", flush=True)
+    if getenv("VPROMPT"): print(f"prompt of {len(ids)} tokens in {(dt:=time.perf_counter() - tp):.2f} s = {len(ids) / dt:.1f} tok/s", flush=True)
     pos, out, times, warm = pos + len(ids), [nxt], [], None
     emit(nxt)
     while len(out) < n and not tok.is_end(out[-1]):

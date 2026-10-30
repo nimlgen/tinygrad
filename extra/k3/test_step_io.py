@@ -4,7 +4,7 @@
 # PYTHONPATH=. python3 extra/k3/test_step_io.py
 import ctypes, threading, unittest
 import numpy as np
-from extra.k3.engine import IoT, host_c, BUFS
+from extra.k3.engine import IoT, host_c, BUFS, CBUFS
 
 E, L, NGPU, K, KMIN, ND, ENTRIES, ROWS = 64, 6, 2, 8, 2, 2, 64, 2
 
@@ -134,6 +134,43 @@ class TestStepIO(unittest.TestCase):
     self.step()
     self.check_tables()
     self.assertGreater(self.io.refs - refs, refs)
+
+  def test_chunk(self):  # a prompt's chunk: every expert of each layer read in, the exact top k of every token in the grouped gemm's tables
+    self.tearDown()
+    self.setUp(slots=L * E + 16)  # (none evicted: every layer's slots checked after)
+    T, nr, rng = 40, E // NGPU, np.random.default_rng(1)
+    P = T * K + 16 * E
+    def gpu(scores):
+      return {"scores": scores, "tslot": np.zeros(P // 16, np.int32), "ntiles": np.zeros(1, np.int32), "rows": np.zeros(P, np.int32),
+              "dest": np.zeros(T * K, np.int32), "w": np.zeros(T * K, np.float32)}
+    logits = [rng.normal(0, 2, (T, E)).astype(np.float32) for _ in range(L)]
+    cbuf = [[gpu(np.ascontiguousarray(logits[li][:, g * nr:(g + 1) * nr])) for g in range(NGPU)] for li in range(L)]
+    self.keep += [a for lb in cbuf for gb in lb for a in gb.values()]
+    cbufs = np.array([[[gb[b].ctypes.data for gb in cbuf[li]] for b in CBUFS] for li in range(L)], np.uint64)
+    for li in range(L):
+      for g in self.gbuf[li]: g["ready"][0] = 0
+    self.io.tokens, self.io.cbufs = T, cbufs.ctypes.data
+    self.assertEqual(host_c().chunk_io(ctypes.byref(self.io)), 0)
+    self.check_tables()
+    for li in range(L):
+      so = self.state["slot_of"][li * E:(li + 1) * E]
+      sig = 1 / (1 + np.exp(-logits[li].astype(np.float64)))
+      top = np.argsort(-(sig + self.bias[li]), axis=1, kind="stable")[:, :K]
+      g0 = cbuf[li][0]
+      tiles = int(g0["ntiles"][0])
+      for t in range(T):
+        dest = g0["dest"][t * K:(t + 1) * K]
+        self.assertTrue((g0["rows"][dest] == t).all())
+        self.assertEqual(sorted(so[top[t]].tolist()), sorted(g0["tslot"][dest // 16].tolist()))
+        self.assertTrue((dest // 16 < tiles).all())
+        self.assertAlmostEqual(float(g0["w"][t * K:(t + 1) * K].sum()), 1.0, places=5)
+      # a tile is one expert's: the rows of a tile (padding too) are tokens routed to it
+      for p in range(tiles * 16):
+        e = int(self.state["expert_in"][g0["tslot"][p // 16]]) - li * E
+        self.assertIn(e, top[g0["rows"][p]].tolist())
+      for b, n in (("tslot", tiles), ("rows", tiles * 16), ("ntiles", 1), ("dest", T * K), ("w", T * K)):
+        self.assertTrue((cbuf[li][1][b][:n] == g0[b][:n]).all())
+      self.assertTrue(all(g["ready"][0] == 1 for g in self.gbuf[li]))
 
 if __name__ == "__main__":
   unittest.main()

@@ -56,10 +56,10 @@ class Eagle3Draft:
 
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.norms[name]
 
-  def __call__(self, tokens:Tensor, hidden:Tensor, start_pos:int|UOp=0) -> Tensor:
-    """(1, T) tokens at positions start_pos.. (a few), (1, T, 3, D) the target's hidden states -> (1, T, vocab) logits"""
+  def __call__(self, tokens:Tensor, hidden:Tensor, start_pos:int|UOp=0, head:bool=True) -> Tensor:
+    """(1, T) tokens at positions start_pos.., (1, T, 3, D) the target's hidden states -> (1, T, vocab) logits (not head: the states before
+    the head, a prompt's chunk filling the cache)"""
     T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
-    assert T <= 8
     hid = self.fc(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1))
     h = self.norm(self.embed(tokens), p + "input_layernorm").cat(self.norm(hid, p + "hidden_norm"), dim=-1)
     q = self.q_b(self.norm(self.q_a(h), a + "q_a_layernorm")).reshape(1, T, self.H, self.nope + self.rope).transpose(1, 2)
@@ -71,9 +71,13 @@ class Eagle3Draft:
     cache = Tensor(self.cache.uop.after(self.cache[:, :, start_pos:start_pos + T].uop.store(store.half().uop)))
     # absorbed: the nope scores (q_nope k_b) . latent, the values v_b (attention . latent), in the target's flash decoding kernels
     qa, scale = (q[..., :self.nope] @ self.k_b).cat(q_pe, dim=-1), self.mscale ** 2 / math.sqrt(self.nope + self.rope)
-    attn = mla_decode_attention(qa, cache, start_pos + T, self.lora, scale)
+    if T <= 8: attn = mla_decode_attention(qa, cache, start_pos + T, self.lora, scale)
+    else:  # (a prompt's chunk: causal)
+      k = cache[:, :, :start_pos + T]
+      mask = Tensor.full((1, 1, T, start_pos + T), float("-inf"), buffer=False).triu(start_pos + 1)
+      attn = ((qa.float() @ k.float().transpose(-1, -2)) * scale + mask).softmax(-1) @ k[..., :self.lora].float()
     o = attn @ self.v_b.transpose(-1, -2)
     x = self.o(o.transpose(1, 2).reshape(1, T, self.H * self.vd)) + hid
     m = self.norm(x, p + "post_attention_layernorm")
     x = x + self.down(self.gate(m).silu() * self.up(m))
-    return self.head(self.norm(x, "norm"))
+    return self.head(self.norm(x, "norm")) if head else x
