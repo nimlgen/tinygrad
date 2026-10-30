@@ -52,15 +52,15 @@ class TestStepIO(unittest.TestCase):
       "victims": np.zeros(32 * T, np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.keep += [*tables.values(), *self.state.values()]
     # the gpus' buffers of every layer: tag, ready, ready1, scores (ROWS of E / NGPU a token), slots and weights (slot, token) of both parts
-    nr, k1 = E // NGPU, K // 2 * T
+    nr, k1 = E // NGPU, K // 2
     def gpu():
       return {"tag": arr(np.ones(1, np.uint32)), "ready": arr(np.zeros(1, np.uint32)), "ready1": arr(np.zeros(1, np.uint32)),
-              "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)), "slots": arr(np.zeros(k1, np.int32)),
-              "ws": arr(np.zeros(k1 * T, np.float32)), "slots2": arr(np.zeros(K * T - k1, np.int32)),
-              "ws2": arr(np.zeros((K * T - k1) * T, np.float32))}
+              "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)), "slots": arr(np.zeros(k1 * T, np.int32)),
+              "ws": arr(np.zeros(k1 * T, np.float32)), "slots2": arr(np.zeros((K - k1) * T, np.int32)),
+              "ws2": arr(np.zeros((K - k1) * T, np.float32))}
     self.gbuf = [[gpu() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
-    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, kmax=K, rows=ROWS, slots=SLOTS, tokens=T, k1=k1, nd=ND, entries=ENTRIES,
+    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, rows=ROWS, slots=SLOTS, tokens=T, k1=k1, nd=ND, entries=ENTRIES,
                        victims_n=32 * T, pf=3, tau=0.03, decay=0.5 ** (1 / 8), bufs=self.bufs.ctypes.data)
     for name, a in {**tables, **self.state}.items(): setattr(io, name, a.ctypes.data)
     self.drives = FakeDrives(self.sq, self.db, self.cq)
@@ -134,21 +134,6 @@ class TestStepIO(unittest.TestCase):
     self.step()
     self.check_tables()
     self.assertGreater(self.io.refs - refs, refs)
-
-  def test_kmax(self):  # at most kmax experts a token
-    self.io.kmax = 5
-    self.step()
-    self.check_tables()
-    for li in range(L):
-      g = self.gbuf[li][0]
-      self.assertLessEqual(int((np.concatenate([g["ws"], g["ws2"]]) > 0).sum()), 5)
-
-  def test_dry(self):
-    self.io.dry = 1
-    self.step()
-    self.assertEqual(self.io.misses + self.io.guesses, 0)
-    self.assertTrue((self.state["slot_of"] < 0).all())
-    for li in range(L): self.assertEqual(self.gbuf[li][0]["slots"].tolist(), list(range(K // 2)))
 
 if __name__ == "__main__":
   unittest.main()

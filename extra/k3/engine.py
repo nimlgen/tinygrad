@@ -4,7 +4,7 @@
 # (hostsignal/hostwait) while the host routes, reads the missing experts straight from the drives into vram and fills the slot tables.
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import ctypes, functools, os, sys, time
-os.environ.setdefault("BEAM", "2")  # the generic kernels searched (cached after the first launch): dry 47 -> 40.5 ms/token
+os.environ.setdefault("BEAM", "2")  # the generic kernels searched (cached after the first launch)
 from typing import Callable, cast
 import numpy as np
 from tinygrad import Tensor, Device, dtypes, nn
@@ -18,36 +18,22 @@ from tinygrad.runtime.support.nvme import PRPList, OP_READ, OP_WRITE, PAGE
 from extra.k3.store import open_store, host_io, read_manifest, write_manifest, STRIPE, EXPERTS
 from extra.k3.draft import q8_0_linear
 
-# an nvme submission entry (nvme.py SQE)
-SQE = np.dtype([("cdw0", "<u4"), ("nsid", "<u4"), ("rsvd", "<u8"), ("mptr", "<u8"), ("prp1", "<u8"), ("prp2", "<u8"),
-                ("cdw10", "<u4"), ("cdw11", "<u4"), ("cdw12", "<u4"), ("pad", "V12")])
-
 # SLOTS: experts cached over all layers (6900 fill 4x32 GB, 6700 with the draft's 0.5 GB a gpu)
 K, KMIN, SLOTS, HALF_LIFE = 16, 4, getenv("SLOTS", 6700 if getenv("DRAFT", "") else 6900), 8.0
-# TAU: the keep-resident truncation of the routing, PREFETCH: the next layer's experts guessed per layer. ROWS: the score rows a layer
-# writes, its router's and the guess of the next layer's
-TAU, PREFETCH, ROWS = getenv("TAU", 0.03), getenv("PREFETCH", 5), 2
-# TAUM: (with TAU) the share of a token's weight tau may take, the lightest first. RENORM=0: the kept keep their weights (not renormalized)
-TAUM, RENORM = getenv("TAUM", 0.0), getenv("RENORM", 1)
+# TAU: the keep-resident truncation of the routing (a token's experts under it that aren't cached are left out). PREFETCH: the next
+# layer's experts guessed per layer. ROWS: the score rows a layer writes, its router's and the guess of the next layer's
+TAU, PREFETCH, ROWS = getenv("TAU", 0.065), getenv("PREFETCH", 5), 2
 # BETA: the routing's bonus of a cached expert (its key sigmoid + bias + BETA): one just out of the top k takes the place of one not cached
-BETA = getenv("BETA", 0.0)
+BETA = getenv("BETA", 0.07)
 # TAUC: the experts under it left out cached or not (the gemvs they'd take)
-TAUC = getenv("TAUC", 0.0)
+TAUC = getenv("TAUC", 0.025)
 # FILL: the experts a layer's tau skipped for not being cached read anyway (up to FILL a layer, after its guesses): cached next time
-FILL = getenv("FILL", 0)
+FILL = getenv("FILL", 2)
 VICTIMS = 32  # slots picked for the next layer's misses while the gpu works
 # K1: the experts of a layer in two parts, the first K1 of them in the order they're ready (cached first) and the rest: the gpu works on
 # the first while the misses are read
-K1 = getenv("K1", 8)
-# KMAX: at most this many experts a token kept, the heaviest (the experts' gemvs are KMAX a token: a slot of weight 0 costs a real one)
-KMAX = getenv("KMAX", K)
-# DRY=1: no expert reads, the slots hold garbage. it times the gpu side and the host round trips
-DRY = getenv("DRY", 0)
-# CHUNKS: a prompt fed in chunks of these many tokens (the largest that fits first, multiples of 16), the rest (and its last token) a token a
-# step. a step of more than CHUNK_MIN tokens is a chunk: all of every layer's experts read in, the gpus route it themselves (exact)
-CHUNKS, CHUNK_MIN = [int(c) for c in getenv("CHUNKS", "1024,128").split(",") if c], 8
-# STORE: the disk 0 offset of the store's manifest. 512 GiB: experts split evenly over the gpus (relayout.py), 0: the first 1024/512/512/1024
-STORE = getenv("STORE", 512 << 30)
+K1 = 8
+STORE = getenv("STORE", 512 << 30)  # the disk 0 offset of the store's manifest (the experts split evenly over the gpus)
 
 def host_tensor(dev:str, shape:tuple[int, ...], dtype) -> tuple[Tensor, np.ndarray]:
   """a buffer of dev in uncached host memory: the gpu reads and writes it over pcie, the host through the numpy view"""
@@ -66,26 +52,15 @@ def vram_pages(buf:Buffer) -> list[int]:
   assert all(p + sz <= bar_size for p, sz in paddrs), f"{buf.device}: vram past the {bar_size:#x} bar"
   return [bar + p + o for p, sz in paddrs for o in range(0, sz, PAGE)]
 
-def cut_blocks(n:int):
-  """Transformer.from_gguf's models cut to their first n blocks"""
-  def cut(path, parse=llm_model.gguf_parse):
-    kv, entries = parse(path)
-    arch = kv["general.architecture"]
-    kv[f"{arch}.block_count"] = n + kv.get(f"{arch}.nextn_predict_layers", 0)
-    return kv, {k: v for k, v in entries.items() if not k.startswith("blk.") or int(k.split(".")[1]) < n}
-  llm_model.gguf_parse = cut
-
 class Gpu:
   """one gpu's part of the experts: its units of every expert, a pool of SLOTS of them and the host buffers of each layer"""
-  def __init__(self, dev:str, disk, units:int, part:int, n_layers:int, n_router:int, rows:int, tokens:int=0, n_experts:int=0):
+  def __init__(self, dev:str, disk, units:int, part:int, n_layers:int, n_router:int, rows:int, tokens:int=0):
     self.dev, self.disk, self.units, self.part = dev, disk, units, part
     self.pool = Tensor.empty(SLOTS * part // 2, dtype=dtypes.uint16, device=dev).realize()
     self.prps = PRPList(disk.drives[0], vram_pages(cast(Buffer, self.pool.uop.buffer)))
     self.pages, self.lists = np.array(self.prps.pages, np.int64), np.array(self.prps.addrs, np.int64)
     # the router's signal, the flags of the experts' first part and of all of them
     self.tag, self.ready1, self.ready = ([host_tensor(dev, (1,), dtypes.uint32) for _ in range(n_layers)] for _ in range(3))
-    # (a prompt's chunk) every layer's experts' slots, the host's slot_of
-    self.tab = host_tensor(dev, (n_layers * n_experts,), dtypes.int32)
     # for a step of T tokens (1, VERIFY's): every token's experts (slot and weight, entry i*T + t the i-th of token t) in two parts, K1 a
     # token in the first, and every token's router logits on the layer's input (of the layer, of the next: the guesses)
     self.slots:dict[int, list] = {}
@@ -94,8 +69,8 @@ class Gpu:
     self.w2:dict[int, list] = {}
     self.scores:dict[int, list] = {}
     for T in sorted({1, tokens or 1}):
-      self.slots[T], self.slots2[T] = ([host_tensor(dev, (n,), dtypes.int32) for _ in range(n_layers)] for n in (K1 * T, (KMAX - K1) * T))
-      self.w[T], self.w2[T] = ([host_tensor(dev, (n,), dtypes.float32) for _ in range(n_layers)] for n in (K1 * T, (KMAX - K1) * T))
+      self.slots[T], self.slots2[T] = ([host_tensor(dev, (n,), dtypes.int32) for _ in range(n_layers)] for n in (K1 * T, (K - K1) * T))
+      self.w[T], self.w2[T] = ([host_tensor(dev, (n,), dtypes.float32) for _ in range(n_layers)] for n in (K1 * T, (K - K1) * T))
       self.scores[T] = [host_tensor(dev, (T * rows, n_router), dtypes.float32) for _ in range(n_layers)]
 
 # *** the trunk as it is in vram after a load, on the store's disks: a launch reads it back (p2p, seconds) instead of unpacking the gguf
@@ -155,11 +130,9 @@ def load_trunk(model:Transformer, disks:list, devs:tuple[str, ...], index:dict):
 
 # the host's part of a step in c (step_io): its state, the drives' command tables and queues, the counts in one struct, io_t (IO: name, c
 # type, a pointer is an address), the gpus' buffers of a layer (BUFS) in a table of every layer's
-IO = [*((n, "int64_t") for n in "layers E ngpu k kmin kmax rows tokens k1 dry nd entries slots victims_n nvict pf fill".split()),
-      ("tau", "float"), ("taum", "float"), ("tauc", "float"), ("raw", "int64_t"), ("beta", "float"), ("decay", "float"), ("bufs", "const uint64_t *"),
-      ("bias", "const float **"), ("tabs", "const uint64_t *"),
-      ("slot_of", "int32_t *"),
-      ("expert_in", "int64_t *"),
+IO = [*((n, "int64_t") for n in "layers E ngpu k kmin rows tokens k1 nd entries slots victims_n nvict pf fill".split()),
+      ("tau", "float"), ("tauc", "float"), ("beta", "float"), ("decay", "float"), ("bufs", "const uint64_t *"), ("bias", "const float **"),
+      ("slot_of", "int32_t *"), ("expert_in", "int64_t *"),
       ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"), ("mask", "uint8_t *"), ("victims", "int64_t *"),
       ("owner", "int64_t *"), ("ptr", "const int64_t *"), ("drive", "const int32_t *"), ("lba", "const int64_t *"), ("nlb", "const uint32_t *"),
       ("kind", "const int8_t *"), *((n, "const int64_t *") for n in "inpart part_pages page_base list_base pages lists".split()),
@@ -171,14 +144,12 @@ CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
 HOST_C = "#include <stdint.h>\ntypedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
   ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\n" + r"""
-#include <stdint.h>
 #include <time.h>
-#include <stdlib.h>
 typedef struct { uint32_t cdw0, nsid; uint64_t rsvd, mptr, prp1, prp2; uint32_t cdw10, cdw11, cdw12, pad[3]; } sqe_t;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
 // the reads of experts codes (layer * E + expert) into slots on queue (0: demand, 1: guesses) of their drives, rung later. a command's
-// owner is its code when owned (guesses, a chunk's reads), else -1: flying counts an owned one's commands till they're reaped
+// owner is its code when owned (guesses), else -1: flying counts an owned one's commands till they're reaped
 static void submit(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots, int64_t queue, int64_t owned) {
   for (int64_t i = 0; i < n; i++) for (int64_t r = s->ptr[codes[i]]; r < s->ptr[codes[i] + 1]; r++) {
     int64_t page = slots[i] * s->part_pages[r] + s->inpart[r], gp = s->page_base[r] + page, q = s->drive[r] + queue * s->nd, cid = s->tails[q];
@@ -219,13 +190,12 @@ static int64_t reap(io_t *s) {
   return 0;
 }
 
-// the k experts of the largest sigmoid + bias (+ beta those with a slot), weights normalized, heaviest first; keep-resident truncation
-// keeps the top kmin, those of weight >= tau and (resident) those with a slot, but those under tauc, at most kmax, renormalized (raw:
-// not; taum: those left out lightest first, while their weight is at most taum); the rest without a slot go on skip (if any, ns of them).
-// sig: every expert's sigmoid (one loop: vectorized, libmvec). returns the number kept
+// the k experts of the largest sigmoid + bias (+ beta those with a slot), heaviest first, their weights (sigmoids) normalized over the k.
+// kept: the top kmin, then those of weight >= tauc that are >= tau or (resident) have a slot; the rest without a slot go on skip (if
+// any, ns of them). sig: every expert's sigmoid (one loop: vectorized, libmvec). returns the number kept
 static int64_t route(const io_t *s, const float *logits, const float *bias, const int32_t *slot, int64_t resident, int64_t *sel, float *w,
                      float *sig, int64_t *skip, int64_t *ns) {
-  int64_t n = s->E, k = s->k, kmin = s->kmin, kmax = s->kmax, idx[64], m = 0; float tau = s->tau, key[64], sv[64];
+  int64_t n = s->E, k = s->k, idx[64], m = 0; float key[64], sv[64];
   for (int64_t i = 0; i < n; i++) sig[i] = 1.0f / (1.0f + __builtin_expf(-logits[i]));
   for (int64_t i = 0; i < n; i++) {
     float v = sig[i], kk = v + bias[i] + (slot[i] >= 0 ? s->beta : 0);
@@ -239,16 +209,12 @@ static int64_t route(const io_t *s, const float *logits, const float *bias, cons
   for (int64_t a = 1; a < m; a++) for (int64_t j = a; j > 0 && sv[j - 1] < sv[j]; j--) {  // by weight
     float t = sv[j]; sv[j] = sv[j - 1], sv[j - 1] = t; int64_t u = idx[j]; idx[j] = idx[j - 1], idx[j - 1] = u;
   }
-  int64_t c = 0; float kept = 0, lost = 0; uint8_t out[64];
-  for (int64_t j = m - 1; j >= 0; j--) {
-    out[j] = j >= kmin && (sv[j] / sum < s->tauc ||
-                           (tau && sv[j] / sum < tau && !(resident && slot[idx[j]] >= 0) && (!s->taum || lost + sv[j] / sum <= s->taum)));
-    if (out[j]) lost += sv[j] / sum;
-  }
-  for (int64_t j = 0; j < m; j++)
-    if (c < kmax && !out[j]) sel[c] = idx[j], w[c] = sv[j], kept += sv[j], c++;
+  int64_t c = 0;
+  for (int64_t j = 0; j < m; j++) {
+    float wj = sv[j] / sum;
+    if (j < s->kmin || (wj >= s->tauc && (wj >= s->tau || (resident && slot[idx[j]] >= 0)))) sel[c] = idx[j], w[c++] = wj;
     else if (skip && slot[idx[j]] < 0) skip[(*ns)++] = idx[j];
-  for (int64_t j = 0; j < c; j++) w[j] /= s->raw ? sum : kept;
+  }
   return c;
 }
 
@@ -315,14 +281,13 @@ static void prefetch(io_t *s, const uint64_t *b, int64_t lj, int64_t row, int64_
 // layer li of a step of tokens (each its rows of the gpus' scores): waits for the gpus' router signals, routes every token on its row 0
 // (the union of their experts read once), reads the misses into victims, queues the guesses of the next layer (row 1, only while every
 // guess queue is under half full: they can't wrap one, the demand's are drained every layer), gives the gpus every token's slots and
-// weights in two parts, each in the order they're ready (cached, cached and in flight, read now): the first K1 a token, those in (one
+// weights in two parts, each in the order they're ready (cached, cached and in flight, read now): the first k1 a token, those in (one
 // in flight or read only when the second can't hold the rest), go while the rest are read; entry i*T + t the i-th of token t, padded
-// with slot 0, weight 0 (the gemvs skip it).
-// releases them. then the counts, li's guesses settled (used when routed), the decayed use counts and the next layer's victims (but this layer's
-// slots). dry: no reads, the slots hold whatever they hold.
+// with slot 0, weight 0 (the gemvs skip it). releases them. then the counts, li's guesses settled (used when routed), the decayed use
+// counts and the next layer's victims (but this layer's slots).
 // 0, -1 a read failed, -2 a timeout, -3 no victims
 static int64_t layer(io_t *s, int64_t li) {
-  int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1 / T, K2 = s->kmax - K1;
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1, K2 = s->k - K1;
   const uint64_t *b = s->bufs + li * NB * ng;
   #define BUF(kind, g, type) ((type *)b[(kind) * ng + (g)])
   double t0 = now();
@@ -347,18 +312,15 @@ static int64_t layer(io_t *s, int64_t li) {
     }
   }
   for (int64_t j = 0; j < nu; j++) {
-    if ((hit[j] = s->dry || so[usel[j]] >= 0)) nh++, late += s->flying[li * E + usel[j]] > 0;
+    if ((hit[j] = so[usel[j]] >= 0)) nh++, late += s->flying[li * E + usel[j]] > 0, s->mask[so[usel[j]]] = 1;
     else codes[nm++] = li * E + usel[j];
-    if (!s->dry && hit[j]) s->mask[so[usel[j]]] = 1;
   }
-  if (!s->dry) {
-    int64_t free = 0;
-    for (int64_t i = 0; i < s->nvict; i++) free += free_slot(s, s->victims[i]);
-    if (free < nm) pick(s, s->victims_n);  // too few: new ones, but this layer's cached
-    for (int64_t i = 0; i < nm; i++) if ((ms[i] = take(s, codes[i])) < 0) return -3;
-    submit(s, nm, codes, ms, 0, 0);
-    ring(s);
-  }
+  int64_t free = 0;
+  for (int64_t i = 0; i < s->nvict; i++) free += free_slot(s, s->victims[i]);
+  if (free < nm) pick(s, s->victims_n);  // too few: new ones, but this layer's cached
+  for (int64_t i = 0; i < nm; i++) if ((ms[i] = take(s, codes[i])) < 0) return -3;
+  submit(s, nm, codes, ms, 0, 0);
+  ring(s);
   double t2 = now();
   #define FLYING(u) (hit[u] && s->flying[li * E + usel[u]] > 0)
   #define RANK(u) (!hit[u] ? 2 : FLYING(u) ? 1 : 0)
@@ -373,10 +335,10 @@ static int64_t layer(io_t *s, int64_t li) {
     p1[t] = nht < K1 ? nht : K1;
     if (c - p1[t] > K2) p1[t] = c - K2;
   }
-  for (int64_t g = 0; g < ng; g++) for (int64_t i = 0; i < s->kmax * T; i++) {
+  for (int64_t g = 0; g < ng; g++) for (int64_t i = 0; i < s->k * T; i++) {
     int64_t second = i >= K1 * T, at = second ? i - K1 * T : i, t = at % T, n = at / T + (second ? p1[t] : 0);
     int64_t on = n < (second ? tc[t] : p1[t]);
-    BUF(second ? B_SLOTS2 : B_SLOTS, g, int32_t)[at] = (int32_t)(!on ? 0 : s->dry ? i % s->slots : so[usel[tj[t * 64 + n]]]);
+    BUF(second ? B_SLOTS2 : B_SLOTS, g, int32_t)[at] = on ? so[usel[tj[t * 64 + n]]] : 0;
     BUF(second ? B_WS2 : B_WS, g, float)[at] = on ? tw[t * 64 + n] : 0;
   }
   for (int64_t r1 = 0, first = 1;; first = 0) {
@@ -391,7 +353,7 @@ static int64_t layer(io_t *s, int64_t li) {
       for (int64_t g = 0; g < ng; g++) *BUF(B_READY1, g, volatile uint32_t) = 1;
       r1 = 1;
     }
-    if (first && !s->dry) {  // (after part 1 is out: the gpus work on it) the next layer's guesses, the fills, this layer's hits unpinned
+    if (first) {  // (after part 1 is out: the gpus work on it) the next layer's guesses, the fills, this layer's hits unpinned
       int64_t room = 1;
       for (int64_t q = nd; q < 2 * nd; q++) room &= s->inflight[q] < s->entries / 2;
       if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, s->pf);
@@ -419,11 +381,9 @@ static int64_t layer(io_t *s, int64_t li) {
   for (int64_t e = 0; e < E; e++) f[e] *= s->decay;
   for (int64_t j = 0; j < nu; j++) f[usel[j]] += 1;
   for (int64_t i = 0; i < nf; i++) f[codes[nm + i] - li * E] += 1;  // (a fill counts as routed: it was)
-  if (!s->dry) {
-    for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 1;
-    pick(s, s->victims_n);
-    for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 0;
-  }
+  for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 1;
+  pick(s, s->victims_n);
+  for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 0;
   s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += t3 - t2, s->t_after += now() - t3;
   return 0;
 }
@@ -448,96 +408,6 @@ int64_t step_io(io_t *s) {
   }
   return 0;
 }
-
-// *** a chunk of a prompt (many tokens a step): the gpus route it themselves, the host reads every expert of a layer into a slot and gives
-// the gpus the layer's slots (its row of tabs). layer l+1's reads go while the gpus work on layer l (from when they're at l's router: its
-// tag, l-1's slots free then), the reads not queued yet wait in pend (a drive's queues hold 1024)
-
-static int64_t pend[8192], npend, pend_at;
-
-// the pending reads queued while a queue of every drive of the next is under full (the demand queue, then the guess one), each command
-// owned by its code: flying counts them till they're in
-static void drain(io_t *s) {
-  for (; pend_at < npend; pend_at++) {
-    int64_t c = pend[pend_at], sl = s->slot_of[c], q = -1;
-    for (int64_t k = 0; k < 2 && q < 0; k++) {
-      int64_t ok = 1;
-      for (int64_t r = s->ptr[c]; r < s->ptr[c + 1]; r++) ok &= s->inflight[s->drive[r] + k * s->nd] < s->entries - 8;
-      if (ok) q = k;
-    }
-    if (q < 0) return;
-    submit(s, 1, &c, &sl, q, 1);
-  }
-}
-
-static void ring_all(io_t *s) {
-  __sync_synchronize();
-  for (int64_t q = 0; q < 2 * s->nd; q++)
-    if (s->tails[q] != s->db_tails[q]) *(volatile uint32_t *)s->db[q] = (uint32_t)(s->db_tails[q] = s->tails[q]);
-}
-
-typedef struct { float f; int32_t sl; } slotkey_t;
-static int cmp_key(const void *a, const void *b) { float x = ((const slotkey_t *)a)->f, y = ((const slotkey_t *)b)->f; return x < y ? -1 : x > y; }
-
-// layer lj's experts without a slot pending, into the least used slots not of layer lj or li (the gpus' now, -1: none). -3: too few slots
-static int64_t queue_layer(io_t *s, int64_t lj, int64_t li) {
-  int64_t E = s->E, n = 0;
-  static slotkey_t keys[16384];
-  for (int64_t e = 0; e < E; e++) {
-    if (s->slot_of[lj * E + e] >= 0) s->mask[s->slot_of[lj * E + e]] = 1;
-    if (li >= 0 && s->slot_of[li * E + e] >= 0) s->mask[s->slot_of[li * E + e]] = 1;
-  }
-  for (int64_t sl = 0; sl < s->slots; sl++) if (free_slot(s, sl)) {
-    int64_t c = s->expert_in[sl];
-    keys[n].f = c >= 0 ? s->freq[c] : -1, keys[n++].sl = (int32_t)sl;
-  }
-  qsort(keys, n, sizeof(slotkey_t), cmp_key);
-  int64_t v = 0, ret = 0;
-  for (int64_t e = 0; e < E; e++) {
-    int64_t c = lj * E + e;
-    if (s->slot_of[c] >= 0) continue;
-    if (v == n) { ret = -3; break; }
-    int64_t sl = keys[v++].sl;
-    if (s->expert_in[sl] >= 0) s->slot_of[s->expert_in[sl]] = -1;
-    s->expert_in[sl] = c, s->slot_of[c] = (int32_t)sl;
-    pend[npend++] = c;
-    s->misses++;
-  }
-  s->refs += E;
-  for (int64_t sl = 0; sl < s->slots; sl++) s->mask[sl] = 0;
-  return ret;
-}
-
-// every layer of a chunk's step. 0, -1 a read failed, -2 a timeout, -3 no slots
-int64_t chunk_io(io_t *s) {
-  int64_t E = s->E, ng = s->ngpu, r;
-  npend = pend_at = 0;
-  if ((r = queue_layer(s, 0, -1))) return r;
-  for (int64_t li = 0; li < s->layers; li++) {
-    const uint64_t *b = s->bufs + li * NB * ng;
-    double t0 = now();
-    for (int64_t g = 0; g < ng; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {
-      if (reap(s) < 0) return -1;
-      drain(s), ring_all(s);
-      if (now() - t0 > 60) return -2;
-    }
-    double t1 = now();
-    if (li + 1 < s->layers && (r = queue_layer(s, li + 1, li))) return r;
-    double t2 = now();
-    for (int64_t busy = 1; busy;) {
-      if (reap(s) < 0) return -1;
-      drain(s), ring_all(s);
-      busy = 0;
-      for (int64_t e = 0; e < E && !busy; e++) busy = s->flying[li * E + e] > 0;
-      if (now() - t0 > 60) return -2;
-    }
-    for (int64_t g = 0; g < ng; g++) for (int64_t e = 0; e < E; e++) ((int32_t *)s->tabs[g])[li * E + e] = s->slot_of[li * E + e];
-    __sync_synchronize();
-    for (int64_t g = 0; g < ng; g++) *BUF(B_READY, g, volatile uint32_t) = 1;
-    s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += now() - t2;
-  }
-  return 0;
-}
 """
 
 @functools.cache
@@ -549,7 +419,6 @@ def host_c():
                    input=HOST_C.encode(), check=True)
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
-  lib.chunk_io.restype, lib.chunk_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib
 
@@ -596,12 +465,11 @@ class Streamer:
     self.E, self.lat, units, parts = m["n_experts"], m["lat"], m["units"], m["part_bytes"]
     blk, tsz = m["block"]
     self.row_up, self.qtype = self.lat // blk * tsz, {n: t for t, n in QUANT_NAMES.items()}[m.get("expert_type", "IQ3_XXS").lower()]
-    self.blocks = [model.blk[L] for L in m["layers"] if L < len(model.blk)]  # BLOCKS=n: a model cut short has the first layers
+    self.blocks = [model.blk[L] for L in m["layers"]]
     devs = self.blocks[0].ffn_gate_inp.weight.device
     assert len(devs) == len(units) and self.E % len(devs) == 0
     self.T = getenv("VERIFY", 2 if getenv("DRAFT", "") else 0)  # tokens of a verify step (0: none)
-    self.gpus = [Gpu(d, disk, u, p, len(self.blocks), self.E // len(devs), ROWS, self.T, self.E)
-                 for d, disk, u, p in zip(devs, self.disks, units, parts)]
+    self.gpus = [Gpu(d, disk, u, p, len(self.blocks), self.E // len(devs), ROWS, self.T) for d, disk, u, p in zip(devs, self.disks, units, parts)]
     self.expert_bytes = sum(g.part for g in self.gpus)
     # a layer's router and the guess of the next layer's experts on its input (GUESS=dir: maps fitted on the traces, extra/k3/train_guess.py
     # guess-T.npy, T the block; else that layer's router) in one q8_0 gemv on each gpu, its rows of the gpu's experts
@@ -616,33 +484,24 @@ class Streamer:
     # the host's state, used and kept by step_io: the slot of each (layer, expert) (-1 when not cached), the layer * E + expert in each
     # slot (-1 when free), the decayed use counts, the commands in flight of each guess, the guesses their layer hasn't routed (they keep
     # their slots till then), pinned slots and the victims of the next misses and guesses
-    L, LE = len(self.blocks), len(self.blocks) * self.E
+    LE = L * self.E
     self.state = {"slot_of": np.full(LE, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(LE, np.float32),
                   "flying": np.zeros(LE, np.int32), "guess": np.zeros(LE, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
                   "victims": np.zeros(VICTIMS * max(self.T, 1), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.reads = Reads(self.gpus, LE, m["experts_off"])
-    self.io = IoT(layers=L, E=self.E, ngpu=len(self.gpus), k=K, kmin=KMIN, kmax=KMAX, rows=ROWS, slots=SLOTS)
+    self.io = IoT(layers=L, E=self.E, ngpu=len(self.gpus), k=K, kmin=KMIN, k1=K1, rows=ROWS, slots=SLOTS, tau=TAU, tauc=TAUC, beta=BETA,
+                  pf=PREFETCH, fill=FILL, decay=0.5 ** (1 / HALF_LIFE), nd=len(self.reads.drives), entries=self.reads.entries)
     for name, a in {**self.state, **self.reads.tables}.items(): setattr(self.io, name, a.ctypes.data)
-    self.io.nd, self.io.entries = len(self.reads.drives), self.reads.entries
     # the gpus' buffers (BUFS) of every layer, (layers, BUFS, gpus), for a step of a token and (VERIFY) of T
     def table(bufs) -> np.ndarray:
       ptrs = [[[b[1].ctypes.data for b in bufs(g, li)] for g in self.gpus] for li in range(L)]
       return np.ascontiguousarray(np.array(ptrs, np.uint64).transpose(0, 2, 1))
     self.bufs = {T: table(lambda g, li: [g.tag[li], g.ready[li], g.ready1[li], g.scores[T][li], g.slots[T][li], g.w[T][li], g.slots2[T][li],
                                          g.w2[T][li]]) for T in self.gpus[0].scores}
-    self.tabs = np.array([g.tab[1].ctypes.data for g in self.gpus], np.uint64)
-    self.io.tabs = self.tabs.ctypes.data
-    # (a prompt's chunk: the gpus route it, exact) every layer's key bias on every gpu
-    self.bias_t = [[Tensor(b).to(d).realize() for d in devs] for b in self.bias]
-    self.io.raw, self.io.beta, self.io.tauc = not RENORM, BETA, TAUC
-    self.io.tau, self.io.taum, self.io.pf, self.io.fill, self.io.decay, self.io.dry = TAU, TAUM, PREFETCH, FILL, 0.5 ** (1 / HALF_LIFE), DRY
     self.step_times, self.slowest = np.zeros(2), cast(list[float], [])
     # after: (T, the step's position) -> more tokens to read with the step's (DRAFT: the draft's guesses), launched after the layers
     self.after:Callable[[int, UOp], Tensor]|None = None  # (slowest: each step's slowest layer)
     self.tok = host_tensor(Device.DEFAULT, (1, 1), dtypes.int32)
-    # (a prompt's chunks) their tokens a size, the graph of a chunk (a jit a size: the engine's main sets it)
-    self.chunk_toks:dict[int, tuple[Tensor, np.ndarray]] = {}
-    self.chunk_model:Callable[..., Tensor] = model
     if self.T: self.tok_t = host_tensor(Device.DEFAULT, (1, self.T), dtypes.int32)
     # the p2p allreduce mailboxes now: made during a step (the graph's first use) its synchronize waits for a gpu that waits for this host
     p2p_allreduce(devs)
@@ -653,7 +512,6 @@ class Streamer:
   def experts(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """the experts of a step of T tokens in two parts, every token its own"""
     T, outs, x = int(x.shape[1]), [], x.half()  # (an mselect of the mix kernel's output has no shape, of its half it does)
-    if T > CHUNK_MIN: return self.chunk_experts(li, x, h)
     for g, gpu in enumerate(self.gpus):
       xg, hg = Tensor(x.uop.mselect(g)).reshape(T, -1), Tensor(h.uop.mselect(g)).reshape(T, self.lat).float()
       # a fresh tensor of the buffer: an assign to the kept one would chain every token's graph onto it
@@ -664,30 +522,6 @@ class Streamer:
       out = self.part(li, gpu, hg, gpu.slots2[T][li][0], gpu.w2[T][li][0], gpu.ready[li][0].uop.after(out.uop), out)
       outs.append(out.reshape(1, T * self.lat))
     # every gpu has the partial sums of its units: the sum over the gpus is the allreduce
-    return partial_sum(Tensor(UOp.mstack(*[o.uop for o in outs]).unshard(0))).reshape(1, T, self.lat)
-
-  def chunk_experts(self, li:int, x:Tensor, h:Tensor) -> Tensor:
-    """the experts of a prompt's chunk: every gpu routes all of its tokens (exact) on the router logits of all the gpus, the host reads in
-    every expert of the layer and gives their slots (tab, once ready)"""
-    T, n, outs = int(x.shape[1]), self.E // len(self.gpus), []
-    logits = [self.scorers[li][g](Tensor(x.uop.mselect(g)).reshape(T, -1))[:, :n] for g in range(len(self.gpus))]
-    for g, gpu in enumerate(self.gpus):
-      full = Tensor.cat(*[lg.to(gpu.dev) for lg in logits], dim=1).float().contiguous()
-      signal = UOp.custom_function("hostsignal").call(gpu.tag[li][0].uop, full.uop)
-      sig = full.sigmoid()
-      sel = (sig + self.bias_t[li][g]).topk(K)[1]
-      w = sig.gather(-1, sel)
-      w = w / w.sum(-1, keepdim=True)
-      wait = UOp.custom_function("hostwait").call(gpu.ready[li][0].uop.after(signal), gpu.tab[0].uop)
-      tab = Tensor(gpu.tab[0].uop.after(wait))[li * self.E:(li + 1) * self.E]
-      # an entry an expert of a token, i*T + t the i-th of token t
-      slots, w = tab[sel].T.flatten().contiguous(), w.T.flatten().contiguous()
-      hg, u = Tensor(h.uop.mselect(g)).reshape(T, self.lat).float(), gpu.units
-      cfg, stride = self.blocks[li].config, gpu.part // 2
-      gu = expert_linear(gpu.pool, slots, hg, 2 * u, self.lat, self.qtype, stride, w=w, summed=False)
-      act = q8_act(functools.partial(gated_activation, limit=cfg.swiglu_limit, situ=cfg.situ), gu, parts=2)
-      y = expert_linear(gpu.pool, slots, act, self.lat, u, self.qtype, stride, 2 * u * self.row_up // 2, w=w, summed=False)
-      outs.append((y.reshape(K, T, self.lat) * w.reshape(K, T, 1)).sum(0).reshape(1, T * self.lat))
     return partial_sum(Tensor(UOp.mstack(*[o.uop for o in outs]).unshard(0))).reshape(1, T, self.lat)
 
   def part(self, li:int, gpu:Gpu, hg:Tensor, slots:Tensor, w:Tensor, ready:UOp, bias:Tensor|None=None) -> Tensor:
@@ -707,15 +541,13 @@ class Streamer:
   def counters(self) -> np.ndarray:
     io = self.io
     return np.array([time.perf_counter(), (io.misses + io.guesses + io.fills) * self.expert_bytes, io.refs, io.hits, io.late, io.guesses, io.used,
-                     io.wasted, io.fills,
-                     io.t_gpu, io.t_route, io.t_reads, io.t_after, *self.step_times])
+                     io.wasted, io.fills, io.t_gpu, io.t_route, io.t_reads, io.t_after, *self.step_times])
 
   def report(self, name:str, c0:np.ndarray, n:int):
     """a token's time, reads, experts ready and guesses, and its time split, over the n steps since the counters c0"""
     dt, gb, refs, hits, late, pf, used, wasted, fills, *ms = (self.counters() - c0) / n
     print(f"{name}: {dt * 1e3:.1f} ms/token = {1 / dt:.1f} tok/s, {gb / 1e9:.2f} GB/token read, {hits / max(refs, 1):.1%} ready at the router, "
-          f"{late / max(refs, 1):.1%} in flight, guesses per token {pf:.0f}: {used:.0f} used, {wasted:.0f} not" +
-          (f", fills {fills:.0f}" if FILL else ""))
+          f"{late / max(refs, 1):.1%} in flight, guesses per token {pf:.0f}: {used:.0f} used, {wasted:.0f} not, fills {fills:.0f}")
     gpu, route, io, rest, launch, tail = (t * 1e3 for t in ms)
     print(f"  per token: {gpu:.1f} ms waiting on the gpu, {route:.1f} routing and queueing reads, {io:.1f} waiting on reads, "
           f"{rest:.1f} bookkeeping under the gpu, {launch:.1f} launching the graph, {tail:.1f} after the last layer", flush=True)
@@ -726,28 +558,11 @@ class Streamer:
 
   def step(self, tok:int, pos:int, v_pos:UOp, temp:Tensor) -> int: return self.steps([tok], pos, v_pos, temp)[0]
 
-  def chunk(self, toks:list[int], pos:int, v_pos:UOp, temp:Tensor):
-    """a step of a prompt's chunk at positions pos..: the gpus run the graph (chunk_model, a graph a size), the host reads in every layer's
-    experts (chunk_io)"""
-    io, T = self.io, len(toks)
-    io.tokens, io.bufs = T, self.bufs[1].ctypes.data
-    self.flags(0)
-    if T not in self.chunk_toks: self.chunk_toks[T] = host_tensor(Device.DEFAULT, (1, T), dtypes.int32)
-    buf, arr = self.chunk_toks[T]
-    arr[0, :] = toks
-    out = self.chunk_model(buf, v_pos.bind(pos), temp)
-    if (err:=host_c().chunk_io(ctypes.byref(io))):
-      self.flags(1)
-      raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no slots left"}[err])
-    more = self.after(T, v_pos.bind(pos)) if self.after is not None else None
-    for o in (out, more):
-      if o is not None: o.numpy()
-
   def steps(self, toks:list[int], pos:int, v_pos:UOp, temp:Tensor) -> list[int]:
     """a step of tokens at positions pos.. (more than one: a verify step, VERIFY=T): the gpus run the graph, the host every layer's
     routing and reads (step_io). the greedy next token after each"""
     io, T, t0 = self.io, len(toks), time.perf_counter()
-    io.tokens, io.bufs, io.k1, io.victims_n = T, self.bufs[T].ctypes.data, K1 * T, VICTIMS * T
+    io.tokens, io.bufs, io.victims_n = T, self.bufs[T].ctypes.data, VICTIMS * T
     self.flags(0)
     buf, arr = self.tok if T == 1 else self.tok_t
     arr[0, :] = toks  # a realized input: realizing a new one walks every live tensor, 25 ms
@@ -759,24 +574,21 @@ class Streamer:
     t2 = time.perf_counter()
     more = self.after(T, v_pos.bind(pos)) if self.after is not None else None  # (launched now: it runs behind the step's tail)
     ret = out.numpy().reshape(-1).tolist() + (more.numpy().reshape(-1).tolist() if more is not None else [])
-    # (NaN logits: argmax past the vocab, e.g. a p2p allreduce past its deadline. DRY: the slots are garbage, NaN or not)
-    if max(ret) >= self.vocab:
-      if not DRY: raise RuntimeError(f"step at {pos}: NaN logits, token {max(ret)}")
-      ret = [min(r, self.vocab - 1) for r in ret]
+    # (NaN logits: argmax past the vocab, e.g. a p2p allreduce past its deadline)
+    if max(ret) >= self.vocab: raise RuntimeError(f"step at {pos}: NaN logits, token {max(ret)}")
     self.step_times += np.array([t1 - t0, time.perf_counter() - t2])  # the graph launch, the tail after the last layer
     self.slowest.append(io.slowest)
     return ret
 
 if __name__ == "__main__":
   from tinygrad.llm.cli import SimpleTokenizer
-  if (NB:=getenv("BLOCKS", 0)): cut_blocks(NB)  # BLOCKS=n: the model cut to its first n blocks, a quick check of the engine
   st = time.perf_counter()
   devs = tuple(Device.canonicalize(f"{Device.DEFAULT}:{i}") for i in range(getenv("SHARD", 4)))
   # a queue per drive for the reads needed now, one for guesses
   disks, m = open_store(queues=2, at=STORE)
   # the trunk from its snapshot on the disks (the gguf's tensors aren't unpacked: placeholders), else unpacked from the gguf, then saved
-  # (SNAP=0: neither; a cut model neither)
-  snap = trunk_index(disks, sys.argv[1]) if not NB and getenv("SNAP", 1) else None
+  # (SNAP=0: neither)
+  snap = trunk_index(disks, sys.argv[1]) if getenv("SNAP", 1) else None
   if snap is not None:
     llm_model.gguf_shard = lambda entries, devices, shard_map=None: {name: Tensor.empty(*shape, dtype=dtypes.float16, device=devices,
       axis=(shard_map or {}).get(name)) for name, (_, shape, _) in entries.items()}
@@ -785,7 +597,7 @@ if __name__ == "__main__":
   print(f"model in {time.perf_counter() - st:.0f} s", flush=True)
   names = list(nn.state.get_state_dict(model))
   if snap is not None: load_trunk(model, disks, devs, snap)
-  elif not NB and getenv("SNAP", 1):
+  elif getenv("SNAP", 1):
     for name in names:
       if isinstance(l:=_part(model, name)[0], Linear) and l.ggml_type is None and l.use_custom_quant: l.set_quantized(l.weight)
     sd = nn.state.get_state_dict(model)
@@ -848,7 +660,6 @@ if __name__ == "__main__":
       streamer.report(f"tau {TAU} prefetch {PREFETCH}", c0, steps - 1)
     sys.exit(0)
   ids = ([tok.bos_id] if tok.bos_id is not None else []) + tok.encode(sys.argv[2] if len(sys.argv) > 2 else "The capital of France is")
-  def chunk_prep(T:int): pass  # (a chunk size's graphs and buffers before its first step)
   if (draft_dir:=getenv("DRAFT", "")):
     # DRAFT=dir: speculative decoding of N tokens (VERIFY=2, SLOTS 6700 by default). the draft guesses the token after the next from the
     # target's hidden states after blocks 1, 45, 89, in the step's graph: a verify step of [next, guess] gives the target's token after
@@ -875,53 +686,22 @@ if __name__ == "__main__":
       dtoks = toks_out[T] if T > 1 else (given[0] >= 0).where(given[0], toks_out[T])
       return draft(dtoks, hidden[T], p).to(Device.DEFAULT).argmax(-1).cast(dtypes.int32)
     drafts = {T: TinyJit(functools.partial(guesses, T)) for T in (1, 2)}
-    # a prompt's chunk: the target's hidden states of every token (not verify: the next token after the last only), the draft's cache of
-    # the chunk's positions on the prompt's tokens after them (given_c)
-    given_c:dict[int, tuple[Tensor, np.ndarray]] = {}
-    def chunk_jits(T:int):
-      if T in given_c: return
-      given_c[T], hidden[T] = host_tensor(Device.DEFAULT, (1, T), dtypes.int32), Tensor.empty(1, T, 3, model.config.dim, device=devs).realize()
-      def tapped_chunk(tokens:Tensor, *a) -> Tensor:
-        model.verify = False
-        out, model.verify = model.forward(tokens, *a), True
-        Tensor.realize(Tensor(hidden[T].uop).assign(Tensor.stack(*[model.hidden[i][:, :, -1] for i in model.keep_hidden], dim=2).float()))
-        return out
-      target[T], drafts[T] = TinyJit(tapped_chunk), TinyJit(lambda p: draft(given_c[T][0], hidden[T], p, head=False))
-      target[T].cnt = drafts[T].cnt = 1
-    streamer.chunk_model, chunk_prep = lambda tokens, *a: target[tokens.shape[1]](tokens, *a), chunk_jits  # type: ignore[assignment]
     streamer.after = lambda T, p: drafts[T](p)
-  else:
-    from tinygrad import TinyJit
-    plain:dict[int, Callable[..., Tensor]] = {}
-    def plain_chunk(tokens:Tensor, *a) -> Tensor:
-      if (T:=int(tokens.shape[1])) not in plain:
-        plain[T] = jit = TinyJit(model.forward)
-        jit.cnt = 1
-      return plain[T](tokens, *a)
-    streamer.chunk_model = plain_chunk
   def decode(ids:list[int], pos:int, n:int, emit:Callable[[int], None]=lambda t: None) -> tuple[list[int], int, list, tuple]:
-    """the greedy tokens after ids (fed from position pos), up to n or an end token (not fed), each to emit as it comes: them, the
-    position after the last fed, each step's (right, step, rollback) times and (counters, tokens, steps) once every jit's captured"""
-    i = 0  # the prompt but its last token in chunks (CHUNKS, the largest that fits first), the rest a token a time (the draft at every position)
-    while (C:=next((c for c in CHUNKS if len(ids) - 1 - i >= c), 0)):
-      t0 = time.perf_counter()
-      chunk_prep(C)
-      if draft_dir: given_c[C][1][0, :] = ids[i + 1:i + C + 1]
-      streamer.chunk(ids[i:i + C], pos + i, v_pos, temp)
-      i += C
-      if getenv("VCHUNK"): print(f"chunk of {C} at {pos + i - C}: {time.perf_counter() - t0:.2f} s", flush=True)
-    for i, t in enumerate(ids[i:], i):
+    """the greedy tokens after ids (fed from position pos, a token a step), up to n or an end token (not fed), each to emit as it comes:
+    them, the position after the last fed, each step's (right, step, rollback) times and (counters, tokens, steps) once every jit's captured"""
+    for i, t in enumerate(ids):
       t0 = time.perf_counter()
       if draft_dir: given[1][0, 0] = ids[i + 1] if i + 1 < len(ids) else -1
       nxt, *g = streamer.steps([t], pos + i, v_pos, temp)
       if pos + i == 0: print(f"first step in {time.perf_counter() - t0:.0f} s", flush=True)
     pos, out, times, warm = pos + len(ids), [nxt], [], None
     emit(nxt)
-    while len(out) < n and (DRY or not tok.is_end(out[-1])):
+    while len(out) < n and not tok.is_end(out[-1]):
       t0, o = time.perf_counter(), len(out)
       if not draft_dir:
         out, pos, right = out + [streamer.step(out[-1], pos, v_pos, temp)], pos + 1, True
-      elif (right:=(r:=streamer.steps([out[-1], g[0]], pos, v_pos, temp))[0] == g[0]) and not (tok.is_end(g[0]) and not DRY):
+      elif (right:=(r:=streamer.steps([out[-1], g[0]], pos, v_pos, temp))[0] == g[0]) and not tok.is_end(g[0]):
         out, g, pos = out + r[:2], r[3:], pos + 2
       else:  # (a right guess of the end: the end isn't fed either)
         model.rollback(1)
@@ -929,9 +709,8 @@ if __name__ == "__main__":
       t1 = time.perf_counter()
       for t in out[o:]: emit(t)
       times.append((right, t1 - t0, time.perf_counter() - t1))
-      # (counted once every jit's captured: two right and two wrong guesses, two plain steps. DRY: the guesses are garbage, eight steps)
-      if warm is None and (len(times) == (8 if draft_dir else 2) if not draft_dir or DRY else
-                           min(sum(x[0] for x in times), sum(not x[0] for x in times)) == 2):
+      # (counted once every jit's captured: two right and two wrong guesses, or two plain steps)
+      if warm is None and (min(sum(x[0] for x in times), sum(not x[0] for x in times)) == 2 if draft_dir else len(times) == 2):
         warm = (streamer.counters(), len(out), len(times))
     return out, pos, times, warm
   if getenv("CHAT") or getenv("BENCH", ""):
@@ -995,8 +774,8 @@ if __name__ == "__main__":
     sys.exit(0)
   # N tokens decoded after the prompt
   out, _, times, (c0, o0, m0) = decode(ids, 0, getenv("N", 32))
-  if not DRY: print(repr(tok.decode(out)), out, flush=True)  # DRY=1 slots are garbage, so are the tokens
-  if not draft_dir: streamer.report("dry" if DRY else f"tau {TAU} prefetch {PREFETCH} half life {HALF_LIFE}", c0, len(out) - o0)
+  print(repr(tok.decode(out)), out, flush=True)
+  if not draft_dir: streamer.report(f"tau {TAU} prefetch {PREFETCH} half life {HALF_LIFE}", c0, len(out) - o0)
   else:
     r, tv, td = (np.array(x) for x in zip(*times[m0:]))
     streamer.report(f"speculative, {r.mean():.1%} of {len(r)} guesses right, {(len(out) - o0) / len(r):.2f} tokens a step, verify step "
