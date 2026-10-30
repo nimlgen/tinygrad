@@ -543,9 +543,9 @@ class Streamer:
     return np.array([time.perf_counter(), (io.misses + io.guesses + io.fills) * self.expert_bytes, io.refs, io.hits, io.late, io.guesses, io.used,
                      io.wasted, io.fills, io.t_gpu, io.t_route, io.t_reads, io.t_after, *self.step_times])
 
-  def report(self, name:str, c0:np.ndarray, n:int):
-    """a token's time, reads, experts ready and guesses, and its time split, over the n steps since the counters c0"""
-    dt, gb, refs, hits, late, pf, used, wasted, fills, *ms = (self.counters() - c0) / n
+  def report(self, name:str, c0:np.ndarray, n:int, c1:np.ndarray|None=None):
+    """a token's time, reads, experts ready and guesses, and its time split, over the n steps between the counters c0 and c1 (now)"""
+    dt, gb, refs, hits, late, pf, used, wasted, fills, *ms = ((self.counters() if c1 is None else c1) - c0) / n
     print(f"{name}: {dt * 1e3:.1f} ms/token = {1 / dt:.1f} tok/s, {gb / 1e9:.2f} GB/token read, {hits / max(refs, 1):.1%} ready at the router, "
           f"{late / max(refs, 1):.1%} in flight, guesses per token {pf:.0f}: {used:.0f} used, {wasted:.0f} not, fills {fills:.0f}")
     gpu, route, io, rest, launch, tail = (t * 1e3 for t in ms)
@@ -774,9 +774,10 @@ if __name__ == "__main__":
     sys.exit(0)
   # N tokens decoded after the prompt
   out, _, times, (c0, o0, m0) = decode(ids, 0, getenv("N", 32))
+  c1 = streamer.counters()
   print(repr(tok.decode(out)), out, flush=True)
-  if not draft_dir: streamer.report(f"tau {TAU} prefetch {PREFETCH} half life {HALF_LIFE}", c0, len(out) - o0)
+  if not draft_dir: streamer.report(f"tau {TAU} prefetch {PREFETCH} half life {HALF_LIFE}", c0, len(out) - o0, c1)
   else:
     r, tv, td = (np.array(x) for x in zip(*times[m0:]))
     streamer.report(f"speculative, {r.mean():.1%} of {len(r)} guesses right, {(len(out) - o0) / len(r):.2f} tokens a step, verify step "
-                    f"{np.median(tv) * 1e3:.1f} ms (with the draft), rollback {np.median(td[~r]) * 1e3:.2f} ms", c0, len(out) - o0)
+                    f"{np.median(tv) * 1e3:.1f} ms (with the draft), rollback {np.median(td[~r]) * 1e3:.2f} ms", c0, len(out) - o0, c1)
