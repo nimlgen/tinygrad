@@ -28,10 +28,6 @@ def open_disks(ngpus:int=4, queues:int=1) -> list[Disk]:
   per = len(bdfs) // ngpus
   return [Disk([NVMeDev(PCIDevice("nvme", b), queues=queues) for b in bdfs[g * per:(g + 1) * per]]) for g in range(ngpus)]
 
-def expert_parts(units:list[int], lat:int, blk:int, tsz:int) -> list[int]:
-  """bytes of each gpu's part of one expert: gate+up rows (lat inputs) and down columns (rows of lat outputs), padded to 4k"""
-  return [round_up(2 * u * (lat // blk * tsz) + lat * (u // blk * tsz), PAGE) for u in units]
-
 def host_io(disk:Disk, opcode:int, off:int, prps:PRPList, size:int, qd:int=32):
   """write/read size bytes at disk offset off from/to the host buffer behind prps"""
   done = 0
