@@ -49,7 +49,7 @@ class TestStepIO(unittest.TestCase):
     self.state:dict[str, np.ndarray] = {
       "slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(L * E, np.float32),
       "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
-      "victims": np.zeros(32 * T, np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
+      "victims": np.zeros(max(32 * T, E), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.keep += [*tables.values(), *self.state.values()]
     # the gpus' buffers of every layer: tag, ready, ready1, scores (ROWS of E / NGPU a token), slots and weights (slot, token) of both parts
     nr, k1 = E // NGPU, K // 2
