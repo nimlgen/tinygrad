@@ -252,6 +252,13 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   accs = [[(s, k in get_call_outs_ins(c)[0]) for k, s in enumerate(c.src[1:]) if not s.is_variable] for c, _, _ in ctx.batch]
   dep_tags:list[list[int]] = [tracker.access_resources(acc, tag) for tag, acc in enumerate(accs)]
 
+  # add barriers when a call deps on another kernel of its queue (a dep on a host sync needs none: the queue waits on it in order)
+  barriers, last_barrier = set[int](), dict[tuple[str, str], int]()
+  for tag, (deps, queue) in enumerate(zip(dep_tags, queue_of)):
+    if any(queue_of[t] == queue and t >= last_barrier.get(queue, 0) and ctx.batch[t][0].body.op is not Ops.CUSTOM_FUNCTION for t in deps):
+      barriers.add(tag)
+      last_barrier[queue] = tag
+
   # keep only latest tags to wait for each queue
   call_waits = [{queue_of[t]: t for t in sorted(deps) if queue_of[t] != queue_of[tag]} for tag, deps in enumerate(dep_tags)]
 
@@ -271,21 +278,6 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
 
   # all tags that should signal
   signal_tags = {tag for waits in [*call_waits, *close_waits.values()] for tag in waits.values()}
-
-  # kernels on a queue may overlap: a kernel waits for the earlier ones (exec_barrier) only if it accesses what they write or writes what
-  # they access. the (writes, accesses) since the last barrier per queue, as byte ranges (buffers in the jit's arena share a base)
-  barriers:set[int] = set()
-  pending:dict[tuple[str, str], tuple[list, list]] = {}
-  for tag, (call, dev, queue) in enumerate(ctx.batch):
-    if not (call.op is Ops.CALL and call.body.op is Ops.PROGRAM): continue
-    bufs = [(base, lane, off, off + b.max_numel() * b.dtype.itemsize) for b in get_call_arg_uops(call) for base, lane, off in [unwrap_lane(b)]]
-    pos = [k for k, a in enumerate(call.src[1:]) if not a.is_variable]
-    writes, (pw, pa) = [bufs[pos.index(i)] for i in get_call_outs_ins(call)[0]], pending.setdefault((dev, queue), ([], []))
-    if any(x[:2] == y[:2] and x[2] < y[3] and y[2] < x[3] for xs, ys in ((pw, bufs), (pa, writes)) for x in xs for y in ys):
-      barriers.add(tag)
-      del pw[:], pa[:]
-    pw.extend(writes)
-    pa.extend(bufs)
 
   def call_cmds(tag:int, call:UOp, dev:str, queue:str) -> list[UOp]:
     barrier = [ins("exec_barrier")] if tag in barriers else []

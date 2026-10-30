@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # runs where the quantized K3 gguf lives: streams the routed experts, cut into per-gpu parts, and the trunk gguf to extra/k3/recv.py.
-# python3 pack.py experts.gguf trunk.gguf host:port [--units 1024,512,512,1024] (trunk "-": only the experts)
+# python3 pack.py experts.gguf trunk.gguf host:port [--units 768,768,768,768] (trunk "-": only the experts)
 import argparse, json, os, socket, struct, sys
 import numpy as np
 
 ap = argparse.ArgumentParser()
 for a in ("experts", "trunk", "dest"): ap.add_argument(a)
-ap.add_argument("--units", default="1024,512,512,1024", help="intermediate units of each expert per gpu, multiples of the quant block")
+ap.add_argument("--units", default="768,768,768,768", help="intermediate units of each expert per gpu, multiples of the quant block")
 ap.add_argument("--gguf_py", default="/home/nimlgen/k3q/atomic-llama/gguf-py")
 args = ap.parse_args()
 sys.path.insert(0, args.gguf_py)
