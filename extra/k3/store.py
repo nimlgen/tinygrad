@@ -47,8 +47,8 @@ def read_manifest(disk0:Disk, at:int=MANIFEST) -> dict:
 
 def open_store(queues:int=1, at:int=MANIFEST) -> tuple[list[Disk], dict]:
   """the disks of the store and its manifest. bus numbers change between boots: each disk gets the order of its drives that reads back
-  the manifest (disk 0) and its first two experts as sane blocks, every block's fp16 scale under 1. a stripe out of place is off the
-  block grid (1 MiB % 98 != 0): its "scales" are quant bytes"""
+  the manifest (disk 0) and its first two experts as sane blocks, every block's scale under 1. a stripe out of place is off the block
+  grid (1 MiB % 98 != 0, % 17 != 0): its "scales" are quant bytes"""
   disks, m = open_disks(queues=queues), {}
   def reads_back(disk:Disk, g:int) -> bool:
     nonlocal m
@@ -60,7 +60,9 @@ def open_store(queues:int=1, at:int=MANIFEST) -> tuple[list[Disk], dict]:
     mem, addrs = disk.drives[0].pci_dev.alloc_sysmem(2 * size)
     host_io(disk, OP_READ, m["experts_off"], PRPList(disk.drives[0], addrs), 2 * size)
     raw = np.frombuffer(mem.mv, np.uint8)
-    return all((np.abs(raw[i * size:i * size + n].reshape(-1, tsz)[:, :2].copy().view(np.float16)) < 1).all() for i in range(2))
+    def sane(b:np.ndarray) -> bool:  # (mxfp4: an e8m0 scale under 1)
+      return bool((b[:, 0] < 127).all() if m.get("expert_type") == "MXFP4" else (np.abs(b[:, :2].copy().view(np.float16)) < 1).all())
+    return all(sane(raw[i * size:i * size + n].reshape(-1, tsz)) for i in range(2))
   for g, disk in enumerate(disks):
     if (order:=next((p for p in itertools.permutations(disk.drives) if reads_back(Disk(list(p)), g)), None)) is None:
       raise RuntimeError(f"disk {g}: no order of its drives reads back the store")

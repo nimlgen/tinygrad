@@ -5,7 +5,8 @@ import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.helpers import DEV
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import expert_linear, expert_gemm, expert_combine, q8_act, q8_rms_norm, _q8_quantize, _q8_cache, QUANT_SIZES, IQ3_XXS
+from tinygrad.llm.kernels.amd import expert_linear, expert_gemm, expert_combine, q8_act, q8_rms_norm, _q8_quantize, _q8_cache, QUANT_SIZES
+from tinygrad.llm.kernels.amd import IQ3_XXS, MXFP4
 
 LAT, UNITS, NSLOTS = 3584, 512, 20
 ROW_UP, ROW_DOWN = LAT // 256 * QUANT_SIZES[IQ3_XXS], UNITS // 256 * QUANT_SIZES[IQ3_XXS]
@@ -118,6 +119,36 @@ class TestExpertLinear(unittest.TestCase):
     out = expert_linear(pool, Tensor(np.full(16, far, np.int32)), Tensor(x), 2 * UNITS, LAT, IQ3_XXS, PART // 2).numpy()
     ref = self.weight(5, 0, 2 * UNITS, LAT) @ x[0]
     for k in range(16): np.testing.assert_allclose(out[k], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
+class TestExpertMXFP4(unittest.TestCase):  # 17 byte blocks: odd ones start mid halfword (units 768: the store's rows, 1904 and 408 bytes)
+  U = 768
+  ROW_UP, ROW_DOWN = LAT // 32 * 17, U // 32 * 17
+  PART = 2 * U * ROW_UP + LAT * ROW_DOWN
+  def setUp(self):
+    self.rng = rng = np.random.default_rng(2)
+    raw = rng.integers(0, 256, NSLOTS * self.PART, dtype=np.uint8)
+    for s in range(NSLOTS):  # (every block's e8m0 scale a sane 2^-12..2^-6)
+      part = raw[s * self.PART:(s + 1) * self.PART]
+      up, down = part[:2 * self.U * self.ROW_UP].reshape(-1, 17), part[2 * self.U * self.ROW_UP:].reshape(-1, 17)
+      for b in (up, down): b[:, 0] = rng.integers(116, 122, len(b))
+    self.raw, self.pool = raw, Tensor(raw).bitcast(dtypes.uint16).realize()
+    self.sel = [5, 0, 19, 7, 3, 11, 2, 18]
+
+  def weight(self, slot:int, off:int, rows:int, cols:int) -> np.ndarray:
+    blob = Tensor(self.raw[slot * self.PART + off:slot * self.PART + off + rows * cols // 32 * 17])
+    return ggml_data_to_tensor(blob, rows * cols, MXFP4).reshape(rows, cols).numpy()
+
+  def test_gate_up_and_down(self):
+    x, slots = self.rng.standard_normal((1, LAT)).astype(np.float32), Tensor(np.array(self.sel, np.int32))
+    gu = expert_linear(self.pool, slots, Tensor(x), 2 * self.U, LAT, MXFP4, self.PART // 2).numpy()
+    h, w = self.rng.standard_normal((len(self.sel), self.U)).astype(np.float32), self.rng.uniform(0, 1, len(self.sel)).astype(np.float32)
+    off = 2 * self.U * self.ROW_UP
+    out = expert_linear(self.pool, slots, Tensor(h), LAT, self.U, MXFP4, self.PART // 2, off // 2, w=Tensor(w)).numpy()
+    for k, s in enumerate(self.sel):
+      ref = self.weight(s, 0, 2 * self.U, LAT) @ x[0]
+      np.testing.assert_allclose(gu[k], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+    ref = sum(w[k] * self.weight(s, off, LAT, self.U) @ h[k] for k, s in enumerate(self.sel))
+    np.testing.assert_allclose(out[0], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
 class TestExpertGemm(unittest.TestCase):  # the prefill's grouped gemm: 16 row tiles of (row, slot) pairs, tiles past ntiles not computed
   def setUp(self):

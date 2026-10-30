@@ -13,7 +13,7 @@ from tinygrad.helpers import getenv, prod, round_up
 from tinygrad.uop.ops import UOp
 from tinygrad.llm import model as llm_model
 from tinygrad.llm.model import Transformer, gated_activation
-from tinygrad.llm.kernels.amd import Linear, expert_linear, expert_gemm, expert_combine, partial_sum, p2p_allreduce, q8_act, QUANT_NAMES
+from tinygrad.llm.kernels.amd import Linear, expert_linear, expert_gemm, expert_combine, partial_sum, IQ3_XXS, p2p_allreduce, q8_act, QUANT_NAMES
 from tinygrad.runtime.support.nvme import PRPList, OP_READ, OP_WRITE, PAGE
 from extra.k3.store import open_store, host_io, read_manifest, write_manifest, STRIPE, EXPERTS
 from extra.k3.draft import q8_0_linear
@@ -36,7 +36,7 @@ K1 = 8
 # CHUNKS: a prompt fed in chunks of these sizes (multiples of 16, the largest that fits first: a graph a size), the rest a token a step. a
 # chunk reads every expert of a layer in (a layer ahead: a chunk's tokens route to nearly all of them) and routes exactly. CHUNK_BEAM: the
 # search of the generic kernels of a chunk's graph (0: none)
-CHUNKS, CHUNK_BEAM = [int(c) for c in getenv("CHUNKS", "1024,256").split(",") if c], getenv("CHUNK_BEAM", 0)
+CHUNKS, CHUNK_BEAM = [int(c) for c in getenv("CHUNKS", "512,256").split(",") if c], getenv("CHUNK_BEAM", 0)
 STORE = getenv("STORE", 512 << 30)  # the disk 0 offset of the store's manifest (the experts split evenly over the gpus)
 
 def host_tensor(dev:str, shape:tuple[int, ...], dtype) -> tuple[Tensor, np.ndarray]:
@@ -558,6 +558,7 @@ class Streamer:
     self.E, self.lat, units, parts = m["n_experts"], m["lat"], m["units"], m["part_bytes"]
     blk, tsz = m["block"]
     self.row_up, self.qtype = self.lat // blk * tsz, {n: t for t, n in QUANT_NAMES.items()}[m.get("expert_type", "IQ3_XXS").lower()]
+    assert not CHUNKS or self.qtype == IQ3_XXS, "a chunk's grouped gemm is of iq3_xxs experts (CHUNKS= for others)"
     self.blocks = [model.blk[L] for L in m["layers"]]
     devs = self.blocks[0].ffn_gate_inp.weight.device
     assert len(devs) == len(units) and self.E % len(devs) == 0

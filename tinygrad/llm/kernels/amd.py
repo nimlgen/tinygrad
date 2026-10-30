@@ -15,13 +15,13 @@ WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * 
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_N, WMMA_M, WMMA_K), 32), math.log2(math.e)
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
 Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 8, 10, 11, 12, 13, 14
-IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS = 17, 18, 20, 21, 22, 23
+IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, MXFP4 = 17, 18, 20, 21, 22, 23, 39
 QUANT_SIZES = {Q8_0: 272, Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210, IQ2_XS: 74,
                IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136}  # bytes per 256 weights
 HALFWORD_QUANTS = (Q8_0, Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
 SMALL_BLOCK_QUANTS = {Q8_0: 17, IQ4_NL: 9}
 QUANT_NAMES = {Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
-               IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
+               IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s", MXFP4: "mxfp4"}
 
 def _unbind(v:int|UOp) -> int|UOp: return v.unbind_all()[0] if isinstance(v, UOp) else v
 
@@ -187,11 +187,11 @@ def _load_u32(raw:UOp, base:UOp, offset:int|UOp, stream:bool=False) -> UOp:
 
 def _half(value:UOp) -> UOp: return value.cast(dtypes.uint16).bitcast(dtypes.float16).float()
 
-def _iq4_bytes(packed:UOp, shift:int|UOp) -> UOp:
-  # the non-linear iq4nl table as a byte lookup: 3 byte_perms beat any arithmetic/select-tree form (~60% decode)
+def _iq4_bytes(packed:UOp, shift:int|UOp, table:tuple[int, int, int, int]=(0xf6eaddcf, 0xbfad9881, 0x71594535, 0x26190d01)) -> UOp:
+  # the non-linear iq4nl table (or mxfp4's) as a byte lookup: 3 byte_perms beat any arithmetic/select-tree form (~60% decode)
   selectors = (packed >> shift) & 0x0f0f0f0f
-  low = _amd_byte_perm(UOp.const(0xf6eaddcf, dtypes.uint32), UOp.const(0xbfad9881, dtypes.uint32), selectors)
-  high = _amd_byte_perm(UOp.const(0x71594535, dtypes.uint32), UOp.const(0x26190d01, dtypes.uint32), selectors & 0x07070707)
+  low = _amd_byte_perm(UOp.const(table[0], dtypes.uint32), UOp.const(table[1], dtypes.uint32), selectors)
+  high = _amd_byte_perm(UOp.const(table[2], dtypes.uint32), UOp.const(table[3], dtypes.uint32), selectors & 0x07070707)
   return _amd_byte_perm(high, low, 0x03020100 | ((selectors & 0x08080808) >> 1))
 
 def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
@@ -518,6 +518,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *extra:UOp, o
     if tokens: k = k*tokens + token
     return slot_dot(k, output, group, table, sign_masks, lds[-2]) * lds[-1][k].load()
   def slot_dot(token:UOp, output:UOp, group:UOp, table:UOp|None, sign_masks:UOp|None, slots:UOp|None) -> UOp:
+    if ggml_type == MXFP4: return mxfp4_dot(token, output, group, slots)
     block, subgroup = group//8, group%8
     base = (output*in_features//256 + block) * (QUANT_SIZES[ggml_type]//raw.dtype.itemsize)
     if ggml_type in SMALL_BLOCK_QUANTS: base = (output*in_features//32 + group)*SMALL_BLOCK_QUANTS[ggml_type]
@@ -565,6 +566,20 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *extra:UOp, o
       if ggml_type == IQ3_S: total *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       if ggml_type == IQ3_XXS: total *= ((word(66+subgroup*4) >> 28).float()+0.5)*0.5
     return total * xd[token, group]
+  def mxfp4_dot(token:UOp, output:UOp, group:UOp, slots:UOp|None) -> UOp:
+    # 17 byte blocks (an e8m0 scale, 16 bytes of e2m1 pairs: element j the low nibble of byte j, j+16 the high) in halfwords: an odd
+    # block's bytes start in the middle of one, its words are made of the 9 halfwords around it
+    at = (output*in_features//32 + group).cast(dtypes.int64)*17
+    if slots is not None and gather is not None: at = at + (slots[token].load().cast(dtypes.int64)*gather[0] + gather[1])*2
+    if xtoken is not None: token = xtoken(token)
+    elif xq.shape[0] != out.shape[0]: token = token % xq.shape[0]
+    h, odd = [raw[(at >> 1) + j].cast(dtypes.uint32) for j in range(9)], (at & 1).ne(0)
+    e = odd.where(h[0] >> 8, h[0] & 255)
+    qs = [odd.where(h[1+2*k] | (h[2+2*k] << 16), (h[2*k] >> 8) | (h[2*k+1] << 8) | ((h[2*k+2] & 255) << 24)) for k in range(4)]
+    xwords, dots = _amd_load(xq[token, group, 0], 8), [UOp.const(0, dtypes.int32)] * 2
+    for i in range(8):  # (the values doubled: e2m1 times 2 as bytes, the scale halved)
+      dots[i//4] = _amd_dp4a(_iq4_bytes(qs[i%4], 4*(i//4), (0x0c080604, 0x03020100, 0xf4f8fafc, 0xfdfeff00)), xwords[i], dots[i//4], cdna)
+    return (dots[0]+dots[1]).float() * ((e.maximum(1) - 1) << 23).bitcast(dtypes.float32) * xd[token, group]
   # (the expert gemvs: 2 groups a lane, profiled best)
   gpk, n = in_features//32, int(xq.shape[0]) // max(tokens, 1) if summed else 1
   def live(t:UOp) -> UOp:  # the groups of a row's slots of weight not 0: a slot's, or the summed slots' of a token
