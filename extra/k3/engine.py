@@ -815,11 +815,12 @@ if __name__ == "__main__":
           q = lp[[x[1] for x in top]]
           rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
           kl = float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))
-          stats.append((lp[outs[j]], r["output_logprobs"][j], float(int(lp.argmax()) == top[0][1]), kl))
+          stats.append((lp[outs[j]], r["output_logprobs"][j], float(int(lp.argmax()) == top[0][1]), kl, np.diff(np.sort(lp)[-2:])[0]))
       a_ = np.array(stats)
       print(f"{r['task_id']}: {len(stats)} tokens, ours logprob {a_[:, 0].mean():.4f} (production {a_[:, 1].mean():.4f}), "
             f"top-1 agree {a_[:, 2].mean():.1%}, KL top-5 {a_[:, 3].mean():.4f}, {time.perf_counter() - st:.0f} s", flush=True)
       streamer.report(f"tau {TAU} prefetch {PREFETCH}", c0, steps - 1)
+    if getenv("EVAL_DUMP", ""): np.save(getenv("EVAL_DUMP", ""), np.array(stats))  # (per position: logprobs, agree, KL, top-2 margin)
     sys.exit(0)
   ids = ([tok.bos_id] if tok.bos_id is not None else []) + tok.encode(sys.argv[2] if len(sys.argv) > 2 else "The capital of France is")
   if (draft_dir:=getenv("DRAFT", "")):
@@ -871,6 +872,7 @@ if __name__ == "__main__":
       if pos + i == 0: print(f"first step in {time.perf_counter() - t0:.0f} s", flush=True)
     if getenv("VPROMPT"): print(f"prompt of {len(ids)} tokens in {(dt:=time.perf_counter() - tp):.2f} s = {len(ids) / dt:.1f} tok/s", flush=True)
     pos, out, times, warm = pos + len(ids), [nxt], [], None
+    first = (streamer.counters(), 1, 0)  # (the counters when not every jit got captured: from the first token)
     emit(nxt)
     while len(out) < n and not tok.is_end(out[-1]):
       t0, o = time.perf_counter(), len(out)
@@ -887,7 +889,7 @@ if __name__ == "__main__":
       # (counted once every jit's captured: two right and two wrong guesses, or two plain steps)
       if warm is None and (min(sum(x[0] for x in times), sum(not x[0] for x in times)) == 2 if draft_dir else len(times) == 2):
         warm = (streamer.counters(), len(out), len(times))
-    return out, pos, times, warm
+    return out, pos, times, warm or first
   if getenv("CHAT") or getenv("BENCH", ""):
     # CHAT=1: a chat in the model's template, THINK=off|low|high|max. the caches only go forward: a turn feeds the end of the last reply
     # (its end token isn't fed) and its own message, without the template's system prefix
@@ -956,3 +958,20 @@ if __name__ == "__main__":
     r, tv, td = (np.array(x) for x in zip(*times[m0:]))
     streamer.report(f"speculative, {r.mean():.1%} of {len(r)} guesses right, {(len(out) - o0) / len(r):.2f} tokens a step, verify step "
                     f"{np.median(tv) * 1e3:.1f} ms (with the draft), rollback {np.median(td[~r]) * 1e3:.2f} ms", c0, len(out) - o0, c1)
+  if getenv("PROFILE"):  # (a verify step's gpu time by kernel on the first gpu: the median of the largest graphs profiled)
+    import collections, re
+    from tinygrad.device import Compiled, ProfileGraphEvent
+    evs = [e for e in Compiled.profile_events if isinstance(e, ProfileGraphEvent)]
+    evs = sorted(evs[-200:], key=lambda e: len(e.ents))[-20:]
+    steps = []
+    for ev in evs:
+      dur, span = collections.Counter(), [float("inf"), 0.0]
+      for ent in ev.ents:
+        if not str(ent.device).endswith(":0") and ent.device != "AMD": continue
+        st_, en_ = float(ev.sigs[ent.st_id]), float(ev.sigs[ent.en_id])
+        dur[re.sub(r"\x1b\[[0-9;]*m", "", str(ent.name)).strip()] += en_ - st_
+        span = [min(span[0], st_), max(span[1], en_)]
+      if dur: steps.append((span[1] - span[0], dur, len(ev.ents)))
+    span, dur, n = sorted(steps, key=lambda x: x[0])[len(steps) // 2]
+    print(f"profiled graph: {n} kernels, span {span / 1e3:.1f} ms, the first gpu busy {sum(dur.values()) / 1e3:.1f} ms")
+    for k, d in dur.most_common(30): print(f"  {d / 1e3:7.2f} ms  {k}")
