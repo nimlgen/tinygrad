@@ -150,9 +150,22 @@ CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
 HOST_C = "#include <stdint.h>\ntypedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
   ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\nenum { " + ", ".join(f"C_{b.upper()}" for b in CBUFS) + ", NCB };\n" + r"""
+#include <stdio.h>
 #include <time.h>
 typedef struct { uint32_t cdw0, nsid; uint64_t rsvd, mptr, prp1, prp2; uint32_t cdw10, cdw11, cdw12, pad[3]; } sqe_t;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+// a timeout's state on stderr: what it waited on, layer li's experts in flight, every queue's commands in flight and unrung
+static int64_t stuck(const io_t *s, const char *on, int64_t li, double t0, int64_t pending) {
+  int64_t fl = 0;
+  for (int64_t e = 0; e < s->E; e++) fl += s->flying[li * s->E + e] > 0;
+  fprintf(stderr, "timeout waiting on %s at layer %ld after %.1f s: %ld of its experts in flight, %ld reads not queued; in flight, unrung:",
+          on, (long)li, now() - t0, (long)fl, (long)pending);
+  for (int64_t q = 0; q < 2 * s->nd; q++)
+    fprintf(stderr, " %ld,%ld", (long)s->inflight[q], (long)((s->tails[q] - s->db_tails[q] + s->entries) % s->entries));
+  fprintf(stderr, "\n");
+  return -2;
+}
 
 // the reads of experts codes (layer * E + expert) into slots on queue (0: demand, 1: guesses) of their drives, rung later. a command's
 // owner is its code when owned (guesses), else -1: flying counts an owned one's commands till they're reaped
@@ -299,7 +312,7 @@ static int64_t layer(io_t *s, int64_t li) {
   for (int64_t g = 0; g < ng; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {  // (the guesses go on)
     if (reap(s) < 0) return -1;
     ring(s);
-    if (now() - t0 > 60) return -2;
+    if (now() - t0 > 60) return stuck(s, "the gpus", li, t0, 0);
   }
   double t1 = now();
   float logits[4096], sig[4096], tw[512];
@@ -372,7 +385,7 @@ static int64_t layer(io_t *s, int64_t li) {
       for (int64_t j = 0; j < nu; j++) if (hit[j]) s->mask[so[usel[j]]] = 0;
     }
     if (!busy) break;
-    if (now() - t0 > 60) return -2;
+    if (now() - t0 > 60) return stuck(s, "reads", li, t0, 0);
   }
   __sync_synchronize();
   for (int64_t g = 0; g < ng; g++) *BUF(B_READY1, g, volatile uint32_t) = 1, *BUF(B_READY, g, volatile uint32_t) = 1;
@@ -450,7 +463,7 @@ int64_t chunk_io(io_t *s) {
     double t0 = now();
     for (int64_t g = 0; g < ng; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {
       if (drain(s) < 0) return -1;
-      if (now() - t0 > 300) return -2;
+      if (now() - t0 > 300) return stuck(s, "the gpus", li, t0, npend - pend_at);
     }
     double t1 = now();
     int64_t lend = npend, tiles = 0;  // (li's reads are those pending before)
@@ -475,7 +488,7 @@ int64_t chunk_io(io_t *s) {
       if (drain(s) < 0) return -1;
       busy = pend_at < lend;
       for (int64_t e = 0; e < E && !busy; e++) busy = s->flying[li * E + e] > 0;
-      if (now() - t0 > 60) return -2;
+      if (now() - t0 > 60) return stuck(s, "reads", li, t0, npend - pend_at);
     }
     __sync_synchronize();
     for (int64_t g = 0; g < ng; g++) *BUF(B_READY, g, volatile uint32_t) = 1;
@@ -953,7 +966,11 @@ if __name__ == "__main__":
           if (n:=min(body.get("max_completion_tokens") or body.get("max_tokens") or getenv("MAXTOK", 2048), model.max_context - 2 - len(ids))) <= 0:
             return self.send(400, {"error": {"message": f"a prompt of {len(ids)} tokens, the context {model.max_context}",
                                              "type": "invalid_request_error", "code": "context_length_exceeded"}})
-          out, pos, times, _ = decode(ids[keep:], keep, n)
+          try: out, pos, times, _ = decode(ids[keep:], keep, n)
+          except RuntimeError as e:  # (the recurrent states half fed: the next prompt's fed from position 0)
+            fed_ids.clear(), last.clear()
+            print(f"failed: {e}", flush=True)
+            return self.send(500, {"error": {"message": str(e), "type": "server_error"}})
           fed_ids[:] = (ids + out)[:pos]
           ntok, t_dec = len(out) - tok.is_end(out[-1]), sum(x[1] + x[2] for x in times)
           # the reply's channels: the one the prompt opened, then any it opens (the tags not shown)
