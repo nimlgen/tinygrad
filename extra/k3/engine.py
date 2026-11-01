@@ -896,7 +896,8 @@ if __name__ == "__main__":
     # BENCH=in.jsonl:out.jsonl: each line's "messages" answered from position 0 (up to MAXTOK tokens), a line out each: its "id", the reply
     # (the ids already out skipped: a run picks up where the last stopped)
     # SERVE=port: openai chat completions on localhost, one at a time and not streamed. a prompt whose text starts with the text fed so far
-    # (the last reply's end token isn't fed) feeds only the rest, else it's fed from position 0
+    # (the last reply's end token isn't fed) feeds only the rest, else it's fed from position 0. the last prompt again (a client's retry after
+    # its timeout) gets the last reply, a prompt whose client has gone (waiting behind a long one) is skipped
     import json, jinja2
     env = jinja2.Environment(extensions=["jinja2.ext.loopcontrols"])
     env.filters["tojson"] = lambda obj, **kw: json.dumps(obj, **kw)
@@ -926,9 +927,10 @@ if __name__ == "__main__":
           print(f"{r['id']}: {ntok} tokens, {ntok / max(t_dec, 1e-9):.1f} tok/s", flush=True)
       sys.exit(0)
     if (port:=getenv("SERVE", 0)):
-      import http.server, re
+      import http.server, re, select, socket
       from tinygrad.llm.serve import normalize_messages
       fed_ids:list[int] = []
+      last:dict = {}
       class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a): pass
         def send(self, code:int, obj:dict):
@@ -939,8 +941,13 @@ if __name__ == "__main__":
         def do_GET(self): self.send(200, {"object": "list", "data": [{"id": "k3", "object": "model"}]})
         def do_POST(self):
           t0, body = time.perf_counter(), json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+          if select.select([self.connection], [], [], 0)[0] and not self.connection.recv(1, socket.MSG_PEEK):
+            return print("the client's gone: skipped", flush=True)
           normalize_messages(body["messages"])
           text, done = template.render(messages=body["messages"], add_generation_prompt=True, **kw), tok.decode(fed_ids)
+          if text == last.get("text"):
+            print("the last prompt again: the last reply", flush=True)
+            return self.send(200, last["reply"])
           keep = len(fed_ids) if fed_ids and text.startswith(done) and len(text) > len(done) else 0
           ids = fed_ids[:keep] + tok.encode(text[len(done):] if keep else text)
           if (n:=min(body.get("max_completion_tokens") or body.get("max_tokens") or getenv("MAXTOK", 2048), model.max_context - 2 - len(ids))) <= 0:
@@ -953,11 +960,12 @@ if __name__ == "__main__":
           reply = f"<|open|>{'response' if think == 'off' else 'think'}<|sep|>" + tok.decode(out[:ntok])
           ch = dict(re.findall(r"<\|open\|>(\w+).*?<\|sep\|>(.*?)(?=<\|close\|>|<\|open\|>|$)", reply, re.DOTALL))
           msg = {"role": "assistant", "content": ch.get("response", ""), **({"reasoning_content": ch["think"]} if "think" in ch else {})}
-          self.send(200, {"id": f"k3-{pos}", "object": "chat.completion", "created": int(time.time()), "model": body.get("model", "k3"),
-                          "choices": [{"index": 0, "message": msg, "finish_reason": "stop" if tok.is_end(out[-1]) else "length"}],
-                          "usage": {"prompt_tokens": len(ids), "completion_tokens": ntok, "total_tokens": len(ids) + ntok}})
+          last.update(text=text, reply={"id": f"k3-{pos}", "object": "chat.completion", "created": int(time.time()),
+            "model": body.get("model", "k3"), "choices": [{"index": 0, "message": msg, "finish_reason": "stop" if tok.is_end(out[-1]) else "length"}],
+            "usage": {"prompt_tokens": len(ids), "completion_tokens": ntok, "total_tokens": len(ids) + ntok}})
           print(f"{keep} kept + {len(ids) - keep} fed in {time.perf_counter() - t0 - t_dec:.1f} s, {ntok} tokens at "
                 f"{ntok / max(t_dec, 1e-9):.1f} tok/s, context {pos}/{model.max_context}", flush=True)
+          self.send(200, last["reply"])
       http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
     if sys.stdin.isatty():  # what was typed while it loaded isn't a message
       import termios
