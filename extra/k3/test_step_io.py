@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
-# extra/k3/engine.py's step_io (the host's part of a step) against fake drives: a thread completes every command rung on a queue, the
-# gpus' router tags are set up front. checks the slots and weights the gpus get, the cache tables, the guesses and the counts.
+# extra/k3/engine.py's step_io (the host's part of a step) against fake drives: a thread completes every command rung on a queue (in any
+# order, as drives do), the gpus' router tags are set up front. checks the slots and weights the gpus get, the cache tables, the guesses
+# and the counts.
 # PYTHONPATH=. python3 extra/k3/test_step_io.py
-import ctypes, threading, unittest
+import ctypes, threading, time, unittest
 import numpy as np
 from extra.k3.engine import IoT, host_c, BUFS, CBUFS
 
 E, L, NGPU, K, KMIN, ND, ENTRIES, ROWS = 64, 6, 2, 8, 2, 2, 64, 2
 
 class FakeDrives(threading.Thread):
-  """every command rung on a queue completed, in order"""
-  def __init__(self, sq, db, cq):
+  """every command rung on a queue completed, a random one of those in flight at a time. slow: the first of each queue only after two
+  rings' worth of others (or when it's the last in flight for 5 ms). dups: the commands whose id was in flight already"""
+  def __init__(self, sq, db, cq, slow=False):
     super().__init__(daemon=True)
-    self.sq, self.db, self.cq, self.stop = sq, db, cq, False
-    self.head, self.tail, self.phase = [0] * len(sq), [0] * len(sq), [1] * len(sq)
+    self.sq, self.db, self.cq, self.stop, self.dups, self.rng = sq, db, cq, False, 0, np.random.default_rng(2)
+    self.head, self.tail, self.phase, self.flying = [0] * len(sq), [0] * len(sq), [1] * len(sq), [[] for _ in sq]
+    self.held, self.passed, self.last = [0 if slow else -1] * len(sq), [0] * len(sq), [0.0] * len(sq)
   def run(self):
     while not self.stop:
       for q in range(len(self.sq)):
         while self.head[q] != int(self.db[q][0]):
           cid = int(self.sq[q][self.head[q] * 16]) >> 16
-          self.head[q] = (self.head[q] + 1) % ENTRIES
-          self.cq[q][self.tail[q] * 4 + 3] = cid | self.phase[q] << 16
-          if (t:=self.tail[q] + 1) == ENTRIES: t, self.phase[q] = 0, self.phase[q] ^ 1
-          self.tail[q] = t
+          self.dups += cid in self.flying[q]
+          self.flying[q].append(cid)
+          self.head[q], self.last[q] = (self.head[q] + 1) % ENTRIES, time.perf_counter()
+        fl = self.flying[q]
+        if not fl: continue
+        alone = len(fl) == 1 and time.perf_counter() - self.last[q] > 5e-3
+        hold = self.held[q] >= 0 and self.held[q] in fl and not alone and self.passed[q] < 2 * ENTRIES
+        i = int(self.rng.integers(len(fl)))
+        if hold and fl[i] == self.held[q]: continue
+        cid = fl.pop(i)
+        if cid == self.held[q]: self.held[q] = -1
+        self.passed[q] += 1
+        self.cq[q][self.tail[q] * 4 + 3] = cid | self.phase[q] << 16
+        if (t:=self.tail[q] + 1) == ENTRIES: t, self.phase[q] = 0, self.phase[q] ^ 1
+        self.tail[q] = t
 
 class TestStepIO(unittest.TestCase):
-  def setUp(self, slots=200, T=1):
+  def setUp(self, slots=200, T=1, slow=False, parts=1):
     SLOTS = self.slots = slots
     rng = np.random.default_rng(0)
     self.keep:list[np.ndarray] = []
@@ -35,16 +49,17 @@ class TestStepIO(unittest.TestCase):
     nq = 2 * ND
     self.sq, self.cq = [arr(np.zeros(ENTRIES * 16, np.uint32)) for _ in range(nq)], [arr(np.zeros(ENTRIES * 4, np.uint32)) for _ in range(nq)]
     self.db, self.cq_db = [arr(np.zeros(1, np.uint32)) for _ in range(nq)], [arr(np.zeros(1, np.uint32)) for _ in range(nq)]
-    # a code's part on each drive: one command each
-    ncodes = L * E
-    tables:dict[str, np.ndarray] = {"ptr": np.arange(0, 2 * ncodes + 1, 2, dtype=np.int64), "drive": np.tile(np.arange(ND, dtype=np.int32), ncodes),
-              "lba": np.zeros(2 * ncodes, np.int64), "nlb": np.zeros(2 * ncodes, np.uint32), "kind": np.zeros(2 * ncodes, np.int8),
-              **{k: np.zeros(2 * ncodes, np.int64) for k in ("inpart", "page_base", "list_base")}, "part_pages": np.ones(2 * ncodes, np.int64),
+    # a code's parts on each drive: a command each
+    ncodes, P = L * E, ND * parts
+    tables:dict[str, np.ndarray] = {"ptr": np.arange(0, P * ncodes + 1, P, dtype=np.int64),
+              "drive": np.tile(np.arange(ND, dtype=np.int32), ncodes * parts),
+              "lba": np.zeros(P * ncodes, np.int64), "nlb": np.zeros(P * ncodes, np.uint32), "kind": np.zeros(P * ncodes, np.int8),
+              **{k: np.zeros(P * ncodes, np.int64) for k in ("inpart", "page_base", "list_base")}, "part_pages": np.ones(P * ncodes, np.int64),
               "pages": np.arange(SLOTS + 1, dtype=np.int64), "lists": np.zeros(1, np.int64),
               "sq": np.array([a.ctypes.data for a in self.sq], np.uint64), "db": np.array([a.ctypes.data for a in self.db], np.uint64),
               "cq": np.array([a.ctypes.data for a in self.cq], np.uint64), "cq_db": np.array([a.ctypes.data for a in self.cq_db], np.uint64),
-              **{k: np.zeros(nq, np.int64) for k in ("tails", "db_tails", "heads", "inflight")}, "phases": np.ones(nq, np.int64),
-              "owner": np.full(nq * ENTRIES, -1, np.int64)}
+              **{k: np.zeros(nq, np.int64) for k in ("tails", "db_tails", "heads", "inflight", "cids")}, "phases": np.ones(nq, np.int64),
+              "owner": np.full(nq * 65536, -2, np.int64)}
     self.bias = [arr(rng.normal(0, 0.1, E).astype(np.float32)) for _ in range(L)]
     self.state:dict[str, np.ndarray] = {
       "slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -63,9 +78,11 @@ class TestStepIO(unittest.TestCase):
     self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, rows=ROWS, slots=SLOTS, tokens=T, k1=k1, nd=ND, entries=ENTRIES,
                        victims_n=32 * T, pf=3, tau=0.03, decay=0.5 ** (1 / 8), bufs=self.bufs.ctypes.data)
     for name, a in {**tables, **self.state}.items(): setattr(io, name, a.ctypes.data)
-    self.drives = FakeDrives(self.sq, self.db, self.cq)
+    self.drives = FakeDrives(self.sq, self.db, self.cq, slow)
     self.drives.start()
-  def tearDown(self): self.drives.stop = True
+  def tearDown(self):
+    self.drives.stop = True
+    self.assertEqual(self.drives.dups, 0)
 
   def test_small_cache(self):  # (the slots go to later layers within a step: only the tables and counts)
     self.tearDown()
@@ -135,10 +152,9 @@ class TestStepIO(unittest.TestCase):
     self.check_tables()
     self.assertGreater(self.io.refs - refs, refs)
 
-  def test_chunk(self):  # a prompt's chunk: every expert of each layer read in, the exact top k of every token in the grouped gemm's tables
-    self.tearDown()
-    self.setUp(slots=L * E + 16)  # (none evicted: every layer's slots checked after)
-    T, nr, rng = 40, E // NGPU, np.random.default_rng(1)
+  def chunk(self, T=40) -> tuple[list, list]:
+    """a prompt's chunk of T tokens (random router logits): chunk_io's return checked, the logits and every layer's gpu buffers"""
+    nr, rng = E // NGPU, np.random.default_rng(1)
     P = T * K + 16 * E
     def gpu(scores):
       return {"scores": scores, "tslot": np.zeros(P // 16, np.int32), "ntiles": np.zeros(1, np.int32), "rows": np.zeros(P, np.int32),
@@ -152,6 +168,13 @@ class TestStepIO(unittest.TestCase):
     self.io.tokens, self.io.cbufs = T, cbufs.ctypes.data
     self.assertEqual(host_c().chunk_io(ctypes.byref(self.io)), 0)
     self.check_tables()
+    return logits, cbuf
+
+  def test_chunk(self):  # a prompt's chunk: every expert of each layer read in, the exact top k of every token in the grouped gemm's tables
+    self.tearDown()
+    self.setUp(slots=L * E + 16)  # (none evicted: every layer's slots checked after)
+    T = 40
+    logits, cbuf = self.chunk(T)
     for li in range(L):
       so = self.state["slot_of"][li * E:(li + 1) * E]
       sig = 1 / (1 + np.exp(-logits[li].astype(np.float64)))
@@ -171,6 +194,13 @@ class TestStepIO(unittest.TestCase):
       for b, n in (("tslot", tiles), ("rows", tiles * 16), ("ntiles", 1), ("dest", T * K), ("w", T * K)):
         self.assertTrue((cbuf[li][1][b][:n] == g0[b][:n]).all())
       self.assertTrue(all(g["ready"][0] == 1 for g in self.gbuf[li]))
+
+  def test_slow_read(self):  # a read passed by two rings' worth of others (a layer's are 8 rings): no command id reused while in flight
+    self.tearDown()
+    self.setUp(slots=L * E + 16, slow=True, parts=4)
+    self.chunk()
+    self.assertTrue(all(h == -1 for h in self.drives.held))
+    self.assertTrue((self.state["flying"] == 0).all())
 
 if __name__ == "__main__":
   unittest.main()

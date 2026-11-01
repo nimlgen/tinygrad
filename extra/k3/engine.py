@@ -141,7 +141,7 @@ IO = [*((n, "int64_t") for n in "layers E ngpu k kmin rows tokens k1 nd entries 
       ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"), ("mask", "uint8_t *"), ("victims", "int64_t *"),
       ("owner", "int64_t *"), ("ptr", "const int64_t *"), ("drive", "const int32_t *"), ("lba", "const int64_t *"), ("nlb", "const uint32_t *"),
       ("kind", "const int8_t *"), *((n, "const int64_t *") for n in "inpart part_pages page_base list_base pages lists".split()),
-      *((n, "const uint64_t *") for n in "sq db cq cq_db".split()), *((n, "int64_t *") for n in "tails db_tails heads phases inflight".split()),
+      *((n, "const uint64_t *") for n in "sq db cq cq_db".split()), *((n, "int64_t *") for n in "tails db_tails heads phases inflight cids".split()),
       *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills".split()),
       *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split())]
 BUFS = ["tag", "ready", "ready1", "scores", "slots", "ws", "slots2", "ws2"]
@@ -168,16 +168,21 @@ static int64_t stuck(const io_t *s, const char *on, int64_t li, double t0, int64
 }
 
 // the reads of experts codes (layer * E + expert) into slots on queue (0: demand, 1: guesses) of their drives, rung later. a command's
-// owner is its code when owned (guesses), else -1: flying counts an owned one's commands till they're reaped
+// id is the queue's next one not in flight (the drives complete out of order: a slow command can be passed by a whole ring's), its owner
+// its code when owned (guesses), else -1, -2 when free: flying counts an owned one's commands till they're reaped
+#define NCID 65536
 static void submit(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots, int64_t queue, int64_t owned) {
   for (int64_t i = 0; i < n; i++) for (int64_t r = s->ptr[codes[i]]; r < s->ptr[codes[i] + 1]; r++) {
-    int64_t page = slots[i] * s->part_pages[r] + s->inpart[r], gp = s->page_base[r] + page, q = s->drive[r] + queue * s->nd, cid = s->tails[q];
-    sqe_t *e = (sqe_t *)s->sq[q] + cid;
+    int64_t page = slots[i] * s->part_pages[r] + s->inpart[r], gp = s->page_base[r] + page, q = s->drive[r] + queue * s->nd, cid = s->cids[q];
+    int64_t *own = s->owner + q * NCID;
+    while (own[cid] != -2) cid = (cid + 1) % NCID;
+    s->cids[q] = (cid + 1) % NCID;
+    sqe_t *e = (sqe_t *)s->sq[q] + s->tails[q];
     e->cdw0 = 2 | (uint32_t)cid << 16; e->nsid = 1; e->rsvd = 0; e->mptr = 0; e->prp1 = s->pages[gp];
     e->prp2 = s->kind[r] == 0 ? 0 : s->kind[r] == 1 ? s->pages[gp + 1] : s->lists[s->list_base[r] + (page + 1) / 256] + (page + 1) % 256 * 8;
     e->cdw10 = (uint32_t)s->lba[r]; e->cdw11 = (uint32_t)(s->lba[r] >> 32); e->cdw12 = s->nlb[r];
-    s->owner[q * s->entries + cid] = owned ? codes[i] : -1;
-    s->tails[q] = (cid + 1) % s->entries, s->inflight[q]++;
+    own[cid] = owned ? codes[i] : -1;
+    s->tails[q] = (s->tails[q] + 1) % s->entries, s->inflight[q]++;
     if (owned) s->flying[codes[i]]++;
   }
 }
@@ -199,7 +204,8 @@ static int64_t reap(io_t *s) {
     uint32_t dw3;
     while (((dw3 = c[h * 4 + 3]) >> 16 & 1) == ph) {
       if (dw3 >> 17) return -1;
-      int64_t o = s->owner[q * s->entries + (dw3 & 0xffff)];
+      int64_t *own = s->owner + q * NCID + (dw3 & 0xffff), o = *own;
+      *own = -2;
       if (o >= 0) s->flying[o]--;
       m++;
       if (++h == s->entries) h = 0, ph ^= 1;
@@ -563,14 +569,14 @@ class Reads:
                    "list_base": i64(np.cumsum([0] + [len(gpu.lists) for gpu in gpus])[gid]),
                    "pages": i64(np.concatenate([gpu.pages for gpu in gpus] + [[0]])),
                    "lists": i64(np.concatenate([gpu.lists for gpu in gpus] + [[0]])),
-                   # every queue's ring, doorbells and state (only step_io pushes on them from here on), each command's guess (-1: demand)
+                   # every queue's ring, doorbells and state (only step_io pushes on them from here on), a command id's guess (-1: demand, -2: free)
                    "sq": np.array([addr(q.sq) for q in queues], np.uint64),
                    "db": np.array([q.dev.regs.addr + q.sq_db * 4 for q in queues], np.uint64),
                    "cq": np.array([addr(q.cq.cast("B")) for q in queues], np.uint64),
                    "cq_db": np.array([q.dev.regs.addr + q.cq_db * 4 for q in queues], np.uint64),
                    **{k: i64([getattr(q, a) for q in queues]) for k, a in (("tails", "tail"), ("db_tails", "db_tail"), ("heads", "head"),
                                                                            ("phases", "phase"), ("inflight", "inflight"))},
-                   "owner": np.full(len(queues) * self.entries, -1, np.int64)}
+                   "owner": np.full(len(queues) * 65536, -2, np.int64), "cids": np.zeros(len(queues), np.int64)}
 
 class Streamer:
   def __init__(self, model:Transformer, disks:list, m:dict):
