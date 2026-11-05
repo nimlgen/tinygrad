@@ -29,7 +29,8 @@ def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for
 
 def get_enqueue_devs(call:UOp) -> tuple[str, ...]:
   if call.op is not Ops.CALL: return () # entries can be AFTER-wrapped calls
-  if call.body.op not in (Ops.PROGRAM, Ops.STORE) and not (call.body.op is Ops.CUSTOM_FUNCTION and call.body.arg.name == "encdec"): return ()
+  if call.body.op not in (Ops.PROGRAM, Ops.STORE) and not (call.body.op is Ops.CUSTOM_FUNCTION and call.body.arg.name in ("encdec", *COPY_HALVES)):
+    return ()
   runs_on = call.device if call.body.op is Ops.STORE and all_devices_in(call.device, HCQ_DEVS - UVM_DEVS) else get_call_arg_uops(call)[0].device
   devs = tuple(Device.canonicalize(d) for d in to_tuple(runs_on))
   if not all_devices_in(devs, HCQ_DEVS) or (call.body.op is Ops.STORE and all_devices_in(devs, UVM_DEVS)): return ()
@@ -45,6 +46,7 @@ def unwrap_lane(v:UOp) -> tuple[UOp, int|None, int]: # look through views and a 
   sel, off = unwrap_view(v)
   if sel.op is not Ops.MSELECT: return sel, None, off
   return (inner:=unwrap_view(sel.src[0]))[0], sel.arg, off + inner[1]
+BUFFERS = (Ops.BUFFER, Ops.ALLOC, Ops.PARAM) # what a call arg unwraps to when it is memory, the rest are values
 
 # **** commands
 
@@ -87,32 +89,12 @@ def announce(slots:dict[str, UOp], num_queues:dict[str, int], dep:UOp) -> list[U
 
 def ins(name:str, *src:UOp|int) -> UOp: return UOp.custom_function(name).call(*[UOp.const(s, dtypes.u32) if isinstance(s, int) else s for s in src])
 
-def copy_submit(s:UOp, keys:dict[int, Any], encode:Callable[[UOp, list[UOp]], list[list[UOp]]]) -> UOp|None:
-  if not keys: return None
-  lin, queue = s.without_after.body, s.without_after.src[1]
-  groups:dict[Any, list[int]] = defaultdict(list)
-  for i, key in keys.items(): groups[key].append(i)
-  copies = {i: cmds for ids in groups.values() for i, cmds in zip(ids, encode(queue, [lin.src[i] for i in ids]))}
-
-  out:list[UOp] = []
-  for active, ids in itertools.groupby(range(len(lin.src)), lambda i: i in keys):
-    if not active:
-      out += [lin.src[i] for i in ids]
-      continue
-    streams:dict[Any, list[UOp]] = defaultdict(list)
-    for i in ids: streams[keys[i]].extend(copies[i])
-    pending = [(cmds, 0, 0) for cmds in streams.values()]
-    while pending := [(cmds, pos, off) for cmds, pos, off in pending if pos < len(cmds)]:
-      ranges = [cmds[pos].src[1] if cmds[pos].op is Ops.END else None for cmds, pos, _ in pending]
-      counts = [(r.src[0].val if r is not None else 1) - off for r, (_, _, off) in zip(ranges, pending)]
-      n = min(counts)
-      k = UOp.range(n, next(UOp.unique_num), dtype=dtypes.u64) if n > 1 else UOp.const(0, dtypes.u64)
-      bodies = [cmds[pos].src[0].substitute({r: k + off}) if r is not None else cmds[pos] for (cmds, pos, off), r in zip(pending, ranges)]
-      issue = flatten(dep.src for u in bodies if u.op is Ops.AFTER for dep in u.src[1:])
-      complete = flatten(u.without_after.src for u in bodies)
-      out += [UOp(Ops.LINEAR, src=tuple(issue + complete)).end(k)] if n > 1 else issue + complete
-      pending = [(cmds, pos + 1, 0) if count == n else (cmds, pos, off + n) for (cmds, pos, off), count in zip(pending, counts)]
-  return s.without_after.replace(src=(lin.replace(src=tuple(out)), queue)).after(*s.src[1:])
+# a copy that goes out to another device (a drive, a nic) is split in prep into copy_issue/copy_complete calls: the issue posts a wave of
+# commands and rings the doorbell, the complete waits for it. a half is custom_function(name).call(buf, far, seq, k, ...): seq is the stream's
+# slot counter on the far device, shared by the copies of the stream so they order, k the wave, a range over the full waves or a const
+def copy_half(call:UOp) -> str|None:
+  return call.body.arg.name if call.op is Ops.CALL and call.body.op is Ops.CUSTOM_FUNCTION and call.body.arg.name in COPY_HALVES else None
+COPY_HALVES = ("copy_issue", "copy_complete")
 
 # **** patchers
 
@@ -243,7 +225,7 @@ class BatchCtx:
   def __post_init__(self):
     # the other devices whose memory a call touches: a usb gpu can't reach host memory
     reach = [HCQ_DEVS if getattr(Device[d], "is_usb", False) else HCQ_DEVS | HOST_DEVS for _, d, _ in self.batch]
-    arg_devs = [{Device.canonicalize(x) for b in get_call_arg_uops(c) for x in to_tuple(b.device)} for c, _, _ in self.batch]
+    arg_devs = [{Device.canonicalize(x) for b in get_call_arg_uops(c) if b.device is not None for x in to_tuple(b.device)} for c, _, _ in self.batch]
     touched = [{x for x in xs if all_devices_in(x, r)} - {d} for xs, r, (_, d, _) in zip(arg_devs, reach, self.batch)]
 
     # queues and devices in first-use order, a call's own device then the peers it touches
@@ -269,18 +251,37 @@ def _wait_ins(ctx:BatchCtx, waits:dict[tuple[str, str], int]) -> list[UOp]:
 def _start_ins(ctx:BatchCtx, dev:str, queue:str) -> list[UOp]:
   return [ins("wait", timeline(d), timeline_value(d)) for d in [dev, *sorted(ctx.peers.get((dev, queue), ()))]] + [ins("memory_barrier")]
 
+def lockstep(streams:list[list[tuple[int, int]]], batch:list[tuple[UOp, str, str]], cmds:Callable[[int], tuple[list[UOp], list[UOp]]]) -> list[UOp]:
+  # the streams are their (issue, complete) tags in order. a step issues the next wave of every stream, then completes them all
+  # a looped wave spans its trips, a step runs to the next wave boundary of any stream, so the loops of the streams merge
+  ranges = [[batch[i][0].src[4] for i, _ in st] for st in streams]
+  starts = [list(itertools.accumulate((r.src[0].val if r.op is Ops.RANGE else 1 for r in rs), initial=0)) for rs in ranges]
+  out:list[UOp] = []
+  for a, b in itertools.pairwise(sorted(set(flatten(starts)))):
+    k = UOp.range(b - a, next(UOp.unique_num), dtype=dtypes.u64) if b - a > 1 else UOp.const(0, dtypes.u64)
+    heads = [(i, c, r, t, e) for st, rs, ts in zip(streams, ranges, starts) for (i, c), r, t, e in zip(st, rs, ts, ts[1:]) if t <= a < e]
+    # the commands around a half (waits, stamps, signals) go around its first and last step, the calls go inside the loop
+    pre = flatten(cmds(tag)[0] for i, c, _, t, _ in heads if t == a for tag in (i, c))
+    post = flatten(cmds(tag)[1] for i, c, _, _, e in heads if e == b for tag in (i, c))
+    calls = UOp.sink(*[batch[i][0] for i, *_ in heads], *[batch[c][0] for _, c, *_ in heads])
+    step = calls.substitute({r: k + (a - t) for _, _, r, t, _ in heads if r.op is Ops.RANGE}).src
+    out += pre + ([UOp(Ops.LINEAR, src=step).end(k)] if b - a > 1 else list(step)) + post
+  return out
+
 def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   queue_of = [(dev, queue) for _, dev, queue in ctx.batch] # the (device, queue) of each call by tag
 
   # calc deps for each tag
   tracker = DepsTracker(queue_of)
-  accs = [[(s, k in get_call_outs_ins(c)[0]) for k, s in enumerate(c.src[1:]) if not s.is_variable] for c, _, _ in ctx.batch]
+  accs = [[(s, k in get_call_outs_ins(c)[0]) for k, s in enumerate(c.src[1:]) if not s.is_variable and unwrap_lane(s)[0].op in BUFFERS]
+          for c, _, _ in ctx.batch]
   dep_tags:list[list[int]] = [tracker.access_resources(acc, tag) for tag, acc in enumerate(accs)]
 
-  # add barriers when a call deps on another call of its queue
+  # add barriers when a call deps on another call of its queue. a copy half waits for its own stream itself
+  stream_of = [c.src[3] if copy_half(c) else None for c, _, _ in ctx.batch]
   barriers, last_barrier = set[int](), dict[tuple[str, str], int]()
   for tag, (deps, queue) in enumerate(zip(dep_tags, queue_of)):
-    if any(queue_of[t] == queue and t >= last_barrier.get(queue, 0) for t in deps):
+    if any(queue_of[t] == queue and t >= last_barrier.get(queue, 0) and (stream_of[tag] is None or stream_of[t] is not stream_of[tag]) for t in deps):
       barriers.add(tag)
       last_barrier[queue] = tag
 
@@ -304,11 +305,23 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   # all tags that should signal
   signal_tags = {tag for waits in [*call_waits, *close_waits.values()] for tag in waits.values()}
 
-  def call_cmds(tag:int, call:UOp, dev:str, queue:str) -> list[UOp]:
-    barrier = [ins("exec_barrier")] if tag in barriers else []
+  def call_cmds(tag:int) -> tuple[list[UOp], list[UOp]]: # the commands before and after a call
+    (_, dev, queue), barrier = ctx.batch[tag], [ins("exec_barrier")] if tag in barriers else []
     stamps = [ins("timestamp", ctx.slot(dev, i)) for i in ctx.stamps(dev, tag)]
     signal = [ins("store", ctx.queue_signal(dev, queue), UOp.const(tag + 1, dtypes.u64))] if tag in signal_tags else []
-    return barrier + _wait_ins(ctx, call_waits[tag]) + [ins("memory_barrier")] * bool(call_waits[tag]) + stamps[:1] + [call] + stamps[1:] + signal
+    return barrier + _wait_ins(ctx, call_waits[tag]) + [ins("memory_barrier")] * bool(call_waits[tag]) + stamps[:1], stamps[1:] + signal
+
+  def program(queue:tuple[str, str]) -> list[UOp]:
+    # copy halves next to each other on a queue overlap: ring early, wait late. another call between them or a barrier keeps them apart
+    def run_of(tag:int) -> tuple[bool, int]: return copy_half(ctx.batch[tag][0]) is not None, sum(b <= tag for b in barriers if queue_of[b] == queue)
+    out:list[UOp] = []
+    for (halves, _), grp in itertools.groupby(ctx.calls.get(queue, []), run_of):
+      tags = list(grp)
+      if not halves: out += [cmd for tag in tags for pre, post in [call_cmds(tag)] for cmd in pre + [ctx.batch[tag][0]] + post]
+      else: # a stream is its (issue, complete) pairs in order
+        streams = [[t for t in tags if stream_of[t] is s] for s in dedup([stream_of[t] for t in tags])]
+        out += lockstep([list(zip(ts[::2], ts[1::2])) for ts in streams], ctx.batch, call_cmds)
+    return out
 
   # closers advance device timelines
   close_cmds = {dev: _wait_ins(ctx, close_waits[dev]) + [ins("store", timeline(dev), timeline_value(dev) + 1)] for dev in ctx.queues}
@@ -317,7 +330,7 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   order = dedup(queue_of + list(closers.values()))
   open_cmds = {queue: _start_ins(ctx, *queue) if queue in ctx.calls or not ctx.queues[queue[0]] else [] for queue in order}
 
-  programs = {queue: [cmd for tag in ctx.calls.get(queue, []) for cmd in call_cmds(tag, *ctx.batch[tag])] for queue in order}
+  programs = {queue: program(queue) for queue in order}
   closings = {queue: [cmd for dev in ctx.queues if closers[dev] == queue for cmd in close_cmds[dev]] for queue in order}
   return {queue: open_cmds[queue] + programs[queue] + closings[queue] for queue in order}
 
@@ -353,7 +366,7 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 
   def queue_for(c:UOp) -> str:
     if c.body.op is Ops.PROGRAM: return "COMPUTE:0"
-    if c.body.op is Ops.CUSTOM_FUNCTION: return "ENCDEC:0"
+    if c.body.op is Ops.CUSTOM_FUNCTION: return "COPY:0" if copy_half(c) else "ENCDEC:0"
     return f"COPY:{copy_of.get((c.src[1].device, c.src[2].device), 0)}"
 
   devs = [get_enqueue_devs(c) for c in l.src]
@@ -411,9 +424,12 @@ class HWQueue:
         else: self.blob += struct.pack(unwrap(w.dtype.fmt), truncate[w.dtype](c.val))
     return len(self.blob)
 
+  def lower(self, cmds:Sequence[UOp]): # the commands go to the stream
+    for u in cmds: self.q_rewrite.rewrite(u, ctx=self)
+
   def loop(self, body:UOp, r:UOp):
     start, first = len(self.blob), len(self.patches)
-    for u in body.src: self.q_rewrite.rewrite(u, ctx=self)
+    self.lower(body.src)
     trip, words = len(self.blob) - start, self.patches[first:]
     # each trip gets its words as dwords: a trip need not be 8 bytes aligned
     self.patches[first:] = [(o + 4 * k + r * trip, (w >> (32 * k)).cast(dtypes.u32)) for o, w in words for k in range(w.dtype.itemsize // 4)]
@@ -425,7 +441,7 @@ class HWQueue:
   def encode(self) -> UOp: return self.submit(encode_cmdbuf(self, self.lin)) # submit(linear) becomes submit(cmdbuf)
 
 def encode_cmdbuf(hq:HWQueue, lin:UOp|None=None, name:str="cmdbuf", device:str|tuple[str, ...]|None=None) -> UOp:
-  for u in lin.src if lin is not None else (): hq.q_rewrite.rewrite(u, ctx=hq) # the commands of the linear go to the stream
+  hq.lower(lin.src if lin is not None else ())
   stream = bytes(hq.blob)
 
   # loop over pathes with the same value
