@@ -1,0 +1,1 @@
+Write a Go function that parses a CSV file of orders (id, customer, amount, date) and returns the total amount per customer for a given month. Include error handling and a short example of usage.
