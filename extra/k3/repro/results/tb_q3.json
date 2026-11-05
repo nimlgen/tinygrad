@@ -1,0 +1,447 @@
+{
+ "adaptive-rejection-sampler": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "bn-fit-modify": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "break-filter-js-from-html": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "build-cython-ext": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "build-pmars": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "build-pov-ray": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "caffe-cifar-10": {
+  "job": "q3_rerun",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "cancel-async-tasks": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "chess-best-move": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "circuit-fibsqrt": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "cobol-modernization": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "code-from-image": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "compile-compcert": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "configure-git-webserver": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "constraints-scheduling": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "count-dataset-tokens": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "crack-7z-hash": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "custom-memory-heap-crash": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "db-wal-recovery": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "distribution-search": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "dna-assembly": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "dna-insert": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "extract-elf": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "extract-moves-from-video": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "feal-differential-cryptanalysis": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "feal-linear-cryptanalysis": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "filter-js-from-html": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "financial-document-processor": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "fix-code-vulnerability": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "fix-git": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "fix-ocaml-gc": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "gcode-to-text": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "git-leak-recovery": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "git-multibranch": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "gpt2-codegolf": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "headless-terminal": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "hf-model-inference": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "install-windows-3.11": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "kv-store-grpc": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "large-scale-text-editing": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "largest-eigenval": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "llm-inference-batching-scheduler": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "log-summary-date-ranges": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "mailman": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "make-doom-for-mips": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "make-mips-interpreter": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "mcmc-sampling-stan": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "merge-diff-arc-agi-task": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "model-extraction-relu-logits": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "modernize-scientific-stack": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "mteb-leaderboard": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "mteb-retrieve": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "multi-source-data-merger": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "nginx-request-logging": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "openssl-selfsigned-cert": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "overfull-hbox": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "password-recovery": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "path-tracing": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "path-tracing-reverse": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "polyglot-c-py": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "polyglot-rust-c": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "portfolio-optimization": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "protein-assembly": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "prove-plus-comm": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "pypi-server": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "pytorch-model-cli": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "pytorch-model-recovery": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "qemu-alpine-ssh": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "qemu-startup": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "query-optimize": {
+  "job": "q3_full",
+  "reward": 0.0,
+  "exception": null
+ },
+ "raman-fitting": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": null
+ },
+ "regex-chess": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "regex-log": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "reshard-c4-data": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "rstan-to-pystan": {
+  "job": "q3_full",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "sam-cell-seg": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": null
+ },
+ "sanitize-git-repo": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "schemelike-metacircular-eval": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "sparql-university": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "sqlite-db-truncate": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "sqlite-with-gcov": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "torch-pipeline-parallelism": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": "AgentTimeoutError"
+ },
+ "torch-tensor-parallelism": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "train-fasttext": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": null
+ },
+ "tune-mjcf": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "video-processing": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "vulnerable-secret": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ },
+ "winning-avg-corewars": {
+  "job": "q3_rerun3",
+  "reward": 0.0,
+  "exception": "AgentTimeoutError"
+ },
+ "write-compressor": {
+  "job": "q3_rerun3",
+  "reward": 1.0,
+  "exception": null
+ }
+}
