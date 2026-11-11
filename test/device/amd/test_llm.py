@@ -486,4 +486,17 @@ class TestExpertLinear(unittest.TestCase):
       ref = self.weight(s, off, self.LAT, self.UNITS) @ h[k]
       np.testing.assert_allclose(out[k], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
+  def test_pool_sharded(self): # device 1's pool is device 0's a slot on: each device its own gate/up rows on x, then its down rows on its own h
+    devs = tuple(f"{Device.DEFAULT.split(':')[0]}:{i}" for i in range(2))
+    pool = Tensor(np.concatenate([self.raw, np.roll(self.raw, -self.PART)])).shard(devs, 0)
+    x, slots = Tensor(self.rng.standard_normal((1, self.LAT)).astype(np.float32)), self.slots.shard(devs)
+    h, off = self.rng.standard_normal((2, len(self.sel), self.UNITS)).astype(np.float32), 2 * self.UNITS * self.ROW_UP
+    gu = expert_linear(pool, slots, x.shard(devs), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
+    down = expert_linear(pool, slots, Tensor(h).shard(devs, 0), self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+    for g in range(2):
+      for k, s in enumerate(self.sel):
+        for out, ref in ((gu[g, k], self.weight((s + g) % self.NSLOTS, 0, 2 * self.UNITS, self.LAT) @ x.numpy()[0]),
+                         (down[g, k], self.weight((s + g) % self.NSLOTS, off, self.LAT, self.UNITS) @ h[g, k])):
+          np.testing.assert_allclose(out, ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
 if __name__ == "__main__": unittest.main()

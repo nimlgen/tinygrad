@@ -287,16 +287,19 @@ def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *
 
 def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0) -> Tensor:
   """out[k] = W[slots[k]] @ x[k % rows]: the quantized experts in the slots of a pool of raw gguf blocks, a slot every stride bytes, W at offset
-  bytes in it. x: (rows, in_features), out: (len(slots), out_features)"""
+  bytes in it. x: (rows, in_features), out: (len(slots), out_features). a pool sharded over devices is a pool on each, of its own experts or
+  parts of them: out is (ndev, len(slots), out_features), each device's, and x is the same on each or each device's (ndev, rows, in_features)"""
   word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
   assert stride % word.itemsize == 0 and offset % word.itemsize == 0, f"{QUANT_NAMES[ggml_type]} slots must be {word.itemsize} byte aligned"
-  rows = int(x.numel()) // in_features
-  out = Tensor.empty(slots.shape[0], out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device)
+  rows, ndev = prod(x.uop.max_shard_shape) // in_features, int(pool.shape[0]) // int(pool.uop.shard_shape[0])
+  out = Tensor.empty(ndev*slots.shape[0], out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=pool.device,
+                     axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_decode_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
                           stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device))
   extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), rows, in_features), slots.cast(dtypes.int32), *extra)
-  return Tensor.custom_kernel(out, *srcs, fxn=fxn)[0].sum(-1)
+  ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0].sum(-1)
+  return ret.reshape(ndev, slots.shape[0], out_features) if ndev > 1 else ret
 
 # kgroups: groups of 16 lanes that split k in a 16x16x16 fragment, RDNA3 copies a and b in both halves
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
