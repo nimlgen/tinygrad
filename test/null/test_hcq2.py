@@ -61,8 +61,8 @@ def word(u:UOp) -> tuple[UOp, int]:
   return hcq2.unwrap_view(u)
 
 T = 5 # the timeline value the last submitted batch of every device signals
-def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[list, dict, dict]:
-  qs, cs, mem = queues(batch), calls(batch), defaultdict(int)
+def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None, mem:defaultdict|None=None) -> tuple[list, dict, dict]:
+  qs, cs, mem = queues(batch), calls(batch), defaultdict(int) if mem is None else mem
   for d in batch.arg.hcq.device:
     mem[word(hcq2.timeline(d))] = (done or {}).get(d, T)
     mem[word(hcq2.timeline(d).index(1))] = T
@@ -70,16 +70,17 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[
     if u.op is Ops.CONST: return u.val
     if u.op is Ops.LOAD: return mem[word(u.src[0])]
     return sum(val(s) for s in u.src)
+  def value(c:UOp) -> int: return val(c.src[0].src[0] if c.src[0].src else c.src[2]) # a wait or store of the graph holds its value
   log:list[int|str] = [] # the calls that ran, and a device each time its timeline bumps
   while True:
     for q in (list(qs) if prio is None else prio):
       if not (cmds:=qs[q]): continue
       c = cmds[0]
       if (name:=ins_name(c)) is not None and name.startswith("wait"):
-        sig, target = mem[word(c.src[1])], val(c.src[2])
+        sig, target = mem[word(c.src[1])], value(c)
         if sig != target if name == "wait_eq" else sig < target: continue
       elif name == "store":
-        mem[w:=word(c.src[1])] = val(c.src[2])
+        mem[w:=word(c.src[1])] = value(c)
         if w[0].arg.name == "timeline": log.append(w[0].device)
       elif c in cs: log.append(cs.index(c))
       cmds.pop(0)
@@ -186,6 +187,26 @@ class TestHCQ2Schedule(unittest.TestCase):
       b = self.batch((self.x.to("NULL:1") + 1).contiguous())
     self.assertTrue(all(c.body.op is Ops.PROGRAM for c in calls(b)))
     self.assertEqual(orders(b), {(0, 1)})
+
+  def test_a_graph_syncs_with_the_host(self):
+    tag, table = Tensor.empty(1, dtype=dtypes.uint32).realize(), Tensor.empty(4, dtype=dtypes.uint32).realize()
+    y = (self.x + 1).contiguous()
+    store = UOp.custom_function("store", UOp.const(1, dtypes.uint32)).call(tag.uop, y.uop) # tag = 1 once y is written
+    wait = UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(table.uop.after(store)) # until the host sets table[0]
+    b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
+    store, wait = [c for c in queues(b)[("NULL", "COPY:0")] if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION and c.body.src]
+    for prio in rotations(b):
+      host = defaultdict(int)
+      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0]) # z waits for the host
+      self.assertEqual(host[word(store.src[1])], 1)
+      host[word(wait.src[1])] = 1
+      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0, 1])
+    # a queue stores 1 to the tag, waits for the table's first word to be 1 and flushes
+    q = SimpleNamespace(log=[], signal=lambda d, v: q.log.append(("store", d, v)), wait=lambda d, v: q.log.append(("wait", d, v)),
+                        memory_barrier=lambda: q.log.append(("memory_barrier",)))
+    for c in (store, wait): hcq2.HWQueue.q_rewrite.rewrite(c, ctx=q)
+    one = UOp.const(1, dtypes.uint32)
+    self.assertEqual(q.log, [("store", store.src[1], one), ("wait", wait.src[1], one), ("memory_barrier",)])
 
   def test_a_host_kernel_splits_the_batch(self):
     self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("PYTHON") + 2).contiguous().to("NULL") + 3)), 2)
