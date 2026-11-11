@@ -44,10 +44,10 @@ def host_tensor(dev:str|tuple[str, ...], n:int, dtype:DType) -> tuple[Tensor, li
   return Tensor(UOp.from_buffer(buf, dtype)), views
 
 class Engine:
-  def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None):
+  def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
-    every expert each (its units), in steps of up to tokens (a draft's verify steps: 2)"""
-    self.model, self.m, self.devs, self.draft = model, m, model.token_embd.weight.device, draft
+    every expert each (its units), in steps of up to tokens (a draft's verify steps: 2), keeping their logits or not"""
+    self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
       m["units"][0], m["part_bytes"][0]
@@ -107,13 +107,14 @@ class Engine:
     return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*hidden, dim=2) if hidden else None
 
   def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor, Tensor]:
-    """the greedy token after each of the step's tokens, their logits and (a draft) its guess of the token after that (after the given one
-    where there's one: a prompt's next)"""
+    """the greedy token after each of the step's tokens, their logits (kept, else the tokens) and (a draft) its guess of the token after
+    that (after the given one where there's one: a prompt's next)"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
     toks = guesses = logits.argmax(-1)
     if self.draft is not None:
       given = self.given[:T].to(toks.device)
       guesses = self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)[0].argmax(-1)
+    if not self.keep_logits: logits = toks  # (realized, the logits are a buffer of their own: only for an eval)
     Tensor.realize(toks, logits, guesses)
     return toks, logits, guesses
 
@@ -226,15 +227,16 @@ if __name__ == "__main__":
   # DRAFT=dir: the eagle head, speculative decoding with T=2 verify steps (memory: fewer SLOTS)
   draft = Eagle3(d, lambda t: model.token_embd(t).float(), model.token_embd.weight.device, model.max_context) if (d:=getenv("DRAFT", "")) \
     else None
-  eng = Engine(model, m, tokens=2 if draft else 1, guess=getenv("GUESS", ""), draft=draft)
+  eng = Engine(model, m, tokens=2 if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")))
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
-  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok: production completions teacher forced, each from position 0
-    path, nseq, ntok = (spec.split(":") + ["16", "256"])[:3]
+  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok:first: production completions teacher forced, each from position 0
+    path, *nums = spec.split(":")
+    nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
     stats:list[tuple[float, float]] = []
-    for r in [json.loads(line) for line in open(path)][:int(nseq)]:
-      ids, outs = r["prompt_ids"], r["output_ids"][:int(ntok)]
+    for r in [json.loads(line) for line in open(path)][first:first + nseq]:
+      ids, outs, n0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats)
       for pos, t in enumerate(ids + outs[:-1]):
         if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
         eng.step([t], pos)
@@ -246,7 +248,8 @@ if __name__ == "__main__":
         p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
         rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
         stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
-      print(f"{r['task_id']}: {len(stats)} tokens, top-1 agree {np.mean([x[0] for x in stats]):.1%}, KL {np.mean([x[1] for x in stats]):.4f}")
+      (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
+      print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
       eng.report(c0, len(ids) + len(outs) - 2)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
