@@ -6,7 +6,7 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import ctypes, functools, json, os, sys, time
 import numpy as np
-from tinygrad import Tensor, TinyJit, UOp, dtypes
+from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
 from tinygrad.dtype import DType
 from tinygrad.helpers import getenv, prod
@@ -18,9 +18,21 @@ from extra.k3.host import IoT, host_c, store, wait, reads
 from extra.k3.draft import Eagle3
 
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
-# routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: the next layer's experts guessed a layer, SLOTS: on a gpu
+# routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: the next layer's experts guessed a layer. SLOTS: on a gpu
+# (default: what's free but SPARE bytes)
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
-SLOTS = getenv("SLOTS", 4000)
+SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
+
+def free_bytes(dev:str, chunk:int=256 << 20) -> int:
+  """the memory dev can still allocate: chunks of it allocated till one fails, then freed"""
+  bufs:list[Buffer] = []
+  try:
+    while True: bufs.append(Buffer(dev, chunk).allocate())
+  except MemoryError: pass
+  n = len(bufs)
+  bufs.clear()
+  Device[dev].allocator.free_cache()
+  return n * chunk
 
 def host_tensor(dev:str|tuple[str, ...], n:int, dtype:DType) -> tuple[Tensor, list[np.ndarray]]:
   """n zeroed words in uncached host memory of the device (or each of the devices: they read and write it over pcie), numpy views of each"""
@@ -35,15 +47,12 @@ class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of up to tokens (a draft's verify steps: 2)"""
-    self.model, self.m, self.devs, self.slots, self.draft = model, m, model.token_embd.weight.device, slots, draft
+    self.model, self.m, self.devs, self.draft = model, m, model.token_embd.weight.device, draft
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
       m["units"][0], m["part_bytes"][0]
     assert len(set(m["part_bytes"])) == 1 and len(set(m["units"])) == 1 and len(m["units"]) == G, "a part of every expert on each gpu"
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
-    # each gpu's pool in the experts' words (a bitcast of it is a copy)
-    self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
-    self.pool = Tensor.zeros(G * slots * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: a token's first k1 experts, then the rest (j*T + t: token t's j-th)
     self.ks = (K // 2, K - K // 2)
@@ -61,6 +70,10 @@ class Engine:
     for li, b in enumerate(blocks):
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
+    # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free
+    self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
+    self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
+    self.pool = Tensor.zeros(G * slots * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -203,7 +216,9 @@ if __name__ == "__main__":
   from tinygrad.llm.cli import SimpleTokenizer, chat_template
   from tinygrad.llm.serve import LLMServer
   from extra.k3.store import open_store
+  # DEADLINE=s: the run stops between steps once it's s seconds in (killed mid-step, the gpus are left waiting on the host)
   st = time.perf_counter()
+  def late() -> bool: return time.perf_counter() - st > getenv("DEADLINE", 540)
   model, kv = Transformer.from_gguf(sys.argv[1], max_context=getenv("CTX", 4096), shard=getenv("SHARD", 4))
   tok = SimpleTokenizer.from_gguf_kv(kv)
   print(f"model in {time.perf_counter() - st:.0f} s", flush=True)
@@ -214,13 +229,14 @@ if __name__ == "__main__":
   eng = Engine(model, m, tokens=2 if draft else 1, guess=getenv("GUESS", ""), draft=draft)
   eng.drives(disks)
   eng.warm()
-  print(f"warm in {time.perf_counter() - st:.0f} s", flush=True)
+  print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
   if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok: production completions teacher forced, each from position 0
     path, nseq, ntok = (spec.split(":") + ["16", "256"])[:3]
     stats:list[tuple[float, float]] = []
     for r in [json.loads(line) for line in open(path)][:int(nseq)]:
       ids, outs = r["prompt_ids"], r["output_ids"][:int(ntok)]
       for pos, t in enumerate(ids + outs[:-1]):
+        if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
         eng.step([t], pos)
         if pos == 1: c0 = eng.counters()
         if pos < len(ids) - 1: continue
@@ -243,7 +259,7 @@ if __name__ == "__main__":
       print(f"prompt of {len(ids)} tokens: {len(ids) / (time.perf_counter() - t0):.2f} tok/s", flush=True)
       c0 = eng.counters()
     out.append(t)
-    if len(out) == getenv("N", 32) or tok.is_end(t): break
+    if len(out) == getenv("N", 32) or tok.is_end(t) or late(): break
   print(repr(tok.decode(out)), out, flush=True)
   if draft: print(f"{eng.verified[1] / eng.verified[0]:.1%} of {eng.verified[0]:.0f} guesses right")
   eng.report(c0, len(out) - 1)
