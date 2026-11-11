@@ -52,6 +52,7 @@ class Engine:
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
       m["units"][0], m["part_bytes"][0]
     assert len(set(m["part_bytes"])) == 1 and len(set(m["units"])) == 1 and len(m["units"]) == G, "a part of every expert on each gpu"
+    assert E <= 4096 and K <= 64 and tokens <= 8 and tokens * K <= 512 and 32 * tokens <= 1024, "past the host's fixed arrays"
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: a token's first k1 experts, then the rest (j*T + t: token t's j-th)
@@ -168,6 +169,7 @@ class Engine:
     t1 = time.perf_counter()
     if (err:=host_c().step_io(ctypes.byref(io))):  # (the gpus run the graph out: one killed waiting on a layer wedges)
       host_c().flags(ctypes.byref(io), 1)
+      out.tolist()
       raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left"}[err])
     t2 = time.perf_counter()
     ret = out.tolist(), guesses.tolist()

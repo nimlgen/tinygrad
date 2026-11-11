@@ -2,10 +2,11 @@
 # stores its router scores and its tag (store), the host routes on them, reads the missing experts straight from the drives into the
 # gpus' slot pools and gives the gpus the slots and weights in two parts (a wait on each): the first those cached, the gpus work on it
 # while the rest are read. the reads go on two host-owned queues of each drive (demand, guesses) the c fills, rings and reaps itself
-import ctypes, functools, hashlib, os, subprocess, tempfile
+import ctypes, functools, hashlib, os, subprocess
 from typing import cast
 import numpy as np
 from tinygrad import Device, dtypes
+from tinygrad.helpers import cache_dir
 from tinygrad.device import Buffer
 from tinygrad.uop.ops import UOp
 from tinygrad.runtime.ops_nvme import NVMEDevice, NVMEAllocator
@@ -64,7 +65,8 @@ static void submit(io_t *s, int64_t n, const int64_t *codes, const int64_t *slot
     int64_t q = s->drive[r] + queue * s->nd, cid = s->cids[q], *own = s->owner + q * NCID, page = slots[i] * s->part_pages[s->gpu[r]] + s->inpart[r];
     int64_t pages = (s->nbytes[r] + 0xfff) >> 12;
     const uint64_t *prp = (const uint64_t *)s->prp[s->gpu[r]];
-    while (s->inflight[q] == s->entries - 1) if (reap(s) < 0) return; else ring(s);  // (a failed read: the next reap says so)
+    for (double t0 = now(); s->inflight[q] == s->entries - 1; ring(s))  // (a failed read or a stuck drive: the layer's wait says so)
+      if (reap(s) < 0 || now() - t0 > 60) return;
     while (own[cid] != -2) cid = (cid + 1) % NCID;
     s->cids[q] = (cid + 1) % NCID;
     sqe_t *e = (sqe_t *)s->sq[q] + s->tails[q];
@@ -337,10 +339,12 @@ int64_t step_io(io_t *s) {
 
 @functools.cache
 def host_c() -> ctypes.CDLL:
-  so = os.path.join(tempfile.gettempdir(), f"k3_host_{hashlib.md5(HOST_C.encode()).hexdigest()}.so")
+  so = os.path.join(cache_dir, f"k3_host_{hashlib.md5(HOST_C.encode()).hexdigest()}.so")  # (the user's, not a shared tmp)
   if not os.path.exists(so):  # (the sigmoids in vector expfs: libmvec)
-    subprocess.run(["clang", "-O2", "-march=native", "-fno-math-errno", "-fveclib=libmvec", "-shared", "-fPIC", "-x", "c", "-", "-o", so, "-lmvec"],
-                   input=HOST_C.encode(), check=True)
+    os.makedirs(cache_dir, exist_ok=True)
+    subprocess.run(["clang", "-O2", "-march=native", "-fno-math-errno", "-fveclib=libmvec", "-shared", "-fPIC", "-x", "c", "-", "-o",
+                    tmp:=f"{so}.{os.getpid()}", "-lmvec"], input=HOST_C.encode(), check=True)
+    os.replace(tmp, so)
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
   lib.read_codes.restype, lib.read_codes.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
