@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna)
-from tinygrad.llm.kernels.amd_gguf import q8_quantize, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S
+from tinygrad.llm.kernels.amd_gguf import q8_quantize, expert_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
@@ -452,5 +452,38 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     values = np.concatenate([old_kv[1, 0, 0], new_kv[1, 0, 0]]).astype(np.float16).astype(np.float32)
     expected = np.stack([values[:start_pos+i+1].mean(0) for i in range(32)])[None, None].repeat(8, axis=1)
     np.testing.assert_allclose(out.numpy(), expected, rtol=2e-3, atol=2e-3)
+
+class TestExpertLinear(unittest.TestCase):
+  # a pool of slots, each an expert's gate and up rows then its down rows (lat -> 2*units -> lat)
+  LAT, UNITS, NSLOTS = 3584, 512, 20
+  ROW_UP, ROW_DOWN = LAT // 256 * QUANT_SIZES[IQ3_XXS], UNITS // 256 * QUANT_SIZES[IQ3_XXS]
+  PART = 2 * UNITS * ROW_UP + LAT * ROW_DOWN
+
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    self.rng = np.random.default_rng(0)
+    self.raw = self.rng.integers(0, 256, self.NSLOTS * self.PART, dtype=np.uint8)
+    self.raw.reshape(-1, QUANT_SIZES[IQ3_XXS])[:, :2] = np.array([0.01], np.float16).view(np.uint8)  # sane block scales
+    self.pool = Tensor(self.raw).realize()
+    self.sel = [5, 0, 19, 7, 3, 11, 2, 18, 9, 1, 14, 6, 17, 4, 12, 8]
+    self.slots = Tensor(np.array(self.sel, np.int32)).realize()
+
+  def weight(self, slot:int, off:int, rows:int, cols:int) -> np.ndarray:
+    blob = Tensor(self.raw[slot * self.PART + off:slot * self.PART + off + rows * cols // 256 * QUANT_SIZES[IQ3_XXS]])
+    return ggml_data_to_tensor(blob, rows * cols, IQ3_XXS).reshape(rows, cols).numpy()
+
+  def test_gate_up_shared_input(self):
+    x = self.rng.standard_normal((1, self.LAT)).astype(np.float32)
+    out = expert_linear(self.pool, self.slots, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
+    for k, s in enumerate(self.sel):
+      ref = self.weight(s, 0, 2 * self.UNITS, self.LAT) @ x[0]
+      np.testing.assert_allclose(out[k], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
+  def test_down_per_expert_input(self):
+    h, off = self.rng.standard_normal((len(self.sel), self.UNITS)).astype(np.float32), 2 * self.UNITS * self.ROW_UP
+    out = expert_linear(self.pool, self.slots, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+    for k, s in enumerate(self.sel):
+      ref = self.weight(s, off, self.LAT, self.UNITS) @ h[k]
+      np.testing.assert_allclose(out[k], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
 if __name__ == "__main__": unittest.main()

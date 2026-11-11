@@ -277,6 +277,27 @@ def moe_linear(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer.packed, xq, xd, xs, sel.cast(dtypes.int32).flatten(), *extra, fxn=fxn)[0].sum(-1)
   return result.reshape(ndev, B, T, slots, global_out) if ndev > 1 else result.reshape(B, T, slots, global_out)
 
+@functools.cache
+def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *grids:UOp,
+                          out_features:int, in_features:int, ggml_type:int, stride:int, offset:int, cdna:bool=False) -> UOp:
+  # out row k reads the weight rows at slots[k]*stride + offset words (64 bit: a pool can pass 2**31 words) and the activation row k % rows
+  def gate(row:UOp, base:UOp) -> UOp: return base.cast(dtypes.int64) + slots[row].cast(dtypes.int64)*stride + offset
+  def xtoken(row:UOp) -> UOp: return row % xq.shape[0]
+  return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken, "expert_")
+
+def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0) -> Tensor:
+  """out[k] = W[slots[k]] @ x[k % rows]: the quantized experts in the slots of a pool of raw gguf blocks, a slot every stride bytes, W at offset
+  bytes in it. x: (rows, in_features), out: (len(slots), out_features)"""
+  word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
+  assert stride % word.itemsize == 0 and offset % word.itemsize == 0, f"{QUANT_NAMES[ggml_type]} slots must be {word.itemsize} byte aligned"
+  rows = int(x.numel()) // in_features
+  out = Tensor.empty(slots.shape[0], out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device)
+  fxn = functools.partial(_expert_decode_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                          stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device))
+  extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
+  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), rows, in_features), slots.cast(dtypes.int32), *extra)
+  return Tensor.custom_kernel(out, *srcs, fxn=fxn)[0].sum(-1)
+
 # kgroups: groups of 16 lanes that split k in a 16x16x16 fragment, RDNA3 copies a and b in both halves
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
   return tuple(range(4)) if kgroups == 1 else tuple(lane_group + kgroups*j for j in range(4//kgroups))
