@@ -4,7 +4,7 @@
 # routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, os, sys, time
+import ctypes, functools, json, os, sys, time
 import numpy as np
 from tinygrad import Tensor, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
@@ -89,7 +89,10 @@ class Engine:
     for b in m.blk: x, mask = b(x, (pos,), mask)
     return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float()
 
-  def run(self, T:int, pos:UOp) -> Tensor: return self.forward(self.tok[:T].reshape(1, T), pos).argmax(-1).realize()
+  def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
+    logits = self.forward(self.tok[:T].reshape(1, T), pos)
+    Tensor.realize(toks:=logits.argmax(-1), logits)
+    return toks, logits
 
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
@@ -126,14 +129,15 @@ class Engine:
     """every step's graph captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
-      for _ in range(3): jit(self.v_pos.bind(0)).tolist()
+      for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
 
   def step(self, toks:list[int], pos:int) -> list[int]:
-    """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each"""
+    """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each
+    (their logits kept)"""
     io, T, t0 = self.io, len(toks), time.perf_counter()
     io.tokens, io.victims_n, self.tok_np[:T] = T, 32 * T, toks
     host_c().flags(ctypes.byref(io), 0)
-    out = self.jits[T](self.v_pos.bind(pos))
+    out, self.logits = self.jits[T](self.v_pos.bind(pos))
     t1 = time.perf_counter()
     if (err:=host_c().step_io(ctypes.byref(io))):  # (the gpus run the graph out: one killed waiting on a layer wedges)
       host_c().flags(ctypes.byref(io), 1)
@@ -168,6 +172,24 @@ if __name__ == "__main__":
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s", flush=True)
+  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok: production completions teacher forced, each from position 0
+    path, nseq, ntok = (spec.split(":") + ["16", "256"])[:3]
+    stats:list[tuple[float, float]] = []
+    for r in [json.loads(line) for line in open(path)][:int(nseq)]:
+      ids, outs = r["prompt_ids"], r["output_ids"][:int(ntok)]
+      for pos, t in enumerate(ids + outs[:-1]):
+        eng.step([t], pos)
+        if pos == 1: c0 = eng.counters()
+        if pos < len(ids) - 1: continue
+        # output token j's: top-1 agreement with production and KL(production's top 5 and the rest || ours)
+        lg = eng.logits.numpy()[0].astype(np.float64)
+        lp, top = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum()), r["output_top"][pos - len(ids) + 1]
+        p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
+        rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
+        stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
+      print(f"{r['task_id']}: {len(stats)} tokens, top-1 agree {np.mean([x[0] for x in stats]):.1%}, KL {np.mean([x[1] for x in stats]):.4f}")
+      eng.report(c0, len(ids) + len(outs) - 2)
+    sys.exit(0)
   ids = tok.encode(sys.argv[2] if len(sys.argv) > 2 else "The capital of France is")
   if tok.bos_id is not None and ids[:1] != [tok.bos_id]: ids = [tok.bos_id] + ids
   t0 = time.perf_counter()
