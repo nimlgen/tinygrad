@@ -3,8 +3,13 @@
 # gpus' slot pools and gives the gpus the slots and weights in two parts (a wait on each): the first those cached, the gpus work on it
 # while the rest are read. the reads go on two host-owned queues of each drive (demand, guesses) the c fills, rings and reaps itself
 import ctypes, functools, hashlib, os, subprocess, tempfile
-from tinygrad import dtypes
+from typing import cast
+import numpy as np
+from tinygrad import Device, dtypes
+from tinygrad.device import Buffer
 from tinygrad.uop.ops import UOp
+from tinygrad.runtime.ops_nvme import NVMEDevice, NVMEAllocator
+from extra.k3.store import STRIPE, pieces, part_off
 
 # the graph's side: store sets tag after deps are written, wait holds a queue till the host sets the first word of buf ([ready | ...])
 def store(tag:UOp, *deps:UOp) -> UOp: return UOp.custom_function("store", UOp.const(1, dtypes.uint32)).call(tag, *deps)
@@ -294,6 +299,20 @@ static int64_t layer(io_t *s, int64_t li) {
   return 0;
 }
 
+// n codes read into slots on the demand queues, waited for. 0, -1 a read failed, -2 a timeout
+int64_t read_codes(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots) {
+  double t0 = now();
+  submit(s, n, codes, slots, 0, 0);
+  for (int64_t busy = 1; busy;) {
+    if (reap(s) < 0) return -1;
+    ring(s);
+    busy = 0;
+    for (int64_t q = 0; q < s->nd; q++) busy |= s->inflight[q] != 0;
+    if (now() - t0 > 60) return stuck(s, "reads", 0, t0);
+  }
+  return 0;
+}
+
 // every layer's ready words set to value, with 0 the tags cleared too (before a step's graph runs)
 void flags(io_t *s, uint32_t value) {
   for (int64_t li = 0; li < s->layers; li++) for (int64_t g = 0; g < s->ngpu; g++) {
@@ -324,6 +343,33 @@ def host_c() -> ctypes.CDLL:
                    input=HOST_C.encode(), check=True)
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
+  lib.read_codes.restype, lib.read_codes.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib
 
+def reads(m:dict, disks:list[list[str]], pools:list[Buffer], ncodes:int) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+  """step_io's reads of every expert code (layer * E + expert) into the gpus' pools (a part a slot): two new host-owned queues on every
+  drive of the disks (queue j of drive k at j * nd + k: the demand's, then the guesses'), the drive commands of each code (a piece of a
+  stripe each, in code order) and the prp table of each pool, the one master maps it with on its disk's first drive (the drives share an
+  address space). the tables and the io_t scalars"""
+  nvs = [cast(NVMEDevice, Device[d]) for disk in disks for d in disk]
+  qs, (nd, shift) = [nv.nvme.new_queue() for _ in range(2) for nv in nvs], (len(nvs), nvs[0].nvme.lba_shift)
+  assert all(nv.nvme.lba_shift == shift and nv.nvme.max_xfer >= STRIPE for nv in nvs), "the drives read a stripe a command, of one block size"
+  rows, ptr = [], [0]
+  for code in range(ncodes):
+    for g, (disk, size) in enumerate(zip(disks, m["part_bytes"])):
+      done = 0
+      for d, o, n in pieces(part_off(m, g, code), size, len(disk)):
+        rows.append((g * len(disk) + d, g, o >> shift, n, done >> 12))
+        done += n
+    ptr.append(len(rows))
+  drive, gpu, lba, nbytes, inpart = (np.array(c, np.int64) for c in zip(*rows))
+  prps = [cast(NVMEAllocator, Device[disk[0]].allocator).prp_tables[pool.get_buf(disk[0])].get_storage().host for disk, pool in zip(disks, pools)]
+  def addrs(xs) -> np.ndarray: return np.array([x.addr for x in xs], np.uint64)
+  tables:dict[str, np.ndarray] = {
+    "ptr": np.array(ptr, np.int64), "drive": drive.astype(np.int32), "gpu": gpu.astype(np.int32), "lba": lba, "nbytes": nbytes, "inpart": inpart,
+    "part_pages": np.array(m["part_bytes"], np.int64) >> 12, "prp": addrs(prps), "sq": addrs(q.sq for q in qs), "cq": addrs(q.cq for q in qs),
+    "db": np.array([q.dev.regs.addr + q.sq_db for q in qs], np.uint64), "cq_db": np.array([q.dev.regs.addr + q.cq_db for q in qs], np.uint64),
+    **{k: np.zeros(2 * nd, np.int64) for k in ("tails", "db_tails", "heads", "inflight", "cids")}, "phases": np.ones(2 * nd, np.int64),
+    "owner": np.full(2 * nd * 65536, -2, np.int64)}
+  return tables, {"nd": nd, "entries": qs[0].entries, "shift": shift}
