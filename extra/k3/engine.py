@@ -9,7 +9,7 @@ import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
 from tinygrad.dtype import DType
-from tinygrad.helpers import getenv, prod
+from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
@@ -162,6 +162,7 @@ class Engine:
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
     """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each
     and the draft's guess after that (their logits kept)"""
+    assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
     io.tokens, io.victims_n, self.tok_np[:T], self.given_np[:T] = T, 32 * T, toks, ((given or []) + [-1] * T)[:T]
     host_c().flags(ctypes.byref(io), 0)
