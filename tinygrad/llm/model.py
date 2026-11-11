@@ -283,7 +283,7 @@ class FFNBlock:
 
   def _routed(self, x:Tensor, h:Tensor) -> Tensor:
     """the routed experts of the tokens x on their expert inputs h (B, T, D): their weighted sum (B, T, D)"""
-    if self.config.streamed_experts: return h.zeros_like()
+    assert not self.config.streamed_experts, "the gguf has no routed experts: an engine streams them in (in place of _routed)"
     h = h.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
     logits = self.ffn_gate_inp(x)
     bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None

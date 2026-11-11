@@ -62,7 +62,7 @@ class TestMLA(unittest.TestCase):
       model = Transformer.from_gguf(path)[0]
     self.assertTrue(model.config.streamed_experts)
     self.assertFalse(any('_exps.' in name for name in nn.state.get_state_dict(model)))
-    self.assertEqual(model.blk[1]._feed_forward(Tensor.empty(1, 3, 16)).shape, (1, 3, 16))
+    with self.assertRaises(AssertionError): model.blk[1]._feed_forward(Tensor.empty(1, 3, 16))  # (an engine streams them in)
 
 if __name__ == '__main__':
   unittest.main()
