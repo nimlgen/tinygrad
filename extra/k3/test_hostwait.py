@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-# DEV=AMD python3 extra/k3/test_hostwait.py: a graph tells the host a result is ready (store) and waits for the host (wait)
+# DEV=AMD PYTHONPATH=. python3 extra/k3/test_hostwait.py: a graph tells the host a result is ready (store) and waits for the host (wait)
 import threading, time, unittest
 import numpy as np
 from tinygrad import Tensor, TinyJit, Device, dtypes
 from tinygrad.device import Buffer, BufferSpec
 from tinygrad.uop.ops import UOp
-
-def store(tag:UOp, *deps:UOp) -> UOp: return UOp.custom_function("store", UOp.const(1, dtypes.uint32)).call(tag, *deps)
-def wait(buf:UOp) -> UOp: return UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(buf)
+from extra.k3.host import store, wait
 
 def host_buffer(n:int) -> tuple[Tensor, np.ndarray]:
   buf = Buffer(Device.DEFAULT, 4 * n, options=BufferSpec(host=True, uncached=True, cpu_access=True)).ensure_allocated()
