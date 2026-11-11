@@ -3,7 +3,7 @@ import numpy as np
 from tinygrad import Tensor, dtypes, nn, UOp, TinyJit
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, MLATransformerBlock, Indexer, IndexerConfig,
-  HyperConnection, HCConfig, AttentionResidual, GatedResidual, PLELayer, PLEConfig,
+  HyperConnection, HCConfig, AttentionResidual, GatedResidual, PLELayer, PLEConfig, Transformer,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, short_conv,
 )
 from tinygrad.llm.gguf import GGUFPackedTable
@@ -416,6 +416,25 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
         np.testing.assert_allclose(np.concatenate(outs, axis=1), decode, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
         np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
         np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
+
+  def test_short_step_rollback(self):
+    # a verify step of [next, wrong guess] then rollback(1) leaves the states as if only next was stepped
+    for kda in (False, True):
+      ssm = SSMConfig(conv_kernel=3, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=kda, silu_gate=not kda)
+      config = self._make_config(ssm=ssm, max_context=8)
+      model = Transformer(config)
+      for p in nn.state.get_parameters(model.blk[0]):
+        p.replace(self._tensor_linspace(-0.05, 0.05, p.shape) if len(p.shape) > 1 else self._tensor_linspace(0.05, 0.1, p.shape))
+      x, guess = self._tensor_linspace(-0.5, 0.5, (1, 3, config.dim)), self._tensor_linspace(0.9, -0.2, (1, 1, config.dim))
+      expected = [self._run_attention(model.blk[0], x[:, i:i+1], i) for i in range(3)]
+      expected_states = [s.numpy() for s in model.blk[0]._states()]
+      self._run_attention(model.blk[0], x[:, :1], 0)
+      verify = self._run_attention(model.blk[0], x[:, 1:2].cat(guess, dim=1), 1)
+      model.rollback(1)
+      last = self._run_attention(model.blk[0], x[:, 2:3], 2)
+      np.testing.assert_allclose(verify[:, :1], expected[1], rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")
+      np.testing.assert_allclose(last, expected[2], rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")
+      for s, e in zip(model.blk[0]._states(), expected_states): np.testing.assert_allclose(s.numpy(), e, rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")
 
   def test_start_zero_resets_realized_state(self):
     config = self._make_config(max_context=3)

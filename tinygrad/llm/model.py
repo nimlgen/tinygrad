@@ -593,6 +593,11 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+    self.kept:list[list[Tensor]] = []
+
+  # a short step (as a speculative decoding verify) keeps the states after each of its tokens but the last, for Transformer.rollback
+  def _kept(self, T:int|UOp) -> int: return T-1 if isinstance(T, int) and T <= 4 else 0
+  def _states(self) -> list[Tensor]: return [*(self.conv_states if unwrap(self.config.ssm).kda else [self.conv_state]), self.recurrent_state]
 
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
     B, T, _ = x.shape
@@ -618,8 +623,12 @@ class GatedDeltaNetBlock(FFNBlock):
     # qkv conv, conv_state is reset when starting from position 0
     projs = (self.attn_q, self.attn_k, self.attn_v) if is_kda else (self.attn_qkv,)
     convs = (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v) if is_kda else (self.ssm_conv1d,)
-    states = self.conv_states if is_kda else [self.conv_state]
-    conv_outs, conv_state_stores = zip(*(short_conv(s, proj(x), w["weight"].flatten(1), initial) for s, proj, w in zip(states, projs, convs)))
+    states, kept = self._states()[:-1], self.kept[:self._kept(T)]
+    conv_ins = [proj(x) for proj in projs]
+    conv_outs, conv_state_stores = zip(*(short_conv(s, p, w["weight"].flatten(1), initial) for s, p, w in zip(states, conv_ins, convs)))
+    # the kept conv states: the rows of [conv_state | x rows] after each token
+    kept_stores = [ks.uop.store(initial.where(0, s).cat(p.cast(s.dtype), dim=1)[:, t+1:t+1+s.shape[1]].uop)
+                   for t, kt in enumerate(kept) for ks, s, p in zip(kt, states, conv_ins)]
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     if symbolic:
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
@@ -635,7 +644,7 @@ class GatedDeltaNetBlock(FFNBlock):
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device) and not kept:
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
       state = Tensor(self.recurrent_state.uop.after(*conv_state_stores))  # carry the conv write into this graph
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos)).transpose(1, 2)
@@ -649,11 +658,12 @@ class GatedDeltaNetBlock(FFNBlock):
         delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
         state = s1 + delta * k[:, :, t]
         outs.append((state * q[:, :, t]).sum(-1))
+        if t < len(kept): kept_stores.append(kept[t][-1].uop.store(state.cast(kept[t][-1].dtype).uop))
 
       # store the updated recurrent state in place, then read the stacked outputs after the state and conv writes
       state_store = self.recurrent_state.uop.after(self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop))
       conv_writes = [c.uop.after(st) for c, st in zip(states, conv_state_stores)]
-      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store, *conv_writes))
+      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store, *conv_writes, *kept_stores))
 
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.silu() if unwrap(self.config.ssm).silu_gate else out_gate.sigmoid())).cast(x.dtype).contiguous()
@@ -667,6 +677,7 @@ class GatedDeltaNetBlock(FFNBlock):
       else: self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device,
                                           axis=1 if kda else None).clone()
+    while len(self.kept) < self._kept(x.shape[1]): self.kept.append([s.empty_like() for s in self._states()])
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -707,6 +718,10 @@ class Transformer:
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+
+  def rollback(self, n:int):
+    """after a short step, the recurrent states go back to after its first n tokens (attention caches are rewritten from start_pos)"""
+    Tensor.realize(*[s.assign(k) for b in self.blk if isinstance(b, GatedDeltaNetBlock) for s, k in zip(b._states(), b.kept[n-1])])
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
