@@ -102,14 +102,15 @@ class TestEngine(unittest.TestCase):
     np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
-  def test_steps(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
+  def test_generate(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
     self.eng.warm()
-    tok = 3
-    for pos in range(6):
-      ours, want = self.eng.step([tok], pos)[0][0], int(self.want(tok, pos).argmax())
-      self.assertEqual(ours, want, f"position {pos}")
-      tok = want
-    self.assertEqual((self.eng.io.refs, self.eng.io.misses, self.eng.io.hits), (6 * 2 * K, 0, 6 * 2 * K))
+    want, tok = [], 3
+    for pos in range(6): want.append(tok:=int(self.want(tok, pos).argmax()))
+    tokens = [3]
+    self.assertEqual([t for _, t in zip(range(3), self.eng.generate(tokens))], want[:3])
+    self.assertEqual(self.eng.get_start_pos(tokens + [want[3]]), 3)  # (a prompt that extends the tokens fed: only the rest)
+    self.assertEqual([t for _, t in zip(range(2), self.eng.generate(tokens + [want[3]]))], want[4:])
+    self.assertEqual((self.eng.io.refs, self.eng.io.misses), (self.eng.io.hits, 0))
 
 if __name__ == "__main__":
   unittest.main()

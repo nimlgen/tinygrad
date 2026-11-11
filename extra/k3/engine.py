@@ -157,12 +157,20 @@ class Engine:
     self.times += (t1 - t0, time.perf_counter() - t2)
     return ret
 
-  def generate(self, tokens:list[int]):
-    """the greedy tokens after tokens, appended as they come: fed from position 0 a token a step, then a token a step or (a draft) a verify
-    step of [the next, the draft's guess after it]: both kept when the guess is right, else the recurrent states rolled back to after the next"""
-    for pos in range(len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+  # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed feeds the rest
+
+  @property
+  def max_context(self) -> int: return self.model.max_context
+  def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
+
+  def generate(self, tokens:list[int], temperature:float=0.0):
+    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos a token a step, then a token a step or
+    (a draft) a verify step of [the next, the draft's guess after it]: both kept when the guess is right, else the recurrent states rolled back
+    to after the next"""
+    for pos in range(self.get_start_pos(tokens), len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     while True:
       tokens.append(t)
+      self.model._cached_tokens = tokens[:-1]
       yield t
       if self.draft is None:
         (t,), (g,) = self.step([t], len(tokens) - 1)
@@ -171,6 +179,7 @@ class Engine:
       self.verified += (1, toks[0] == g)
       if toks[0] == g:
         tokens.append(g)
+        self.model._cached_tokens = tokens[:]
         yield g
         t, g = toks[1], guesses[1]
       else:
@@ -191,7 +200,8 @@ class Engine:
                                                                            "after the reads", "launching", "after the last layer"), ms)), flush=True)
 
 if __name__ == "__main__":
-  from tinygrad.llm.cli import SimpleTokenizer
+  from tinygrad.llm.cli import SimpleTokenizer, chat_template
+  from tinygrad.llm.serve import LLMServer
   from extra.k3.store import open_store
   st = time.perf_counter()
   model, kv = Transformer.from_gguf(sys.argv[1], max_context=getenv("CTX", 4096), shard=getenv("SHARD", 4))
@@ -223,6 +233,8 @@ if __name__ == "__main__":
       print(f"{r['task_id']}: {len(stats)} tokens, top-1 agree {np.mean([x[0] for x in stats]):.1%}, KL {np.mean([x[1] for x in stats]):.4f}")
       eng.report(c0, len(ids) + len(outs) - 2)
     sys.exit(0)
+  # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
+  if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()
   ids = tok.encode(sys.argv[2] if len(sys.argv) > 2 else "The capital of France is")
   if tok.bos_id is not None and ids[:1] != [tok.bos_id]: ids = [tok.bos_id] + ids
   t0, out = time.perf_counter(), []
