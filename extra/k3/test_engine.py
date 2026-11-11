@@ -61,13 +61,13 @@ class TestEngine(unittest.TestCase):
     # every expert in its slot, a code (layer * E + expert) a slot
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    self.eng = eng = Engine(model, m, slots=len(layers) * E)
+    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2)
     pools = [b''.join(parts(weights, li, e, part)[g] for li in layers for e in range(E)) for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
     eng.state["slot_of"][:] = eng.state["expert_in"][:] = np.arange(len(layers) * E)
 
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
-    return Engine.forward(SimpleNamespace(model=self.ref), Tensor([[tok]], dtype=dtypes.int32), pos).numpy()[0]
+    return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
   def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts
     eng = self.eng
@@ -87,20 +87,29 @@ class TestEngine(unittest.TestCase):
     self.stub()
     tok = 3
     for pos in range(6):
-      ours, want = self.eng.forward(Tensor([[tok]], dtype=dtypes.int32), pos).numpy()[0], self.want(tok, pos)
+      ours, want = self.eng.forward(Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0], self.want(tok, pos)
       np.testing.assert_allclose(ours, want, rtol=1e-2, atol=1e-2 * np.abs(want).max(), err_msg=f"position {pos}")
       self.assertEqual(ours.argmax(), want.argmax())
       tok = int(want.argmax())
+
+  def test_verify(self):  # a step of [the next, a wrong guess], rollback(1): the step after as after the next alone
+    self.stub()
+    def logits(toks:list[int], pos:int) -> np.ndarray: return self.eng.forward(Tensor([toks], dtype=dtypes.int32), pos)[0].numpy()
+    want = [logits([t], pos)[0] for pos, t in enumerate([3, 5, 7])]
+    logits([3], 0)
+    np.testing.assert_allclose(logits([5, 1], 1)[0], want[1], rtol=1e-4, atol=1e-4)
+    self.eng.model.rollback(1)
+    np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_steps(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
     self.eng.warm()
     tok = 3
     for pos in range(6):
-      ours, want = self.eng.step([tok], pos)[0], int(self.want(tok, pos).argmax())
+      ours, want = self.eng.step([tok], pos)[0][0], int(self.want(tok, pos).argmax())
       self.assertEqual(ours, want, f"position {pos}")
       tok = want
-    self.assertEqual((self.eng.io.refs, self.eng.io.misses), (self.eng.io.hits, 0))
+    self.assertEqual((self.eng.io.refs, self.eng.io.misses, self.eng.io.hits), (6 * 2 * K, 0, 6 * 2 * K))
 
 if __name__ == "__main__":
   unittest.main()
