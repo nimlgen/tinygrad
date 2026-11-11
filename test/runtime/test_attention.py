@@ -430,9 +430,11 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       expected_states = [s.numpy() for s in model.blk[0]._states()]
       self._run_attention(model.blk[0], x[:, :2], 0)  # (not opted in: a short step keeps nothing)
       self.assertEqual(model.blk[0].kept, [])
+      with self.assertRaises(AssertionError): model.rollback(1)
       model.blk[0].keep = 1
       self._run_attention(model.blk[0], x[:, :1], 0)
       verify = self._run_attention(model.blk[0], x[:, 1:2].cat(guess, dim=1), 1)
+      with self.assertRaises(AssertionError): model.rollback(0)
       model.rollback(1)
       last = self._run_attention(model.blk[0], x[:, 2:3], 2)
       np.testing.assert_allclose(verify[:, :1], expected[1], rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")

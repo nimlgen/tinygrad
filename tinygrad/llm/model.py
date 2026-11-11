@@ -722,7 +722,9 @@ class Transformer:
 
   def rollback(self, n:int):
     """after a short step, the recurrent states go back to after its first n tokens (attention caches are rewritten from start_pos)"""
-    Tensor.realize(*[s.assign(k) for b in self.blk if isinstance(b, GatedDeltaNetBlock) for s, k in zip(b._states(), b.kept[n-1])])
+    blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+    assert all(1 <= n <= len(b.kept) for b in blocks), f"rollback({n}) after a step that kept {[len(b.kept) for b in blocks]}"
+    Tensor.realize(*[s.assign(k) for b in blocks for s, k in zip(b._states(), b.kept[n-1])])
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
