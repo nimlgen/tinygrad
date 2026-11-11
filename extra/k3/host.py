@@ -11,9 +11,10 @@ from tinygrad.uop.ops import UOp
 from tinygrad.runtime.ops_nvme import NVMEDevice, NVMEAllocator
 from extra.k3.store import STRIPE, pieces, part_off
 
-# the graph's side: store sets tag after deps are written, wait holds a queue till the host sets the first word of buf ([ready | ...])
+# the graph's side: store sets tag after deps are written, wait holds a queue till the host sets the first word of buf ([ready | ...]), after
+# deps are written
 def store(tag:UOp, *deps:UOp) -> UOp: return UOp.custom_function("store", UOp.const(1, dtypes.uint32)).call(tag, *deps)
-def wait(buf:UOp) -> UOp: return UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(buf)
+def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(buf, *deps)
 
 # io_t: the host's state, the drives' queues and command tables, the counts (IO: name, c type, a pointer is an address). bufs: every layer's
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each

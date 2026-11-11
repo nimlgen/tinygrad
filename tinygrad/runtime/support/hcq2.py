@@ -380,7 +380,7 @@ class HWQueue:
      lambda ctx, dst, src: ctx.copy(dst, src, src.max_numel() * src.dtype.itemsize)),
     (UPat(Ops.CALL, src=(UPat.custom_function("encdec", name="s"),), name="c", allow_any_len=True), lambda ctx, c, s: ctx.encdec(c, s)),
     # the graph's host syncs: their value is in the function's src, an ins's is an arg
-    (UPat(Ops.CALL, src=(UPat.custom_function("wait", src=(UPat(name="val"),)), UPat(name="dst"))),
+    (UPat(Ops.CALL, src=(UPat.custom_function("wait", src=(UPat(name="val"),)), UPat(name="dst")), allow_any_len=True),
      lambda ctx, dst, val: (ctx.wait(dst, val), ctx.memory_barrier())),
     (UPat(Ops.CALL, src=(UPat.custom_function("store", src=(UPat(name="val"),)), UPat(name="dst")), allow_any_len=True),
      lambda ctx, dst, val: ctx.signal(dst, val)),

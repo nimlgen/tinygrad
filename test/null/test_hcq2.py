@@ -208,6 +208,21 @@ class TestHCQ2Schedule(unittest.TestCase):
     one = UOp.const(1, dtypes.uint32)
     self.assertEqual(q.log, [("store", store.src[1], one), ("wait", wait.src[1], one), ("memory_barrier",)])
 
+  def test_a_wait_after_a_result(self): # the results a wait comes after are its args: it holds the queue after their kernels
+    table = Tensor.empty(4, dtype=dtypes.uint32).realize()
+    y = (self.x + 1).contiguous()
+    wait = UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(table.uop, y.uop)
+    b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
+    (wait,) = [c for c in queues(b)[("NULL", "COPY:0")] if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION and c.body.src]
+    for prio in rotations(b):
+      host = defaultdict(int)
+      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0])
+      host[word(wait.src[1])] = 1
+      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0, 1])
+    q = SimpleNamespace(log=[], wait=lambda d, v: q.log.append(("wait", d, v)), memory_barrier=lambda: q.log.append(("memory_barrier",)))
+    hcq2.HWQueue.q_rewrite.rewrite(wait, ctx=q)
+    self.assertEqual(q.log, [("wait", wait.src[1], UOp.const(1, dtypes.uint32)), ("memory_barrier",)])
+
   def test_a_host_kernel_splits_the_batch(self):
     self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("PYTHON") + 2).contiguous().to("NULL") + 3)), 2)
 
