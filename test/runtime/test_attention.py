@@ -428,6 +428,9 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       x, guess = self._tensor_linspace(-0.5, 0.5, (1, 3, config.dim)), self._tensor_linspace(0.9, -0.2, (1, 1, config.dim))
       expected = [self._run_attention(model.blk[0], x[:, i:i+1], i) for i in range(3)]
       expected_states = [s.numpy() for s in model.blk[0]._states()]
+      self._run_attention(model.blk[0], x[:, :2], 0)  # (not opted in: a short step keeps nothing)
+      self.assertEqual(model.blk[0].kept, [])
+      model.blk[0].keep = 1
       self._run_attention(model.blk[0], x[:, :1], 0)
       verify = self._run_attention(model.blk[0], x[:, 1:2].cat(guess, dim=1), 1)
       model.rollback(1)

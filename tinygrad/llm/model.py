@@ -594,9 +594,10 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
     self.kept:list[list[Tensor]] = []
+    self.keep = 0  # (a speculative decoder's short steps: the states kept after up to keep of their tokens)
 
-  # a short step (as a speculative decoding verify) keeps the states after each of its tokens but the last, for Transformer.rollback
-  def _kept(self, T:int|UOp) -> int: return T-1 if isinstance(T, int) and T <= 4 else 0
+  # a short step (as a speculative decoding verify) of a block asked to (keep) keeps the states after its first keep tokens, for Transformer.rollback
+  def _kept(self, T:int|UOp) -> int: return min(self.keep, T-1) if isinstance(T, int) else 0
   def _states(self) -> list[Tensor]: return [*(self.conv_states if unwrap(self.config.ssm).kda else [self.conv_state]), self.recurrent_state]
 
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:

@@ -10,7 +10,7 @@ from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
 from tinygrad.dtype import DType
 from tinygrad.helpers import getenv, prod
-from tinygrad.llm.model import Transformer, gated_activation
+from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd_gguf import expert_linear, QUANT_NAMES, HALFWORD_QUANTS
@@ -67,6 +67,8 @@ class Engine:
     self.scorers = [Tensor(np.stack([r, guessed(min(li + 1, L - 1))]).astype(np.float16)).shard(self.devs, 1).realize()
                     for li, r in enumerate(routers)]
     self.bias = [b.exp_probs_b["bias"].float().numpy() for b in blocks]
+    for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
+      if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
     for li, b in enumerate(blocks):
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
