@@ -70,17 +70,16 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None, mem:defau
     if u.op is Ops.CONST: return u.val
     if u.op is Ops.LOAD: return mem[word(u.src[0])]
     return sum(val(s) for s in u.src)
-  def value(c:UOp) -> int: return val(c.src[0].src[0] if c.src[0].src else c.src[2]) # a wait or store of the graph holds its value
   log:list[int|str] = [] # the calls that ran, and a device each time its timeline bumps
   while True:
     for q in (list(qs) if prio is None else prio):
       if not (cmds:=qs[q]): continue
       c = cmds[0]
-      if (name:=ins_name(c)) is not None and name.startswith("wait"):
-        sig, target = mem[word(c.src[1])], value(c)
+      if (name:=ins_name(c)) is not None and name.startswith(("wait", "host_wait")):
+        sig, target = mem[word(c.src[1])], 1 if name == "host_wait" else val(c.src[2])
         if sig != target if name == "wait_eq" else sig < target: continue
-      elif name == "store":
-        mem[w:=word(c.src[1])] = value(c)
+      elif name in ("store", "host_store"):
+        mem[w:=word(c.src[1])] = 1 if name == "host_store" else val(c.src[2])
         if w[0].arg.name == "timeline": log.append(w[0].device)
       elif c in cs: log.append(cs.index(c))
       cmds.pop(0)
@@ -191,10 +190,10 @@ class TestHCQ2Schedule(unittest.TestCase):
   def test_a_graph_syncs_with_the_host(self):
     tag, table = Tensor.empty(1, dtype=dtypes.uint32).realize(), Tensor.empty(4, dtype=dtypes.uint32).realize()
     y = (self.x + 1).contiguous()
-    store = UOp.custom_function("store", UOp.const(1, dtypes.uint32)).call(tag.uop, y.uop) # tag = 1 once y is written
-    wait = UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(table.uop.after(store)) # until the host sets table[0]
+    store = UOp.custom_function("host_store").call(tag.uop, y.uop) # tag = 1 once y is written
+    wait = UOp.custom_function("host_wait").call(table.uop.after(store)) # until the host sets table[0]
     b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
-    store, wait = [c for c in queues(b)[("NULL", "COPY:0")] if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION and c.body.src]
+    store, wait = [c for c in queues(b)[("NULL", "COPY:0")] if ins_name(c) in ("host_store", "host_wait")]
     for prio in rotations(b):
       host = defaultdict(int)
       self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0]) # z waits for the host
@@ -211,9 +210,9 @@ class TestHCQ2Schedule(unittest.TestCase):
   def test_a_wait_after_a_result(self): # the results a wait comes after are its args: it holds the queue after their kernels
     table = Tensor.empty(4, dtype=dtypes.uint32).realize()
     y = (self.x + 1).contiguous()
-    wait = UOp.custom_function("wait", UOp.const(1, dtypes.uint32)).call(table.uop, y.uop)
+    wait = UOp.custom_function("host_wait").call(table.uop, y.uop)
     b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
-    (wait,) = [c for c in queues(b)[("NULL", "COPY:0")] if c.op is Ops.CALL and c.body.op is Ops.CUSTOM_FUNCTION and c.body.src]
+    (wait,) = [c for c in queues(b)[("NULL", "COPY:0")] if ins_name(c) == "host_wait"]
     for prio in rotations(b):
       host = defaultdict(int)
       self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0])

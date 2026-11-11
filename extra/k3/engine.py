@@ -153,6 +153,7 @@ class Engine:
 
   def warm(self):
     """every step's graph captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
+    assert all(Device[d].has_copy_queue for d in self.devs), "the host syncs run on the gpus' copy queues"
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
       for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
