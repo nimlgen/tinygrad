@@ -279,36 +279,40 @@ class FFNBlock:
       self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
+  def _routed(self, x:Tensor, h:Tensor) -> Tensor:
+    """the routed experts of the tokens x on their expert inputs h (B, T, D): their weighted sum (B, T, D)"""
+    h = h.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
+    logits = self.ffn_gate_inp(x)
+    bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None
+    gating, normalize_topk = self.config.expert_gating_func, self.config.norm_topk_prob
+    # fast path: without selection bias, normalized SOFTMAX is equivalent to SOFTMAX_WEIGHT
+    if gating == ExpertGating.SOFTMAX and bias is None and normalize_topk:
+      gating, normalize_topk = ExpertGating.SOFTMAX_WEIGHT, False
+    if   gating == ExpertGating.SOFTMAX_WEIGHT: scores = logits
+    elif gating == ExpertGating.SOFTMAX:        scores = logits.softmax(-1)
+    elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
+    elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
+
+    route_scores = scores if bias is None else scores + bias
+    if self.config.expert_group_count > 1:
+      groups = route_scores.unflatten(-1, (self.config.expert_group_count, -1))
+      gscore = groups.topk(1 if bias is None else 2)[0].sum(-1)
+      keep = gscore.zeros_like(dtype=dtypes.bool).scatter(-1, gscore.topk(self.config.expert_group_used)[1], True)
+      route_scores = keep.unsqueeze(-1).where(groups, -math.inf).flatten(-2)
+    _, sel = pairwise_topk(route_scores, self.config.num_experts_per_tok)
+    probs = scores.gather(-1, sel)
+    # SOFTMAX_WEIGHT applies softmax after top-k selection
+    if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
+    if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
+    probs = probs * self.config.routed_scaling_factor
+    gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
+    x_down = self.ffn_down_exps(sel, gated_activation(gate, up, self.config).contiguous())  # ([ndev,] B, T, k, D)
+    out = (x_down * probs.unsqueeze(-1)).sum(axis=-2)  # ([ndev,] B, T, D)
+    return out.sum(0) if out.ndim == x.ndim + 1 else out
+
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
-      h = (self.ffn_routed_down(x) if self.config.expert_latent_dim else x).unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
-      logits = self.ffn_gate_inp(x)
-      bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None
-      gating, normalize_topk = self.config.expert_gating_func, self.config.norm_topk_prob
-      # fast path: without selection bias, normalized SOFTMAX is equivalent to SOFTMAX_WEIGHT
-      if gating == ExpertGating.SOFTMAX and bias is None and normalize_topk:
-        gating, normalize_topk = ExpertGating.SOFTMAX_WEIGHT, False
-      if   gating == ExpertGating.SOFTMAX_WEIGHT: scores = logits
-      elif gating == ExpertGating.SOFTMAX:        scores = logits.softmax(-1)
-      elif gating == ExpertGating.SIGMOID:        scores = logits.sigmoid()
-      elif gating == ExpertGating.SQRT_SOFTPLUS:  scores = logits.softplus().sqrt()
-
-      route_scores = scores if bias is None else scores + bias
-      if self.config.expert_group_count > 1:
-        groups = route_scores.unflatten(-1, (self.config.expert_group_count, -1))
-        gscore = groups.topk(1 if bias is None else 2)[0].sum(-1)
-        keep = gscore.zeros_like(dtype=dtypes.bool).scatter(-1, gscore.topk(self.config.expert_group_used)[1], True)
-        route_scores = keep.unsqueeze(-1).where(groups, -math.inf).flatten(-2)
-      _, sel = pairwise_topk(route_scores, self.config.num_experts_per_tok)
-      probs = scores.gather(-1, sel)
-      # SOFTMAX_WEIGHT applies softmax after top-k selection
-      if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
-      if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
-      probs = probs * self.config.routed_scaling_factor
-      gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
-      x_down = self.ffn_down_exps(sel, gated_activation(gate, up, self.config).contiguous())  # ([ndev,] B, T, k, D)
-      out = (x_down * probs.unsqueeze(-1)).sum(axis=-2)  # ([ndev,] B, T, D)
-      if out.ndim == x.ndim + 1: out = out.sum(0)
+      out = self._routed(x, self.ffn_routed_down(x) if self.config.expert_latent_dim else x)
       if self.config.expert_latent_dim: out = self.ffn_routed_up(self.ffn_routed_norm(out))
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(gated_activation(self.ffn_gate_shexp(x), self.ffn_up_shexp(x), self.config).contiguous())
