@@ -192,6 +192,7 @@ class TransformerConfig:
   attn_res_new_block: bool = False
   attn_head_gate: bool = False
   mla_nope: bool = False  # NoPE (No Positional Embeddings)
+  streamed_experts: bool = False  # no routed expert weights: _routed is zero unless replaced (by an engine that streams the experts in)
 
 class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
@@ -263,9 +264,10 @@ class FFNBlock:
       self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=config.expert_proj_bias)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
       expert_dim = config.expert_latent_dim or config.dim
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, expert_dim, config.hidden_dim, bias=config.expert_proj_bias)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, expert_dim, config.hidden_dim, bias=config.expert_proj_bias)
-      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, expert_dim, bias=config.expert_proj_bias)
+      if not config.streamed_experts:
+        self.ffn_gate_exps = ExpertWeights(config.num_experts, expert_dim, config.hidden_dim, bias=config.expert_proj_bias)
+        self.ffn_up_exps = ExpertWeights(config.num_experts, expert_dim, config.hidden_dim, bias=config.expert_proj_bias)
+        self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, expert_dim, bias=config.expert_proj_bias)
       if config.shared_expert_dim > 0:
         self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
@@ -281,6 +283,7 @@ class FFNBlock:
 
   def _routed(self, x:Tensor, h:Tensor) -> Tensor:
     """the routed experts of the tokens x on their expert inputs h (B, T, D): their weighted sum (B, T, D)"""
+    if self.config.streamed_experts: return h.zeros_like()
     h = h.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
     logits = self.ffn_gate_inp(x)
     bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None
@@ -311,7 +314,7 @@ class FFNBlock:
     return out.sum(0) if out.ndim == x.ndim + 1 else out
 
   def _feed_forward(self, x:Tensor) -> Tensor:
-    if hasattr(self, 'ffn_gate_exps'):
+    if hasattr(self, 'ffn_gate_inp'):
       out = self._routed(x, self.ffn_routed_down(x) if self.config.expert_latent_dim else x)
       if self.config.expert_latent_dim: out = self.ffn_routed_up(self.ffn_routed_norm(out))
       if hasattr(self, 'ffn_gate_shexp'):
@@ -847,7 +850,8 @@ class Transformer:
       ple=PLEConfig(kv[f'{arch}.ple.layers'][0], ple_entry[1][1], tuple(kv[f'{arch}.ple.layer_multipliers']),
                     tuple(kv[f'{arch}.ple.head_vocab_sizes']), kv[f'{arch}.ple.eos_token_id'], kv[f'{arch}.ple.conv_kernel']) if ple_entry else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
-      situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None)
+      situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
+      streamed_experts=bool(kv.get(f'{arch}.expert_count')) and not any(k.endswith('.ffn_gate_exps.weight') for k in state_dict))
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused

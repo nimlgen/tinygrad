@@ -4,7 +4,7 @@ from gguf import GGUFWriter
 from tinygrad import Tensor, nn
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, IndexerConfig, MLATransformerBlock, GatedDeltaNetBlock, ExpertGating
 
-def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False):
+def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False, experts:bool=True):
   # two blocks: a dense kda block, then an mla block with routed experts
   config = TransformerConfig(num_blocks=2, dim=16, hidden_dim=8, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=12,
     rope_theta=10000.0, rope_dim=4, v_head_dim=8, max_context=8, num_experts=4, num_experts_per_tok=2, expert_gating_func=ExpertGating.SIGMOID,
@@ -25,6 +25,7 @@ def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False):
   writer.add_float32(f'{arch}.kda.gate_lower_bound', -5.0)
   writer.add_array('tokenizer.ggml.tokens', [str(i) for i in range(16)])
   for name, weight in nn.state.get_state_dict(Transformer(config)).items():
+    if not experts and '_exps.' in name: continue
     writer.add_tensor(name.replace('blk.0.ssm_out', 'blk.0.attn_output'), np.zeros(weight.shape, dtype=np.float32))
   writer.write_header_to_file()
   writer.write_kv_data_to_file()
@@ -53,6 +54,15 @@ class TestMLA(unittest.TestCase):
     self.assertIsInstance(model.blk[1], MLATransformerBlock)
     self.assertFalse(hasattr(model.blk[0], 'indexer'))
     self.assertIsNotNone(model.blk[1].indexer)
+    self.assertFalse(model.config.streamed_experts)
+
+  def test_kimi_without_routed_experts(self):
+    with tempfile.TemporaryDirectory() as folder:
+      write_kimi_gguf(path:=pathlib.Path(folder)/'model.gguf', 'kimi-k3', experts=False)
+      model = Transformer.from_gguf(path)[0]
+    self.assertTrue(model.config.streamed_experts)
+    self.assertFalse(any('_exps.' in name for name in nn.state.get_state_dict(model)))
+    self.assertEqual(model.blk[1]._feed_forward(Tensor.empty(1, 3, 16)).shape, (1, 3, 16))
 
 if __name__ == '__main__':
   unittest.main()
