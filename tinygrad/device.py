@@ -278,7 +278,9 @@ class Allocator(Generic[DeviceType]):
 
   def free_cache(self):
     for (_, options), storages in self.cache.items():
-      for storage, _ in storages: self.do_free(storage, options if options is not None else BufferSpec())
+      for storage, freed_at in storages:
+        for dev in freed_at: dev.synchronize()
+        self.do_free(storage, options if options is not None else BufferSpec())
       storages.clear()
 
   def do_free(self, storage:BufferStorage, options:BufferSpec):
