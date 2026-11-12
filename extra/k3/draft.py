@@ -28,6 +28,7 @@ class Eagle3:
     kv_b = st["layers.0.self_attn.kv_b_proj.weight"].to(devs[0]).half().reshape(self.H, self.nope + self.vd, self.lora)
     self.k_b, self.v_b = (x.contiguous().shard(devs, 0).realize() for x in (kv_b[:, :self.nope], kv_b[:, self.nope:]))
     self.cache = Tensor.empty(1, 1, max_context, self.lora + self.rope, dtype=dtypes.half, device=devs).realize()
+    self.positions = Tensor.arange(max_context).to(devs).realize()  # (the causal mask's, on the gpus: a symbolic arange isn't)
 
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return x.half() @ self.w[name].T
@@ -45,7 +46,7 @@ class Eagle3:
     k = Tensor(self.cache.uop.after(self.cache[:, :, pos:pos + T].uop.store(store.half().uop)))[:, :, :pos + T].float()
     # absorbed: the nope scores (q_nope k_b) . latent, causal over the cache, the values v_b (attention . latent)
     qa = (q[..., :self.nope].half() @ self.k_b).float().cat(q_pe.float(), dim=-1)
-    mask = Tensor.full((1, 1, T, pos + T), float("-inf"), buffer=False).triu(pos + 1)
+    mask = (self.positions[:pos + T].reshape(1, 1, 1, -1) > self.positions[pos:pos + T].reshape(1, 1, T, 1)).where(float("-inf"), 0)
     attn = ((qa @ k.transpose(-1, -2)) * (self.mscale ** 2 / math.sqrt(self.nope + self.rope)) + mask).softmax(-1) @ k[..., :self.lora]
     x = self.lin((attn.half() @ self.v_b.transpose(-1, -2)).transpose(1, 2).reshape(1, T, -1), a + "o_proj") + hid
     m = self.norm(x, p + "post_attention_layernorm")

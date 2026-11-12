@@ -2,14 +2,15 @@
 # the engine's forward against master's model with the routed experts on a tiny random kimi-k3 on two CPU "gpus": every expert in the pools
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
-import pathlib, tempfile, unittest
+import json, pathlib, tempfile, unittest
 from types import SimpleNamespace
 import numpy as np
 from gguf import GGUFWriter, GGMLQuantizationType, quants
-from tinygrad import Tensor, Device, nn, dtypes
+from tinygrad import Tensor, Device, UOp, nn, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating
 from extra.k3.engine import Engine
+from extra.k3.draft import Eagle3
 
 DIM, LAT, FF, E, K, G, VOCAB = 64, 32, 64, 8, 4, 2, 32
 CONFIG = TransformerConfig(num_blocks=3, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
@@ -48,6 +49,22 @@ def parts(weights:dict[str, np.ndarray], li:int, e:int, part:int) -> list[bytes]
   u = FF // G
   return [(gate[g*u:(g+1)*u].tobytes() + up[g*u:(g+1)*u].tobytes() + down[:, g*u//32*34:(g+1)*u//32*34].tobytes()).ljust(part, b'\0')
           for g in range(G)]
+
+def eagle(folder:str, rng:np.random.Generator) -> str:
+  """a tiny random EAGLE-3 head (kimi-k3-eagle3.1-mla's layout) on the hidden states after blocks 0, 1, 2"""
+  H, nope, rope, vd, lora, ql, ff, p, a = 2, 8, 8, 8, 16, 16, 32, "layers.0.", "layers.0.self_attn."
+  json.dump({"num_attention_heads": H, "qk_nope_head_dim": nope, "qk_rope_head_dim": rope, "v_head_dim": vd, "kv_lora_rank": lora,
+             "rms_norm_eps": 1e-5, "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}, "rope_theta": 10000.0, "rope_scaling":
+             {"factor": 4.0, "original_max_position_embeddings": 16, "beta_fast": 32, "beta_slow": 1, "mscale_all_dim": 1.0}},
+            open(f"{folder}/config.json", "w"))
+  shapes = {**{f"fc_norm.{i}.weight": (DIM,) for i in range(3)}, "fc.weight": (DIM, 3*DIM), p+"input_layernorm.weight": (DIM,),
+            p+"hidden_norm.weight": (DIM,), a+"q_a_proj.weight": (ql, 2*DIM), a+"q_a_layernorm.weight": (ql,),
+            a+"q_b_proj.weight": (H*(nope+rope), ql),
+            a+"kv_a_proj_with_mqa.weight": (lora+rope, 2*DIM), a+"kv_a_layernorm.weight": (lora,), a+"kv_b_proj.weight": (H*(nope+vd), lora),
+            a+"o_proj.weight": (DIM, H*vd), p+"post_attention_layernorm.weight": (DIM,), p+"mlp.gate_proj.weight": (ff, DIM),
+            p+"mlp.up_proj.weight": (ff, DIM), p+"mlp.down_proj.weight": (DIM, ff), "norm.weight": (DIM,), "lm_head.weight": (VOCAB, DIM)}
+  nn.state.safe_save({k: Tensor(rng.normal(0, 0.3, s).astype(np.float32)) for k, s in shapes.items()}, f"{folder}/model.safetensors")
+  return folder
 
 class TestEngine(unittest.TestCase):
   def setUp(self):
@@ -100,6 +117,16 @@ class TestEngine(unittest.TestCase):
     np.testing.assert_allclose(logits([5, 1], 1)[0], want[1], rtol=1e-4, atol=1e-4)
     self.eng.model.rollback(1)
     np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
+
+  def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
+    self.stub()
+    eng, folder = self.eng, tempfile.mkdtemp()
+    eng.draft = Eagle3(eagle(folder, np.random.default_rng(1)), lambda t: eng.model.token_embd(t).float(), eng.devs, eng.model.max_context)
+    eng.tok_np[:2], eng.given_np[:2] = [3, 5], [-1, -1]
+    eng.run(2, UOp.variable("start_pos", 0, 15).bind(0))
+    want = eng.res_np.copy()
+    for _ in range(3): eng.jits[2](eng.v_pos.bind(0))
+    np.testing.assert_equal(eng.res_np, want)
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_generate(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
