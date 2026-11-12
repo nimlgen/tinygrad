@@ -158,11 +158,12 @@ class Engine:
   # *** the host's side
 
   def warm(self):
-    """every step's graph captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
+    """every step's graph (and the rollback's) captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
     assert all(Device[d].has_copy_queue for d in self.devs), "the host syncs run on the gpus' copy queues"
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
       for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
+    for _ in range(3 if len(self.jits) > 1 else 0): self.model.rollback(1)  # (its jit captured too, after a verify step)
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
     """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each
