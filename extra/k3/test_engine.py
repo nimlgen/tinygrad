@@ -86,7 +86,8 @@ class TestEngine(unittest.TestCase):
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
-  def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts
+  def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an
+    # entry a token's: a union of the tokens' with an expert more than once)
     eng = self.eng
     tables:dict[int, list[Tensor]] = {}
     def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
@@ -94,9 +95,13 @@ class TestEngine(unittest.TestCase):
         sig = dep[:, 0].to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
-        tables[li] = [Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
-                                                           w[:, ks].T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-                      for ks in (slice(0, eng.ks[0]), slice(eng.ks[0], K))]
+        T = sel.shape[0]
+        def table(ks:slice) -> Tensor:  # (an entry a token's expert, j*T + t: its weight the token's, the others' 0)
+          n, tok = (ks.stop - ks.start) * T, Tensor.arange((ks.stop - ks.start) * T).to("CPU").reshape(-1, 1) % T
+          wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
+          return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
+                                                                    wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
+        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]
 

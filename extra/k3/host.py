@@ -38,7 +38,8 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 
 # io_t: the host's state, the drives' queues and command tables, the counts (IO: name, c type, a pointer is an address). bufs: every layer's
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each
-# [ready | slots | weights], the first k1 of a token's k experts, the second the rest (entry i*T + t the i-th of token t)
+# [ready | slots | weights], k1*T then (k-k1)*T entries: the union of the tokens' first k1 experts, then of the rest, an expert once, its
+# weight a token (entry i's at i*T + t, 0: not the token's), padded with slot 0
 IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n nvict pf fill".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),
@@ -268,11 +269,25 @@ static int64_t layer(io_t *s, int64_t li) {
     p1[t] = nht < K1 ? nht : K1;
     if (c - p1[t] > K2) p1[t] = c - K2;
   }
-  for (int64_t g = 0; g < ng; g++) for (int64_t i = 0; i < s->k * T; i++) {
-    int64_t second = i >= K1 * T, at = second ? i - K1 * T : i, t = at % T, n = at / T + (second ? p1[t] : 0), on = n < (second ? tc[t] : p1[t]);
+  // the parts' unions: an expert in part 1 when it's in a token's first p1, its weight each token's (0: not its)
+  int64_t in1[512], n1 = 0, n2 = 0, at[512];
+  float wu[512 * 8];
+  for (int64_t u = 0; u < nu; u++) in1[u] = 0;
+  for (int64_t i = 0; i < nu * T; i++) wu[i] = 0;
+  for (int64_t t = 0; t < T; t++) for (int64_t n = 0; n < tc[t]; n++) {
+    wu[tj[t * 64 + n] * T + t] = tw[t * 64 + n];
+    if (n < p1[t]) in1[tj[t * 64 + n]] = 1;
+  }
+  for (int64_t u = 0; u < nu; u++) at[u] = in1[u] ? n1++ : n2++;
+  for (int64_t g = 0; g < ng; g++) for (int64_t second = 0; second < 2; second++) {
+    int64_t cap = (second ? K2 : K1) * T;
     uint32_t *part = BUF(second ? B_PART2 : B_PART1, g, uint32_t);
-    ((int32_t *)part)[1 + at] = on ? so[usel[tj[t * 64 + n]]] : 0;
-    ((float *)part)[1 + (second ? K2 : K1) * T + at] = on ? tw[t * 64 + n] : 0;
+    for (int64_t i = 0; i < cap; i++) ((int32_t *)part)[1 + i] = 0;
+    for (int64_t i = 0; i < cap * T; i++) ((float *)part)[1 + cap + i] = 0;
+    for (int64_t u = 0; u < nu; u++) if (in1[u] != second) {
+      ((int32_t *)part)[1 + at[u]] = so[usel[u]];
+      for (int64_t t = 0; t < T; t++) ((float *)part)[1 + cap + at[u] * T + t] = wu[u * T + t];
+    }
   }
   for (int64_t r1 = 0, first = 1;; first = 0) {
     if (reap(s) < 0) return -1;

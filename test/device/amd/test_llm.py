@@ -541,6 +541,17 @@ class TestExpertLinear(unittest.TestCase):
     ref = (ref * w[:, None]).reshape(-1, 2, self.LAT).sum(0)
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
 
+  def test_a_slots_rows(self): # per tokens a slot (their weights loaded once): as with each slot repeated
+    x, off, per = Tensor(self.rng.standard_normal((2, self.LAT)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP, 2
+    rep = Tensor(np.repeat(np.array(self.sel, np.int32), per))
+    out = expert_linear(self.pool, self.slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=per).numpy()
+    np.testing.assert_allclose(out, expert_linear(self.pool, rep, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy(), rtol=1e-5, atol=1e-5)
+    h = Tensor(self.rng.standard_normal((len(self.sel) * per, self.UNITS)).astype(np.float32))
+    w = Tensor(self.rng.standard_normal(len(self.sel) * per).astype(np.float32))
+    out = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per, per=per).numpy()
+    ref = expert_linear(self.pool, rep, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()
