@@ -77,10 +77,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
             return k
 
-  # are we grouping? (requires local shape support) a reduce of few outputs groups more: up to the threads of the most outputs grouped by 16
-  if resolve((outs:=prod(k.full_shape[i] for i in k.upcastable_dims())) <= (limit:=240 if k.ren.target.device == "QCOM" else 2048), False):
-    sizes = [sz for sz in (256, 128, 64, 32) if outs*sz <= limit*16 and k.ren.target.device != "QCOM"] + [16]
+  # are we grouping? (requires local shape support) a long reduce of fewer than 256 outputs groups more, up to 4096 threads (a thread still 16
+  # or more of it): 16 threads an output don't fill the gpu
+  if resolve((outs:=prod(k.full_shape[i] for i in k.upcastable_dims())) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+    sizes = [sz for sz in (256, 128, 64, 32) if outs*sz <= 4096 and k.ren.target.device != "QCOM"] + [16]
     for axis, sz in itertools.product(k.axes_of(AxisType.WEAK, reduce=True)[:3], sizes):
+      if sz > 16 and resolve(k.full_shape[axis] < 16*sz, True): continue
       try:
         k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL, True)))
         break
