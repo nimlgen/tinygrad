@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # K3 decode with the routed experts streamed from the nvme drives: master's model (a trunk gguf without the routed experts, sharded over the
-# gpus) in a jitted step graph of the engine's own forward. at a moe block every gpu writes its router scores to the host (store), the host
-# routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
-# (host.py's step_io, in c alongside the graph), the gpus wait for each (wait) and run their units of the experts over the pool
+# gpus) in a jitted step graph of the engine's own forward. at a moe block every gpu writes its router scores and a tag to host memory, the
+# host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
+# (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, json, os, sys, time
+import ctypes, functools, os, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.device import Buffer, BufferSpec, MultiBuffer
@@ -242,26 +242,9 @@ if __name__ == "__main__":
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
-  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok:first: production completions teacher forced, each from position 0
-    path, *nums = spec.split(":")
-    nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
-    stats:list[tuple[float, float]] = []
-    for r in [json.loads(line) for line in open(path)][first:first + nseq]:
-      ids, outs, n0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats)
-      for pos, t in enumerate(ids + outs[:-1]):
-        if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
-        eng.step([t], pos)
-        if pos == 1: c0 = eng.counters()
-        if pos < len(ids) - 1: continue
-        # output token j's: top-1 agreement with production and KL(production's top 5 and the rest || ours)
-        lg = eng.logits.numpy()[0].astype(np.float64)
-        lp, top = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum()), r["output_top"][pos - len(ids) + 1]
-        p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
-        rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
-        stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
-      (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
-      print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
-      eng.report(c0, len(ids) + len(outs) - 2)
+  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok:first (eval.py)
+    from extra.k3.eval import evaluate
+    evaluate(eng, spec, late)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
   if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()
