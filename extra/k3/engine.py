@@ -56,7 +56,7 @@ class Engine:
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: a token's first k1 experts, then the rest (j*T + t: token t's j-th)
-    self.ks = (K // 2, K - K // 2)
+    self.ks, self.act = (K // 2, K - K // 2), functools.partial(gated_activation, config=model.config)
     bufs = [[host_tensor(self.devs, n, dt) for n, dt in ((1, dtypes.uint32), (tokens * 2 * E // G, dtypes.float32),
                                                           *((1 + 2 * k * tokens, dtypes.uint32) for k in self.ks))] for _ in blocks]
     self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
@@ -138,17 +138,18 @@ class Engine:
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
   def experts(self, i:int, h:Tensor, table:Tensor) -> Tensor:
-    """each gpu's units of the experts of part i's table (j*T + t: token t's j-th, padded with slot 0 weight 0) on h (T, lat): (gpus, T, lat)"""
-    T, u, n = h.shape[0], self.units, self.ks[i] * h.shape[0]
+    """each gpu's units of the experts of part i's table (j*T + t: token t's j-th, padded with slot 0 weight 0) on h (T, lat): (gpus, T, lat).
+    the act in the q8 of the down gemv's input, the down gemv a token's weighted sum"""
+    T, u, n, off = h.shape[0], self.units, self.ks[i] * h.shape[0], 2 * self.units * self.lat // self.block[0] * self.block[1]
     slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + 2 * n].bitcast(dtypes.float32)
-    gu = self.gemv(slots, h, 2 * u, self.lat, 0)
-    act = gated_activation(gu[..., :u], gu[..., u:], self.model.config)
-    down = self.gemv(slots, act, self.lat, u, 2 * u * self.lat // self.block[0] * self.block[1])
+    if amd_custom_kernels_supported(h.device):
+      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True)
+      return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T)
+    down = self.gemv(slots, self.act(*self.gemv(slots, h, 2 * u, self.lat, 0).split(u, -1)), self.lat, u, off)
     return (down * w.reshape(n, 1)).reshape(-1, self.ks[i], T, self.lat).sum(1)
 
   def gemv(self, slots:Tensor, x:Tensor, out_f:int, in_f:int, off:int) -> Tensor:
-    """(gpus, n, out_f): W @ x[k % rows] (or a gpu's x[k]) of the W at off bytes in slots[k] of each gpu's pool (decoded where there's no kernel)"""
-    if amd_custom_kernels_supported(x.device): return expert_linear(self.pool, slots, x, out_f, in_f, self.qtype, self.part, off)
+    """(gpus, n, out_f): W @ x[k % rows] (or a gpu's x[k]) of the W at off bytes in slots[k] of each gpu's pool, decoded (no kernel)"""
     n, size, isz = slots.shape[0], out_f * in_f // self.block[0] * self.block[1], self.word.itemsize
     w = self.pool.reshape(-1, self.slots, self.part // isz)[:, slots][..., off // isz:(off + size) // isz].bitcast(dtypes.uint8)
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // self.block[1] * self.block[0], self.qtype).reshape(-1, n, out_f, in_f)

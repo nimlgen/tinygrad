@@ -95,11 +95,16 @@ def iq4_half_lut(device:str|tuple[str, ...]|None) -> Tensor:
                       dtypes.float16).to(device, force=True).bitcast(dtypes.uint32)
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int, act:Callable|None=None) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   token, group = token_group//groups, token_group%groups
-  value = x.reshape(tokens, groups, 32)[token, group, lane].load().float()
+  if act is None: value = x.reshape(tokens, groups, 32)[token, group, lane].load().float()
+  else:  # x: a gate and up gemv's partial sums (tokens, 2*in_features, splits), the act of its halves' sums
+    x = x.reshape(tokens, 2*in_features, x.shape[-1])
+    gate, up = (sum((x[token, h*in_features + group*32 + lane, s].load() for s in range(1, x.shape[-1])),
+                    x[token, h*in_features + group*32 + lane, 0].load()) for h in range(2))
+    value = act(gate, up).float()
   # Quantize each input once, then pack four neighboring lanes into one word.
   # Keep divisions intact: reciprocal multiplication can move half-precision inputs across rounding ties.
   warp_max = warp_reduce(value.abs(), maximum=True, full_wave=True)
@@ -115,12 +120,14 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
             xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -> tuple[Tensor, Tensor, Tensor]:
+  """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits)"""
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
-  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, act=act)
+  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
 
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False) -> UOp:
@@ -200,9 +207,14 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp, o
   return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna)
 
 def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp, ...], out_features:int, in_features:int, ggml_type:int,
-                       cdna:bool, gate:Callable|None=None, xtoken:Callable|None=None, name:str="linear_") -> UOp:
-  # gate(token, base) -> base: moves the weight rows, xtoken(token) -> the activation row of an output row
+                       cdna:bool, gate:Callable|None=None, xtoken:Callable|None=None, name:str="linear_", w:UOp|None=None) -> UOp:
+  # gate(token, base) -> base: moves the weight rows, xtoken(token) -> the activation row of an output row. w: output row t the sum over the
+  # rows k = j*rows + t (out's rows) of their outputs weighted by w[k] (a row's groups go over its k)
+  gpk = in_features//32
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
+    if w is None: return dot(token, output, group)
+    return dot(k:=group//gpk*out.shape[0] + token, output, group%gpk) * w[k].load()
+  def dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group//8, group%8
     base = (output*in_features//256 + block) * (QUANT_SIZES[ggml_type]//raw.dtype.itemsize)
     if ggml_type in SMALL_BLOCK_QUANTS: base = (output*in_features//32 + group)*SMALL_BLOCK_QUANTS[ggml_type]
@@ -246,7 +258,8 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
       if ggml_type == IQ3_S: total *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
       if ggml_type == IQ3_XXS: total *= ((word(66+subgroup*4) >> 28).float()+0.5)*0.5
     return total * xd[token, group]
-  return _decode_linear(out, out_features, in_features//32, group_dot, name+QUANT_NAMES[ggml_type], gate is None)
+  groups = gpk * (1 if w is None else cast(int, w.shape[0])//cast(int, out.shape[0]))
+  return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], gate is None)
 
 @functools.cache
 def _moe_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, *grids:UOp,
@@ -278,28 +291,35 @@ def moe_linear(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
   return result.reshape(ndev, B, T, slots, global_out) if ndev > 1 else result.reshape(B, T, slots, global_out)
 
 @functools.cache
-def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *grids:UOp,
-                          out_features:int, in_features:int, ggml_type:int, stride:int, offset:int, cdna:bool=False) -> UOp:
-  # out row k reads the weight rows at slots[k]*stride + offset words (64 bit: a pool can pass 2**31 words) and the activation row k % rows
+def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *extra:UOp,
+                          out_features:int, in_features:int, ggml_type:int, stride:int, offset:int, cdna:bool=False, weighted:bool=False) -> UOp:
+  # row k reads the weight rows at slots[k]*stride + offset words (64 bit: a pool can pass 2**31 words) and the activation row k % rows.
+  # weighted: extra[0] the rows' weights, their weighted sums out's rows
   def gate(row:UOp, base:UOp) -> UOp: return base.cast(dtypes.int64) + slots[row].cast(dtypes.int64)*stride + offset
   def xtoken(row:UOp) -> UOp: return row % xq.shape[0]
-  return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken, "expert_")
+  w, grids = (extra[0], extra[1:]) if weighted else (None, extra)
+  return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken, "expert_", w)
 
-def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0) -> Tensor:
+def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
+                  act:Callable|None=None, split:bool=False, w:Tensor|None=None, rows:int=1) -> Tensor:
   """out[k] = W[slots[k]] @ x[k % rows]: the quantized experts in the slots of a pool of raw gguf blocks, a slot every stride bytes, W at offset
   bytes in it. x: (rows, in_features), out: (len(slots), out_features). a pool sharded over devices is a pool on each, of its own experts or
-  parts of them: out is (ndev, len(slots), out_features), each device's, and x is the same on each or each device's (ndev, rows, in_features)"""
+  parts of them: out is (ndev, len(slots), out_features), each device's, and x is the same on each or each device's (ndev, rows, in_features).
+  act: x is a gate and up expert_linear's split output, the gemv's input act(gate, up) (in its q8, one kernel). split: out's partial sums
+  over the input's 1024 chunks, a last axis. w: out (rows, out_features) the sums over the slots j*rows + t of their outputs weighted by w"""
   word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
   assert stride % word.itemsize == 0 and offset % word.itemsize == 0, f"{QUANT_NAMES[ggml_type]} slots must be {word.itemsize} byte aligned"
-  rows, ndev = prod(x.uop.max_shard_shape) // in_features, int(pool.shape[0]) // int(pool.uop.shard_shape[0])
-  out = Tensor.empty(ndev*slots.shape[0], out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=pool.device,
-                     axis=0 if ndev > 1 else None)
+  ndev = int(pool.shape[0]) // int(pool.uop.shard_shape[0])
+  xrows = int(x.uop.max_shard_shape[-3]) if act is not None else prod(x.uop.max_shard_shape) // in_features
+  n, groups = slots.shape[0] if w is None else rows, in_features//32 * (1 if w is None else slots.shape[0]//rows)
+  out = Tensor.empty(ndev*n, out_features, (groups+31)//32, dtype=dtypes.float32, device=pool.device, axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_decode_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
-                          stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device))
+                          stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device), weighted=w is not None)
   extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
-  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), rows, in_features), slots.cast(dtypes.int32), *extra)
-  ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0].sum(-1)
-  return ret.reshape(ndev, slots.shape[0], out_features) if ndev > 1 else ret
+  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), xrows, in_features, act), slots.cast(dtypes.int32), *([] if w is None else [w]), *extra)
+  ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
+  ret = ret if split else ret[..., 0] if ret.shape[-1] == 1 else ret.sum(-1)  # (a sum of one is a copy)
+  return ret.reshape(ndev, n, *ret.shape[1:]) if ndev > 1 else ret
 
 # kgroups: groups of 16 lanes that split k in a 16x16x16 fragment, RDNA3 copies a and b in both halves
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:

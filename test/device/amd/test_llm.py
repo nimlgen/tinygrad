@@ -499,6 +499,23 @@ class TestExpertLinear(unittest.TestCase):
                          (down[g, k], self.weight((s + g) % self.NSLOTS, off, self.LAT, self.UNITS) @ h[g, k])):
           np.testing.assert_allclose(out, ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
+  def test_act_in_the_q8(self): # the down gemv on act(gate, up) of the gate and up gemv's partial sums: as on the act computed apart
+    x, off = Tensor(self.rng.standard_normal((1, self.LAT)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP
+    def act(g, u): return g.sigmoid() * u
+    gu = expert_linear(self.pool, self.slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, split=True)
+    out = expert_linear(self.pool, self.slots, gu, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, act=act).numpy()
+    summed = gu.sum(-1)
+    ref = expert_linear(self.pool, self.slots, act(summed[:, :self.UNITS], summed[:, self.UNITS:]), self.LAT, self.UNITS, IQ3_XXS, self.PART, off)
+    np.testing.assert_allclose(out, ref.numpy(), rtol=1e-3, atol=1e-3 * np.abs(ref.numpy()).max())
+
+  def test_weighted_sum(self): # a token's rows (j*tokens + t) summed weighted in the down gemv: as summed apart
+    h, off = Tensor(self.rng.standard_normal((len(self.sel), self.UNITS)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP
+    w = self.rng.standard_normal(len(self.sel)).astype(np.float32)
+    out = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=Tensor(w), rows=2).numpy()
+    ref = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+    ref = (ref * w[:, None]).reshape(-1, 2, self.LAT).sum(0)
+    np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()
