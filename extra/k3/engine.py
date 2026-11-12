@@ -89,6 +89,7 @@ class Engine:
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos = UOp.variable("start_pos", 0, model.max_context - 1)
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], tokens, dtypes.int32) for _ in range(2))
+    self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * tokens, dtypes.int32)  # (a step's [done | tokens | guesses])
     self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in range(1, tokens + 1)}
     self.times, self.verified = np.zeros(2), np.zeros(2)  # (launching the graphs, after the last layer), (verify steps, right guesses)
 
@@ -109,17 +110,19 @@ class Engine:
       if self.draft is not None and i in self.draft.layers: hidden.append(x[:, :, -1])
     return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*hidden, dim=2) if hidden else None
 
-  def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor, Tensor]:
-    """the greedy token after each of the step's tokens, their logits (kept, else the tokens) and (a draft) its guess of the token after
-    that (after the given one where there's one: a prompt's next)"""
+  def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
+    """the greedy token after each of the step's tokens and (a draft) its guess of the token after that (after the given one where there's
+    one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits (kept, else done)"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
-    toks = guesses = logits.argmax(-1)
+    out = toks = logits.argmax(-1)
     if self.draft is not None:
       given = self.given[:T].to(toks.device)
-      guesses = self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)[0].argmax(-1)
-    if not self.keep_logits: logits = toks  # (realized, the logits are a buffer of their own: only for an eval)
-    Tensor.realize(toks, logits, guesses)
-    return toks, logits, guesses
+      out = toks.cat(self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)[0].argmax(-1))
+    outs = Tensor(self.res.uop)[1:1 + out.shape[0]].assign(out.to(self.devs[0]).cast(dtypes.int32))
+    done = Tensor(self.res.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0]))
+    if not self.keep_logits: logits = done  # (realized, the logits are a buffer of their own: only for an eval)
+    Tensor.realize(done, logits)
+    return done, logits
 
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
@@ -165,18 +168,19 @@ class Engine:
     and the draft's guess after that (their logits kept)"""
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
-    io.tokens, io.victims_n, self.tok_np[:T], self.given_np[:T] = T, 32 * T, toks, ((given or []) + [-1] * T)[:T]
+    io.tokens, io.victims_n, self.tok_np[:T], self.given_np[:T], self.res_np[0] = T, 32 * T, toks, ((given or []) + [-1] * T)[:T], 0
     host_c().flags(ctypes.byref(io), 0)
-    out, self.logits, guesses = self.jits[T](self.v_pos.bind(pos))
+    _, self.logits = self.jits[T](self.v_pos.bind(pos))
     t1 = time.perf_counter()
-    if (err:=host_c().step_io(ctypes.byref(io))):  # (the gpus run the graph out: one killed waiting on a layer wedges)
-      host_c().flags(ctypes.byref(io), 1)
-      out.tolist()
-      raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left"}[err])
+    err = host_c().step_io(ctypes.byref(io))
+    if err: host_c().flags(ctypes.byref(io), 1)  # (the gpus run the graph out: one killed waiting on a layer wedges)
     t2 = time.perf_counter()
-    ret = out.tolist(), guesses.tolist()
+    while self.res_np[0] != 1:
+      if time.perf_counter() - t2 > 60: raise RuntimeError("the step's graph didn't finish")
+    if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left"}[err])
+    ret = self.res_np[1:1 + (2 * T if self.draft is not None else T)].tolist()
     self.times += (t1 - t0, time.perf_counter() - t2)
-    return ret
+    return ret[:T], ret[T:] or ret
 
   # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed feeds the rest
 
