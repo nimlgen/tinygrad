@@ -22,7 +22,8 @@ class Eagle3:
     self.freqs_cis = (precompute_freqs_cis(self.rope, max_context, cfg["rope_theta"], yarn=yarn) / self.mscale).to(devs).realize()
     st = nn.state.safe_load(f"{path}/model.safetensors")
     def w(name:str, axis:int|None=None) -> Tensor|Linear:  # (read once)
-      if len(st[name].shape) == 1 or not amd_custom_kernels_supported(devs): return st[name].to(devs[0]).half().shard(devs, axis).realize()
+      if len(st[name].shape) == 1 or st[name].shape[1] % (32 * len(devs)) or not amd_custom_kernels_supported(devs):  # (vectors, rows not of blocks)
+        return st[name].to(devs[0]).half().shard(devs, axis).realize()
       return q8_0_linear(st[name].to(devs[0]), devs, axis)
     self.w = {k[:-len(".weight")]: w(k, axis) for k, axis in (
       *((k, None) for k in st if k.endswith("norm.weight") or k.startswith("fc_norm") or "_a_proj" in k or k == "fc.weight"),
