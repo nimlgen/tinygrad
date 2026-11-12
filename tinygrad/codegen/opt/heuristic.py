@@ -77,11 +77,12 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
             return k
 
-  # are we grouping? (requires local shape support)
-  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
-    for axis in k.axes_of(AxisType.WEAK, reduce=True)[:3]:
+  # are we grouping? (requires local shape support) a reduce of few outputs groups more: up to the threads of the most outputs grouped by 16
+  if resolve((outs:=prod(k.full_shape[i] for i in k.upcastable_dims())) <= (limit:=240 if k.ren.target.device == "QCOM" else 2048), False):
+    sizes = [sz for sz in (256, 128, 64, 32) if outs*sz <= limit*16 and k.ren.target.device != "QCOM"] + [16]
+    for axis, sz in itertools.product(k.axes_of(AxisType.WEAK, reduce=True)[:3], sizes):
       try:
-        k.apply_opt(Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL, True)))
+        k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL, True)))
         break
       except KernelOptError: pass
 
