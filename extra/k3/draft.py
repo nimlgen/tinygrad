@@ -33,17 +33,21 @@ class Eagle3:
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return x.half() @ self.w[name].T
 
-  def __call__(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
-    """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states -> (1, T, vocab) logits"""
+  def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:UOp|None=None) -> tuple[Tensor, Tensor, UOp]:
+    """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states (or hid, its own of the step before: a chain of guesses)
+    -> (1, T, vocab) logits, (1, T, dim) its hidden states, its cache after their keys (a chain's next step's cache)"""
     T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
-    hid = self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
+    if hid is None:
+      assert hidden is not None
+      hid = self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
     h = self.norm(self.embed(tokens), p + "input_layernorm").cat(self.norm(hid, p + "hidden_norm"), dim=-1)
     q = self.lin(self.norm(self.lin(h, a + "q_a_proj"), a + "q_a_layernorm"), a + "q_b_proj").reshape(1, T, self.H, -1).transpose(1, 2)
     kv, fc = self.lin(h, a + "kv_a_proj_with_mqa"), self.freqs_cis[pos:pos + T]
     q_pe = apply_rope(q[..., self.nope:], fc, interleaved=True)
     k_pe = apply_rope(kv[..., self.lora:].reshape(1, 1, T, self.rope), fc, interleaved=True)
     store = self.norm(kv[..., :self.lora], a + "kv_a_layernorm").reshape(1, 1, T, self.lora).cat(k_pe, dim=-1)
-    k = Tensor(self.cache.uop.after(self.cache[:, :, pos:pos + T].uop.store(store.half().uop)))[:, :, :pos + T].float()
+    cache = (c:=self.cache.uop if cache is None else cache).after(c[:, :, pos:pos + T].store(store.half().uop))
+    k = Tensor(cache)[:, :, :pos + T].float()
     # absorbed: the nope scores (q_nope k_b) . latent, causal over the cache, the values v_b (attention . latent)
     qa = (q[..., :self.nope].half() @ self.k_b).float().cat(q_pe.float(), dim=-1)
     mask = (self.positions[:pos + T].reshape(1, 1, 1, -1) > self.positions[pos:pos + T].reshape(1, 1, T, 1)).where(float("-inf"), 0)
@@ -51,4 +55,4 @@ class Eagle3:
     x = self.lin((attn.half() @ self.v_b.transpose(-1, -2)).transpose(1, 2).reshape(1, T, -1), a + "o_proj") + hid
     m = self.norm(x, p + "post_attention_layernorm")
     x = x + self.lin(self.lin(m, p + "mlp.gate_proj").silu() * self.lin(m, p + "mlp.up_proj"), p + "mlp.down_proj")
-    return self.lin(self.norm(x, "norm"), "lm_head")
+    return self.lin(self.norm(x, "norm"), "lm_head"), x, cache

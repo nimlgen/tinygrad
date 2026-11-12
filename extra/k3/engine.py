@@ -4,7 +4,7 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, os, sys, time
+import ctypes, functools, itertools, os, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.helpers import DEBUG, getenv, prod
@@ -24,7 +24,7 @@ SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
-    every expert each (its units), in steps of up to tokens (a draft's verify steps: 2), keeping their logits or not"""
+    every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, keeping their logits or not"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
@@ -68,8 +68,12 @@ class Engine:
     self.v_pos = UOp.variable("start_pos", 0, model.max_context - 1)
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], tokens, dtypes.int32) for _ in range(2))
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * tokens, dtypes.int32)  # (a step's [done | tokens | guesses])
-    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in range(1, tokens + 1)}
-    self.times, self.verified = np.zeros(2), np.zeros(2)  # (launching the graphs, after the last layer), (verify steps, right guesses)
+    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens})}
+    # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
+    self.cres, (self.cres_np,) = host_tensor(self.devs[0], max(tokens - 1, 1), dtypes.int32)  # ([done | guesses])
+    self.dx, self.v_row = Tensor.empty(tokens, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
+    self.chain_jit = TinyJit(self.run_chain) if draft is not None and tokens > 2 else None
+    self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
@@ -92,15 +96,27 @@ class Engine:
     """the greedy token after each of the step's tokens and (a draft) its guess of the token after that (after the given one where there's
     one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits (kept, else done)"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
-    out = toks = logits.argmax(-1)
+    out, dx = (toks:=logits.argmax(-1)), []
     if self.draft is not None:
       given = self.given[:T].to(toks.device)
-      out = toks.cat(self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)[0].argmax(-1))
+      guess, x, _ = self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)
+      out = toks.cat(guess[0].argmax(-1))
+      dx = [Tensor(self.dx.uop)[:T].assign(x[0].float())]
     outs = Tensor(self.res.uop)[1:1 + out.shape[0]].assign(out.to(self.devs[0]).cast(dtypes.int32))
     done = Tensor(self.res.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0]))
     if not self.keep_logits: logits = done  # (realized, the logits are a buffer of their own: only for an eval)
-    Tensor.realize(done, logits)
+    Tensor.realize(done, logits, *dx)
     return done, logits
+
+  def run_chain(self, pos:UOp, row:UOp) -> Tensor:
+    """the draft's next guesses after the given one (a token at pos+1), a step each on its own hidden state of the step before (from its
+    row of the verify step's) into host memory, then the done word"""
+    tok, hid, cache, out = self.given[:1].to(self.devs), Tensor(self.dx.uop)[row:row + 1], None, []
+    for k in range(self.cres_np.size - 1):
+      logits, hid, cache = self.draft(tok.reshape(1, 1), None, pos + k, hid=hid.reshape(1, 1, -1), cache=cache)
+      out.append(tok:=logits[0].argmax(-1))
+    outs = Tensor(self.cres.uop)[1:].assign(Tensor.cat(*[t.to(self.devs[0]) for t in out]).cast(dtypes.int32))
+    return Tensor(self.cres.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0])).realize()
 
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
@@ -141,7 +157,8 @@ class Engine:
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
       for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
-    for _ in range(3 if len(self.jits) > 1 else 0): self.model.rollback(1)  # (its jit captured too, after a verify step)
+    for n, _ in itertools.product(range(1, max(self.jits)), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
+    for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
     """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each
@@ -162,6 +179,16 @@ class Engine:
     self.times += (t1 - t0, time.perf_counter() - t2)
     return ret[:T], ret[T:] or ret
 
+  def chain(self, g:int, pos:int, row:int) -> list[int]:
+    """the draft's guesses after g (at pos+1, guessed at the step's row) for a verify step"""
+    if self.chain_jit is None: return []
+    self.given_np[0], self.cres_np[0] = g, 0
+    self.chain_jit(self.v_pos.bind(pos), self.v_row.bind(row))
+    st = time.perf_counter()
+    while self.cres_np[0] != 1:
+      if time.perf_counter() - st > 60: raise RuntimeError("the draft's chain didn't finish")
+    return self.cres_np[1:].tolist()
+
   # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed feeds the rest
 
   @property
@@ -170,9 +197,10 @@ class Engine:
 
   def generate(self, tokens:list[int], temperature:float=0.0):
     """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos a token a step, then a token a step or
-    (a draft) a verify step of [the next, the draft's guess after it]: both kept when the guess is right, else the recurrent states rolled back
-    to after the next"""
+    (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first wrong one, the target's token
+    after them next, the recurrent states rolled back to after the kept ones"""
     for pos in range(self.get_start_pos(tokens), len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+    row = 0
     while True:
       tokens.append(t)
       self.model._cached_tokens = tokens[:-1]
@@ -180,16 +208,16 @@ class Engine:
       if self.draft is None:
         (t,), (g,) = self.step([t], len(tokens) - 1)
         continue
-      toks, guesses = self.step([t, g], len(tokens) - 1)
-      self.verified += (1, toks[0] == g)
-      if toks[0] == g:
+      gs = [g, *self.chain(g, len(tokens) - 1, row)]
+      toks, guesses = self.step([t, *gs], len(tokens) - 1)
+      row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
+      self.verified += (1, len(gs), row)
+      for g in gs[:row]:
         tokens.append(g)
         self.model._cached_tokens = tokens[:]
         yield g
-        t, g = toks[1], guesses[1]
-      else:
-        self.model.rollback(1)
-        t, g = toks[0], guesses[0]
+      if row < len(gs): self.model.rollback(row + 1)
+      t, g = toks[row], guesses[row]
 
   def counters(self) -> np.ndarray:
     io = self.io
@@ -218,7 +246,8 @@ if __name__ == "__main__":
   # DRAFT=dir: the eagle head, speculative decoding with T=2 verify steps (memory: fewer SLOTS)
   draft = Eagle3(d, lambda t: model.token_embd(t).float(), model.token_embd.weight.device, model.max_context) if (d:=getenv("DRAFT", "")) \
     else None
-  eng = Engine(model, m, tokens=2 if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")))
+  # VERIFY=n: a verify step's tokens, the next and the draft's chain of n-1 guesses
+  eng = Engine(model, m, tokens=getenv("VERIFY", 2) if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")))
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
@@ -238,5 +267,6 @@ if __name__ == "__main__":
     out.append(t)
     if len(out) == getenv("N", 32) or tok.is_end(t) or late(): break
   print(repr(tok.decode(out)), out, flush=True)
-  if draft: print(f"{eng.verified[1] / eng.verified[0]:.1%} of {eng.verified[0]:.0f} guesses right")
+  steps, guesses, right = eng.verified
+  if draft: print(f"{right / guesses:.1%} of {guesses:.0f} guesses right, {(steps + right) / steps:.2f} tokens a step")
   eng.report(c0, len(out) - 1)
