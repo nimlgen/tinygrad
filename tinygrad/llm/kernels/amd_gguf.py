@@ -18,6 +18,18 @@ SMALL_BLOCK_QUANTS = {Q8_0: 17, IQ4_NL: 9}
 QUANT_NAMES = {Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
                IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
 
+def q8_0_linear(w:Tensor, devices:tuple[str, ...]|str, axis:int|None=None) -> Linear:
+  """w (out, in) as a Linear of ggml Q8_0 blocks (an f16 scale, 32 int8), split over devices on axis (None: a copy on each)"""
+  out_features, in_features = cast(tuple[int, int], w.shape)
+  blocks = w.float().reshape(out_features, in_features // 32, 32)
+  d = blocks.abs().max(-1, keepdim=True) / 127
+  q = (blocks / (d == 0).where(1, d)).round().cast(dtypes.int8)
+  raw = d.half().bitcast(dtypes.uint8).cat(q.bitcast(dtypes.uint8), dim=-1).reshape(out_features, -1).bitcast(dtypes.uint16)
+  lin = Linear(in_features, out_features, bias=False)
+  lin.ggml_type, lin.shard_axis = Q8_0, axis
+  lin.weight = (raw.shard(devices, axis) if isinstance(devices, tuple) else raw.to(devices)).realize()
+  return lin
+
 def find_packed(decoded:Tensor, in_features:int) -> tuple[int, Tensor]|None:
   """(ggml type, packed words) if `decoded` is exactly the dequantization of packed ggml weights, rows of in_features"""
   if in_features % Q8_GROUP_SIZE: return None

@@ -5,7 +5,8 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna)
-from tinygrad.llm.kernels.amd_gguf import q8_quantize, expert_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K,
+  IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
@@ -289,6 +290,13 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
     gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, Tensor(UOp.variable("start", 0, 3).bind(1)), kept).realize()
     np.testing.assert_allclose(kept.numpy(), np.stack(states[:2]), rtol=2e-4, atol=2e-6)
     np.testing.assert_allclose(state.numpy(), states[2], rtol=2e-4, atol=2e-6)
+
+  def test_q8_0_linear(self): # a float weight quantized to q8_0 blocks, its gemv
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(3)
+    w, x = rng.normal(size=(96, 256)).astype(np.float32), rng.normal(size=(2, 256)).astype(np.float32)
+    out = q8_0_linear(Tensor(w), Tensor.empty(1).device)(Tensor(x)).numpy()
+    np.testing.assert_allclose(out, x @ w.T, rtol=0.02, atol=0.02 * np.abs(x @ w.T).max())
 
   def test_dense_gemv_bias(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")

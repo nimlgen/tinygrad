@@ -1,10 +1,12 @@
 # the EAGLE-3 draft of K3 (kimi-k3-eagle3.1-mla): one MLA decoder layer on the target's hidden states after three of its blocks. a position
 # j takes the next token t[j+1] and the target's hidden states after t[j], and guesses t[j+2]. its MLA keys (the normed latent, the roped key)
-# in a cache. its linears split over the target's gpus like the trunk's (outputs or inputs), in f16
+# in a cache. its linears split over the target's gpus like the trunk's (outputs or inputs), in q8_0 (in f16 where there's no kernel)
 import json, math
 from typing import Callable
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
 class Eagle3:
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int):
@@ -19,10 +21,12 @@ class Eagle3:
     self.mscale = 0.1 * rs["mscale_all_dim"] * math.log(rs["factor"]) + 1.0
     self.freqs_cis = (precompute_freqs_cis(self.rope, max_context, cfg["rope_theta"], yarn=yarn) / self.mscale).to(devs).realize()
     st = nn.state.safe_load(f"{path}/model.safetensors")
-    def w(name:str, axis:int|None=None) -> Tensor: return st[name].to(devs[0]).half().shard(devs, axis).realize()  # (read once)
+    def w(name:str, axis:int|None=None) -> Tensor|Linear:  # (read once)
+      if len(st[name].shape) == 1 or not amd_custom_kernels_supported(devs): return st[name].to(devs[0]).half().shard(devs, axis).realize()
+      return q8_0_linear(st[name].to(devs[0]), devs, axis)
     self.w = {k[:-len(".weight")]: w(k, axis) for k, axis in (
-      *((k, None) for k in st if k.endswith("norm.weight") or k.startswith("fc_norm") or "_a_proj" in k),
-      ("fc.weight", 1), ("layers.0.self_attn.o_proj.weight", 1), ("layers.0.mlp.down_proj.weight", 1), ("layers.0.self_attn.q_b_proj.weight", 0),
+      *((k, None) for k in st if k.endswith("norm.weight") or k.startswith("fc_norm") or "_a_proj" in k or k == "fc.weight"),
+      ("layers.0.self_attn.o_proj.weight", 1), ("layers.0.mlp.down_proj.weight", 1), ("layers.0.self_attn.q_b_proj.weight", 0),
       ("layers.0.mlp.gate_proj.weight", 0), ("layers.0.mlp.up_proj.weight", 0), ("lm_head.weight", 0))}
     # kv_b by head: the up projections of the latent to the nope keys (absorbed into the queries) and to the values
     kv_b = st["layers.0.self_attn.kv_b_proj.weight"].to(devs[0]).half().reshape(self.H, self.nope + self.vd, self.lora)
@@ -31,7 +35,7 @@ class Eagle3:
     self.positions = Tensor.arange(max_context).to(devs).realize()  # (the causal mask's, on the gpus: a symbolic arange isn't)
 
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
-  def lin(self, x:Tensor, name:str) -> Tensor: return x.half() @ self.w[name].T
+  def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
 
   def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:UOp|None=None) -> tuple[Tensor, Tensor, UOp]:
     """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states (or hid, its own of the step before: a chain of guesses)
