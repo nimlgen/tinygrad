@@ -441,6 +441,20 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       np.testing.assert_allclose(last, expected[2], rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")
       for s, e in zip(model.blk[0]._states(), expected_states): np.testing.assert_allclose(s.numpy(), e, rtol=1e-3, atol=1e-3, err_msg=f"{kda=}")
 
+  def test_rollback_replayed(self):  # rollbacks after verify steps, more than a jit's capture: the states as if only the next tokens were stepped
+    ssm = SSMConfig(conv_kernel=3, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=True)
+    model = Transformer(self._make_config(ssm=ssm, max_context=8))
+    for p in nn.state.get_parameters(model.blk[0]):
+      p.replace(self._tensor_linspace(-0.05, 0.05, p.shape) if len(p.shape) > 1 else self._tensor_linspace(0.05, 0.1, p.shape))
+    x, guess = self._tensor_linspace(-0.5, 0.5, (1, 5, model.config.dim)), self._tensor_linspace(0.9, -0.2, (1, 1, model.config.dim))
+    expected = [self._run_attention(model.blk[0], x[:, i:i+1], i) for i in range(5)]
+    model.blk[0].keep = 1
+    self._run_attention(model.blk[0], x[:, :1], 0)
+    for i in range(1, 4):
+      np.testing.assert_allclose(self._run_attention(model.blk[0], x[:, i:i+1].cat(guess, dim=1), i)[:, :1], expected[i], rtol=1e-3, atol=1e-3)
+      model.rollback(1)
+    np.testing.assert_allclose(self._run_attention(model.blk[0], x[:, 4:5], 4), expected[4], rtol=1e-3, atol=1e-3)
+
   def test_start_zero_resets_realized_state(self):
     config = self._make_config(max_context=3)
     x = self._tensor_linspace(-1, 1, (1, 3, config.dim))
