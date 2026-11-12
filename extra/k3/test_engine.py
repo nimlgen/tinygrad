@@ -18,7 +18,7 @@ CONFIG = TransformerConfig(num_blocks=3, dim=DIM, hidden_dim=FF, n_heads=2, n_kv
   norm_topk_prob=True, q_lora_rank=16, kv_lora_rank=16, shared_expert_dim=FF, ssm_layers=(True, True, False), attn_output_gate=True,
   leading_dense_blocks=1, dense_hidden_dim=64, expert_bias=True, shared_expert_gate=False, expert_latent_dim=LAT, attn_res_block_size=1,
   situ=(4.0, 25.0), ssm=SSMConfig(conv_kernel=2, state_size=16, group_count=2, time_step_rank=2, inner_size=32, kda=True, gate_lower_bound=-5.0,
-                                    full_rank_gate=True))
+                                    full_rank=(True, False)))
 
 def write(path:pathlib.Path, weights:dict[str, np.ndarray], experts:bool):
   w = GGUFWriter(path, "kimi-k3")

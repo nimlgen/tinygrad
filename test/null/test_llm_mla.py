@@ -10,7 +10,8 @@ def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False, experts:boo
     rope_theta=10000.0, rope_dim=4, v_head_dim=8, max_context=8, num_experts=4, num_experts_per_tok=2, expert_gating_func=ExpertGating.SIGMOID,
     q_lora_rank=8, kv_lora_rank=8, shared_expert_dim=8, ssm_layers=(True, False), attn_output_gate=True, leading_dense_blocks=1,
     dense_hidden_dim=16, expert_bias=True, shared_expert_gate=False, expert_latent_dim=8, attn_res_block_size=1,
-    ssm=SSMConfig(conv_kernel=2, state_size=8, group_count=2, time_step_rank=2, inner_size=16, kda=True, gate_lower_bound=-5.0, full_rank_gate=True),
+    ssm=SSMConfig(conv_kernel=2, state_size=8, group_count=2, time_step_rank=2, inner_size=16, kda=True, gate_lower_bound=-5.0,
+                  full_rank=(True, False)),
     indexer=IndexerConfig(n_heads=2, head_dim=8, top_k=4) if indexer else None)
   writer = GGUFWriter(path, arch)
   for key, value in {'context_length': 8, 'embedding_length': 16, 'feed_forward_length': 16, 'expert_feed_forward_length': 8, 'block_count': 2,
