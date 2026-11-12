@@ -7,14 +7,12 @@
 import ctypes, functools, os, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
-from tinygrad.device import Buffer, BufferSpec, MultiBuffer
-from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd_gguf import expert_linear, QUANT_NAMES, HALFWORD_QUANTS
-from extra.k3.host import IoT, host_c, wait, reads
+from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3
 
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
@@ -22,26 +20,6 @@ from extra.k3.draft import Eagle3
 # (default: what's free but SPARE bytes)
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
-
-def free_bytes(dev:str, chunk:int=256 << 20) -> int:
-  """the memory dev can still allocate: chunks of it allocated till one fails, then freed"""
-  bufs:list[Buffer] = []
-  try:
-    while True: bufs.append(Buffer(dev, chunk).allocate())
-  except MemoryError: pass
-  n = len(bufs)
-  bufs.clear()
-  Device[dev].allocator.free_cache()
-  return n * chunk
-
-def host_tensor(dev:str|tuple[str, ...], n:int, dtype:DType) -> tuple[Tensor, list[np.ndarray]]:
-  """n zeroed words in uncached host memory of the device (or each of the devices: they read and write it over pcie), numpy views of each"""
-  spec = BufferSpec(host=True, uncached=True, cpu_access=True)
-  buf = MultiBuffer(dev, n * dtype.itemsize, spec) if isinstance(dev, tuple) else Buffer(dev, n * dtype.itemsize, options=spec)
-  bufs = buf.bufs if isinstance(buf, MultiBuffer) else [buf]
-  views = [np.frombuffer(b.ensure_allocated().host.view(fmt='B').mv, np.dtype(dtype.fmt)) for b in bufs]
-  for v in views: v[:] = 0
-  return Tensor(UOp.from_buffer(buf, dtype)), views
 
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False):

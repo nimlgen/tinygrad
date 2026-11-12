@@ -5,12 +5,33 @@
 import ctypes, functools, hashlib, os, subprocess
 from typing import cast
 import numpy as np
-from tinygrad import Device
+from tinygrad import Device, Tensor
 from tinygrad.helpers import cache_dir
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, BufferSpec, MultiBuffer
+from tinygrad.dtype import DType
 from tinygrad.uop.ops import UOp
 from tinygrad.runtime.ops_nvme import NVMEDevice, NVMEAllocator
 from extra.k3.store import STRIPE, pieces, part_off
+
+def free_bytes(dev:str, chunk:int=256 << 20) -> int:
+  """the memory dev can still allocate: chunks of it allocated till one fails, then freed"""
+  bufs:list[Buffer] = []
+  try:
+    while True: bufs.append(Buffer(dev, chunk).allocate())
+  except MemoryError: pass
+  n = len(bufs)
+  bufs.clear()
+  Device[dev].allocator.free_cache()
+  return n * chunk
+
+def host_tensor(dev:str|tuple[str, ...], n:int, dtype:DType) -> tuple[Tensor, list[np.ndarray]]:
+  """n zeroed words in uncached host memory of the device (or each of the devices: they read and write it over pcie), numpy views of each"""
+  spec = BufferSpec(host=True, uncached=True, cpu_access=True)
+  buf = MultiBuffer(dev, n * dtype.itemsize, spec) if isinstance(dev, tuple) else Buffer(dev, n * dtype.itemsize, options=spec)
+  bufs = buf.bufs if isinstance(buf, MultiBuffer) else [buf]
+  views = [np.frombuffer(b.ensure_allocated().host.view(fmt='B').mv, np.dtype(dtype.fmt)) for b in bufs]
+  for v in views: v[:] = 0
+  return Tensor(UOp.from_buffer(buf, dtype)), views
 
 # the graph's side: wait holds a queue till the host sets the first word of buf ([ready | ...]) to 1, after deps are written
 def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").call(buf, *deps)
