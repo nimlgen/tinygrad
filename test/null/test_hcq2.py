@@ -78,8 +78,8 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None, mem:defau
       if (name:=ins_name(c)) is not None and name.startswith(("wait", "host_wait")):
         sig, target = mem[word(c.src[1])], 1 if name == "host_wait" else val(c.src[2])
         if sig != target if name == "wait_eq" else sig < target: continue
-      elif name in ("store", "host_store"):
-        mem[w:=word(c.src[1])] = 1 if name == "host_store" else val(c.src[2])
+      elif name == "store":
+        mem[w:=word(c.src[1])] = val(c.src[2])
         if w[0].arg.name == "timeline": log.append(w[0].device)
       elif c in cs: log.append(cs.index(c))
       cmds.pop(0)
@@ -187,27 +187,7 @@ class TestHCQ2Schedule(unittest.TestCase):
     self.assertTrue(all(c.body.op is Ops.PROGRAM for c in calls(b)))
     self.assertEqual(orders(b), {(0, 1)})
 
-  def test_a_graph_syncs_with_the_host(self):
-    tag, table = Tensor.empty(1, dtype=dtypes.uint32).realize(), Tensor.empty(4, dtype=dtypes.uint32).realize()
-    y = (self.x + 1).contiguous()
-    store = UOp.custom_function("host_store").call(tag.uop, y.uop) # tag = 1 once y is written
-    wait = UOp.custom_function("host_wait").call(table.uop.after(store)) # until the host sets table[0]
-    b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
-    store, wait = [c for c in queues(b)[("NULL", "COPY:0")] if ins_name(c) in ("host_store", "host_wait")]
-    for prio in rotations(b):
-      host = defaultdict(int)
-      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0]) # z waits for the host
-      self.assertEqual(host[word(store.src[1])], 1)
-      host[word(wait.src[1])] = 1
-      self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0, 1])
-    # a queue stores 1 to the tag, waits for the table's first word to be 1 and flushes
-    q = SimpleNamespace(log=[], signal=lambda d, v: q.log.append(("store", d, v)), wait=lambda d, v: q.log.append(("wait", d, v)),
-                        memory_barrier=lambda: q.log.append(("memory_barrier",)))
-    for c in (store, wait): hcq2.HWQueue.q_rewrite.rewrite(c, ctx=q)
-    one = UOp.const(1, dtypes.uint32)
-    self.assertEqual(q.log, [("store", store.src[1], one), ("wait", wait.src[1], one), ("memory_barrier",)])
-
-  def test_a_wait_after_a_result(self): # the results a wait comes after are its args: it holds the queue after their kernels
+  def test_a_wait_after_a_result(self): # a graph waits for the host after the results that are its args: it holds the queue after their kernels
     table = Tensor.empty(4, dtype=dtypes.uint32).realize()
     y = (self.x + 1).contiguous()
     wait = UOp.custom_function("host_wait").call(table.uop, y.uop)

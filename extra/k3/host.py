@@ -5,15 +5,14 @@
 import ctypes, functools, hashlib, os, subprocess
 from typing import cast
 import numpy as np
-from tinygrad import Device, dtypes
+from tinygrad import Device
 from tinygrad.helpers import cache_dir
 from tinygrad.device import Buffer
 from tinygrad.uop.ops import UOp
 from tinygrad.runtime.ops_nvme import NVMEDevice, NVMEAllocator
 from extra.k3.store import STRIPE, pieces, part_off
 
-# the graph's side, after deps are written: store sets tag to 1, wait holds a queue till the host sets the first word of buf ([ready | ...])
-def store(tag:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_store").call(tag, *deps)
+# the graph's side: wait holds a queue till the host sets the first word of buf ([ready | ...]) to 1, after deps are written
 def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").call(buf, *deps)
 
 # io_t: the host's state, the drives' queues and command tables, the counts (IO: name, c type, a pointer is an address). bufs: every layer's

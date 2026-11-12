@@ -14,7 +14,7 @@ from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.kernels.amd_gguf import expert_linear, QUANT_NAMES, HALFWORD_QUANTS
-from extra.k3.host import IoT, host_c, store, wait, reads
+from extra.k3.host import IoT, host_c, wait, reads
 from extra.k3.draft import Eagle3
 
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
@@ -59,7 +59,7 @@ class Engine:
     self.ks = (K // 2, K - K // 2)
     bufs = [[host_tensor(self.devs, n, dt) for n, dt in ((1, dtypes.uint32), (tokens * 2 * E // G, dtypes.float32),
                                                           *((1 + 2 * k * tokens, dtypes.uint32) for k in self.ks))] for _ in blocks]
-    self.tags, self.parts = [b[0][0] for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
+    self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
     self.scores = [b[1][0].uop.reshape(tokens, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows. the routers' memory freed: the scorers route
@@ -129,9 +129,10 @@ class Engine:
     return (out + self.experts(1, h[0], self.host(li, 1, out))).sum(0).unsqueeze(0)
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
-    """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in)"""
-    t = self.parts[i][li].uop
-    return Tensor(t.after(wait(t.after(store(self.tags[li].uop, dep.uop))) if i == 0 else wait(t, dep.uop)))
+    """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
+    a gpu's tag set 1 after its scores, 0 on a NaN)"""
+    if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).cast(dtypes.uint32))
+    return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
   def experts(self, i:int, h:Tensor, table:Tensor) -> Tensor:
     """each gpu's units of the experts of part i's table (j*T + t: token t's j-th, padded with slot 0 weight 0) on h (T, lat): (gpus, T, lat)"""

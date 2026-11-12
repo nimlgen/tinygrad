@@ -22,8 +22,8 @@ def get_call_kernel_args(call:UOp, prg:UOp, devs:tuple[str, ...]) -> list[UOp]:
           call.src[1+p.arg.slot].getaddr(devs) for p in prg.kernel_params]
 
 # functions a device queue runs in the graph and their queue, each writes its first arg after reading the rest. host_wait holds the queue
-# till the host sets the first word of its arg to 1, host_store sets it to 1: a graph syncs with the host
-QUEUE_FUNCTIONS = {"encdec": "ENCDEC:0", "host_wait": "COPY:0", "host_store": "COPY:0"}
+# till the host sets the first word of its arg to 1: a graph waits for the host
+QUEUE_FUNCTIONS = {"encdec": "ENCDEC:0", "host_wait": "COPY:0"}
 
 def get_call_outs_ins(call:UOp) -> tuple[tuple[int, ...], tuple[int, ...]]:
   ast = call.body
