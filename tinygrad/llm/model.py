@@ -645,10 +645,10 @@ class GatedDeltaNetBlock(FFNBlock):
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device) and not kept:
-      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4)
-      state = Tensor(self.recurrent_state.uop.after(*conv_state_stores))  # carry the conv write into this graph
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos)).transpose(1, 2)
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4), writes the kept ones
+      state = Tensor(self.recurrent_state.uop.after(*conv_state_stores, *kept_stores))  # carry the conv writes into this graph
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos), self.kept_states[:len(kept)] if kept else None).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
@@ -678,7 +678,10 @@ class GatedDeltaNetBlock(FFNBlock):
       else: self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device,
                                           axis=1 if kda else None).clone()
-    while len(self.kept) < self._kept(x.shape[1]): self.kept.append([s.empty_like() for s in self._states()])
+    if self.keep and not self.kept:  # (the kept recurrent states in one buffer: the fused scan writes them)
+      shape, axis = self.recurrent_state.shape, self.recurrent_state.uop.axis
+      self.kept_states = Tensor.empty(self.keep, *shape, device=x.device, axis=None if axis is None else axis+1).realize()
+      self.kept = [[*(s.empty_like() for s in self._states()[:-1]), self.kept_states[t]] for t in range(self.keep)]
 
 class Transformer:
   def __init__(self, config:TransformerConfig):

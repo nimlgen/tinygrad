@@ -273,6 +273,23 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
           np.testing.assert_allclose(out.numpy(), np.stack(outputs, axis=2), rtol=2e-4, atol=2e-6)
           np.testing.assert_allclose(state.numpy(), expected_state, rtol=2e-4, atol=2e-6)
 
+  def test_gated_delta_kept_states(self): # a short scan keeps the states after its first tokens (a speculative verify's rollback)
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    rng = np.random.default_rng(1)
+    q, k = (rng.normal(0, 0.1, (1, 2, 3, 32)).astype(np.float32) for _ in range(2))
+    v, beta, alpha = rng.normal(size=(1, 2, 3, 8)).astype(np.float32), rng.uniform(0, 1, (1, 2, 3)).astype(np.float32), \
+      rng.uniform(0.8, 1, (1, 2, 3, 32)).astype(np.float32)
+    initial = rng.normal(0, 0.1, (1, 2, 8, 32)).astype(np.float32)
+    expected, states = initial.copy(), []
+    for t in range(3):
+      expected *= alpha[:, :, t, None, :]
+      expected += ((v[:, :, t] - (expected*k[:, :, t, None]).sum(-1)) * beta[:, :, t, None])[..., None]*k[:, :, t, None]
+      states.append(expected.copy())
+    state, kept = Tensor(initial).contiguous().realize(), Tensor.empty(2, 1, 2, 8, 32).realize()
+    gated_delta_prefill(*map(Tensor, (q, k, v, beta, alpha)), state, Tensor(UOp.variable("start", 0, 3).bind(1)), kept).realize()
+    np.testing.assert_allclose(kept.numpy(), np.stack(states[:2]), rtol=2e-4, atol=2e-6)
+    np.testing.assert_allclose(state.numpy(), states[2], rtol=2e-4, atol=2e-6)
+
   def test_dense_gemv_bias(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     rng = np.random.default_rng(42)

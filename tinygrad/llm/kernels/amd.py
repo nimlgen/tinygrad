@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, math
+import functools, itertools, math
 from typing import cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
@@ -422,7 +422,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
+                                kept:UOp|None=None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -450,12 +451,17 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     delta = (v[bh, token, row].load() - state_k) * bv
     updates += [x + delta*y for x,y in zip(decayed, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q + delta*kq[bh, token]))
+  if kept is not None:  # the states after each of the first kept tokens (a short step's, for a rollback)
+    kept = kept.reshape(nk:=kept.shape[0], batch*heads, value_dim, key_dim)
+    stores += [kept[token.valid(token < nk), bh, row, col].store(u.cast(kept.dtype)) for (row, col), u in zip(itertools.product(rows, cols), updates)]
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
   state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
+                        kept:Tensor|None=None) -> Tensor:
+  """the scan's outputs; state updated in place, kept (n, *state.shape) the states after each of the first n tokens"""
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -467,8 +473,9 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
     assert start_pos.uop.is_bound_var
     state = Tensor(state.uop.after(start_pos.uop))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
+  assert kept is None or kept.uop.contiguous_view_offset() is not None, "kept states must be contiguous"
+  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq, *([] if kept is None else [kept]))
+  contig = tuple(x.uop if x.uop.op is Ops.AFTER or x is kept else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
+  call = _gated_delta_prefill_kernel(*params[:8], None if start_pos is None else start_pos.uop.unbound(), *params[8:]).call(*contig)
   return Tensor(contig[0].after(call))
