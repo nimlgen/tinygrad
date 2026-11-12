@@ -499,4 +499,15 @@ class TestExpertLinear(unittest.TestCase):
                          (down[g, k], self.weight((s + g) % self.NSLOTS, off, self.LAT, self.UNITS) @ h[g, k])):
           np.testing.assert_allclose(out, ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
+  def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
+    nslots = (1 << 32) // self.PART + 2
+    pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()
+    self.assertEqual(pool[-4:].tolist(), [0] * 4)
+    last = nslots - 1
+    pool[last * self.PART // 2:(last + 1) * self.PART // 2].assign(Tensor(self.raw[:self.PART].view(np.uint16))).realize()
+    x = self.rng.standard_normal((1, self.LAT)).astype(np.float32)
+    out = expert_linear(pool, Tensor([last], dtype=dtypes.int32), Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
+    ref = self.weight(0, 0, 2 * self.UNITS, self.LAT) @ x[0]
+    np.testing.assert_allclose(out[0], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
 if __name__ == "__main__": unittest.main()
