@@ -257,9 +257,9 @@ if __name__ == "__main__":
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
-  if (spec:=getenv("EVAL", "")):  # EVAL=corpus.jsonl:nseq:ntok:first (eval.py)
-    from extra.k3.eval import evaluate
-    evaluate(eng, spec, late)
+  if (spec:=getenv("EVAL", "") or getenv("BENCH", "")):  # EVAL=/BENCH=corpus.jsonl:nseq:ntok:first (eval.py)
+    from extra.k3.eval import evaluate, bench
+    (evaluate if getenv("EVAL", "") else bench)(eng, spec, late)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
   if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()
