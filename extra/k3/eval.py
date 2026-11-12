@@ -9,17 +9,19 @@ def evaluate(eng, spec:str, late:Callable[[], bool]):
   nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
   stats:list[tuple[float, float]] = []
   for r in [json.loads(line) for line in open(path)][first:first + nseq]:
-    ids, outs, n0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats)
-    for pos, t in enumerate(ids + outs[:-1]):
+    ids, outs, n0, c0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats), eng.counters()
+    seq, T, at = ids + outs[:-1], max(eng.jits), 0  # (steps of T tokens: a verify step's numerics)
+    while at < len(seq):
       if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
-      eng.step([t], pos)
-      if pos == 1: c0 = eng.counters()
-      if pos < len(ids) - 1: continue
-      lg = eng.logits.numpy()[0].astype(np.float64)
-      lp, top = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum()), r["output_top"][pos - len(ids) + 1]
-      p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
-      rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
-      stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
+      n = T if len(seq) - at >= T else 1
+      eng.step(seq[at:at + n], at)
+      for pos, lg in enumerate(eng.logits.numpy().astype(np.float64), at):
+        if pos < len(ids) - 1: continue
+        lp, top = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum()), r["output_top"][pos - len(ids) + 1]
+        p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
+        rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
+        stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
+      at += n
     (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
     eng.report(c0, len(ids) + len(outs) - 2)
