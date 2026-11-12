@@ -381,7 +381,7 @@ class HWQueue:
     (UPat(Ops.CALL, src=(UPat.custom_function("encdec", name="s"),), name="c", allow_any_len=True), lambda ctx, c, s: ctx.encdec(c, s)),
     # a graph's wait for the host
     (UPat(Ops.CALL, src=(UPat.custom_function("host_wait"), UPat(name="dst")), allow_any_len=True),
-     lambda ctx, dst: (ctx.wait(dst, UOp.const(1, dtypes.u32)), ctx.memory_barrier())),
+     lambda ctx, dst: ctx.wait(dst, UOp.const(1, dtypes.u32))),
 
     # ins
     (UPat(Ops.CALL, src=(UPat.custom_function("copy"), UPat(name="dst"), UPat(name="src"), UPat(name="n"))),
