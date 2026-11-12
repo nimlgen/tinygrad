@@ -10,8 +10,8 @@ from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
 from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
-from tinygrad.llm.kernels.amd_gguf import expert_linear, QUANT_NAMES, HALFWORD_QUANTS
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd_gguf import expert_linear, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3
 
@@ -40,11 +40,13 @@ class Engine:
     self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
     self.scores = [b[1][0].uop.reshape(tokens, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
-    # else the next layer's router), a gpu its experts' rows. the routers' memory freed: the scorers route
+    # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
     routers = [b.ffn_gate_inp.weight.float().numpy() for b in blocks]
     def guessed(li:int) -> np.ndarray: return np.load(f) if os.path.exists(f:=f"{guess}/guess-{m['layers'][li]}.npy") else routers[li]
-    self.scorers = [Tensor(np.stack([r, guessed(min(li + 1, L - 1))]).astype(np.float16)).shard(self.devs, 1).realize()
-                    for li, r in enumerate(routers)]
+    def scorer(w:np.ndarray) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
+      w = Tensor(w.reshape(2, G, E // G, -1).transpose(1, 0, 2, 3).reshape(2 * E, -1).astype(np.float16))
+      return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0).realize()
+    self.scorers = [scorer(np.stack([r, guessed(min(li + 1, L - 1))])) for li, r in enumerate(routers)]
     self.bias = [b.exp_probs_b["bias"].float().numpy() for b in blocks]
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
@@ -121,7 +123,9 @@ class Engine:
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
     of the experts it gives in two parts, summed over the gpus"""
-    scores = Tensor(self.scores[li])[:x.shape[1]].assign((self.scorers[li] @ x[0].T).float().permute(2, 0, 1))
+    s = w(x[0]) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
+    scores = Tensor(self.scores[li])[:x.shape[1]].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
+                                                     .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
     out = self.experts(0, h[0], self.host(li, 0, scores)).contiguous()  # (a buffer: part 2 waited for after it)
     return (out + self.experts(1, h[0], self.host(li, 1, out))).sum(0).unsqueeze(0)
 
