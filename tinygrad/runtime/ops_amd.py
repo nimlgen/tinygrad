@@ -861,6 +861,8 @@ class AMDDevice(Compiled):
 
     # Scratch setup
     self.max_private_segment_size = 0
+    waves = self.iface.props['max_slots_scratch_cu'] * self.cu_cnt // (self.se_cnt if self.target[0] != 9 else 1)
+    self.var_vals = {to_name(self.device, "waves"): waves & 0xfff}
     # the ring and its pointers of every queue it can make, made on first use
     queues = {"COMPUTE:0": lambda: self.compute_queue} | {f"COPY:{i}": functools.partial(self.sdma_queue, i) for i in range(8)}
     names = ("ring", "write_ptr", "doorbell", "put_value")
@@ -937,21 +939,9 @@ class AMDDevice(Compiled):
       self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 16 << 20, idx=idx)
     return self.sdma_queues.get(idx, None)
 
-  def tmpring_size(self, private_segment_size):
-    private_segment_size = max(private_segment_size, 128)
-
-    lanes_per_wave = 64 # wave64
-    mem_alignment_size = 256 if self.target[0] != 9 else 1024
-    size_per_thread = round_up(private_segment_size, mem_alignment_size // lanes_per_wave)
-    size_per_xcc = size_per_thread * lanes_per_wave * self.iface.props['max_slots_scratch_cu'] * self.cu_cnt
-
-    # NOTE: xcc logic is correct only for GFX9.
-    max_scratch_waves = self.cu_cnt * self.iface.props['max_slots_scratch_cu'] * self.xccs
-    wave_scratch = ceildiv(lanes_per_wave * size_per_thread, mem_alignment_size)
-    num_waves = (size_per_xcc // (wave_scratch * mem_alignment_size)) // (self.se_cnt if self.target[0] != 9 else 1)
-
-    tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
-    return int.from_bytes(tmpring_t(WAVES=min(num_waves, max_scratch_waves), WAVESIZE=wave_scratch), 'little')
+  def tmpring_size(self, private_segment_size) -> UOp: # [waves: of the device, read at run][wavesize: of the program]
+    wavesize = ceildiv(max(private_segment_size, 128) * 64, 256 if self.target[0] != 9 else 1024)
+    return UOp.variable(to_name(self.device, "waves"), 0, 0xfff, dtypes.uint32) | (wavesize << 12)
 
   def scratch_buffer(self, private_segment_size):
     AMDDevice.max_scratch_psize = private_segment_size = max(private_segment_size, 128, AMDDevice.max_scratch_psize)
