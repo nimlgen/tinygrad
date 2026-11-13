@@ -171,15 +171,13 @@ def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
                       dtypes.uint32).to(device, force=True)
 
 def _iq_even_signs(signs:UOp) -> UOp:
-  parity = signs ^ (signs >> 4)
-  parity ^= parity >> 2
-  parity ^= parity >> 1
-  return signs | ((parity & 1) << 7)
+  popcount = UOp.custom_function("__builtin_popcount({})", shape=signs.shape, dtype=dtypes.uint32, fmt=True)
+  return signs | ((popcount.call(signs.cast(dtypes.uint32), inline=True) & 1) << 7)
 
 def _iq_signed_word(word:UOp, signs:UOp) -> UOp:
-  mask = sum(((signs >> i) & 1) * (255 << (8*i)) for i in range(4))
+  low = ((signs & 15) * 0x00204081) & 0x01010101
   # Grid magnitudes are nonzero and <128, so each byte can be negated without a carry into its neighbor.
-  return (word ^ mask) + (mask & 0x01010101)
+  return (word ^ _amd_byte_perm(UOp.const(0, dtypes.uint32), UOp.const(0, dtypes.uint32), low | 0x0c0c0c0c)) + low
 
 def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:UOp|None) -> UOp:
   # Four packed weight bytes, shared by integer-dot decode and FP16 WMMA prefill.
