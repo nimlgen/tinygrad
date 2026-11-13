@@ -148,7 +148,7 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False, tables:tuple[UOp, ...]=()) -> UOp:
   chunks = out.shape[2]
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
@@ -159,7 +159,13 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
   token, output = token_output // out_features * tokens, token_output % out_features
   group = lane+chunk*32
-  value = [(group < group_count).where(group_dot(token+t, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32)) for t in range(tokens)]
+  if tables:  # (group_dot's lookup tables in LDS)
+    lts = [UOp.alloc((int(t.numel()),), t.dtype, addrspace=AddrSpace.LOCAL) for t in tables]
+    fill = UOp.group(*[lt[(i:=lane+wave*32+k*rows*32).valid(i < n)].store(t[i.minimum(n-1)].load()) for lt, t in zip(lts, tables)
+                       for n in [int(t.numel())] for k in range(-(-n//(rows*32)))]).barrier()
+    tables = tuple(lt.after(fill) for lt in lts)
+  value = [(group < group_count).where(group_dot(token+t, output, group.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
+           for t in range(tokens)]
   stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=True).cast(out.dtype)) for t,v in enumerate(value)]
   return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
@@ -228,10 +234,10 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
   # gate(token, base) -> base: moves the weight rows, xtoken(token) -> the activation row of an output row. w: output row t the sum over the
   # rows k = j*rows + t (out's rows) of their outputs weighted by w[k] (a row's groups go over its k)
   gpk = in_features//32
-  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
-    if w is None: return dot(token, output, group)
-    return dot(k:=group//gpk*out.shape[0] + token, output, group%gpk) * w[k].load()
-  def dot(token:UOp, output:UOp, group:UOp) -> UOp:
+  def group_dot(token:UOp, output:UOp, group:UOp, *grid:UOp) -> UOp:
+    if w is None: return dot(token, output, group, *grid)
+    return dot(k:=group//gpk*out.shape[0] + token, output, group%gpk, *grid) * w[k].load()
+  def dot(token:UOp, output:UOp, group:UOp, grid:UOp|None=None) -> UOp:
     block, subgroup = group//8, group%8
     base = (output*in_features//256 + block) * (QUANT_SIZES[ggml_type]//raw.dtype.itemsize)
     if ggml_type in SMALL_BLOCK_QUANTS: base = (output*in_features//32 + group)*SMALL_BLOCK_QUANTS[ggml_type]
@@ -243,7 +249,7 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
     # One accumulator per scale group: 32 weights for Q4/Q5/IQ4_XS, two groups of 16 otherwise.
     dots = [UOp.const(0, dtypes.int32)] * (1 if ggml_type in (Q4_K, Q5_K, IQ4_XS) else 2)
     for i in range(8):
-      weights = _quant_word(raw, base, subgroup, i, ggml_type, grids[0] if grids else None)
+      weights = _quant_word(raw, base, subgroup, i, ggml_type, grid)
       acc = i//(8//len(dots))
       dots[acc] = _amd_dp4a(weights, xwords[i], dots[acc], cdna)
     if ggml_type in (Q4_K, Q5_K):
@@ -278,7 +284,7 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
   # (an expert gemv's tokens a slot share its weight loads)
   share = gate is None if tokens is None else tokens
   groups = gpk * (1 if w is None else cast(int, w.shape[0])//cast(int, out.shape[0]))
-  return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share)
+  return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share, grids)
 
 @functools.cache
 def _moe_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, *grids:UOp,
