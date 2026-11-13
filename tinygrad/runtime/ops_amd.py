@@ -391,7 +391,8 @@ class AMDComputeQueue(HWQueue):
     self.wreg(self.gc.regCOMPUTE_PGM_LO, prog_addr >> 8)
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC1, data.rsrc1, data.rsrc2)
     self.wreg(self.gc.regCOMPUTE_PGM_RSRC3, data.rsrc3)
-    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, self.dev.tmpring_size(data.private_segment_size))
+    waves = UOp.variable(to_name(self.dev.device, "waves"), 0, 0xfff, dtypes.uint32)
+    self.wreg(self.gc.regCOMPUTE_TMPRING_SIZE, waves | self.dev.tmpring_size(data.private_segment_size))
     for xcc_id in range(self.dev.xccs): # architected flat scratch: each xcc gets its part
       with self.pred_exec(xcc_mask=1 << xcc_id):
         self.wreg(self.gc.regCOMPUTE_DISPATCH_SCRATCH_BASE_LO, (scratch_addr + data.private_segment_size // self.dev.xccs * xcc_id) >> 8)
@@ -939,10 +940,10 @@ class AMDDevice(Compiled):
       self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 16 << 20, idx=idx)
     return self.sdma_queues.get(idx, None)
 
-  def tmpring_size(self, private_segment_size) -> UOp: # [waves: of the device, read at run][wavesize: of the program]
+  def tmpring_size(self, private_segment_size) -> int: # [waves: of the device, read at run][wavesize: of the program]
     wavesize = ceildiv(max(private_segment_size, 128) * 64, 256 if self.target[0] != 9 else 1024)
     tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
-    return UOp.variable(to_name(self.device, "waves"), 0, 0xfff, dtypes.uint32) | int.from_bytes(tmpring_t(WAVESIZE=wavesize), 'little')
+    return int.from_bytes(tmpring_t(WAVESIZE=wavesize), 'little')
 
   def scratch_buffer(self, private_segment_size):
     AMDDevice.max_scratch_psize = private_segment_size = max(private_segment_size, 128, AMDDevice.max_scratch_psize)
@@ -968,7 +969,7 @@ class AMDDevice(Compiled):
     self.aql_desc.scratch_wave64_lane_byte_size = self.max_private_segment_size
     self.aql_desc.scratch_resource_descriptor[:] = [lo32(base), int.from_bytes(rsrc1_t(BASE_ADDRESS_HI=hi32(base), SWIZZLE_ENABLE=1), 'little'),
                                                     lo32(self.scratch.nbytes // self.xccs), int.from_bytes(bytes(rsrc3_t(**rsrc)), 'little')]
-    self.aql_desc.compute_tmpring_size = self.tmpring_size(self.max_private_segment_size)
+    self.aql_desc.compute_tmpring_size = self.var_vals[to_name(self.device, "waves")] | self.tmpring_size(self.max_private_segment_size)
     self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
   def _prof_buffer(self, size:int, dtype, host:bool=True) -> Buffer:
