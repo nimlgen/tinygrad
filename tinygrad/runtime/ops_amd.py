@@ -941,7 +941,8 @@ class AMDDevice(Compiled):
 
   def tmpring_size(self, private_segment_size) -> UOp: # [waves: of the device, read at run][wavesize: of the program]
     wavesize = ceildiv(max(private_segment_size, 128) * 64, 256 if self.target[0] != 9 else 1024)
-    return UOp.variable(to_name(self.device, "waves"), 0, 0xfff, dtypes.uint32) | (wavesize << 12)
+    tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
+    return UOp.variable(to_name(self.device, "waves"), 0, 0xfff, dtypes.uint32) | int.from_bytes(tmpring_t(WAVESIZE=wavesize), 'little')
 
   def scratch_buffer(self, private_segment_size):
     AMDDevice.max_scratch_psize = private_segment_size = max(private_segment_size, 128, AMDDevice.max_scratch_psize)
