@@ -3,7 +3,7 @@ import functools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -510,7 +510,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
-  if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
+  if splits > 1: result = partial_sum(result.reshape(splits, tokens, out_features))
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
 

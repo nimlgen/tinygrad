@@ -592,3 +592,91 @@ def topk_indices(scores:Tensor, k:int) -> Tensor:
     state = kernel(state, counts, fxn=_topk_byte_kernel, shift=shift, k=k)
   offs = kernel(Tensor.empty(R, N // TOPK_KEYS, 2, dtype=dtypes.int32, device=scores.device), counts, state, fxn=_topk_offsets_kernel)
   return kernel(Tensor.empty(R, k, dtype=dtypes.int32, device=scores.device), scores, state, offs, fxn=_topk_compact_kernel)
+
+# ******** small allreduces: the gpus write their partials into each other's memory ********
+
+# every gpu has a mailbox in its memory, mapped into the others: cached, a writer's l2 combines its stores into lines and a system release
+# writes them back (rdna4's system scope loads miss the reader's l2, rdna3's don't see the others' stores). a workgroup has a region of each:
+# two parities of a slot per gpu and of the sums, AR_WORDS words each, a value and its epoch in a word (no torn reads, no flags). the epochs
+# are the workgroups' counters on each gpu, the same on all of them: every gpu runs the same allreduces. no gpu is an epoch ahead of another's
+# reads (it waits for their values)
+AR_GROUPS, AR_WORDS, AR_TIMEOUT_MS, AR_TWO_SHOT = 64, 1024, 50, 4096
+
+@functools.cache
+def _mailboxes(devs:tuple[str, ...]) -> tuple[Tensor, ...]:
+  """each gpu's epoch counters (a workgroup's, then the gpu's index) and mailboxes (k: the one of gpu (d+k)%N), zeroed: no word has an epoch"""
+  from tinygrad.device import Buffer, MultiBuffer
+  N, nbytes = len(devs), AR_GROUPS * 2 * (len(devs) + 1) * AR_WORDS * 8
+  def multi(bufs:list[Buffer], dtype) -> Tensor:
+    (mb:=MultiBuffer.__new__(MultiBuffer)).bufs = bufs
+    return Tensor(UOp.from_buffer(mb, dtype, devs))
+  with Context(ALLOW_DEVICE_USAGE=1):
+    own = [Buffer(d, nbytes, initial_value=bytes(nbytes)) for d in devs]
+    counters = [Buffer(d, (AR_GROUPS + 1) * 4, initial_value=bytes(AR_GROUPS * 4) + i.to_bytes(4, "little")) for i, d in enumerate(devs)]
+  return multi(counters, dtypes.int32), *(multi([own[(d + k) % N] for d in range(N)], dtypes.uint64) for k in range(N))
+
+def _ar_shape(n:int) -> tuple[int, int]|None:
+  """(threads, values a thread) of a workgroup of an allreduce of n: small ones in narrow workgroups, larger in up to 24 of 256 threads"""
+  for T, EP in (((128, 1),) if n <= 2048 else ()) + ((256, 1), (256, 2), (256, 4)):
+    if n % (T * EP) == 0 and n // (T * EP) <= (AR_GROUPS if n <= 2048 else 24): return T, EP
+  return next(((T, EP) for T, EP in ((256, 4), (128, 4), (64, 4)) if n % (T * EP) == 0 and n // (T * EP) <= AR_GROUPS), None)
+
+def _sys(fmt:str, dtype, *src:UOp) -> UOp: return UOp.custom_function(fmt, dtype=dtype, fmt=True).call(*src)
+
+@functools.cache
+def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int) -> UOp:
+  # one shot: a gpu stores its values into its slot of every other gpu's mailbox and polls its own for theirs. two shot: workgroup g's go to
+  # gpu g%N (its owner) only, the owner sums them and stores the sums into the others' mailboxes. a sum adds the gpus' values in gpu order on
+  # every gpu: the same bits on all. a poll gives up at a deadline: the words it didn't get are NaN (and the sums), not a gpu that never ends
+  N, G, two_shot = len(mb), n // (T * EP), n >= AR_TWO_SHOT
+  wg, t = UOp.range(G, 0, AxisType.GLOBAL), UOp.range(T, 1, AxisType.LOCAL)
+  li = [t * EP + i for i in range(EP)]
+  els = [wg * T * EP + l for l in li]
+  epoch, me = (counter[wg].load() + 1).cast(dtypes.uint32), counter[AR_GROUPS].load().cast(dtypes.weakint)
+  deadline = _sys("__builtin_readsteadycounter()", dtypes.uint64, epoch) + AR_TIMEOUT_MS * 100000  # (100 MHz)
+  par = (epoch & 1).cast(dtypes.weakint)
+  def reg(s:int|UOp, l:UOp) -> UOp: return ((wg * 2 + par) * (N + 1) + s) * AR_WORDS + l
+  vals = [x.reshape(-1)[e].load().float() for e in els]
+  def word(v:UOp) -> UOp: return (epoch.cast(dtypes.uint64) << 32) | v.bitcast(dtypes.uint32).cast(dtypes.uint64)
+  def value(w:UOp) -> UOp: return (w >> 32).cast(dtypes.uint32).eq(epoch).where(w.cast(dtypes.uint32).bitcast(dtypes.float32), math.nan)
+  def push(stores:list[UOp], after:UOp|None=None) -> UOp:
+    # the stores in the l2, the workgroup's, then one wave writes the l2 back to the others
+    fenced = _sys('__builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");', dtypes.void, UOp.const(0, dtypes.int).after(*stores))
+    once = UOp.range((t < 32).where(1, 0).after(UOp.group(fenced, *([] if after is None else [after])).barrier()), next(UOp.unique_num),
+                     AxisType.LOOP)
+    return _sys('__builtin_amdgcn_fence(__ATOMIC_RELEASE, "");', dtypes.void, once).end(once).barrier()
+  def poll(after:UOp, slots:list[UOp], waits:list[UOp]) -> list[UOp]:
+    # the slots' words (system scope loads of this gpu's mailbox) until those it waits for have the epoch
+    loop = UOp.loop(next(UOp.unique_num)).replace(src=(UOp(Ops.NOOP).after(after),))
+    got = [_sys("__hip_atomic_load({0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)", dtypes.uint64, mb[0].after(loop).index(s)) for s in slots]
+    stale = functools.reduce(lambda a, b: a | b, [w & (g >> 32).cast(dtypes.uint32).ne(epoch) for g, w in zip(got, waits)])
+    words = UOp.alloc((len(slots),), dtypes.uint64, addrspace=AddrSpace.REG)
+    kept = UOp.group(*[words[i].store(g) for i, g in enumerate(got)])
+    words = words.after(kept.backedge(loop, stale & (_sys("__builtin_readsteadycounter()", dtypes.uint64, stale) < deadline)))
+    return [words[i].load() for i in range(len(slots))]
+  def ordered_sum(parts:list[UOp]) -> UOp: return functools.reduce(lambda a, b: a + b, parts)
+  if not two_shot:
+    sent = push([mb[k][reg(me, l)].store(word(v)) for k in range(1, N) for l, v in zip(li, vals)])
+    got = poll(sent, [reg(s, l) for s in range(N) for l in li], [me.ne(s) for s in range(N) for _ in li])
+    stores = [out[e].store(ordered_sum([me.eq(s).where(v, value(got[s * EP + i])) for s in range(N)])) for i, (e, v) in enumerate(zip(els, vals))]
+  else:
+    owner = (wg % N).cast(dtypes.weakint)
+    k_owner, is_owner = (owner - me + N) % N, owner.eq(me)
+    sent = push([mb[k][reg(me, l).valid(k_owner.eq(k))].store(word(v)) for k in range(1, N) for l, v in zip(li, vals)])
+    got = poll(sent, [reg(s, l) for s in range(N) for l in li], [is_owner & me.ne(s) for s in range(N) for _ in li])
+    sums = [ordered_sum([me.eq(s).where(v, value(got[s * EP + i])) for s in range(N)]) for i, v in enumerate(vals)]
+    published = push([mb[k][reg(N, l).valid(is_owner)].store(word(sm)) for k in range(1, N) for l, sm in zip(li, sums)], sent)
+    got = poll(published, [reg(N, l) for l in li], [is_owner.logical_not() for _ in li])
+    stores = [out[e].store(is_owner.where(sm, value(g))) for e, sm, g in zip(els, sums, got)]
+  # the next epoch, once every thread of the workgroup read the counter
+  done = counter.after(UOp.group(*stores).barrier())[wg.valid(t.eq(0))].store(epoch.cast(dtypes.int32))
+  return UOp.group(*stores, done).end(wg, t).sink(arg=KernelInfo(name="allreduce", opts_to_apply=()))
+
+def partial_sum(x:Tensor) -> Tensor:
+  """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes"""
+  n = prod(x.shape[1:])
+  if not (isinstance(x.device, tuple) and x.uop.axis == 0 and isinstance(n, int) and (shape:=_ar_shape(n))
+          and amd_custom_kernels_supported(x.device) and _is_rdna4(x.device)): return x.sum(0)
+  fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
+  out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
+  return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])

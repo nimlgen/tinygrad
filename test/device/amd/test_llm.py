@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna, topk_indices)
+                                      _is_rdna4, _is_cdna, topk_indices, partial_sum)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K,
   IQ3_S, IQ3_XXS)
@@ -595,5 +595,21 @@ class TestTopk(unittest.TestCase):
       mask = np.full((1, 1, T, pos + T), -np.inf, np.float32)
       for t in range(T): mask[0, 0, t, sel[t][sel[t] <= pos + t]] = 0
       np.testing.assert_allclose(blk._attention(x, (p,), idx).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
+
+class TestPartialSum(unittest.TestCase):
+  def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot
+    devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(4))
+    if not amd_custom_kernels_supported(devs) or not _is_rdna4(devs): self.skipTest("4 RDNA4 gpus required")
+    for n in (2048, 14336):
+      p = np.random.default_rng(n).standard_normal((4, n)).astype(np.float32)
+      parts, ref = Tensor(p).shard(devs, 0).realize(), np.zeros(n, np.float32)
+      @TinyJit
+      def chain(y:Tensor, parts=parts) -> Tensor:
+        for _ in range(16): y = partial_sum(parts + y * 0.25)
+        return y.realize()
+      y = Tensor.zeros(n).contiguous().to(devs).realize()
+      for _ in range(4): y = chain(y)
+      for _ in range(4 * 16): ref = (((q:=p + ref * np.float32(0.25))[0] + q[1]) + q[2]) + q[3]
+      for i in range(4): np.testing.assert_array_equal(Tensor(y.uop.mselect(i)).numpy().view(np.uint32), ref.view(np.uint32))
 
 if __name__ == "__main__": unittest.main()

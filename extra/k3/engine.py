@@ -10,7 +10,7 @@ from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum
 from tinygrad.llm.kernels.amd_gguf import expert_linear, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3
@@ -138,7 +138,7 @@ class Engine:
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
     if T > self.tokens: return self.experts(h[0], self.host(li, 0, scores), sum(self.ks) * T, 1).sum(0).unsqueeze(0)
     out = self.experts(h[0], self.host(li, 0, scores), self.ks[0] * T, T).contiguous()  # (a buffer: part 2 waited for after it)
-    return (out + self.experts(h[0], self.host(li, 1, out), self.ks[1] * T, T)).sum(0).unsqueeze(0)
+    return partial_sum(out + self.experts(h[0], self.host(li, 1, out), self.ks[1] * T, T)).unsqueeze(0)
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
