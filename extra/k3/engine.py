@@ -60,9 +60,10 @@ class Engine:
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
     # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states
+    weights = {id(t) for t in nn.state.get_parameters(model.blk)}  # (not realized here: some are decoded in the step's graph)
     for b in model.blk: b._init_state(Tensor.empty(1, 1, model.config.dim, device=self.devs))
-    Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if t.numel()]))
-    for buf in (t.uop.base.buffer for t in states):  # (the empty ones too)
+    Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if id(t) not in weights and t.numel()]))
+    for buf in (t.uop.base.buffer for t in states):  # (the empty ones too, else allocated at their first use)
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
     self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
