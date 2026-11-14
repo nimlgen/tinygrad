@@ -491,7 +491,7 @@ def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:U
   # a lane's fragment: RDNA4 words (ph, ph+2) of a half group, RDNA3 all four; its accumulator rows ph*8 + j (RDNA3: 2j + ph)
   assert ggml_type in (Q8_0, IQ3_XXS), f"{QUANT_NAMES[ggml_type]} has no int8 expert kernel"
   xrow, grids = (extra[0], extra[1:]) if gathered else (None, extra)
-  layout = _wmma_layout(out, out_features, 16, 2, 32)
+  layout = _wmma_layout(out, out_features, 16, 4 if gathered else 1, 32)  # (a gathered row's fragment for 4 output tiles)
   _, token_block, _, lane, wave, ph, outputs, inputs, tokens = layout
   rows = tokens[0] if rdna4 else tuple(token_block*16 + 2*j + ph for j in range(8))
   grid = None
