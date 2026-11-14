@@ -101,14 +101,12 @@ class TestEngine(unittest.TestCase):
           wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
                                                                     wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        def chunk() -> Tensor:  # (host.py's chunk table, a tile expert e's (T <= 16): token t's pick of it at its row 16*e + t)
+        def chunk() -> Tensor:  # (host.py's chunk table, a tile expert e's (T <= 16): token t's row of it 16*e + t)
           n, NT, cpu = K * T, K * T // 16 + E, "CPU"
-          k, t, nt = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(T, dtype=dtypes.int32).to(cpu), Tensor.arange(NT).to(cpu)
-          j = (sel.unsqueeze(-1) == Tensor.arange(E).to(cpu)).cast(dtypes.int32).argmax(1).cast(dtypes.int32)  # (T, E): token t's pick of e
-          trow = (j * T + t.reshape(T, 1)).T.pad(((0, NT - E), (0, 16 - T))).flatten().cast(dtypes.int32)
+          k, nt = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(NT).to(cpu)
           tslot = (nt < E).where(nt + li * E, 0).cast(dtypes.int32)
-          return Tensor([1], dtype=dtypes.int32, device=cpu).cat((sel.T.flatten() + li * E).cast(dtypes.int32), tslot, trow,
-                                                                (sel.T.flatten() * 16 + k % T).cast(dtypes.int32)) \
+          ttok = Tensor.arange(T, dtype=dtypes.int32).to(cpu).reshape(1, T).expand(NT, T).pad(((0, 0), (0, 16 - T))).flatten()
+          return Tensor([1], dtype=dtypes.int32, device=cpu).cat(tslot, ttok, (sel.T.flatten() * 16 + k % T).cast(dtypes.int32)) \
             .bitcast(dtypes.uint32).cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
         tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else [chunk()]
       return tables[li][i]
