@@ -559,12 +559,12 @@ class MLATransformerBlock(FFNBlock):
     cache = _update_cache(self.cache_k, k_store, start_pos, 2)
     scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
     if idx_mask is not None and dtypes.is_int(idx_mask.dtype):
-      # the indexer's positions (B, T, top_k): each token's keys gathered (past the ones there are, and its future, masked)
+      # the indexer's positions (B, T, top_k): each token's keys gathered (the slots past the keys there are the first key's, masked as its future)
       S, K = ssimplify(smax(start_pos) + T), idx_mask.shape[-1]
-      keys = cache[:, 0].gather(1, idx_mask.clip(0, self.config.max_context - 1).reshape(B, -1, 1).expand(B, T*K, cache.shape[-1]))
-      keys = keys.reshape(B, 1, T, K, -1).contiguous()
+      pos = (Tensor.arange(K) < S).where(idx_mask, 0)
+      keys = cache[:, 0].gather(1, pos.reshape(B, -1, 1).expand(B, T*K, cache.shape[-1])).reshape(B, 1, T, K, -1).contiguous()
       q_pos = Tensor.stack(*(Tensor(p) for p in start_pos)).reshape(-1, 1, 1) + Tensor.arange(T).reshape(1, T, 1)
-      mask = ((Tensor.arange(K) < S) & (idx_mask <= q_pos)).where(0.0, -math.inf).reshape(B, 1, T, 1, K)
+      mask = ((Tensor.arange(K) < S) & (pos <= q_pos)).where(0.0, -math.inf).reshape(B, 1, T, 1, K)
       attn = ((q.unsqueeze(-2) @ keys.transpose(-1, -2) * scale + mask).softmax(-1) @ keys[..., :self.config.kv_lora_rank]).squeeze(-2).contiguous()
     else:
       k = _cache_prefix(cache, start_pos, T, 2)

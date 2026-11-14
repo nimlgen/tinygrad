@@ -588,10 +588,13 @@ class TestTopk(unittest.TestCase):
     for T, pos in ((1, 3), (2, 7), (1, 40), (2, 50)):
       x, p = Tensor(rng.standard_normal((1, T, 64)).astype(np.float32)), UOp.variable("start_pos", 0, 63).bind(pos)
       blk._init_state(x)
-      blk.cache_k.assign(Tensor(rng.standard_normal(blk.cache_k.shape).astype(np.float16))).realize()
+      cache = rng.standard_normal(blk.cache_k.shape).astype(np.float16)
+      cache[:, :, pos + T:] = np.nan  # (past the keys there are: never read)
+      blk.cache_k.assign(Tensor(cache)).realize()
       blk.indexer.cache_kg.assign(Tensor(rng.standard_normal(blk.indexer.cache_kg.shape).astype(np.float16))).realize()
-      idx = blk._indexer_mask(x, (p,), None)
-      sel = idx.numpy()[0, :, :min(8, pos + T)]
+      idx = blk._indexer_mask(x, (p,), None).numpy()
+      idx[..., min(8, pos + T):] = 63  # (the slots past the keys there are: unset, here the last position's)
+      sel, idx = idx[0, :, :min(8, pos + T)], Tensor(idx)
       mask = np.full((1, 1, T, pos + T), -np.inf, np.float32)
       for t in range(T): mask[0, 0, t, sel[t][sel[t] <= pos + t]] = 0
       np.testing.assert_allclose(blk._attention(x, (p,), idx).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
