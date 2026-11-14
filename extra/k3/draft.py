@@ -2,7 +2,7 @@
 # j takes the next token t[j+1] and the target's hidden states after t[j], and guesses t[j+2]. its MLA keys (the normed latent, the roped key)
 # in a cache. its linears split over the target's gpus like the trunk's (outputs or inputs), in q8_0 (in f16 where there's no kernel)
 import json, math
-from typing import Callable
+from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
@@ -37,21 +37,30 @@ class Eagle3:
 
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
+  def fc(self, hidden:Tensor) -> Tensor:  # (the target's hidden states (1, T, 3, dim) to the layer's)
+    return self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
+
+  def keys(self, tokens:Tensor, hid:Tensor, pos:int|UOp, cache:UOp) -> tuple[Tensor, UOp]:
+    """the layer's input of (1, T) tokens at positions pos.. on hid (1, T, dim), the cache after their keys (the normed latent, the roped key)"""
+    T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
+    h = self.norm(self.embed(tokens), p + "input_layernorm").cat(self.norm(hid, p + "hidden_norm"), dim=-1)
+    kv = self.lin(h, a + "kv_a_proj_with_mqa")
+    k_pe = apply_rope(kv[..., self.lora:].reshape(1, 1, T, self.rope), self.freqs_cis[pos:pos + T], interleaved=True)
+    store = self.norm(kv[..., :self.lora], a + "kv_a_layernorm").reshape(1, 1, T, self.lora).cat(k_pe, dim=-1)
+    return h, cache.after(cache[:, :, pos:pos + T].store(store.half().uop))
+
+  def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
+    """the cache after the keys of a prompt's chunk (tokens at positions pos.. on the target's hidden states), its guesses not needed"""
+    return Tensor(self.keys(tokens, self.fc(hidden), pos, self.cache.uop)[1])
 
   def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:UOp|None=None) -> tuple[Tensor, Tensor, UOp]:
     """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states (or hid, its own of the step before: a chain of guesses)
     -> (1, T, vocab) logits, (1, T, dim) its hidden states, its cache after their keys (a chain's next step's cache)"""
     T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
-    if hid is None:
-      assert hidden is not None
-      hid = self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
-    h = self.norm(self.embed(tokens), p + "input_layernorm").cat(self.norm(hid, p + "hidden_norm"), dim=-1)
+    if hid is None: hid = self.fc(cast(Tensor, hidden))
+    h, cache = self.keys(tokens, hid, pos, self.cache.uop if cache is None else cache)
     q = self.lin(self.norm(self.lin(h, a + "q_a_proj"), a + "q_a_layernorm"), a + "q_b_proj").reshape(1, T, self.H, -1).transpose(1, 2)
-    kv, fc = self.lin(h, a + "kv_a_proj_with_mqa"), self.freqs_cis[pos:pos + T]
-    q_pe = apply_rope(q[..., self.nope:], fc, interleaved=True)
-    k_pe = apply_rope(kv[..., self.lora:].reshape(1, 1, T, self.rope), fc, interleaved=True)
-    store = self.norm(kv[..., :self.lora], a + "kv_a_layernorm").reshape(1, 1, T, self.lora).cat(k_pe, dim=-1)
-    cache = (c:=self.cache.uop if cache is None else cache).after(c[:, :, pos:pos + T].store(store.half().uop))
+    q_pe = apply_rope(q[..., self.nope:], self.freqs_cis[pos:pos + T], interleaved=True)
     k = Tensor(cache)[:, :, :pos + T].float()
     # absorbed: the nope scores (q_nope k_b) . latent, causal over the cache, the values v_b (attention . latent)
     qa = (q[..., :self.nope].half() @ self.k_b).float().cat(q_pe.float(), dim=-1)

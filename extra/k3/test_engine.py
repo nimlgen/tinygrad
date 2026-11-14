@@ -161,6 +161,20 @@ class TestEngine(unittest.TestCase):
     for t in (*(b.cache_k for b in model.blk if isinstance(b, MLATransformerBlock)), draft.cache, model.blk[0].kept[0][0]):
       self.assertTrue(all(b.is_allocated() for b in t.uop.base.buffer.bufs))
 
+  def test_draft_chunk(self):  # a chunk fills the draft's cache as its tokens a step each do (its guesses not made)
+    self.stub()
+    eng, folder = self.eng, tempfile.mkdtemp()
+    eng.draft = Eagle3(eagle(folder, np.random.default_rng(1)), lambda t: eng.model.token_embd(t).float(), eng.devs, eng.model.max_context)
+    toks, given = [3, 5, 7, 1], [5, 7, 1, 2]
+    for p, (t, g) in enumerate(zip(toks, given)):
+      eng.tok_np[:1], eng.given_np[:1] = [t], [g]
+      eng.run(1, UOp.variable("start_pos", 0, 15).bind(p))
+    want = eng.draft.cache.numpy()[..., :4, :]
+    eng.draft.cache.assign(eng.draft.cache.zeros_like()).realize()
+    eng.tok_np[:4], eng.given_np[:4] = toks, given
+    eng.run(4, UOp.variable("start_pos", 0, 15).bind(0))
+    np.testing.assert_allclose(eng.draft.cache.numpy()[..., :4, :], want, rtol=1e-2, atol=1e-2)
+
   def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
     self.stub()
     eng, folder = self.eng, tempfile.mkdtemp()

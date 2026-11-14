@@ -128,14 +128,16 @@ class Engine:
     return max(used.values(), default=0)
 
   def outputs(self, T:int, pos:UOp) -> list[Tensor]:
-    """run's tensors: the done word, the logits (kept, else the done word) and the draft's hidden states"""
+    """run's tensors: the done word, the logits (kept, else the done word) and the draft's hidden states (a chunk: its cache)"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
     out, dx = (toks:=logits.argmax(-1)), []
     if self.draft is not None:
-      given = self.given[:T].to(toks.device)
-      guess, x, _ = self.draft((given >= 0).where(given, toks).reshape(1, T), hidden, pos)
-      out = toks.cat(guess[0].argmax(-1))
-      dx = [Tensor(self.dx.uop)[:T].assign(x[0].float())]
+      given = ((g:=self.given[:T].to(toks.device)) >= 0).where(g, toks).reshape(1, T)
+      if T > self.tokens: dx = [self.draft.fill(given, hidden, pos)]  # (a chunk: the draft's cache of its positions, no guesses)
+      else:
+        guess, x, _ = self.draft(given, hidden, pos)
+        out = toks.cat(guess[0].argmax(-1))
+        dx = [Tensor(self.dx.uop)[:T].assign(x[0].float())]
     outs = Tensor(self.res.uop)[1:1 + out.shape[0]].assign(out.to(self.devs[0]).cast(dtypes.int32))
     done = Tensor(self.res.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0]))
     return [done, logits if self.keep_logits else done, *dx]  # (realized, the logits are a buffer of their own: only for an eval)
@@ -227,7 +229,7 @@ class Engine:
     while self.res_np[0] != 1:
       if time.perf_counter() - t2 > 60: raise RuntimeError("the step's graph didn't finish")
     if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left"}[err])
-    ret = self.res_np[1:1 + (2 * T if self.draft is not None else T)].tolist()
+    ret = self.res_np[1:1 + (2 * T if self.draft is not None and T <= self.tokens else T)].tolist()
     self.times += (t1 - t0, time.perf_counter() - t2)
     return ret[:T], ret[T:] or ret
 
