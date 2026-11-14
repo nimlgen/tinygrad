@@ -563,6 +563,9 @@ class TestExpertLinear(unittest.TestCase):
     out = expert_gemm(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
     ref = expert_linear(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, per=16).numpy()
     np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
+    dead = Tensor(np.array(self.sel[:2] + [-1], np.int32))  # (a tile of no expert: its rows not written, the others as before)
+    got = expert_gemm(self.pool, dead, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+    np.testing.assert_allclose(got[:32], ref[:32], rtol=0.03, atol=0.03 * np.abs(ref).max())
 
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2

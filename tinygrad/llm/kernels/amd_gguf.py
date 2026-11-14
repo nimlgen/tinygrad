@@ -7,6 +7,7 @@ from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, 
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
+from tinygrad.renderer import Estimates
 
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
 Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 8, 10, 11, 12, 13, 14
@@ -488,7 +489,8 @@ def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:U
                            stride:int, offset:int, gathered:bool, rdna4:bool) -> UOp:
   # out[r] = W[slots[r // 16]] @ x[r] (gathered: x[extra[0][r]]) on the int8 tensor cores: a token block of 16 rows an expert's, its weights'
   # bytes (the decode gemv's words) times the q8 of x, a 32 input group's int32 dot scaled once (formats of a scale a group: Q8_0, IQ3_XXS).
-  # a lane's fragment: RDNA4 words (ph, ph+2) of a half group, RDNA3 all four; its accumulator rows ph*8 + j (RDNA3: 2j + ph)
+  # a lane's fragment: RDNA4 words (ph, ph+2) of a half group, RDNA3 all four; its accumulator rows ph*8 + j (RDNA3: 2j + ph). a block of slot
+  # -1 (no expert) skips its loop and stores nothing
   assert ggml_type in (Q8_0, IQ3_XXS), f"{QUANT_NAMES[ggml_type]} has no int8 expert kernel"
   xrow, grids = (extra[0], extra[1:]) if gathered else (None, extra)
   layout = _wmma_layout(out, out_features, 16, 4 if gathered else 1, 32)  # (a gathered row's fragment for 4 output tiles)
@@ -501,8 +503,9 @@ def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:U
     grid = grid.after(*(grid[tid+i*threads].store(grids[0][tid+i*threads]) for i in range(int(grid.numel())//threads)))
   def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.weakint)
   type_words = QUANT_SIZES[ggml_type]//raw.dtype.itemsize
-  output_words, slot_base = in_features * type_words // GGML_BLOCK_SIZE, slots[token_block].cast(dtypes.int64)*stride + offset
-  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.LOOP)
+  slot = slots[token_block].cast(dtypes.int32)
+  output_words, slot_base = in_features * type_words // GGML_BLOCK_SIZE, slot.maximum(0).cast(dtypes.int64)*stride + offset
+  group = UOp.range((slot >= 0).where(in_features // Q8_GROUP_SIZE, 0), 4, AxisType.LOOP)
   block, subgroup = group // 8, group % 8
   accs = [UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in outputs]
   accs = [acc.after(acc.store(acc.const_like(0))) for acc in accs]
@@ -521,9 +524,12 @@ def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:U
     d = d.after(d.store(dot))
     vals[o] = [v + xds[j] * scale * d[j].load().float() for j, v in enumerate(vals[o])]
   update = UOp.group(*(acc.store(UOp.stack(*v)) for acc, v in zip(accs, vals))).end(group)
-  stores = [out[r, output].store(acc.after(update)[j].load()) for output, acc in zip(outputs, accs) for j, r in enumerate(rows)]
+  stores = [out[r.valid(slot >= 0), output].store(acc.after(update)[j].load()) for output, acc in zip(outputs, accs) for j, r in enumerate(rows)]
+  # (the work of every block: a block's loop bound is data)
+  weights = cast(int, out.shape[0]) * out_features * in_features
+  estimates = Estimates(2*weights, weights*type_words*2//GGML_BLOCK_SIZE, weights*type_words*2//GGML_BLOCK_SIZE)
   name = f"expert_{QUANT_NAMES[ggml_type]}_i8_wmma"
-  return UOp.group(*stores).end(*layout[1:3], lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  return UOp.group(*stores).end(*layout[1:3], lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=(), estimates=estimates))
 
 def _i8_frag(words:tuple[UOp, ...]) -> UOp:  # (an int8 fragment of the words' bytes)
   return UOp.stack(*(((w >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8) for w in words for i in range(4)))
