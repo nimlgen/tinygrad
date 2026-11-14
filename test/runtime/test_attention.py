@@ -481,13 +481,13 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     model, rng = Transformer(self._make_config(num_blocks=2, ssm_layers=(True, False), ssm=ssm, max_context=24)), np.random.default_rng(7)
     for p in nn.state.get_parameters(model): p.replace(Tensor(rng.standard_normal(p.shape).astype(np.float32)))
     X = [1, 2, 3, 4, 5, 6]
-    def take(gen) -> list[int]: return [t for _, t in zip(range(4), gen)]
-    want = take(model.generate(X + [11, 12]))
-    take(model.generate(X + [7, 8]))  # (from 0: its states kept after X, where it diverges)
+    def take(prompt:list[int]) -> list[int]: return [t for _, t in zip(range(4), model.generate(prompt, chunk_size=2))]  # (X: whole chunks)
+    want = take(X + [11, 12])
+    take(X + [7, 8])  # (from 0: its states kept after X, where it diverges)
     self.assertEqual(model.get_start_pos(X + [9, 10]), len(X))
-    take(model.generate(X + [9, 10]))
+    take(X + [9, 10])
     self.assertEqual(model.get_start_pos(X + [11, 12]), len(X))
-    self.assertEqual(take(model.generate(X + [11, 12])), want)
+    self.assertEqual(take(X + [11, 12]), want)
     self.assertEqual(model.get_start_pos([5, 6, 7]), 0)  # (a prompt of other tokens from 0: the ones kept dropped)
     self.assertEqual(model.get_start_pos(X + [1]), 0)
 
