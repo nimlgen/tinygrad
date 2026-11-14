@@ -195,7 +195,8 @@ class Engine:
       if time.perf_counter() - st > 60: raise RuntimeError("the draft's chain didn't finish")
     return self.cres_np[1:].tolist()
 
-  # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed feeds the rest
+  # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed (or the last prompt) feeds
+  # the rest
 
   @property
   def max_context(self) -> int: return self.model.max_context
@@ -206,6 +207,7 @@ class Engine:
     (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first wrong one, the target's token
     after them next, the recurrent states rolled back to after the kept ones"""
     for pos in range(self.get_start_pos(tokens), len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+    self.model.save(tokens)
     row = 0
     while True:
       tokens.append(t)

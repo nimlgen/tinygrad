@@ -705,6 +705,7 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    self._saved: tuple[list[int], list[Tensor]] = ([], [])  # (the last prompt fed, the recurrent states after it)
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
@@ -731,6 +732,13 @@ class Transformer:
     def copy(): Tensor.realize(*[s.assign(k) for b in blocks for s, k in zip(b._states(), b.kept[n-1])])
     if n not in self._rollbacks: self._rollbacks[n] = TinyJit(copy)  # (a copy a state, scheduled once)
     self._rollbacks[n]()
+
+  def _states(self) -> list[Tensor]: return [s for b in self.blk if isinstance(b, GatedDeltaNetBlock) for s in b._states()]
+  def save(self, tokens:list[int]):
+    """after a prompt is fed, its recurrent states kept: get_start_pos restores them for a prompt that extends it"""
+    if not (states:=self._states()): return
+    self._saved = (tokens[:], self._saved[1] or [s.empty_like() for s in states])
+    Tensor.realize(*[k.assign(s) for k, s in zip(self._saved[1], states)])
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
@@ -969,10 +977,15 @@ class Transformer:
     for _ in range(2): list(zip(range(2), self.generate([0])))
 
   def get_start_pos(self, tokens:list[int]) -> int:
-    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
+    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix, else the last prompt's
+    # (its saved states restored, the attention caches are still valid up to it)
     if self.has_recurrent_block:
-      return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
-        and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
+      def extends(prefix:list[int]) -> bool: return 0 < len(prefix) < len(tokens) and tokens[:len(prefix)] == prefix
+      if extends(self._cached_tokens): return len(self._cached_tokens)
+      if not extends(prompt:=self._saved[0]): return 0
+      Tensor.realize(*[s.assign(k) for s, k in zip(self._states(), self._saved[1])])
+      self._cached_tokens = prompt[:]
+      return len(prompt)
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
@@ -995,6 +1008,7 @@ class Transformer:
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
+      if start_pos == prompt_len: self.save(tokens)
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]

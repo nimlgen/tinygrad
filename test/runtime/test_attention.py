@@ -455,6 +455,19 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       model.rollback(1)
     np.testing.assert_allclose(self._run_attention(model.blk[0], x[:, 4:5], 4), expected[4], rtol=1e-3, atol=1e-3)
 
+  def test_prompt_states_restored(self):  # a prompt that extends the last one, not what was generated after it: as if fed from 0
+    ssm = SSMConfig(conv_kernel=3, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=True)
+    model, rng = Transformer(self._make_config(num_blocks=2, ssm_layers=(True, False), ssm=ssm, max_context=16)), np.random.default_rng(7)
+    for p in nn.state.get_parameters(model): p.replace(Tensor(rng.standard_normal(p.shape).astype(np.float32)))
+    first, second = [1, 2, 3, 4], [1, 2, 3, 4, 7, 9]
+    def take(gen) -> list[int]: return [t for _, t in zip(range(4), gen)]
+    want = take(model.generate(second[:]))
+    out = take(model.generate(first[:]))  # (from 0: first extends neither the tokens fed nor the last prompt)
+    self.assertNotEqual(out[0], second[len(first)])
+    self.assertEqual(model.get_start_pos(second), len(first))
+    self.assertEqual(take(model.generate(second[:])), want)
+    self.assertEqual(model.get_start_pos([5, 6]), 0)
+
   def test_start_zero_resets_realized_state(self):
     config = self._make_config(max_context=3)
     x = self._tensor_linspace(-1, 1, (1, 3, config.dim))
