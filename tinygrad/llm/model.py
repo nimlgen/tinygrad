@@ -456,7 +456,7 @@ def topk_mask(x:Tensor, k:int) -> Tensor:
   """x >= its k-th largest on the last axis (all of it if shorter, ties all in): a radix select of the floats' bits in order, a byte a pass"""
   u = x.float().bitcast(dtypes.uint32)
   key = (u >> 31).eq(1).where(u ^ 0xFFFFFFFF, u | 0x80000000).unsqueeze(-1)
-  kth, need, byte = key[..., :1, :].zeros_like(), Tensor.full((*x.shape[:-1], 1), k), Tensor.arange(256, dtype=dtypes.uint32)
+  kth, need, byte = key[..., :1, :].zeros_like(), x[..., :1].full_like(k, dtype=dtypes.int32), Tensor.arange(256, dtype=dtypes.uint32)
   for shift in (24, 16, 8, 0):  # (ge: the keys under the bytes chosen so far with this byte >= each one)
     ge = ((key & (0xFFFFFFFF << (shift + 8) & 0xFFFFFFFF)).eq(kth) & ((key >> shift) & 255 >= byte)).sum(-2)
     b = ((ge >= need).sum(-1, keepdim=True) - 1).maximum(0)
