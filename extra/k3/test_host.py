@@ -77,7 +77,7 @@ class TestStepIO(unittest.TestCase):
     nr, self.k1 = E // NGPU, K // 2
     def gpu_bufs():
       return {"tag": arr(np.ones(1, np.uint32)), "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)),
-              "part1": arr(np.zeros(1 + 4 * K * T + 17 * (K * T // 16 + E) if chunk else 1 + 2 * self.k1 * T, np.uint32)),
+              "part1": arr(np.zeros(1 + 3 * K * T + 17 * (K * T // 16 + E) if chunk else 1 + 2 * self.k1 * T, np.uint32)),
               "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
     self.gbuf = [[gpu_bufs() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
@@ -160,7 +160,7 @@ class TestStepIO(unittest.TestCase):
     self.check_counts()
 
   def test_chunk(self): # a prompt's chunk: each token's exact top k read (the first layer's every expert, then the guessed and the missed),
-    # its rows (a row a token's expert, by expert, in tiles of 16 an expert's) and entry j*T + t's tile row, the same on every gpu
+    # entry j*T + t's slot and tile row (an expert's entries in tiles of 16), the same on every gpu
     self.tearDown()
     T = 40
     self.setUp(slots=L * E + 16, T=T, chunk=True)  # (none evicted: every layer's slots checked after)
@@ -177,14 +177,13 @@ class TestStepIO(unittest.TestCase):
       for g in self.gbuf[li]:
         self.assertEqual(g["part1"][0], 1)
         n, NT, p = K * T, K * T // 16 + E, g["part1"][1:].view(np.int32)
-        rslot, rtok, tslot, trow, rows = p[:n], p[n:2 * n], p[2 * n:2 * n + NT], p[2 * n + NT:2 * n + 17 * NT], p[2 * n + 17 * NT:3 * n + 17 * NT]
-        ws = g["part1"][1 + 3 * n + 17 * NT:].view(np.float32).reshape(K, T)
+        slots, tslot, trow, rows = p[:n], p[n:n + NT], p[n + NT:n + 17 * NT], p[n + 17 * NT:2 * n + 17 * NT]
+        ws = g["part1"][1 + 2 * n + 17 * NT:].view(np.float32).reshape(K, T)
         np.testing.assert_allclose(ws.sum(0), 1, atol=1e-5)
-        self.assertTrue((np.diff(self.state["expert_in"][rslot]) >= 0).all())
-        np.testing.assert_equal((rslot[trow[rows]], rtok[trow[rows]]), (tslot[rows // 16], np.arange(n) % T))
-        nt = rows.max() // 16 + 1  # (the tiles used, every row of a tile its expert's)
+        np.testing.assert_equal((trow[rows], tslot[rows // 16]), (np.arange(n), slots))  # (an entry's tile row: itself, of its expert's tile)
+        nt = rows.max() // 16 + 1  # (the tiles used, every row of a tile one of its expert's entries)
         self.assertEqual(sorted(set((rows // 16).tolist())), list(range(nt)))
-        np.testing.assert_equal(rslot[trow[:16 * nt]], np.repeat(tslot[:nt], 16))
+        np.testing.assert_equal(slots[trow[:16 * nt]], np.repeat(tslot[:nt], 16))
         for t in range(T): self.assertEqual(sorted(tslot[rows // 16].reshape(K, T)[:, t].tolist()), sorted(so[top[t]].tolist()))
 
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
