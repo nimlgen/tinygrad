@@ -210,9 +210,11 @@ static int64_t poll_io(io_t *s) {
 // (a chunk) the n experts of layer lj not cached into victims, the least used slots but layer lj's and the one's before it, their reads
 // pending, counted in count. -3 too few victims
 static int64_t queue(io_t *s, int64_t lj, int64_t n, const int64_t *experts, int64_t *count) {
-  int64_t E = s->E, c0 = (lj ? lj - 1 : 0) * E, c1 = (lj + 1) * E;
+  int64_t E = s->E, c0 = (lj ? lj - 1 : 0) * E, c1 = (lj + 1) * E, m = 0;
+  for (int64_t i = 0; i < n; i++) m += s->slot_of[lj * E + experts[i]] < 0;
+  if (!m) return 0;  // (victims only for those not cached)
   for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 1;
-  pick(s, n);
+  pick(s, m);
   for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 0;
   for (int64_t i = 0, c; i < n; i++) if (s->slot_of[c = lj * E + experts[i]] < 0) {
     if (take(s, c) < 0) return -3;
