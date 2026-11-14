@@ -385,9 +385,8 @@ def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, k
   return [out[token, output].store(value) for ot,(output,output_accs) in enumerate(zip(outputs, accs))
           for tile,(tile_tokens,_acc) in enumerate(zip(tokens, output_accs)) for token,value in zip(tile_tokens, values(ot*tt+tile))]
 
-def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes, base=None, xrow=None):
-  # base(token_block): the weights' first word of a token block (one weight a block: experts), xrow: an output row's row of x
-  x = x.reshape(-1, in_features)
+def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes):
+  x = x.reshape(out.shape[0], in_features)
   output_waves, token_block, output_block, lane, wave, lane_group, outputs, input_tokens, tokens = layout
   token_tile, output_tiles = len(tokens)*16, len(outputs)
   # IQ4_NL blocks are 32 wide: a device can hold part of a 256 weight row group
@@ -400,10 +399,10 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   wmma_accs = [list(output_accs) for output_accs in accs]
   ks = tuple(word*4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
   for half in range(2):
-    afrags = tuple(UOp.stack(*(x[input_token if xrow is None else xrow[input_token].cast(dtypes.weakint), group*32 + half*16 + i]
-                               .cast(dtypes.float16) for i in ks)) for input_token in input_tokens)
+    afrags = tuple(UOp.stack(*(x[input_token, group*32 + half*16 + i].cast(dtypes.float16) for i in ks))
+                   for input_token in input_tokens)
     for output_tile,output in enumerate(outputs):
-      bfrag = UOp.stack(*dequant(output*output_words + block*type_words + (0 if base is None else base(token_block)), subgroup, half))
+      bfrag = UOp.stack(*dequant(output*output_words + block*type_words, subgroup, half))
       for tile,afrag in enumerate(afrags):
         previous = accs[output_tile][tile].after(group) if half == 0 else wmma_accs[output_tile][tile]
         wmma_accs[output_tile][tile] = UOp.wmma(afrag, bfrag, previous, WMMA_ARG[0], lanes)
@@ -447,11 +446,9 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[IQ4_XS]//4, layout, dequant, "linear_iq4_xs_f16_wmma", kgroups, lanes)
 
 @functools.cache
-def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp, out_features:int, in_features:int, ggml_type:int, kgroups:int,
-                                  lanes:int, experts:int=0, stride:int=0, offset:int=0) -> UOp:
-  # experts: grids' first the slots of the token blocks of 16 (a block's weights at slot*stride + offset words: 64 bit), then (2) the rows of x
-  slots, xrow, grids = (grids[0], grids[1] if experts == 2 else None, grids[experts:]) if experts else (None, None, grids)
-  token_tile = 16 if experts else 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
+def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
+                                  out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int) -> UOp:
+  token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
   layout = _wmma_layout(out, out_features, token_tile, 2, lanes)
   output_waves, _, _, lane, wave, lane_group, _, _, _ = layout
   word_indices = _wmma_words(lane_group, kgroups)
@@ -483,23 +480,66 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp, out_featu
     words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid) for i in word_indices)
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
-  def base(block:UOp) -> UOp: return cast(UOp, slots)[block].cast(dtypes.int64)*stride + offset
-  return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize, layout, dequant,
-                            f"{'expert' if experts else 'linear'}_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes, base if experts else None, xrow)
+  return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
+                            layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes)
+
+@functools.cache
+def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int,
+                           stride:int, offset:int, gathered:bool, rdna4:bool) -> UOp:
+  # out[r] = W[slots[r // 16]] @ x[r] (gathered: x[extra[0][r]]) on the int8 tensor cores: a token block of 16 rows an expert's, its weights'
+  # bytes (the decode gemv's words) times the q8 of x, a 32 input group's int32 dot scaled once (formats of a scale a group: Q8_0, IQ3_XXS).
+  # a lane's fragment: RDNA4 words (ph, ph+2) of a half group, RDNA3 all four; its accumulator rows ph*8 + j (RDNA3: 2j + ph)
+  assert ggml_type in (Q8_0, IQ3_XXS), f"{QUANT_NAMES[ggml_type]} has no int8 expert kernel"
+  xrow, grids = (extra[0], extra[1:]) if gathered else (None, extra)
+  layout = _wmma_layout(out, out_features, 16, 2, 32)
+  _, token_block, _, lane, wave, ph, outputs, inputs, tokens = layout
+  rows = tokens[0] if rdna4 else tuple(token_block*16 + 2*j + ph for j in range(8))
+  grid = None
+  if grids:
+    grid = UOp.alloc((int(grids[0].numel()),), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+    tid, threads = wave*32+lane, layout[0]*32
+    grid = grid.after(*(grid[tid+i*threads].store(grids[0][tid+i*threads]) for i in range(int(grid.numel())//threads)))
+  def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.weakint)
+  type_words = QUANT_SIZES[ggml_type]//raw.dtype.itemsize
+  output_words, slot_base = in_features * type_words // GGML_BLOCK_SIZE, slots[token_block].cast(dtypes.int64)*stride + offset
+  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.LOOP)
+  block, subgroup = group // 8, group % 8
+  accs = [UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in outputs]
+  accs = [acc.after(acc.store(acc.const_like(0))) for acc in accs]
+  vals = [[acc.after(group)[j].load() for j in range(8)] for acc in accs]
+  words = [(h*4 + ph, h*4 + 2 + ph) if rdna4 else tuple(h*4 + i for i in range(4)) for h in range(2)]
+  afrags, xds = [_i8_frag(tuple(xq[xr(inputs[0]), group, w].load() for w in ws)) for ws in words], [xd[xr(r), group].load() for r in rows]
+  for o, output in enumerate(outputs):
+    base = slot_base + output*output_words + block*type_words
+    if ggml_type in SMALL_BLOCK_QUANTS: base = base + subgroup*SMALL_BLOCK_QUANTS[ggml_type]
+    scale = _half(raw[base])
+    if ggml_type == IQ3_XXS: scale = scale * ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
+    dot = UOp.stack(*[UOp.const(0, dtypes.int32)]*8)
+    for afrag, ws in zip(afrags, words): dot = UOp.wmma(afrag, _i8_frag(tuple(_quant_word(raw, base, subgroup, w, ggml_type, grid) for w in ws)),
+                                                        dot, WMMA_ARG[0], 32)
+    d = UOp.alloc((8,), dtypes.int32, addrspace=AddrSpace.REG)
+    d = d.after(d.store(dot))
+    vals[o] = [v + xds[j] * scale * d[j].load().float() for j, v in enumerate(vals[o])]
+  update = UOp.group(*(acc.store(UOp.stack(*v)) for acc, v in zip(accs, vals))).end(group)
+  stores = [out[r, output].store(acc.after(update)[j].load()) for output, acc in zip(outputs, accs) for j, r in enumerate(rows)]
+  name = f"expert_{QUANT_NAMES[ggml_type]}_i8_wmma"
+  return UOp.group(*stores).end(*layout[1:3], lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+
+def _i8_frag(words:tuple[UOp, ...]) -> UOp:  # (an int8 fragment of the words' bytes)
+  return UOp.stack(*(((w >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8) for w in words for i in range(4)))
 
 def expert_gemm(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
                 xrow:Tensor|None=None) -> Tensor:
-  """out[k] = W[slots[k // 16]] @ x[xrow[k]] (or x[k]): expert_linear's experts in a WMMA gemm of 16 row tiles, a tile an expert's (its
-  weights decoded once for its rows), x in half. out: (16*len(slots), out_features), a pool sharded over devices (ndev, .., out_features)"""
+  """out[k] = W[slots[k // 16]] @ x[xrow[k]] (or x[k]): expert_linear's experts in an int8 WMMA gemm of 16 row tiles, a tile an expert's (its
+  weights read once for its rows), on the q8 of x. out: (16*len(slots), out_features), a pool sharded over devices (ndev, .., out_features)"""
   word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
-  ndev, n, cdna = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), 16 * slots.shape[0], _is_cdna(x.device)
+  ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), 16 * slots.shape[0]
   out = Tensor.empty(ndev*n, out_features, dtype=dtypes.float32, device=pool.device, axis=0 if ndev > 1 else None)
-  fxn = functools.partial(_quant_linear_f16_wmma_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
-                          kgroups=4 if cdna else 2 if _is_rdna4(x.device) else 1, lanes=64 if cdna else 32, experts=1 if xrow is None else 2,
-                          stride=stride//word.itemsize, offset=offset//word.itemsize)
+  fxn = functools.partial(_expert_i8_wmma_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                          stride=stride//word.itemsize, offset=offset//word.itemsize, gathered=xrow is not None, rdna4=_is_rdna4(x.device))
+  xq, xd, _ = q8_quantize(x.contiguous(), prod(x.uop.max_shard_shape) // in_features, in_features)
   extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
-  srcs = (pool.bitcast(word), x.cast(dtypes.float16).contiguous(), slots.cast(dtypes.int32), *([] if xrow is None else [xrow.cast(dtypes.int32)]),
-          *extra)
+  srcs = (pool.bitcast(word), xq, xd, slots.cast(dtypes.int32), *([] if xrow is None else [xrow.cast(dtypes.int32)]), *extra)
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   return ret.reshape(ndev, n, out_features) if ndev > 1 else ret
 
