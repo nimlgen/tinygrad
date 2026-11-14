@@ -6,8 +6,8 @@ from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
-from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K,
-  IQ3_S, IQ3_XXS)
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
+  Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
@@ -565,6 +565,17 @@ class TestExpertLinear(unittest.TestCase):
     out = expert_linear(self.pool, self.slots, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2, xrow=Tensor(perm)).numpy()
     ref = expert_linear(self.pool, self.slots, Tensor(h[perm]), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
+
+  def test_expert_gemm(self): # 16 row tiles an expert's (WMMA), x's rows from a table or its own: as the gemv's rows of a slot
+    tiles, off = Tensor(np.array(self.sel[:3], np.int32)), 2 * self.UNITS * self.ROW_UP
+    x, xr = Tensor(self.rng.standard_normal((5, self.LAT)).astype(np.float32)), Tensor(self.rng.integers(0, 5, 48).astype(np.int32))
+    out = expert_gemm(self.pool, tiles, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=xr).numpy()
+    ref = expert_linear(self.pool, tiles, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=16, xrow=xr).numpy()
+    np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
+    h = Tensor(self.rng.standard_normal((48, self.UNITS)).astype(np.float32))
+    out = expert_gemm(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+    ref = expert_linear(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, per=16).numpy()
+    np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
 
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
