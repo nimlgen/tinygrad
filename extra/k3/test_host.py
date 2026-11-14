@@ -159,14 +159,16 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(all(self.state["expert_in"][s] // E == li for s, w in zip(slots, ws) if w > 0))
     self.check_counts()
 
-  def test_chunk(self): # a prompt's chunk: every expert of each layer read, each token's exact top k (entry j*T + t) and its row (its slot and
-    # token, the rows by expert), the same on every gpu
+  def test_chunk(self): # a prompt's chunk: each token's exact top k read (the first layer's every expert, then the guessed and the missed),
+    # each entry j*T + t and its row (its slot and token, the rows by expert), the same on every gpu
     self.tearDown()
     T = 40
     self.setUp(slots=L * E + 16, T=T, chunk=True)  # (none evicted: every layer's slots checked after)
     self.step()
     self.check_tables()
-    self.assertEqual((self.io.misses, int(self.state["flying"].sum())), (L * E, 0))
+    self.assertEqual(int(self.state["flying"].sum()), 0)
+    self.assertGreater(self.io.guesses, 0)
+    self.assertLessEqual(self.io.misses + self.io.guesses, L * E)
     for li in range(L):
       so = self.state["slot_of"][li * E:(li + 1) * E]
       logits = np.concatenate([g["scores"][::ROWS] for g in self.gbuf[li]], axis=1).astype(np.float64)

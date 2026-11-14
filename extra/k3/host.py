@@ -207,16 +207,16 @@ static int64_t poll_io(io_t *s) {
   return 0;
 }
 
-// (a chunk) every uncached expert of layer lj into a victim, the least used slots but layer lj's and the one's before it, its read pending.
-// -3 too few victims
-static int64_t queue_layer(io_t *s, int64_t lj) {
+// (a chunk) the n experts of layer lj not cached into victims, the least used slots but layer lj's and the one's before it, their reads
+// pending, counted in count. -3 too few victims
+static int64_t queue(io_t *s, int64_t lj, int64_t n, const int64_t *experts, int64_t *count) {
   int64_t E = s->E, c0 = (lj ? lj - 1 : 0) * E, c1 = (lj + 1) * E;
   for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 1;
-  pick(s, E);
+  pick(s, n);
   for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 0;
-  for (int64_t c = lj * E; c < c1; c++) if (s->slot_of[c] < 0) {
+  for (int64_t i = 0, c; i < n; i++) if (s->slot_of[c = lj * E + experts[i]] < 0) {
     if (take(s, c) < 0) return -3;
-    pend[npend++ % NPEND] = c, s->misses++;
+    pend[npend++ % NPEND] = c, (*count)++;
   }
   return 0;
 }
@@ -373,18 +373,17 @@ static int64_t layer(io_t *s, int64_t li) {
   return 0;
 }
 
-// layer li of a prompt's chunk (many tokens): waits for the gpus' tags, queues the next layer's every uncached expert (a chunk's tokens route
-// to nearly all of them), routes every token exactly (its top k: no tau, no cached bonus), gives the gpus part 1 once li's reads are in: a
-// row a token's expert, [ready | the rows' slots, tokens by expert | the slots, rows of entry j*T + t (token t's j-th) | its weights]. then
-// the counts and the decayed use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no victims
+// layer li of a prompt's chunk (many tokens): waits for the gpus' tags, routes every token exactly (its top k: no tau, no cached bonus),
+// queues the reads of its experts not cached or guessed, then of the next layer's guesses (every token's top k on its guess row), gives the
+// gpus part 1 once li's experts are in: a row a token's expert, [ready | the rows' slots, tokens by expert | the slots, rows of entry j*T + t
+// (token t's j-th) | its weights]. then the counts and the decayed use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no
+// victims
 static int64_t chunk(io_t *s, int64_t li) {
-  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096];
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096], use[4096], nu = 0;
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
-  int64_t r = tags(s, b, li, t0), lend = npend;  // (li's reads: those pending before li + 1's)
+  int64_t r = tags(s, b, li, t0);
   if (r) return r;
-  if (li + 1 < s->layers && (r = queue_layer(s, li + 1))) return r;
-  if (poll_io(s) < 0) return -1;
   double t1 = now();
   io_t exact = *s;
   exact.tau = exact.tauc = exact.beta = 0, exact.kmin = K;
@@ -396,6 +395,21 @@ static int64_t chunk(io_t *s, int64_t li) {
     route(&exact, logits, s->bias[li], so, 0, sel, w, sig, 0, 0);
     for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[1 + 2 * n + j * T + t] = (int32_t)sel[j], ((float *)part)[1 + 4 * n + j * T + t] = w[j];
   }
+  for (int64_t e = 0; e < E; e++) if (cnt[e]) use[nu++] = e;
+  if ((r = queue(s, li, nu, use, &s->misses))) return r;
+  int64_t lend = npend;  // (li's reads: those pending before the next layer's guesses)
+  if (li + 1 < s->layers) {
+    for (int64_t e = 0; e < E; e++) at[e] = 0;
+    for (int64_t t = 0; t < T; t++) {
+      logits_of(s, b, t * s->rows + 1, logits);
+      route(&exact, logits, s->bias[li + 1], s->slot_of + (li + 1) * E, 0, sel, w, sig, 0, 0);
+      for (int64_t j = 0; j < K; j++) at[sel[j]] = 1;
+    }
+    nu = 0;
+    for (int64_t e = 0; e < E; e++) if (at[e]) use[nu++] = e;
+    if ((r = queue(s, li + 1, nu, use, &s->guesses))) return r;
+  }
+  if (poll_io(s) < 0) return -1;
   for (int64_t e = 0, r = 0; e < E; e++) at[e] = r, r += cnt[e];
   for (int64_t i = 0; i < n; i++) {
     int64_t e = part[1 + 2 * n + i], r = at[e]++;
@@ -406,7 +420,7 @@ static int64_t chunk(io_t *s, int64_t li) {
   for (int64_t busy = 1; busy;) {
     if (poll_io(s) < 0) return -1;
     busy = pend_at < lend;
-    for (int64_t e = 0; e < E && !busy; e++) busy = s->flying[li * E + e] > 0;
+    for (int64_t e = 0; e < E && !busy; e++) busy = cnt[e] && s->flying[li * E + e] > 0;
     if (now() - t2 > 60) return stuck(s, "reads", li, t2);
   }
   __sync_synchronize();
@@ -445,7 +459,9 @@ void flags(io_t *s, uint32_t value) {
 int64_t step_io(io_t *s) {
   int64_t r = 0;
   s->slowest = 0, npend = pend_at = 0;
-  if (s->chunk && (r = queue_layer(s, 0))) return r;
+  int64_t all[4096];  // (a chunk's first layer: all its experts, no guesses)
+  for (int64_t e = 0; e < s->E; e++) all[e] = e;
+  if (s->chunk && (r = queue(s, 0, s->E, all, &s->misses))) return r;
   for (int64_t li = 0; li < s->layers; li++) {
     double t = now();
     r = s->chunk ? chunk(s, li) : layer(s, li);
