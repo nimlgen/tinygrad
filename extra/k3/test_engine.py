@@ -8,7 +8,7 @@ import numpy as np
 from gguf import GGUFWriter, GGMLQuantizationType, quants
 from tinygrad import Tensor, Device, UOp, nn, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
-from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating
+from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock
 from extra.k3.engine import Engine
 from extra.k3.draft import Eagle3
 
@@ -143,6 +143,13 @@ class TestEngine(unittest.TestCase):
     self.eng.chunk = 0
     self.assertEqual(self.eng.prefill(list(range(9)), 3), 3)
     self.assertEqual(len(steps), 3)
+
+  def test_states_allocated(self):  # the blocks' caches and states and the draft's allocated by the engine, before its pool takes what's free
+    model, folder = self.eng.model, tempfile.mkdtemp()
+    draft = Eagle3(eagle(folder, np.random.default_rng(1)), lambda t: model.token_embd(t).float(), self.eng.devs, model.max_context)
+    Engine(model, self.eng.m, slots=1, tokens=2, draft=draft)
+    for t in (*(b.cache_k for b in model.blk if isinstance(b, MLATransformerBlock)), draft.cache, model.blk[0].kept[0][0]):
+      self.assertTrue(all(b.is_allocated() for b in t.uop.base.buffer.bufs))
 
   def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
     self.stub()

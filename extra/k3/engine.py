@@ -8,6 +8,7 @@ import ctypes, functools, itertools, os, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
+from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum
@@ -63,7 +64,8 @@ class Engine:
     weights = {id(t) for t in nn.state.get_parameters(model.blk)}  # (not realized here: some are decoded in the step's graph)
     for b in model.blk: b._init_state(Tensor.empty(1, 1, model.config.dim, device=self.devs))
     Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if id(t) not in weights and t.numel()]))
-    for buf in (t.uop.base.buffer for t in states):  # (the empty ones too, else allocated at their first use)
+    # (the empty ones allocated too, else at their first use: the ones with a buffer, not the folded constants)
+    for buf in (t.uop.base.buffer for t in states if t.uop.base.op in (Ops.BUFFER, Ops.UNSHARD)):
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
     self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
