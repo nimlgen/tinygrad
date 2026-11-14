@@ -553,6 +553,19 @@ class TestExpertLinear(unittest.TestCase):
     ref = expert_linear(self.pool, rep, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
 
+  def test_x_rows(self): # a row's activation row from a table: as on x's rows gathered (gate/up, the weighted down)
+    x, off = self.rng.standard_normal((3, self.LAT)).astype(np.float32), 2 * self.UNITS * self.ROW_UP
+    xr = self.rng.integers(0, 3, len(self.sel)).astype(np.int32)
+    out = expert_linear(self.pool, self.slots, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=Tensor(xr)).numpy()
+    ref = expert_linear(self.pool, self.slots, Tensor(x[xr]), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+    h = self.rng.standard_normal((len(self.sel), self.UNITS)).astype(np.float32)
+    w = Tensor(self.rng.standard_normal(len(self.sel)).astype(np.float32))
+    perm = self.rng.permutation(len(self.sel)).astype(np.int32)
+    out = expert_linear(self.pool, self.slots, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2, xrow=Tensor(perm)).numpy()
+    ref = expert_linear(self.pool, self.slots, Tensor(h[perm]), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()
