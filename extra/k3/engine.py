@@ -174,7 +174,7 @@ class Engine:
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
       for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
-    for n, _ in itertools.product(range(1, max(self.jits)), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
+    for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
     for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
@@ -229,7 +229,7 @@ class Engine:
       (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
     row = 0
-    while len(tokens) + self.tok_np.size <= self.max_context:  # (a verify step's last token in the context)
+    while len(tokens) + self.tokens <= self.max_context:  # (a verify step's last token in the context)
       tokens.append(t)
       self.model._cached_tokens = tokens[:-1]
       yield t
