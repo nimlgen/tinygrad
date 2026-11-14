@@ -216,7 +216,8 @@ class Engine:
 
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in steps of a chunk (exact routing, every expert of a layer read in), the position after them"""
-    end = pos + (len(tokens) - 1 - pos) // self.chunk * self.chunk if self.chunk else pos
+    if not self.chunk: return pos
+    end = pos + (len(tokens) - 1 - pos) // self.chunk * self.chunk
     for p in range(pos, end, self.chunk): self.step(tokens[p:p + self.chunk], p, tokens[p + 1:p + 1 + self.chunk])
     return end
 

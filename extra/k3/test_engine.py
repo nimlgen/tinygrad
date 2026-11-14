@@ -133,6 +133,17 @@ class TestEngine(unittest.TestCase):
     ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
     np.testing.assert_allclose(ours, want, rtol=1e-4, atol=1e-4 * np.abs(want).max())
 
+  def test_prefill(self):  # the chunks of a prompt but its last token (each with the tokens after it given), none without a chunk
+    steps:list = []
+    self.eng.step = lambda toks, pos, given: steps.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
+    self.assertEqual(self.eng.prefill(list(range(10)), 2), 6)
+    self.assertEqual(steps, [(2, [2, 3, 4, 5], [3, 4, 5, 6])])
+    self.assertEqual(self.eng.prefill(list(range(9)), 0), 8)
+    self.assertEqual([s[0] for s in steps[1:]], [0, 4])
+    self.eng.chunk = 0
+    self.assertEqual(self.eng.prefill(list(range(9)), 3), 3)
+    self.assertEqual(len(steps), 3)
+
   def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
     self.stub()
     eng, folder = self.eng, tempfile.mkdtemp()
