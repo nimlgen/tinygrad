@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores)
+                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores, mla_topk_attention)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
   Q4_K, IQ3_S, IQ3_XXS)
@@ -620,6 +620,18 @@ class TestTopk(unittest.TestCase):
       mask = np.full((1, 1, T, pos + T), -np.inf, np.float32)
       for t in range(T): mask[0, 0, t, sel[t][sel[t] <= pos + t]] = 0
       np.testing.assert_allclose(blk._attention(x, (p,), idx).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
+
+  def test_mla_every_position(self): # the top-k attention kernel without positions: causal over every key there is
+    rng, H, D, V, N = np.random.default_rng(1), 4, 80, 64, 64
+    cache = rng.standard_normal((1, 1, N, D)).astype(np.float16)
+    for T, start in ((1, 0), (2, 30), (5, 40)):
+      q = rng.standard_normal((1, H, T, D)).astype(np.float32)
+      v = UOp.variable("start_pos", 0, N - 8).bind(start)
+      got = mla_topk_attention(Tensor(q), Tensor(cache).realize(), None, v, V, 0.1).numpy()
+      k = cache[0, 0, :start + T].astype(np.float32)
+      s = q[0] @ k.T * 0.1 + np.where(np.arange(start + T) > start + np.arange(T)[:, None], -np.inf, 0)
+      p = np.exp(s - s.max(-1, keepdims=True))
+      np.testing.assert_allclose(got[0], (p / p.sum(-1, keepdims=True)) @ k[:, :V], rtol=1e-4, atol=1e-4)
 
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot

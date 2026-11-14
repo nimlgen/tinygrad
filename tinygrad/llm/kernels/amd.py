@@ -641,14 +641,15 @@ def topk_indices(scores:Tensor, k:int, valid:int|UOp) -> Tensor:
 # *** mla attention over each query's top-k positions: flash-decode's partials, a block a query row and head, the keys read by position
 
 @functools.cache
-def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, start:int|UOp, scale:float, waves:int=4, unroll:int=2) -> UOp:
+def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, waves:int=4, unroll:int=2) -> UOp:
   """out (B*T, H, P, V), stats (B*T, H, P, 2): of query row b*T + t (at position start + t) and head h, block p's softmax partial over its
   slots of idx[b, t] (a wave every P*waves-th, a key a step of its online softmax) of the first start + T at or before the query. a key is
   the cache's row (B, 1, N, D) at a slot's position, its value the row's first V; a lane holds dims [lane*V/32, ..) of the values (vector
   loads) and V + lane + 32*i of the rest"""
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
-  N, K, P, V = cast(int, cache.shape[2]), cast(int, idx.shape[2]), cast(int, out.shape[2]), cast(int, out.shape[3])
+  N, P, V = cast(int, cache.shape[2]), cast(int, out.shape[2]), cast(int, out.shape[3])
+  K = cast(int, idx[0].shape[2]) if idx else N  # (no positions: slot j is position j, every key there is)
   DV, DR, G = V // WARP_SIZE, -(-(D - V) // WARP_SIZE), P * waves
   assert V % WARP_SIZE == 0
   row, h, part = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(H, 1, AxisType.GLOBAL), UOp.range(P, 2, AxisType.GLOBAL)
@@ -664,7 +665,7 @@ def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, start:int|U
   acc, m, l = [acc_reg.after(step)[i].load() for i in range(DV)], max_reg.after(step)[0].load(), sum_reg.after(step)[0].load()
   for u in range(unroll):  # (an online softmax step a key, a finite initial max)
     slot = (step*unroll + u)*G + part*waves + wave
-    pos = idx[b, t, slot.minimum(K - 1)].load()
+    pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
     valid = (slot < keys) & (pos <= start + t) & (pos >= 0)
     row_k = cache[b, 0, valid.where(pos, 0).minimum(N - 1)]  # (a slot not a key's: the first key, never an unwritten row)
     kf = values(row_k) + [load(row_k, d) for d in rest]
@@ -691,16 +692,17 @@ def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, start:int|U
                                                                                               zero)))]
   return UOp.group(*final).end(lane, wave, part, h, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
 
-def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor, start:int|UOp, values:int, scale:float) -> Tensor:
+def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
-  idx (B, T, K) (of the first start + T slots, at or before the query), a row's value its first values dims"""
+  idx (B, T, K) (of the first start + T slots, at or before the query; None: every position, causal), a row's value its first values dims"""
   B, H, T, _ = q.shape
   parts = 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   stats = Tensor.empty(B*T, H, parts, 2, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
   fxn = functools.partial(_mla_topk_partial, start=start, scale=scale)
-  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, idx.cast(dtypes.int32).contiguous(), fxn=fxn)[:2]
+  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
+                                        fxn=fxn)[:2]
   out = Tensor.empty(B*T, H, 1, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   out = Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=parts))[0]
   return out.reshape(B, T, H, values).transpose(1, 2)
