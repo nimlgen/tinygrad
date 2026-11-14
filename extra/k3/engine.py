@@ -191,7 +191,7 @@ class Engine:
       gu = expert_gemm(self.pool, tslot, h, 2 * u, self.lat, self.qtype, self.part, xrow=ttok)
       y = expert_gemm(self.pool, tslot, self.act(*gu.split(u, -1)), self.lat, u, self.qtype, self.part, off)
     else:
-      slots = tslot.reshape(NT, 1).expand(NT, 16).flatten()
+      slots = tslot.maximum(0).reshape(NT, 1).expand(NT, 16).flatten()
       y = self.gemv(slots, self.act(*self.gemv(slots, h[ttok], 2 * u, self.lat, 0).split(u, -1)), self.lat, u, off)
     return (y[:, rows] * w.reshape(n, 1)).reshape(-1, n // T, T, self.lat).sum(1)
 

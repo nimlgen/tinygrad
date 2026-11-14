@@ -377,8 +377,8 @@ static int64_t layer(io_t *s, int64_t li) {
 
 // layer li of a prompt's chunk (many tokens): waits for the gpus' tags, routes every token exactly (its top k: no tau, no cached bonus),
 // queues the reads of its experts not cached or guessed, then of the next layer's guesses (every token's top k on its guess row), gives the
-// gpus part 1 once li's experts are in: [ready | the tiles' slots (an expert's entries in tiles of 16, padded with a tile's first; then slot 0
-// to n/16 + E), their rows' tokens | entry j*T + t's (token t's j-th) tile row | its weight]. then the counts and the decayed
+// gpus part 1 once li's experts are in: [ready | the tiles' slots (an expert's entries in tiles of 16, padded with a tile's first; then -1, no
+// expert, to n/16 + E), their rows' tokens | entry j*T + t's (token t's j-th) tile row | its weight]. then the counts and the decayed
 // use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no victims
 static int64_t chunk(io_t *s, int64_t li) {
   int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096], tile[4096], fill[4096], use[4096], nu = 0;
@@ -424,7 +424,7 @@ static int64_t chunk(io_t *s, int64_t li) {
     part[TS + tile[e] + j] = so[e];
     for (int64_t q = 0, r0 = at[e] + j * 16; q < 16; q++) part[TR + (tile[e] + j) * 16 + q] = (int32_t)(by[j * 16 + q < cnt[e] ? r0 + q : r0] % T);
   }
-  for (int64_t i = TS + nt; i < TS + NT; i++) part[i] = 0;
+  for (int64_t i = TS + nt; i < TS + NT; i++) part[i] = -1;
   for (int64_t i = TR + 16 * nt; i < TR + 16 * NT; i++) part[i] = 0;
   for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i < W + n; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
   double t2 = now();

@@ -104,7 +104,7 @@ class TestEngine(unittest.TestCase):
         def chunk() -> Tensor:  # (host.py's chunk table, a tile expert e's (T <= 16): token t's row of it 16*e + t)
           n, NT, cpu = K * T, K * T // 16 + E, "CPU"
           k, nt = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(NT).to(cpu)
-          tslot = (nt < E).where(nt + li * E, 0).cast(dtypes.int32)
+          tslot = (nt < E).where(nt + li * E, -1).cast(dtypes.int32)
           ttok = Tensor.arange(T, dtype=dtypes.int32).to(cpu).reshape(1, T).expand(NT, T).pad(((0, 0), (0, 16 - T))).flatten()
           return Tensor([1], dtype=dtypes.int32, device=cpu).cat(tslot, ttok, (sel.T.flatten() * 16 + k % T).cast(dtypes.int32)) \
             .bitcast(dtypes.uint32).cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
