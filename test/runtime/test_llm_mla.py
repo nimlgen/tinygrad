@@ -87,7 +87,7 @@ class TestMLA(unittest.TestCase):
     block._init_state(x_norm)
     prefill = block._attention(x_norm[:, :3], (0,)).realize()
     decode = block._attention(x_norm[:, 3:], (3,)).realize()
-    np.testing.assert_allclose(prefill.cat(decode, dim=1).numpy(), abs_np, atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(prefill.cat(decode, dim=1).numpy(), abs_np, atol=5e-4, rtol=5e-4)  # (the cache in half)
 
   def test_fp8_projections(self):
     formats = [fnuz for fnuz, dt in ((False, dtypes.fp8e4m3), (True, dtypes.fp8e4m3fnuz))
