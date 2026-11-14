@@ -101,9 +101,11 @@ class TestEngine(unittest.TestCase):
           wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
                                                                     wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else \
-          [Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel.T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
-                                                             w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)]
+        def chunk() -> Tensor:  # (the rows in entry order: [1 | their slots, tokens | the entries' slots, rows | weights])
+          slots, k = (sel.T.flatten() + li * E).cast(dtypes.int32), Tensor.arange(K * T, dtype=dtypes.int32).to("CPU")
+          return Tensor([1], dtype=dtypes.int32, device="CPU").cat(slots, k % T, slots, k).bitcast(dtypes.uint32) \
+            .cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
+        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else [chunk()]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]
 

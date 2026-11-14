@@ -374,11 +374,11 @@ static int64_t layer(io_t *s, int64_t li) {
 }
 
 // layer li of a prompt's chunk (many tokens): waits for the gpus' tags, queues the next layer's every uncached expert (a chunk's tokens route
-// to nearly all of them), routes every token exactly (its top k: no tau, no cached bonus), gives the gpus part 1 an entry a token's expert
-// (j*T + t: token t's j-th, its slot and weight) once li's reads are in. then the counts and the decayed use counts (a use a token).
-// 0, -1 a read failed, -2 a timeout, -3 no victims
+// to nearly all of them), routes every token exactly (its top k: no tau, no cached bonus), gives the gpus part 1 once li's reads are in: a
+// row a token's expert, [ready | the rows' slots, tokens by expert | the slots, rows of entry j*T + t (token t's j-th) | its weights]. then
+// the counts and the decayed use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no victims
 static int64_t chunk(io_t *s, int64_t li) {
-  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, sel[64], cnt[4096];
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096];
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
   int64_t r = tags(s, b, li, t0), lend = npend;  // (li's reads: those pending before li + 1's)
@@ -391,12 +391,17 @@ static int64_t chunk(io_t *s, int64_t li) {
   float logits[4096], sig[4096], w[64];
   int32_t *so = s->slot_of + li * E, *part = BUF(B_PART1, 0, int32_t);
   for (int64_t e = 0; e < E; e++) cnt[e] = 0;
-  for (int64_t t = 0; t < T; t++) {
+  for (int64_t t = 0; t < T; t++) {  // (an entry's expert in its slot's place till the rows are known)
     logits_of(s, b, t * s->rows, logits);
     route(&exact, logits, s->bias[li], so, 0, sel, w, sig, 0, 0);
-    for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[1 + j * T + t] = so[sel[j]], ((float *)part)[1 + (K + j) * T + t] = w[j];
+    for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[1 + 2 * n + j * T + t] = (int32_t)sel[j], ((float *)part)[1 + 4 * n + j * T + t] = w[j];
   }
-  for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i <= 2 * K * T; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
+  for (int64_t e = 0, r = 0; e < E; e++) at[e] = r, r += cnt[e];
+  for (int64_t i = 0; i < n; i++) {
+    int64_t e = part[1 + 2 * n + i], r = at[e]++;
+    part[1 + r] = part[1 + 2 * n + i] = so[e], part[1 + n + r] = (int32_t)(i % T), part[1 + 3 * n + i] = (int32_t)r;
+  }
+  for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i <= 5 * n; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
   double t2 = now();
   for (int64_t busy = 1; busy;) {
     if (poll_io(s) < 0) return -1;

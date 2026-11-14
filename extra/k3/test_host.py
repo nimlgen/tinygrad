@@ -77,7 +77,8 @@ class TestStepIO(unittest.TestCase):
     nr, self.k1 = E // NGPU, K // 2
     def gpu_bufs():
       return {"tag": arr(np.ones(1, np.uint32)), "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)),
-              "part1": arr(np.zeros(1 + 2 * (K if chunk else self.k1) * T, np.uint32)), "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
+              "part1": arr(np.zeros(1 + (5 * K if chunk else 2 * self.k1) * T, np.uint32)),
+              "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
     self.gbuf = [[gpu_bufs() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
     self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T, chunk=chunk, nd=ND, entries=ENTRIES, shift=9,
@@ -158,7 +159,8 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(all(self.state["expert_in"][s] // E == li for s, w in zip(slots, ws) if w > 0))
     self.check_counts()
 
-  def test_chunk(self): # a prompt's chunk: every expert of each layer read, each token's exact top k (entry j*T + t), the same on every gpu
+  def test_chunk(self): # a prompt's chunk: every expert of each layer read, each token's exact top k (entry j*T + t) and its row (its slot and
+    # token, the rows by expert), the same on every gpu
     self.tearDown()
     T = 40
     self.setUp(slots=L * E + 16, T=T, chunk=True)  # (none evicted: every layer's slots checked after)
@@ -172,9 +174,12 @@ class TestStepIO(unittest.TestCase):
       top = np.argsort(-(sig + self.bias[li]), axis=1, kind="stable")[:, :K]
       for g in self.gbuf[li]:
         self.assertEqual(g["part1"][0], 1)
-        slots, ws = g["part1"][1:1 + K * T].view(np.int32).reshape(K, T), g["part1"][1 + K * T:].view(np.float32).reshape(K, T)
+        rslot, rtok, slots, rows = (g["part1"][1 + i * K * T:1 + (i + 1) * K * T].view(np.int32) for i in range(4))
+        ws = g["part1"][1 + 4 * K * T:].view(np.float32).reshape(K, T)
         np.testing.assert_allclose(ws.sum(0), 1, atol=1e-5)
-        for t in range(T): self.assertEqual(sorted(slots[:, t].tolist()), sorted(so[top[t]].tolist()))
+        self.assertTrue((np.diff(self.state["expert_in"][rslot]) >= 0).all())
+        np.testing.assert_equal((rslot[rows], rtok[rows]), (slots, np.arange(K * T) % T))
+        for t in range(T): self.assertEqual(sorted(slots.reshape(K, T)[:, t].tolist()), sorted(so[top[t]].tolist()))
 
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
     self.io.tau, self.io.pf, self.io.fill = 0.2, 0, 4
