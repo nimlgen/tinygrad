@@ -42,8 +42,9 @@ class FakeDrives(threading.Thread):
         self.tail[q] = t
 
 class TestStepIO(unittest.TestCase):
-  def setUp(self, slots=200, T=1, slow=False, parts=1):
-    """gpu g reads its part of a code (parts pages on each of its ND // NGPU drives, a command each) into its pool, a prp table each"""
+  def setUp(self, slots=200, T=1, slow=False, parts=1, chunk=False):
+    """gpu g reads its part of a code (parts pages on each of its ND // NGPU drives, a command each) into its pool, a prp table each. chunk:
+    steps of a prompt's chunk of T tokens"""
     SLOTS, rng, self.keep = slots, np.random.default_rng(0), []
     def arr(a) -> np.ndarray:
       self.keep.append(a := np.ascontiguousarray(a))
@@ -71,14 +72,16 @@ class TestStepIO(unittest.TestCase):
       "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
       "victims": np.zeros(32 * T, np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.keep += [*self.tables.values(), *self.state.values()]
-    # the gpus' buffers of every layer: tag, scores (ROWS of E / NGPU a token), the two parts' tables [ready | slots | weights]
+    # the gpus' buffers of every layer: tag, scores (ROWS of E / NGPU a token), the two parts' tables [ready | slots | weights] (a chunk's in
+    # part 1: an entry a token's expert)
     nr, self.k1 = E // NGPU, K // 2
     def gpu_bufs():
       return {"tag": arr(np.ones(1, np.uint32)), "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)),
-              "part1": arr(np.zeros(1 + 2 * self.k1 * T, np.uint32)), "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
+              "part1": arr(np.zeros(1 + 2 * (K if chunk else self.k1) * T, np.uint32)), "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
     self.gbuf = [[gpu_bufs() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
-    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T, nd=ND, entries=ENTRIES, shift=9, slots=SLOTS,
+    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T, chunk=chunk, nd=ND, entries=ENTRIES, shift=9,
+                       slots=SLOTS,
                        victims_n=32 * T, pf=3, tau=0.03, decay=0.5 ** (1 / 8), bufs=self.bufs.ctypes.data)
     for name, a in {**self.tables, **self.state}.items(): setattr(io, name, a.ctypes.data)
     self.drives = FakeDrives(self.sq, self.db, self.cq, slow)
@@ -154,6 +157,24 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(np.allclose(ws.reshape(-1, 2).sum(0), 1, atol=1e-5))
         self.assertTrue(all(self.state["expert_in"][s] // E == li for s, w in zip(slots, ws) if w > 0))
     self.check_counts()
+
+  def test_chunk(self): # a prompt's chunk: every expert of each layer read, each token's exact top k (entry j*T + t), the same on every gpu
+    self.tearDown()
+    T = 40
+    self.setUp(slots=L * E + 16, T=T, chunk=True)  # (none evicted: every layer's slots checked after)
+    self.step()
+    self.check_tables()
+    self.assertEqual((self.io.misses, int(self.state["flying"].sum())), (L * E, 0))
+    for li in range(L):
+      so = self.state["slot_of"][li * E:(li + 1) * E]
+      logits = np.concatenate([g["scores"][::ROWS] for g in self.gbuf[li]], axis=1).astype(np.float64)
+      sig = 1 / (1 + np.exp(-logits))
+      top = np.argsort(-(sig + self.bias[li]), axis=1, kind="stable")[:, :K]
+      for g in self.gbuf[li]:
+        self.assertEqual(g["part1"][0], 1)
+        slots, ws = g["part1"][1:1 + K * T].view(np.int32).reshape(K, T), g["part1"][1 + K * T:].view(np.float32).reshape(K, T)
+        np.testing.assert_allclose(ws.sum(0), 1, atol=1e-5)
+        for t in range(T): self.assertEqual(sorted(slots[:, t].tolist()), sorted(so[top[t]].tolist()))
 
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
     self.io.tau, self.io.pf, self.io.fill = 0.2, 0, 4

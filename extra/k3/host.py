@@ -40,7 +40,7 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each
 # [ready | slots | weights], k1*T then (k-k1)*T entries: the union of the tokens' first k1 experts, then of the rest, an expert once, its
 # weight a token (entry i's at i*T + t, 0: not the token's), padded with slot 0
-IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n nvict pf fill".split()),
+IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens chunk nd entries shift slots victims_n nvict pf fill".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),
       ("mask", "uint8_t *"), ("victims", "int64_t *"), ("owner", "int64_t *"),
@@ -189,6 +189,47 @@ static int64_t take(io_t *s, int64_t code) {
   return -1;
 }
 
+// the codes of a chunk's reads not on a queue yet: a ring of at most two layers' (npend and pend_at count a step's)
+#define NPEND 4096
+static int64_t pend[NPEND], npend, pend_at;
+
+// the completions reaped, the pending reads queued on the demand queues while every drive of the next has room, the queues that moved
+// rung. -1 a read failed
+static int64_t poll_io(io_t *s) {
+  if (reap(s) < 0) return -1;
+  for (; pend_at < npend; pend_at++) {
+    int64_t c = pend[pend_at % NPEND], sl = s->slot_of[c], r = s->ptr[c];
+    while (r < s->ptr[c + 1] && s->inflight[s->drive[r]] < s->entries - 8) r++;
+    if (r < s->ptr[c + 1]) break;
+    submit(s, 1, &c, &sl, 0, 1);
+  }
+  ring(s);
+  return 0;
+}
+
+// (a chunk) every uncached expert of layer lj into a victim, the least used slots but layer lj's and the one's before it, its read pending.
+// -3 too few victims
+static int64_t queue_layer(io_t *s, int64_t lj) {
+  int64_t E = s->E, c0 = (lj ? lj - 1 : 0) * E, c1 = (lj + 1) * E;
+  for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 1;
+  pick(s, E);
+  for (int64_t c = c0; c < c1; c++) if (s->slot_of[c] >= 0) s->mask[s->slot_of[c]] = 0;
+  for (int64_t c = lj * E; c < c1; c++) if (s->slot_of[c] < 0) {
+    if (take(s, c) < 0) return -3;
+    pend[npend++ % NPEND] = c, s->misses++;
+  }
+  return 0;
+}
+
+// waits for the gpus' tags of the layer li of buffers b, the reads go on. 0, -1 a read failed, -2 a timeout
+static int64_t tags(io_t *s, const uint64_t *b, int64_t li, double t0) {
+  for (int64_t g = 0; g < s->ngpu; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {
+    if (poll_io(s) < 0) return -1;
+    if (now() - t0 > 60) return stuck(s, "the gpus", li, t0);
+  }
+  return 0;
+}
+
 // a row of every expert's logit: each gpu's scores hold E / ngpu of them
 static void logits_of(const io_t *s, const uint64_t *b, int64_t row, float *out) {
   for (int64_t g = 0, nr = s->E / s->ngpu; g < s->ngpu; g++) for (int64_t i = 0; i < nr; i++) out[g * nr + i] = BUF(B_SCORES, g, float)[row * nr + i];
@@ -226,11 +267,8 @@ static int64_t layer(io_t *s, int64_t li) {
   int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1, K2 = s->k - K1;
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
-  for (int64_t g = 0; g < ng; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {  // (the guesses go on)
-    if (reap(s) < 0) return -1;
-    ring(s);
-    if (now() - t0 > 60) return stuck(s, "the gpus", li, t0);
-  }
+  int64_t r = tags(s, b, li, t0);  // (the guesses go on)
+  if (r) return r;
   double t1 = now();
   float logits[4096], sig[4096], tw[512];
   int64_t sel[64], pos[4096], usel[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0, late = 0, ns = 0, nf = 0;
@@ -290,8 +328,7 @@ static int64_t layer(io_t *s, int64_t li) {
     }
   }
   for (int64_t r1 = 0, first = 1;; first = 0) {
-    if (reap(s) < 0) return -1;
-    ring(s);
+    if (poll_io(s) < 0) return -1;
     int64_t reads = 0, busy = 0, busy1 = 0;
     for (int64_t q = 0; q < nd; q++) reads |= s->inflight[q] != 0;
     for (int64_t u = 0; u < nu; u++) busy |= BUSY(u);
@@ -336,6 +373,45 @@ static int64_t layer(io_t *s, int64_t li) {
   return 0;
 }
 
+// layer li of a prompt's chunk (many tokens): waits for the gpus' tags, queues the next layer's every uncached expert (a chunk's tokens route
+// to nearly all of them), routes every token exactly (its top k: no tau, no cached bonus), gives the gpus part 1 an entry a token's expert
+// (j*T + t: token t's j-th, its slot and weight) once li's reads are in. then the counts and the decayed use counts (a use a token).
+// 0, -1 a read failed, -2 a timeout, -3 no victims
+static int64_t chunk(io_t *s, int64_t li) {
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, sel[64], cnt[4096];
+  const uint64_t *b = s->bufs + li * NB * ng;
+  double t0 = now();
+  int64_t r = tags(s, b, li, t0), lend = npend;  // (li's reads: those pending before li + 1's)
+  if (r) return r;
+  if (li + 1 < s->layers && (r = queue_layer(s, li + 1))) return r;
+  if (poll_io(s) < 0) return -1;
+  double t1 = now();
+  io_t exact = *s;
+  exact.tau = exact.tauc = exact.beta = 0, exact.kmin = K;
+  float logits[4096], sig[4096], w[64];
+  int32_t *so = s->slot_of + li * E, *part = BUF(B_PART1, 0, int32_t);
+  for (int64_t e = 0; e < E; e++) cnt[e] = 0;
+  for (int64_t t = 0; t < T; t++) {
+    logits_of(s, b, t * s->rows, logits);
+    route(&exact, logits, s->bias[li], so, 0, sel, w, sig, 0, 0);
+    for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[1 + j * T + t] = so[sel[j]], ((float *)part)[1 + (K + j) * T + t] = w[j];
+  }
+  for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i <= 2 * K * T; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
+  double t2 = now();
+  for (int64_t busy = 1; busy;) {
+    if (poll_io(s) < 0) return -1;
+    busy = pend_at < lend;
+    for (int64_t e = 0; e < E && !busy; e++) busy = s->flying[li * E + e] > 0;
+    if (now() - t2 > 60) return stuck(s, "reads", li, t2);
+  }
+  __sync_synchronize();
+  for (int64_t g = 0; g < ng; g++) *BUF(B_PART1, g, volatile uint32_t) = 1;
+  float *f = s->freq + li * E;
+  for (int64_t e = 0; e < E; e++) f[e] = f[e] * s->decay + cnt[e], s->refs += cnt[e] > 0;
+  s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += now() - t2;
+  return 0;
+}
+
 // n codes read into slots on the demand queues, waited for. 0, -1 a read failed, -2 a timeout
 int64_t read_codes(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots) {
   double t0 = now();
@@ -359,12 +435,15 @@ void flags(io_t *s, uint32_t value) {
   }
 }
 
-// every layer of a step: the host's whole part of it while the gpus run the graph. 0, else the layer's error. slowest: its slowest layer
+// every layer of a step (a chunk: layer 0's reads queued first): the host's whole part of it while the gpus run the graph. 0, else the
+// layer's error. slowest: its slowest layer
 int64_t step_io(io_t *s) {
-  s->slowest = 0;
+  int64_t r = 0;
+  s->slowest = 0, npend = pend_at = 0;
+  if (s->chunk && (r = queue_layer(s, 0))) return r;
   for (int64_t li = 0; li < s->layers; li++) {
     double t = now();
-    int64_t r = layer(s, li);
+    r = s->chunk ? chunk(s, li) : layer(s, li);
     if (r) return r;
     if (now() - t > s->slowest) s->slowest = now() - t;
   }
