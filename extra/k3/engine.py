@@ -6,7 +6,7 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import ctypes, functools, itertools, os, sys, time
 import numpy as np
-from tinygrad import Tensor, Device, TinyJit, UOp, dtypes
+from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -54,7 +54,11 @@ class Engine:
     for li, b in enumerate(blocks):
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
-    # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free
+    # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states
+    for b in model.blk: b._init_state(Tensor.empty(1, 1, model.config.dim, device=self.devs))
+    Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if t.numel()]))
+    for buf in (t.uop.base.buffer for t in states):  # (the empty ones too)
+      for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
     self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
     self.pool = Tensor.zeros(G * slots * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
