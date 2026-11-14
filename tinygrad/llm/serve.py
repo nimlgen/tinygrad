@@ -149,7 +149,8 @@ class Handler(VizHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
-      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
+      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True,
+                                             **({"thinking_effort": e} if (e:=body.get("reasoning_effort")) else {}))
       ids: list[int] = self.server.tok.encode(rendered)
       log_prefix += f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  "
       if len(ids) >= self.server.model.max_context:
