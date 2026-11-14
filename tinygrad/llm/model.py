@@ -560,7 +560,9 @@ class MLATransformerBlock(FFNBlock):
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     cache = _update_cache(self.cache_k, k_store, start_pos, 2)
     scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
-    if idx_mask is not None and dtypes.is_int(idx_mask.dtype) and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
+    if idx_mask is None and len(start_pos) == 1 and self.config.kv_lora_rank % 32 == 0 and amd_custom_kernels_supported(x.device):
+      attn = mla_topk_attention(q, cache, None, start_pos[0], self.config.kv_lora_rank, scale)  # (no indexer: every key there is)
+    elif idx_mask is not None and dtypes.is_int(idx_mask.dtype) and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
       attn = mla_topk_attention(q, cache, idx_mask, start_pos[0], self.config.kv_lora_rank, scale)
     elif idx_mask is not None and dtypes.is_int(idx_mask.dtype):
       # the indexer's positions (B, T, top_k): each token's keys gathered (the slots past the keys there are the first key's, masked as its future)

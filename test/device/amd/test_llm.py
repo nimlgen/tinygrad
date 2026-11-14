@@ -633,6 +633,18 @@ class TestTopk(unittest.TestCase):
       p = np.exp(s - s.max(-1, keepdims=True))
       np.testing.assert_allclose(got[0], (p / p.sum(-1, keepdims=True)) @ k[:, :V], rtol=1e-4, atol=1e-4)
 
+  def test_mla_every_key(self): # no indexer: the indexed kernel over every position, as the dense attention masked causal
+    cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=4, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=80, rope_theta=1e4,
+                            rope_dim=16, v_head_dim=16, max_context=64, q_lora_rank=32, kv_lora_rank=64, mla_nope=True)
+    rng, blk = np.random.default_rng(0), MLATransformerBlock(cfg)
+    for v in nn.state.get_parameters(blk): v.replace(Tensor(rng.standard_normal(v.shape).astype(np.float32) * 0.3).cast(v.dtype))
+    for T, pos in ((1, 3), (2, 7), (2, 50), (16, 40)):
+      x, p = Tensor(rng.standard_normal((1, T, 64)).astype(np.float32)), UOp.variable("start_pos", 0, 63).bind(pos)
+      blk._init_state(x)
+      blk.cache_k.assign(Tensor(rng.standard_normal(blk.cache_k.shape).astype(np.float16))).realize()
+      mask = np.where(np.arange(pos + T) <= pos + np.arange(T)[:, None], 0, -np.inf).astype(np.float32).reshape(1, 1, T, pos + T)
+      np.testing.assert_allclose(blk._attention(x, (p,)).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
+
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot
     devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(4))
