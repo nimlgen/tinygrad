@@ -67,6 +67,7 @@ class Engine:
     # (the empty ones allocated too, else at their first use: the ones with a buffer, not the folded constants)
     for buf in (t.uop.base.buffer for t in states if t.uop.base.op in (Ops.BUFFER, Ops.UNSHARD)):
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
+    model.save([])  # (and the two sets of saved recurrent states)
     self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
     self.pool = Tensor.zeros(G * slots * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
@@ -228,7 +229,11 @@ class Engine:
     """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
     a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
-    for pos in range(self.prefill(tokens, self.get_start_pos(tokens)), len(tokens)):
+    start = self.get_start_pos(tokens)
+    if (fork:=self.model.fork(tokens, start, self.chunk or 1)) > start:  # (where tokens diverge from the tokens fed before: its states saved)
+      for pos in range(self.prefill(tokens[:fork + 1], start), fork): self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+      self.model.save(tokens[:fork])
+    for pos in range(self.prefill(tokens, fork), len(tokens)):
       (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
     row = 0

@@ -476,6 +476,21 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     self.assertEqual(take(model.generate(second[:])), want)
     self.assertEqual(model.get_start_pos([5, 6]), 0)
 
+  def test_prompt_fork_restored(self):  # prompts sharing a prefix X: fed from where one diverged from the tokens fed before it (its states saved)
+    ssm = SSMConfig(conv_kernel=3, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=True)
+    model, rng = Transformer(self._make_config(num_blocks=2, ssm_layers=(True, False), ssm=ssm, max_context=24)), np.random.default_rng(7)
+    for p in nn.state.get_parameters(model): p.replace(Tensor(rng.standard_normal(p.shape).astype(np.float32)))
+    X = [1, 2, 3, 4, 5, 6]
+    def take(gen) -> list[int]: return [t for _, t in zip(range(4), gen)]
+    want = take(model.generate(X + [11, 12]))
+    take(model.generate(X + [7, 8]))  # (from 0: its states kept after X, where it diverges)
+    self.assertEqual(model.get_start_pos(X + [9, 10]), len(X))
+    take(model.generate(X + [9, 10]))
+    self.assertEqual(model.get_start_pos(X + [11, 12]), len(X))
+    self.assertEqual(take(model.generate(X + [11, 12])), want)
+    self.assertEqual(model.get_start_pos([5, 6, 7]), 0)  # (a prompt of other tokens from 0: the ones kept dropped)
+    self.assertEqual(model.get_start_pos(X + [1]), 0)
+
   def test_start_zero_resets_realized_state(self):
     config = self._make_config(max_context=3)
     x = self._tensor_linspace(-1, 1, (1, 3, config.dim))

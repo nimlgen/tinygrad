@@ -172,5 +172,15 @@ class TestEngine(unittest.TestCase):
     self.assertEqual([t for _, t in zip(range(2), self.eng.generate(tokens + [want[3]]))], want[4:])
     self.assertEqual((self.eng.io.refs, self.eng.io.misses), (self.eng.io.hits, 0))
 
+  @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
+  def test_generate_fork(self):  # prompts sharing X: the third fed from where the second diverged from the first (a chunk's end, its states saved)
+    self.eng.warm()
+    X = [3, 5, 7, 9]
+    def take(prompt:list[int]) -> list[int]: return [t for _, t in zip(range(3), self.eng.generate(prompt))]
+    want = take(X + [2, 4])
+    take(X + [6, 8])
+    self.assertEqual(self.eng.get_start_pos(X + [2, 4]), len(X))
+    self.assertEqual(take(X + [2, 4]), want)
+
 if __name__ == "__main__":
   unittest.main()

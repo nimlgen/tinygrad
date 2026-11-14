@@ -731,7 +731,9 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    self._saved: tuple[list[int], list[Tensor]] = ([], [])  # (the last prompt fed, the recurrent states after it)
+    # (prompts fed, or where they diverged from the tokens fed before, and which of the two state sets has the recurrent states after them)
+    self._saved: list[tuple[list[int], int]] = []
+    self._sets: list[list[Tensor]] = []
     self._position_count: int|None = None
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
@@ -761,10 +763,22 @@ class Transformer:
 
   def _states(self) -> list[Tensor]: return [s for b in self.blk if isinstance(b, GatedDeltaNetBlock) for s in b._states()]
   def save(self, tokens:list[int]):
-    """after a prompt is fed, its recurrent states kept: get_start_pos restores them for a prompt that extends it"""
+    """the recurrent states after tokens (a prompt fed, or its part before it diverged from the tokens fed before: fork) kept, with the deepest
+    kept ones tokens extend: get_start_pos restores the deepest a prompt extends"""
     if not (states:=self._states()): return
-    self._saved = (tokens[:], self._saved[1] or [s.empty_like() for s in states])
-    Tensor.realize(*[k.assign(s) for k, s in zip(self._saved[1], states)])
+    if not self._sets:
+      self._sets = [[s.clone() for s in states] for _ in range(2)]
+      Tensor.realize(*[s for st in self._sets for s in st])
+    keep = [(t, i) for t, i in self._saved if len(t) < len(tokens) and tokens[:len(t)] == t][-1:]
+    i = next(j for j in range(2) if all(j != k for _, k in keep))
+    Tensor.realize(*[k.assign(s) for k, s in zip(self._sets[i], states)])
+    self._saved = keep + [(tokens[:], i)]
+
+  def fork(self, tokens:list[int], start:int, step:int) -> int:
+    """where (start and whole steps of a feed) tokens diverge from the tokens fed before, its states to be saved there for a later prompt that
+    shares only that part (start: nowhere)"""
+    n = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, self._cached_tokens)))
+    return f if self.has_recurrent_block and start < (f:=start + (n - start) // step * step) < len(tokens) else start
 
   def __call__(self, tokens:Tensor, start_pos:StartPos, temperature:Tensor) -> Tensor:
     assert len(start_pos) in (1, tokens.shape[0]), "expected one shared position or one position per batch row"
@@ -1003,13 +1017,15 @@ class Transformer:
     for _ in range(2): list(zip(range(2), self.generate([0])))
 
   def get_start_pos(self, tokens:list[int]) -> int:
-    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix, else the last prompt's
-    # (its saved states restored, the attention caches are still valid up to it)
+    # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix, else the deepest saved
+    # one (restored, the attention caches are still valid up to it). the saved ones tokens don't extend are dropped: they'll be overwritten
     if self.has_recurrent_block:
       def extends(prefix:list[int]) -> bool: return 0 < len(prefix) < len(tokens) and tokens[:len(prefix)] == prefix
       if extends(self._cached_tokens): return len(self._cached_tokens)
-      if not extends(prompt:=self._saved[0]): return 0
-      Tensor.realize(*[s.assign(k) for s, k in zip(self._states(), self._saved[1])])
+      self._saved = [(t, i) for t, i in self._saved if extends(t)]
+      if not self._saved: return 0
+      prompt, i = self._saved[-1]
+      Tensor.realize(*[s.assign(k) for s, k in zip(self._states(), self._sets[i])])
       self._cached_tokens = prompt[:]
       return len(prompt)
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
@@ -1025,13 +1041,14 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
-    out, prompt_len = None, len(tokens)
+    fork, out, prompt_len = self.fork(tokens, start_pos, chunk_size), None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
+      n_toks = min(chunk_size, len(tokens) - start_pos, *([fork - start_pos] if start_pos < fork else []))
       if self.config.ple: self.blk[self.config.ple.layer].ple.write_rows(tokens, start_pos, n_toks, chunk_size)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, (sp,), temp).realize()
       start_pos += n_toks
+      if start_pos == fork: self.save(tokens[:fork])
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       if start_pos == prompt_len: self.save(tokens)
