@@ -135,6 +135,11 @@ class TestEngine(unittest.TestCase):
     ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
     np.testing.assert_allclose(ours, want, rtol=1e-4, atol=1e-4 * np.abs(want).max())
 
+  def test_planned(self):  # the chunk graph's buffers planned (the pool sized after them), the steps after as without it
+    self.stub()
+    self.assertGreater(self.eng.planned(4), 0)
+    self.test_chunk()
+
   def test_prefill(self):  # the chunks of a prompt but its last token (each with the tokens after it given), none without a chunk
     steps:list = []
     self.eng.step = lambda toks, pos, given: steps.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]

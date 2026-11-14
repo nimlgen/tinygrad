@@ -4,7 +4,7 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, itertools, os, signal, sys, time
+import collections, ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
@@ -60,7 +60,6 @@ class Engine:
     for li, b in enumerate(blocks):
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
-    # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states
     weights = {id(t) for t in nn.state.get_parameters(model.blk)}  # (not realized here: some are decoded in the step's graph)
     for b in model.blk: b._init_state(Tensor.empty(1, 1, model.config.dim, device=self.devs))
     Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if id(t) not in weights and t.numel()]))
@@ -68,18 +67,6 @@ class Engine:
     for buf in (t.uop.base.buffer for t in states if t.uop.base.op in (Ops.BUFFER, Ops.UNSHARD)):
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
     model.save([])  # (and the two sets of saved recurrent states)
-    self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part
-    self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
-    self.pool = Tensor.zeros(G * slots * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
-    # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
-    # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
-    self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
-                  "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(slots, np.uint8),
-                  "victims": np.zeros(max(32 * tokens, E), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
-                  "bufs": np.array([[[v.ctypes.data for v in views] for _, views in b] for b in bufs], np.uint64)}
-    self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
-                  fill=FILL, decay=0.5 ** (1 / 8))
-    for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos = UOp.variable("start_pos", 0, model.max_context - 1)
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
@@ -90,6 +77,22 @@ class Engine:
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
     self.chain_jit = TinyJit(self.run_chain) if draft is not None and tokens > 2 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
+    # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states and the buffers of
+    # the chunk's graph (planned on a pool of a slot, before it's captured)
+    self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
+    def pool(n:int) -> Tensor: return Tensor.zeros(G * n * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
+    self.pool = pool(1)
+    self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE - (self.planned(chunk) if chunk else 0)) // self.part
+    self.pool = pool(slots)
+    # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
+    # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
+    self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
+                  "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(slots, np.uint8),
+                  "victims": np.zeros(max(32 * tokens, E), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
+                  "bufs": np.array([[[v.ctypes.data for v in views] for _, views in b] for b in bufs], np.uint64)}
+    self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
+                  fill=FILL, decay=0.5 ** (1 / 8))
+    for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
@@ -111,6 +114,21 @@ class Engine:
   def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
     """the greedy token after each of the step's tokens and (a draft) its guess of the token after that (after the given one where there's
     one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits (kept, else done)"""
+    done, logits, *dx = self.outputs(T, pos)
+    Tensor.realize(done, logits, *dx)
+    return done, logits
+
+  def planned(self, T:int) -> int:
+    """the most bytes on a gpu of the buffers of the step graph of T tokens, its schedule's (not run)"""
+    linear, _ = Tensor.linear_with_vars(*self.outputs(T, self.v_pos.bind(0)))
+    used = collections.Counter()
+    for u in linear.toposort():
+      if u.op is Ops.BUFFER and not all(b.is_allocated() for b in getattr(u.buffer, "bufs", [u.buffer])):
+        for d in (u.device if isinstance(u.device, tuple) else (u.device,)): used[d] += u.nbytes()
+    return max(used.values(), default=0)
+
+  def outputs(self, T:int, pos:UOp) -> list[Tensor]:
+    """run's tensors: the done word, the logits (kept, else the done word) and the draft's hidden states"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
     out, dx = (toks:=logits.argmax(-1)), []
     if self.draft is not None:
@@ -120,9 +138,7 @@ class Engine:
       dx = [Tensor(self.dx.uop)[:T].assign(x[0].float())]
     outs = Tensor(self.res.uop)[1:1 + out.shape[0]].assign(out.to(self.devs[0]).cast(dtypes.int32))
     done = Tensor(self.res.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0]))
-    if not self.keep_logits: logits = done  # (realized, the logits are a buffer of their own: only for an eval)
-    Tensor.realize(done, logits, *dx)
-    return done, logits
+    return [done, logits if self.keep_logits else done, *dx]  # (realized, the logits are a buffer of their own: only for an eval)
 
   def run_chain(self, pos:UOp, row:UOp) -> Tensor:
     """the draft's next guesses after the given one (a token at pos+1), a step each on its own hidden state of the step before (from its
