@@ -3,7 +3,7 @@ import functools, itertools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod, getenv, unwrap, round_up
+from tinygrad.helpers import prod, getenv, unwrap, round_up, dedup
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 
@@ -576,13 +576,58 @@ def _topk_compact_kernel(idx:UOp, scores:UOp, state:UOp, offs:UOp, valid:UOp, th
     sg, se = sg + g, se + q
   return UOp.group(*stores).end(b, chunk, row).sink(arg=KernelInfo(name="topk_compact", opts_to_apply=()))
 
-def topk_indices(scores:Tensor, k:int) -> Tensor:
-  """(R, k): the positions of the k largest of each row of scores (R, S) (ties: the earlier), the slots past min(k, S) unset"""
-  R, S = scores.shape
-  valid = _unbind(S)
-  N = round_up(int(S.vmax) if isinstance(S, UOp) else S, TOPK_KEYS)
-  scores = scores.float().contiguous().pad_to(R, N).contiguous()  # (the scores of the keys there are, then their padding)
-  if isinstance(S, UOp): scores = Tensor(scores.uop.after(S))  # (carry its binding)
+def _carry(t:Tensor, *vals:int|UOp) -> Tensor:  # (t after the bindings of the variables in vals: the kernels take them unbound)
+  return Tensor(t.uop.after(*binds)) if (binds:=dedup(u for v in vals if isinstance(v, UOp) for u in v.toposort() if u.is_bound_var)) else t
+
+def _xor16(x:UOp) -> UOp:  # (x of the lane lane ^ 16, a float)
+  return UOp.custom_function(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | 16 << 10}))",
+                             shape=x.shape, dtype=dtypes.float, fmt=True).call(x)
+
+INDEX_ROWS = 16  # (a workgroup's rows: their scores of its keys, the keys' fragments read once)
+
+@functools.cache
+def _indexer_scores_kernel(out:UOp, q:UOp, keys:UOp, w:UOp, valid:int|UOp, start:int|UOp, T:int, rdna4:bool) -> UOp:
+  """out (B*T, N): of row r (batch r // T, its token t = r % T at start + t) every key's score, the heads' sum of w[r, h] relu(q[r, h] . key),
+  -inf past the token (and anything past valid). q (B*T, H, D) half, keys (B, N, D) half, w (B*T, H) float. WMMA: a wave 16 keys (their
+  fragments read once), a 16 head tile of a row a step: the heads a lane's accumulators, the other half's through a swizzle"""
+  R, H, D = cast(tuple[int, int, int], q.shape)
+  N = keys.shape[1]
+  assert H % 16 == 0 and D % 16 == 0
+  WAVES = 4
+  kb, rg = UOp.range((valid + 16*WAVES - 1) // (16*WAVES), 0, AxisType.GLOBAL), UOp.range(-(-R // INDEX_ROWS), 1, AxisType.GLOBAL)
+  wave, lane = UOp.range(WAVES, 2, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  key = (kb*WAVES + wave)*16 + lane % 16
+  rr = UOp.range(INDEX_ROWS, 3, AxisType.LOOP)
+  r = (rg*INDEX_ROWS + rr).minimum(R - 1)
+  kf = [_wmma_fragment(keys.reshape(-1, N, D // 16, 16)[r // T, key.minimum(N - 1), ks], lane, rdna4) for ks in range(D // 16)]
+  total = UOp.const(0.0, dtypes.float)
+  for tile in range(H // 16):
+    acc = _reg((8,), 0, rr)
+    acc = acc.after(acc.store(functools.reduce(lambda c, ks: UOp.wmma(_wmma_fragment(q.reshape(R, H, D // 16, 16)[r, tile*16 + lane % 16, ks],
+                                                                                     lane, rdna4), kf[ks], c, *WMMA_ARG), range(D // 16), acc)))
+    heads = [tile*16 + ((lane // 16)*8 + i if rdna4 else 2*i + lane // 16) for i in range(8)]
+    total = total + functools.reduce(UOp.__add__, [w[r, h].load() * acc[i].load().maximum(0) for i, h in enumerate(heads)])
+  total = total + _xor16(total)
+  score = (key > start + r % T).where(-math.inf, total)
+  return out[r.valid(rg*INDEX_ROWS + rr < R), key.valid((lane < 16) & (key < N))].store(score).end(rr, lane, wave, rg, kb) \
+    .sink(arg=KernelInfo(name="indexer_scores", opts_to_apply=()))
+
+def indexer_scores(q:Tensor, keys:Tensor, w:Tensor, start:int|UOp, valid:int|UOp) -> Tensor:
+  """(B*T, N) of the keys (B, N, D) cache's first valid ones: a row (token t at start + t) a score of each, the heads' sum of w (B, T, H) of
+  relu(q (B, T, H, D) . key), -inf past the token"""
+  B, T, H, D = q.shape
+  q, w = q.pad((None, None, (0, -H % 16), None)), w.pad((None, None, (0, -H % 16)))  # (a 16 head tile: the padded heads weigh 0)
+  H, N = H + -H % 16, round_up(cast(int, keys.shape[1]), TOPK_KEYS)
+  out = Tensor.empty(B*T, N, dtype=dtypes.float32, device=q.device)
+  keys = _carry(keys, start, valid)
+  fxn = functools.partial(_indexer_scores_kernel, valid=_unbind(valid), start=_unbind(start), T=T, rdna4=_is_rdna4(q.device))
+  return Tensor.custom_kernel(out, q.half().reshape(B*T, H, D).contiguous(), keys, w.float().reshape(B*T, H).contiguous(), fxn=fxn)[0]
+
+def topk_indices(scores:Tensor, k:int, valid:int|UOp) -> Tensor:
+  """(R, k): the positions of the k largest of each row's first valid scores (R, N) (ties: the earlier), the slots past min(k, valid) unset"""
+  R, N = scores.shape
+  assert N % TOPK_KEYS == 0
+  scores, valid = _carry(scores, valid), _unbind(valid)
   def kernel(out:Tensor, *src:Tensor, fxn:Callable, **kw) -> Tensor:
     return Tensor.custom_kernel(out, *src, fxn=functools.partial(fxn, valid=valid, **kw))[0]
   state = Tensor.empty(R, 2, dtype=dtypes.int32, device=scores.device)

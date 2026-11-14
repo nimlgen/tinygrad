@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  topk_indices
+  indexer_scores, topk_indices
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -491,6 +491,10 @@ class Indexer:
       rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos))
       if not idx.qsa: k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
       iq = apply_rope(iq[..., :idx.rope_dim].transpose(1, 2), rot, idx.rope_interleave).transpose(1, 2).cat(iq[..., idx.rope_dim:], dim=-1)
+    if idx.kpool == 1 and not (idx.msa or idx.qsa) and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
+      # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
+      keys, w = _update_cache(self.cache_kg, k, start_pos, 1), self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5
+      return topk_indices(indexer_scores(iq, keys, w, start_pos[0], S), idx.top_k, S).reshape(B, T, -1)
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
       kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
@@ -510,8 +514,6 @@ class Indexer:
     k_pos = Tensor.arange(S)
     scores = ((Tensor.arange(scores.shape[-1]) + 1) * idx.kpool <= q_pos + 1).where(scores, -math.inf)
     if idx.msa: scores = (Tensor.arange(scores.shape[-1]) == q_pos // idx.kpool).where(math.inf, scores)
-    # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
-    if idx.kpool == 1 and amd_custom_kernels_supported(x.device): return topk_indices(scores.reshape(B*T, -1), idx.top_k).reshape(B, T, -1)
     # selected incomplete pools add only tail/future tokens, handled by the final tail and causal mask
     picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :S]
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)

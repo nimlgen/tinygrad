@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna, topk_indices, partial_sum)
+                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K,
   IQ3_S, IQ3_XXS)
@@ -573,11 +573,22 @@ class TestTopk(unittest.TestCase):
     for R, N in ((1, 4096), (3, 5000)):
       s = rng.standard_normal((R, N)).astype(np.float32)
       s[0, :3000:7], s[-1, 100:200] = 0.5, -np.inf
-      v, x = UOp.variable("S", 1, N), Tensor(s).realize()
+      v, x = UOp.variable("S", 1, N), Tensor(s).pad((None, (0, -N % 1024))).contiguous().realize()
       for S in (1, 100, 2048, 2049, 3001, N):
-        got = topk_indices(x[:, :v.bind(S)], 2048).numpy()
+        got = topk_indices(x, 2048, v.bind(S)).numpy()
         for r in range(R):
           self.assertEqual(set(got[r, :min(2048, S)].tolist()), set(np.lexsort((np.arange(S), -s[r, :S]))[:2048].tolist()), f"{R=} {S=} {r=}")
+
+  def test_indexer_scores(self): # a row's (token t at start + t) score of each key: the heads' sum of w relu(q . key), -inf past the token
+    rng = np.random.default_rng(0)
+    for T, H, start in ((1, 32, 2999), (2, 32, 1000), (5, 4, 40)):
+      q, w = rng.standard_normal((1, T, H, 128)).astype(np.float16), rng.standard_normal((1, T, H)).astype(np.float32)
+      keys = rng.standard_normal((1, 4096, 128)).astype(np.float16)
+      v = UOp.variable("start_pos", 0, 4095)
+      got = indexer_scores(Tensor(q), Tensor(keys).realize(), Tensor(w), v.bind(start), v.bind(start) + T).numpy()[:, :start + T]
+      want = (np.maximum(np.einsum("thd,sd->ths", q[0].astype(np.float32), keys[0, :start + T].astype(np.float32)), 0) * w[0][..., None]).sum(1)
+      want[np.arange(start + T) > start + np.arange(T)[:, None]] = -np.inf
+      np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3, err_msg=f"{T=} {H=}")
 
   def test_mla_gathered_keys(self): # attention over the keys of the indexer's positions: as over the cache masked to them
     cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=4, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=80, rope_theta=1e4,
