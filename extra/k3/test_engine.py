@@ -71,10 +71,10 @@ class TestEngine(unittest.TestCase):
     rng = np.random.default_rng(0)
     weights = {n: (1 + rng.normal(0, 0.1, t.shape) if 'norm' in n or 'res_score' in n else rng.normal(0, 0.3, t.shape)).astype(np.float32)
                for n, t in nn.state.get_state_dict(Transformer(CONFIG)).items()}
-    with tempfile.TemporaryDirectory() as folder:
-      write(full:=pathlib.Path(folder)/'full.gguf', weights, True)
-      write(trunk:=pathlib.Path(folder)/'trunk.gguf', weights, False)
-      self.ref, model = Transformer.from_gguf(full)[0], Transformer.from_gguf(trunk, shard=G)[0]
+    folder = tempfile.mkdtemp()
+    write(full:=pathlib.Path(folder)/'full.gguf', weights, True)
+    write(trunk:=pathlib.Path(folder)/'trunk.gguf', weights, False)
+    self.ref, model, self.trunk = Transformer.from_gguf(full)[0], Transformer.from_gguf(trunk, shard=G)[0], trunk
     # every expert in its slot, a code (layer * E + expert) a slot
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
@@ -145,7 +145,7 @@ class TestEngine(unittest.TestCase):
     self.assertEqual(len(steps), 3)
 
   def test_states_allocated(self):  # the blocks' caches and states and the draft's allocated by the engine, before its pool takes what's free
-    model, folder = self.eng.model, tempfile.mkdtemp()
+    model, folder = Transformer.from_gguf(self.trunk, shard=G)[0], tempfile.mkdtemp()
     draft = Eagle3(eagle(folder, np.random.default_rng(1)), lambda t: model.token_embd(t).float(), self.eng.devs, model.max_context)
     Engine(model, self.eng.m, slots=1, tokens=2, draft=draft)
     for t in (*(b.cache_k for b in model.blk if isinstance(b, MLATransformerBlock)), draft.cache, model.blk[0].kept[0][0]):
