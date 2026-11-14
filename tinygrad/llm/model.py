@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices
+  indexer_scores, topk_indices, mla_topk_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -560,7 +560,9 @@ class MLATransformerBlock(FFNBlock):
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     cache = _update_cache(self.cache_k, k_store, start_pos, 2)
     scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
-    if idx_mask is not None and dtypes.is_int(idx_mask.dtype):
+    if idx_mask is not None and dtypes.is_int(idx_mask.dtype) and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
+      attn = mla_topk_attention(q, cache, idx_mask, start_pos[0], self.config.kv_lora_rank, scale)
+    elif idx_mask is not None and dtypes.is_int(idx_mask.dtype):
       # the indexer's positions (B, T, top_k): each token's keys gathered (the slots past the keys there are the first key's, masked as its future)
       S, K = ssimplify(smax(start_pos) + T), idx_mask.shape[-1]
       pos = (Tensor.arange(K) < S).where(idx_mask, 0)

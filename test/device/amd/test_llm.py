@@ -596,7 +596,7 @@ class TestTopk(unittest.TestCase):
                             indexer=IndexerConfig(4, 16, 8))
     rng, blk = np.random.default_rng(0), MLATransformerBlock(cfg)
     for v in nn.state.get_parameters(blk): v.replace(Tensor(rng.standard_normal(v.shape).astype(np.float32) * 0.3).cast(v.dtype))
-    for T, pos in ((1, 3), (2, 7), (1, 40), (2, 50)):
+    for T, pos in ((1, 3), (2, 7), (1, 40), (2, 50), (5, 2), (16, 40)):  # (a chunk's rows too)
       x, p = Tensor(rng.standard_normal((1, T, 64)).astype(np.float32)), UOp.variable("start_pos", 0, 63).bind(pos)
       blk._init_state(x)
       cache = rng.standard_normal(blk.cache_k.shape).astype(np.float16)

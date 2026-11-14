@@ -638,6 +638,77 @@ def topk_indices(scores:Tensor, k:int, valid:int|UOp) -> Tensor:
   offs = kernel(Tensor.empty(R, N // TOPK_KEYS, 2, dtype=dtypes.int32, device=scores.device), counts, state, fxn=_topk_offsets_kernel)
   return kernel(Tensor.empty(R, k, dtype=dtypes.int32, device=scores.device), scores, state, offs, fxn=_topk_compact_kernel)
 
+# *** mla attention over each query's top-k positions: flash-decode's partials, a block a query row and head, the keys read by position
+
+@functools.cache
+def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, start:int|UOp, scale:float, block_n:int=64, waves:int=4) -> UOp:
+  """out (B*T, H, P, V), stats (B*T, H, P, 2): of query row b*T + t (at position start + t) and head h, block p's softmax partial over its
+  slots of idx[b, t] (block_n each, every P-th) that are of the first start + T and at or before the query. a key is the cache's row (B, 1,
+  N, D) at a slot's position, its value the row's first V; a lane holds dims [lane*V/32, ..) of the values and V + lane + 32*i of the rest"""
+  start = _unbind(start)
+  B, H, T, D = cast(tuple[int, int, int, int], q.shape)
+  N, K, P, V = cast(int, cache.shape[2]), cast(int, idx.shape[2]), cast(int, out.shape[2]), cast(int, out.shape[3])
+  DV, DR, SEC = V // WARP_SIZE, -(-(D - V) // WARP_SIZE), block_n // waves
+  assert V % WARP_SIZE == 0 and K % (block_n * P) == 0 and block_n % waves == 0
+  row, h, part = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(H, 1, AxisType.GLOBAL), UOp.range(P, 2, AxisType.GLOBAL)
+  lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(waves, 3, axis_type=AxisType.LOCAL)
+  b, t = row // T, row % T
+  dims, zero = [lane*DV + i for i in range(DV)] + [V + lane + WARP_SIZE*i for i in range(DR)], UOp.const(0, dtypes.float)
+  def load(x:UOp, d:UOp) -> UOp: return (d < D).where(x[d.minimum(D - 1)].load().float(), zero)  # (the rest's lanes past D: 0)
+  qf = [load(q[b, h, t], d) for d in dims]
+  rnd = UOp.range(K // (block_n * P), 4, AxisType.LOOP)
+  valids, scores, vfrags = [], [], []
+  for j in range(SEC):
+    slot = (rnd*P + part)*block_n + wave*SEC + j
+    pos = idx[b, t, slot].load()
+    valid = (slot < start + T) & (pos <= start + t) & (pos >= 0)
+    kf = [load(cache[b, 0, valid.where(pos, 0).minimum(N - 1)], d) for d in dims]  # (a slot not a key's: the first key, never an unwritten row)
+    valids.append(valid)
+    scores.append(valid.where(warp_reduce(sum((x*y for x, y in zip(qf, kf)), zero), full_wave=True) * scale, UOp.const(-1e30, dtypes.float)))
+    vfrags.append([valid.where(v, zero) for v in kf[:DV]])
+  # (flash-decode partial's online softmax over the rounds, a finite initial max)
+  acc_reg, max_reg, sum_reg = _reg((DV,), 0), _reg((1,), -1e30), _reg((1,), 0)
+  prev_acc, prev_max, prev_sum = acc_reg.after(rnd), max_reg.after(rnd), sum_reg.after(rnd)
+  m = functools.reduce(UOp.maximum, scores, prev_max[0].load())
+  alpha = ((prev_max[0].load() - m)*LOG2E).exp2()
+  acc, l = [alpha*prev_acc[i].load() for i in range(DV)], alpha*prev_sum[0].load()
+  for valid, s, vf in zip(valids, scores, vfrags):
+    beta = valid.where(((s - m)*LOG2E).exp2(), zero)
+    acc, l = [a + beta*v for a, v in zip(acc, vf)], l + beta
+  update = UOp.group(acc_reg.store(UOp.stack(*acc)), max_reg[0].store(m), sum_reg[0].store(l)).end(rnd)
+  acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
+  # the block's waves merged through LDS
+  acc_lds = UOp.alloc((waves, V), dtypes.float, addrspace=AddrSpace.LOCAL)
+  ml_lds = UOp.alloc((waves, 2), dtypes.float, addrspace=AddrSpace.LOCAL)
+  stores = [acc_lds[wave, lane*DV + i].store(acc_reg[i].load()) for i in range(DV)]
+  stores += [ml_lds[wave, i].store(x) for i, x in enumerate((max_reg[0].load(), sum_reg[0].load()))]
+  acc_lds, ml_lds = acc_lds.after(*stores), ml_lds.after(*stores)
+  M = functools.reduce(UOp.maximum, (ml_lds[w, 0].load() for w in range(waves)))
+  ws = [((ml_lds[w, 0].load() - M)*LOG2E).exp2() for w in range(waves)]
+  tid, final = wave*WARP_SIZE + lane, []
+  for i in range(-(-V // (waves*WARP_SIZE))):
+    d = tid + i*waves*WARP_SIZE
+    val = sum((w*acc_lds[x, d.minimum(V - 1)].load() for x, w in enumerate(ws)), zero)
+    final.append(out[row, h, part, d.valid(d < V)].store(val))
+  final += [stats[row, h, part, tid.valid(tid.eq(i))].store(x) for i, x in enumerate((M, sum((w*ml_lds[x, 1].load() for x, w in enumerate(ws)),
+                                                                                              zero)))]
+  return UOp.group(*final).end(lane, wave, part, h, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
+
+def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor, start:int|UOp, values:int, scale:float) -> Tensor:
+  """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
+  idx (B, T, K) (of the first start + T slots, at or before the query), a row's value its first values dims"""
+  B, H, T, _ = q.shape
+  block_n = min(64, K:=idx.shape[2])
+  parts = min(8, K // block_n)
+  partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
+  stats = Tensor.empty(B*T, H, parts, 2, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
+  if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
+  fxn = functools.partial(_mla_topk_partial, start=start, scale=scale, block_n=block_n)
+  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, idx.cast(dtypes.int32).contiguous(), fxn=fxn)[:2]
+  out = Tensor.empty(B*T, H, 1, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
+  out = Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=parts))[0]
+  return out.reshape(B, T, H, values).transpose(1, 2)
+
 # ******** small allreduces: the gpus write their partials into each other's memory ********
 
 # every gpu has a mailbox in its memory, mapped into the others: cached, a writer's l2 combines its stores into lines and a system release
