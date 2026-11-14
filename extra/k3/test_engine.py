@@ -101,10 +101,15 @@ class TestEngine(unittest.TestCase):
           wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
                                                                     wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        def chunk() -> Tensor:  # (the rows in entry order: [1 | their slots, tokens | the entries' slots, rows | weights])
-          slots, k = (sel.T.flatten() + li * E).cast(dtypes.int32), Tensor.arange(K * T, dtype=dtypes.int32).to("CPU")
-          return Tensor([1], dtype=dtypes.int32, device="CPU").cat(slots, k % T, slots, k).bitcast(dtypes.uint32) \
-            .cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
+        def chunk() -> Tensor:  # (host.py's chunk table, the rows in entry order, a tile expert e's (T <= 16): its token t's row at 16*e + t)
+          n, NT, cpu = K * T, K * T // 16 + E, "CPU"
+          k, t = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(T, dtype=dtypes.int32).to(cpu)
+          j = (sel.unsqueeze(-1) == Tensor.arange(E).to(cpu)).cast(dtypes.int32).argmax(1).cast(dtypes.int32)  # (T, E): token t's pick of e
+          slots = (Tensor.arange(NT, dtype=dtypes.int32).to(cpu) < E).where(Tensor.arange(NT, dtype=dtypes.int32).to(cpu) + li * E, 0)
+          trow = (j * T + t.reshape(T, 1)).T.pad(((0, NT - E), (0, 16 - T))).flatten().cast(dtypes.int32)
+          rows = (sel.T.flatten() * 16 + k % T).cast(dtypes.int32)
+          return Tensor([1], dtype=dtypes.int32, device=cpu).cat((sel.T.flatten() + li * E).cast(dtypes.int32), k % T, slots, trow, rows) \
+            .bitcast(dtypes.uint32).cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
         tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else [chunk()]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]

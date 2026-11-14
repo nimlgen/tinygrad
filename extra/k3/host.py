@@ -375,11 +375,12 @@ static int64_t layer(io_t *s, int64_t li) {
 
 // layer li of a prompt's chunk (many tokens): waits for the gpus' tags, routes every token exactly (its top k: no tau, no cached bonus),
 // queues the reads of its experts not cached or guessed, then of the next layer's guesses (every token's top k on its guess row), gives the
-// gpus part 1 once li's experts are in: a row a token's expert, [ready | the rows' slots, tokens by expert | the slots, rows of entry j*T + t
-// (token t's j-th) | its weights]. then the counts and the decayed use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no
-// victims
+// gpus part 1 once li's experts are in: a row a token's expert, by expert, [ready | the rows' slots, tokens | the tiles' slots (an expert's
+// rows in tiles of 16, padded with a tile's first; then slot 0 to n/16 + E), their rows | entry j*T + t's (token t's j-th) tile row | its
+// weight]. then the counts and the decayed use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no victims
 static int64_t chunk(io_t *s, int64_t li) {
-  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096], use[4096], nu = 0;
+  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, sel[64], cnt[4096], at[4096], tile[4096], fill[4096], use[4096], nu = 0;
+  int64_t NT = n / 16 + E, TS = 1 + 2 * n, TR = TS + NT, ER = TR + 16 * NT, W = ER + n;
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
   int64_t r = tags(s, b, li, t0);
@@ -390,10 +391,10 @@ static int64_t chunk(io_t *s, int64_t li) {
   float logits[4096], sig[4096], w[64];
   int32_t *so = s->slot_of + li * E, *part = BUF(B_PART1, 0, int32_t);
   for (int64_t e = 0; e < E; e++) cnt[e] = 0;
-  for (int64_t t = 0; t < T; t++) {  // (an entry's expert in its slot's place till the rows are known)
+  for (int64_t t = 0; t < T; t++) {  // (an entry's expert in its row's place till the rows are known)
     logits_of(s, b, t * s->rows, logits);
     route(&exact, logits, s->bias[li], so, 0, sel, w, sig, 0, 0);
-    for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[1 + 2 * n + j * T + t] = (int32_t)sel[j], ((float *)part)[1 + 4 * n + j * T + t] = w[j];
+    for (int64_t j = 0; j < K; j++) cnt[sel[j]]++, part[ER + j * T + t] = (int32_t)sel[j], ((float *)part)[W + j * T + t] = w[j];
   }
   for (int64_t e = 0; e < E; e++) if (cnt[e]) use[nu++] = e;
   if ((r = queue(s, li, nu, use, &s->misses))) return r;
@@ -410,12 +411,19 @@ static int64_t chunk(io_t *s, int64_t li) {
     if ((r = queue(s, li + 1, nu, use, &s->guesses))) return r;
   }
   if (poll_io(s) < 0) return -1;
-  for (int64_t e = 0, r = 0; e < E; e++) at[e] = r, r += cnt[e];
-  for (int64_t i = 0; i < n; i++) {
-    int64_t e = part[1 + 2 * n + i], r = at[e]++;
-    part[1 + r] = part[1 + 2 * n + i] = so[e], part[1 + n + r] = (int32_t)(i % T), part[1 + 3 * n + i] = (int32_t)r;
+  int64_t nt = 0;
+  for (int64_t e = 0, r = 0; e < E; e++) at[e] = r, tile[e] = nt, fill[e] = 0, r += cnt[e], nt += (cnt[e] + 15) / 16;
+  for (int64_t e = 0; e < E; e++) for (int64_t j = 0; j < (cnt[e] + 15) / 16; j++) {
+    part[TS + tile[e] + j] = so[e];
+    for (int64_t q = 0, r0 = at[e] + j * 16; q < 16; q++) part[TR + (tile[e] + j) * 16 + q] = (int32_t)(j * 16 + q < cnt[e] ? r0 + q : r0);
   }
-  for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i <= 5 * n; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
+  for (int64_t i = TS + nt; i < TS + NT; i++) part[i] = 0;
+  for (int64_t i = TR + 16 * nt; i < TR + 16 * NT; i++) part[i] = 0;
+  for (int64_t i = 0; i < n; i++) {
+    int64_t e = part[ER + i], k = fill[e]++;
+    part[1 + at[e] + k] = so[e], part[1 + n + at[e] + k] = (int32_t)(i % T), part[ER + i] = (int32_t)(tile[e] * 16 + k);
+  }
+  for (int64_t g = 1; g < ng; g++) for (int64_t i = 1; i < W + n; i++) BUF(B_PART1, g, int32_t)[i] = part[i];
   double t2 = now();
   for (int64_t busy = 1; busy;) {
     if (poll_io(s) < 0) return -1;
