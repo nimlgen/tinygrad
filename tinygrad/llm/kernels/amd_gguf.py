@@ -324,8 +324,7 @@ def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *
   def gate(row:UOp, base:UOp) -> UOp: return base.cast(dtypes.int64) + slots[row // per].cast(dtypes.int64)*stride + offset
   def xtoken(row:UOp) -> UOp: return row % xq.shape[0]
   w, grids = (extra[0], extra[1:]) if weighted else (None, extra)
-  tokens = per if w is None else cast(int, out.shape[0])
-  return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken, "expert_", w, tokens)
+  return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken, "expert_", w, per)
 
 def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
                   act:Callable|None=None, split:bool=False, w:Tensor|None=None, rows:int=1, per:int=1) -> Tensor:
