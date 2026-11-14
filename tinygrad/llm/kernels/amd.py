@@ -581,7 +581,7 @@ def topk_indices(scores:Tensor, k:int) -> Tensor:
   R, S = scores.shape
   valid = _unbind(S)
   N = round_up(int(S.vmax) if isinstance(S, UOp) else S, TOPK_KEYS)
-  scores = scores.float().pad_to(R, N).contiguous()
+  scores = scores.float().contiguous().pad_to(R, N).contiguous()  # (the scores of the keys there are, then their padding)
   if isinstance(S, UOp): scores = Tensor(scores.uop.after(S))  # (carry its binding)
   def kernel(out:Tensor, *src:Tensor, fxn:Callable, **kw) -> Tensor:
     return Tensor.custom_kernel(out, *src, fxn=functools.partial(fxn, valid=valid, **kw))[0]
