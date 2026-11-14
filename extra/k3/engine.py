@@ -4,7 +4,7 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, itertools, os, sys, time
+import ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
 from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
@@ -267,7 +267,9 @@ if __name__ == "__main__":
   from tinygrad.llm.cli import SimpleTokenizer, chat_template
   from tinygrad.llm.serve import LLMServer
   from extra.k3.store import open_store
-  # DEADLINE=s: the run stops between steps once it's s seconds in (killed mid-step, the gpus are left waiting on the host)
+  # DEADLINE=s: the run stops between steps once it's s seconds in (killed mid-step, the gpus are left waiting on the host). SIGTERM as SIGINT:
+  # a clean exit (the devices finalized)
+  signal.signal(signal.SIGTERM, signal.default_int_handler)
   st = time.perf_counter()
   def late() -> bool: return time.perf_counter() - st > getenv("DEADLINE", 540)
   model, kv = Transformer.from_gguf(sys.argv[1], max_context=getenv("CTX", 4096), shard=getenv("SHARD", 4))
