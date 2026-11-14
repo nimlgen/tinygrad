@@ -553,24 +553,11 @@ class TestExpertLinear(unittest.TestCase):
     ref = expert_linear(self.pool, rep, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
 
-  def test_x_rows(self): # a row's activation row from a table: as on x's rows gathered (gate/up, the weighted down)
-    x, off = self.rng.standard_normal((3, self.LAT)).astype(np.float32), 2 * self.UNITS * self.ROW_UP
-    xr = self.rng.integers(0, 3, len(self.sel)).astype(np.int32)
-    out = expert_linear(self.pool, self.slots, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=Tensor(xr)).numpy()
-    ref = expert_linear(self.pool, self.slots, Tensor(x[xr]), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
-    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
-    h = self.rng.standard_normal((len(self.sel), self.UNITS)).astype(np.float32)
-    w = Tensor(self.rng.standard_normal(len(self.sel)).astype(np.float32))
-    perm = self.rng.permutation(len(self.sel)).astype(np.int32)
-    out = expert_linear(self.pool, self.slots, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2, xrow=Tensor(perm)).numpy()
-    ref = expert_linear(self.pool, self.slots, Tensor(h[perm]), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=2).numpy()
-    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
-
   def test_expert_gemm(self): # 16 row tiles an expert's (WMMA), x's rows from a table or its own: as the gemv's rows of a slot
     tiles, off = Tensor(np.array(self.sel[:3], np.int32)), 2 * self.UNITS * self.ROW_UP
     x, xr = Tensor(self.rng.standard_normal((5, self.LAT)).astype(np.float32)), Tensor(self.rng.integers(0, 5, 48).astype(np.int32))
     out = expert_gemm(self.pool, tiles, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=xr).numpy()
-    ref = expert_linear(self.pool, tiles, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=16, xrow=xr).numpy()
+    ref = expert_linear(self.pool, tiles, x[xr], 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=16).numpy()
     np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
     h = Tensor(self.rng.standard_normal((48, self.UNITS)).astype(np.float32))
     out = expert_gemm(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
