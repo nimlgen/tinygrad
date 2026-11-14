@@ -3,7 +3,8 @@ import enum, functools, itertools, json, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
+  topk_indices
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -509,6 +510,8 @@ class Indexer:
     k_pos = Tensor.arange(S)
     scores = ((Tensor.arange(scores.shape[-1]) + 1) * idx.kpool <= q_pos + 1).where(scores, -math.inf)
     if idx.msa: scores = (Tensor.arange(scores.shape[-1]) == q_pos // idx.kpool).where(math.inf, scores)
+    # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
+    if idx.kpool == 1 and amd_custom_kernels_supported(x.device): return topk_indices(scores.reshape(B*T, -1), idx.top_k).reshape(B, T, -1)
     # selected incomplete pools add only tail/future tokens, handled by the final tail and causal mask
     picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :S]
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)
@@ -553,14 +556,22 @@ class MLATransformerBlock(FFNBlock):
     if freqs is not None: k_rope = apply_rope(k_rope, freqs, self.config.rope_interleave)
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = _cache_prefix(_update_cache(self.cache_k, k_store, start_pos, 2), start_pos, T, 2)
-    v = k[..., :self.config.kv_lora_rank]
-
-    attn = q @ k.transpose(-1, -2) * ((self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5)
-    mask = idx_mask if idx_mask is not None else _causal_mask(x, start_pos)
-    if mask is not None: attn = attn + mask
-    attn = attn.softmax(-1)
-    attn = attn @ v
+    cache = _update_cache(self.cache_k, k_store, start_pos, 2)
+    scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
+    if idx_mask is not None and dtypes.is_int(idx_mask.dtype):
+      # the indexer's positions (B, T, top_k): each token's keys gathered (past the ones there are, and its future, masked)
+      S, K = ssimplify(smax(start_pos) + T), idx_mask.shape[-1]
+      keys = cache[:, 0].gather(1, idx_mask.clip(0, self.config.max_context - 1).reshape(B, -1, 1).expand(B, T*K, cache.shape[-1]))
+      keys = keys.reshape(B, 1, T, K, -1).contiguous()
+      q_pos = Tensor.stack(*(Tensor(p) for p in start_pos)).reshape(-1, 1, 1) + Tensor.arange(T).reshape(1, T, 1)
+      mask = ((Tensor.arange(K) < S) & (idx_mask <= q_pos)).where(0.0, -math.inf).reshape(B, 1, T, 1, K)
+      attn = ((q.unsqueeze(-2) @ keys.transpose(-1, -2) * scale + mask).softmax(-1) @ keys[..., :self.config.kv_lora_rank]).squeeze(-2).contiguous()
+    else:
+      k = _cache_prefix(cache, start_pos, T, 2)
+      attn = q @ k.transpose(-1, -2) * scale
+      mask = idx_mask if idx_mask is not None else _causal_mask(x, start_pos)
+      if mask is not None: attn = attn + mask
+      attn = attn.softmax(-1) @ k[..., :self.config.kv_lora_rank]
     if 'weight_scale_inv' in self.attn_v_b:
       attn = fp8_matmul(attn, self.attn_v_b['weight'], self.attn_v_b['weight_scale_inv'], self.kv_b_block_size)
     else: attn = attn @ self.attn_v_b['weight'].transpose(-1, -2)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 import functools, itertools, math
-from typing import cast
+from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod, getenv, unwrap
+from tinygrad.helpers import prod, getenv, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.renderer.cstyle import HIPRenderer
 
@@ -479,3 +479,116 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   call = _gated_delta_prefill_kernel(*params[:8], None if start_pos is None else start_pos.uop.unbound(), *params[8:]).call(*contig)
   return Tensor(contig[0].after(call))
+
+# *** top-k: a radix select of the scores' bits a byte a pass, chunks of TOPK_KEYS keys a workgroup, then the positions compacted
+
+TOPK_KEYS, TOPK_THREADS, TOPK_BINS = 1024, 288, 257  # (a chunk's keys, a workgroup's threads: a count each of a byte's values and above them)
+
+def _topk_key(x:UOp) -> UOp:  # (a float's bits in its order)
+  u = x.bitcast(dtypes.uint32)
+  return (u >> 31).eq(1).where(u ^ 0xFFFFFFFF, u | 0x80000000)
+
+def _isum(n:int|UOp, rid:int, term:Callable[[UOp], UOp], unroll:int=2) -> UOp:  # (a register's sum of term(x) over x in range(n))
+  acc = UOp.alloc((1,), dtypes.int, addrspace=AddrSpace.REG)
+  acc = acc.after(acc[0].store(0))
+  x = UOp.range((n + unroll - 1) // unroll, rid, AxisType.LOOP)
+  terms = [term(x*unroll + u) if isinstance(n, int) and n % unroll == 0 else (x*unroll + u < n).where(term((x*unroll + u).minimum(n - 1)), 0)
+           for u in range(unroll)]
+  return acc.after(acc[0].store(acc.after(x)[0].load() + functools.reduce(UOp.__add__, terms)).end(x))[0].load()
+
+def _topk_chunks(scores:UOp, valid:UOp, threads:int) -> tuple[int, int, UOp, UOp, UOp]:
+  R, N = cast(tuple[int, int], scores.shape)
+  return R, N, UOp.range(R, 0, AxisType.GLOBAL), UOp.range((valid + TOPK_KEYS - 1) // TOPK_KEYS, 1, AxisType.GLOBAL), \
+    UOp.range(threads, 2, AxisType.LOCAL)
+
+@functools.cache
+def _topk_count_kernel(counts:UOp, scores:UOp, state:UOp, valid:UOp, shift:int) -> UOp:
+  """counts (R, C, 257): of row r's chunk c of its first valid scores, the keys >= the bytes chosen so far (state[r, 0]) with byte b at shift
+  (256: above them)"""
+  R, N, row, chunk, b = _topk_chunks(scores, valid, TOPK_THREADS)
+  def digit(i:UOp) -> UOp:  # (key i's byte + 1, 257 above the chosen bytes, 0 under them or past valid)
+    key = _topk_key(scores[row, i.minimum(N - 1)].load())
+    d = (key >> shift & 255) + 1
+    if shift < 24:
+      hi, kth = 0xFFFFFFFF << (shift + 8) & 0xFFFFFFFF, state[row, 0].load().bitcast(dtypes.uint32)
+      d = ((key & hi) > kth).where(257, (key & hi).eq(kth).where(d, 0))
+    return (i < valid).where(d, 0)
+  # the chunk's digits in LDS two to a word, a thread counts the ones over its b, four words a load
+  W = TOPK_KEYS // 2
+  e = UOp.range(-(-W // TOPK_THREADS), 3)
+  m = e*TOPK_THREADS + b
+  L = UOp.alloc((W,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  L = L.after(L[m.valid(m < W)].store(digit(chunk*TOPK_KEYS + 2*m) | (digit(chunk*TOPK_KEYS + 2*m + 1) << 16)).end(e).barrier())
+  def over(j:UOp) -> UOp:
+    words = UOp(Ops.SHRINK, src=(L, j*4, UOp.const(4))).load()
+    return functools.reduce(UOp.__add__, [((words[x] & 0xFFFF) > b.cast(dtypes.uint32)).cast(dtypes.int) +
+                                          ((words[x] >> 16) > b.cast(dtypes.uint32)).cast(dtypes.int) for x in range(4)])
+  return counts[row, chunk, b.valid(b < TOPK_BINS)].store(_isum(W // 4, 4, over)).end(b, chunk, row) \
+    .sink(arg=KernelInfo(name="topk_count", opts_to_apply=()))
+
+@functools.cache
+def _topk_byte_kernel(state:UOp, counts:UOp, valid:UOp, shift:int, k:int) -> UOp:
+  """state (R, 2) [the k-th largest key's bytes chosen so far, the keys above them]: its byte at shift chosen, from counts"""
+  R, b = counts.shape[0], UOp.range(TOPK_THREADS, 1, AxisType.LOCAL)
+  row = UOp.range(R, 0, AxisType.GLOBAL)
+  G = UOp.alloc((TOPK_BINS,), dtypes.int, addrspace=AddrSpace.LOCAL)
+  ge = _isum((valid + TOPK_KEYS - 1) // TOPK_KEYS, 2, lambda c: counts[row, c, b.minimum(TOPK_BINS - 1)].load())
+  G = G.after(G[b.valid(b < TOPK_BINS)].store(ge).barrier())
+  # (every thread the byte: the count of the bytes with k keys or more past them, its keys above; the same stores from every thread)
+  pick = (_isum(TOPK_BINS - 1, 3, lambda x: (G[x].load() >= k).cast(dtypes.int)) - 1).maximum(0)
+  kth = pick.cast(dtypes.uint32) << shift
+  if shift < 24: kth = state[row, 0].load().bitcast(dtypes.uint32) | kth
+  return UOp.group(state[row, 0].store(kth.bitcast(dtypes.int)), state[row, 1].store(G[pick + 1].load())).end(b, row) \
+    .sink(arg=KernelInfo(name="topk_byte", opts_to_apply=()))
+
+@functools.cache
+def _topk_offsets_kernel(offs:UOp, counts:UOp, state:UOp, valid:UOp) -> UOp:
+  """offs (R, C, 2): the first slots of chunk c's keys above the k-th of row r and of the ones equal to it, from the last byte's counts"""
+  R, C = counts.shape[0], counts.shape[1]
+  assert C <= TOPK_THREADS
+  row, c = UOp.range(R, 0, AxisType.GLOBAL), UOp.range(TOPK_THREADS, 1, AxisType.LOCAL)
+  low, live, cc = state[row, 0].load() & 255, c < (valid + TOPK_KEYS - 1) // TOPK_KEYS, c.minimum(C - 1)
+  gt = live.where(counts[row, cc, low + 1].load(), 0)
+  L = UOp.alloc((2, TOPK_THREADS), dtypes.int, addrspace=AddrSpace.LOCAL)
+  L = L.after(UOp.group(L[0, c].store(gt), L[1, c].store(live.where(counts[row, cc, low].load(), 0) - gt)).barrier())
+  def before(n:int) -> UOp: return _isum(c, 3 + n, lambda x: L[n, x].load())  # (the chunks' before this one)
+  return UOp.group(*[offs[row, c.valid(c < C), n].store(before(n)) for n in (0, 1)]) \
+    .end(c, row).sink(arg=KernelInfo(name="topk_offsets", opts_to_apply=()))
+
+@functools.cache
+def _topk_compact_kernel(idx:UOp, scores:UOp, state:UOp, offs:UOp, valid:UOp, threads:int=256) -> UOp:
+  """idx (R, K): row r's positions of the keys above the k-th (by position, from 0) then of the ones equal to it (after them, to K), from
+  the chunks' first slots of each; slots past min(K, valid) unwritten"""
+  R, N, row, chunk, b = _topk_chunks(scores, valid, threads)
+  K, E = idx.shape[1], TOPK_KEYS // threads
+  kth, ngt = state[row, 0].load().bitcast(dtypes.uint32), state[row, 1].load()
+  pos = [chunk*TOPK_KEYS + b*E + e for e in range(E)]
+  keys = [_topk_key(scores[row, p.minimum(N - 1)].load()) for p in pos]
+  gt = [((p < valid) & (key > kth)).cast(dtypes.int) for p, key in zip(pos, keys)]
+  eq = [((p < valid) & key.eq(kth)).cast(dtypes.int) for p, key in zip(pos, keys)]
+  L = UOp.alloc((2, threads), dtypes.int, addrspace=AddrSpace.LOCAL)
+  L = L.after(UOp.group(L[0, b].store(functools.reduce(UOp.__add__, gt)), L[1, b].store(functools.reduce(UOp.__add__, eq))).barrier())
+  def first(n:int) -> UOp: return offs[row, chunk, n].load() + _isum(threads, 3 + n, lambda x: (x < b).where(L[n, x].load(), 0))  # (its slot)
+  sg, se = first(0), first(1)
+  stores = []
+  for p, g, q in zip(pos, gt, eq):
+    stores += [idx[row, sg.valid(g.eq(1))].store(p.cast(dtypes.int)), idx[row, (ngt + se).valid(q.eq(1) & (ngt + se < K))].store(p.cast(dtypes.int))]
+    sg, se = sg + g, se + q
+  return UOp.group(*stores).end(b, chunk, row).sink(arg=KernelInfo(name="topk_compact", opts_to_apply=()))
+
+def topk_indices(scores:Tensor, k:int) -> Tensor:
+  """(R, k): the positions of the k largest of each row of scores (R, S) (ties: the earlier), the slots past min(k, S) unset"""
+  R, S = scores.shape
+  valid = _unbind(S)
+  N = round_up(int(S.vmax) if isinstance(S, UOp) else S, TOPK_KEYS)
+  scores = scores.float().pad_to(R, N).contiguous()
+  if isinstance(S, UOp): scores = Tensor(scores.uop.after(S))  # (carry its binding)
+  def kernel(out:Tensor, *src:Tensor, fxn:Callable, **kw) -> Tensor:
+    return Tensor.custom_kernel(out, *src, fxn=functools.partial(fxn, valid=valid, **kw))[0]
+  state = Tensor.empty(R, 2, dtype=dtypes.int32, device=scores.device)
+  for shift in (24, 16, 8, 0):
+    counts = kernel(Tensor.empty(R, N // TOPK_KEYS, TOPK_BINS, dtype=dtypes.int32, device=scores.device), scores, state, fxn=_topk_count_kernel,
+                    shift=shift)
+    state = kernel(state, counts, fxn=_topk_byte_kernel, shift=shift, k=k)
+  offs = kernel(Tensor.empty(R, N // TOPK_KEYS, 2, dtype=dtypes.int32, device=scores.device), counts, state, fxn=_topk_offsets_kernel)
+  return kernel(Tensor.empty(R, k, dtype=dtypes.int32, device=scores.device), scores, state, offs, fxn=_topk_compact_kernel)

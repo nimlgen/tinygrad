@@ -4,7 +4,8 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna)
+                                      _is_rdna4, _is_cdna, topk_indices)
+from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K,
   IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -562,5 +563,37 @@ class TestExpertLinear(unittest.TestCase):
     out = expert_linear(pool, Tensor([last], dtype=dtypes.int32), Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
     ref = self.weight(0, 0, 2 * self.UNITS, self.LAT) @ x[0]
     np.testing.assert_allclose(out[0], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
+class TestTopk(unittest.TestCase):
+  def setUp(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA3/4 required")
+
+  def test_topk_indices(self): # each row's k largest of its first S scores (ties: the earlier, all of them while S <= k), S symbolic
+    rng = np.random.default_rng(0)
+    for R, N in ((1, 4096), (3, 5000)):
+      s = rng.standard_normal((R, N)).astype(np.float32)
+      s[0, :3000:7], s[-1, 100:200] = 0.5, -np.inf
+      v, x = UOp.variable("S", 1, N), Tensor(s).realize()
+      for S in (1, 100, 2048, 2049, 3001, N):
+        got = topk_indices(x[:, :v.bind(S)], 2048).numpy()
+        for r in range(R):
+          self.assertEqual(set(got[r, :min(2048, S)].tolist()), set(np.lexsort((np.arange(S), -s[r, :S]))[:2048].tolist()), f"{R=} {S=} {r=}")
+
+  def test_mla_gathered_keys(self): # attention over the keys of the indexer's positions: as over the cache masked to them
+    cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=4, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=80, rope_theta=1e4,
+                            rope_dim=16, v_head_dim=16, max_context=64, q_lora_rank=32, kv_lora_rank=64, mla_nope=True,
+                            indexer=IndexerConfig(4, 16, 8))
+    rng, blk = np.random.default_rng(0), MLATransformerBlock(cfg)
+    for v in nn.state.get_parameters(blk): v.replace(Tensor(rng.standard_normal(v.shape).astype(np.float32) * 0.3).cast(v.dtype))
+    for T, pos in ((1, 3), (2, 7), (1, 40), (2, 50)):
+      x, p = Tensor(rng.standard_normal((1, T, 64)).astype(np.float32)), UOp.variable("start_pos", 0, 63).bind(pos)
+      blk._init_state(x)
+      blk.cache_k.assign(Tensor(rng.standard_normal(blk.cache_k.shape).astype(np.float16))).realize()
+      blk.indexer.cache_kg.assign(Tensor(rng.standard_normal(blk.indexer.cache_kg.shape).astype(np.float16))).realize()
+      idx = blk._indexer_mask(x, (p,), None)
+      sel = idx.numpy()[0, :, :min(8, pos + T)]
+      mask = np.full((1, 1, T, pos + T), -np.inf, np.float32)
+      for t in range(T): mask[0, 0, t, sel[t][sel[t] <= pos + t]] = 0
+      np.testing.assert_allclose(blk._attention(x, (p,), idx).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
 
 if __name__ == "__main__": unittest.main()
