@@ -78,7 +78,7 @@ class TestEngine(unittest.TestCase):
     # every expert in its slot, a code (layer * E + expert) a slot
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2)
+    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2, chunk=4)
     pools = [b''.join(parts(weights, li, e, part)[g] for li in layers for e in range(E)) for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
     eng.state["slot_of"][:] = eng.state["expert_in"][:] = np.arange(len(layers) * E)
@@ -87,7 +87,7 @@ class TestEngine(unittest.TestCase):
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
   def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an
-    # entry a token's: a union of the tokens' with an expert more than once)
+    # entry a token's: a union of the tokens' with an expert more than once), a chunk's in one (entry j*T + t token t's j-th)
     eng = self.eng
     tables:dict[int, list[Tensor]] = {}
     def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
@@ -101,7 +101,9 @@ class TestEngine(unittest.TestCase):
           wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
                                                                     wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))]
+        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else \
+          [Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel.T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
+                                                             w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]
 
@@ -122,6 +124,14 @@ class TestEngine(unittest.TestCase):
     np.testing.assert_allclose(logits([5, 1], 1)[0], want[1], rtol=1e-4, atol=1e-4)
     self.eng.model.rollback(1)
     np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
+
+  def test_chunk(self):  # a prompt of 9 in two chunks of 4 then a token: the logits after it as a token a step's
+    self.stub()
+    toks = [3, 5, 7, 1, 2, 9, 4, 6, 8]
+    for pos, t in enumerate(toks): want = self.eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].numpy()[0]
+    for pos in (0, 4): self.eng.forward(Tensor([toks[pos:pos + 4]], dtype=dtypes.int32), pos)[0].realize()
+    ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
+    np.testing.assert_allclose(ours, want, rtol=1e-4, atol=1e-4 * np.abs(want).max())
 
   def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
     self.stub()

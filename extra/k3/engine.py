@@ -22,24 +22,29 @@ TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), get
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
 
 class Engine:
-  def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False):
+  def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False,
+               chunk:int=0):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
-    every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, keeping their logits or not"""
+    every expert each (its units), in steps of a token or (a draft's verify steps) of tokens or (a prompt's) chunk tokens, keeping their
+    logits or not"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
       m["units"][0], m["part_bytes"][0]
     assert len(set(m["part_bytes"])) == 1 and len(set(m["units"])) == 1 and len(m["units"]) == G, "a part of every expert on each gpu"
-    assert E <= 4096 and K <= 64 and tokens <= 8 and tokens * K <= 512 and 32 * tokens <= 1024, "past the host's fixed arrays"
+    assert E <= 4096 and K <= 64 and tokens <= 8 and tokens * K <= 512 and 32 * tokens <= 1024 and (not chunk or E <= 1024), \
+    "past the host's fixed arrays"
+    self.tokens, self.chunk, n = tokens, chunk, max(tokens, chunk)  # (n: a step's most tokens)
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: the union of the tokens' first k1 experts, then of the rest, their
-    # weights a token's (entry j's at j*T + t)
+    # weights a token's (entry j's at j*T + t); a chunk's in part 1, an entry a token's expert (j*T + t, token t's j-th)
     self.ks, self.act = (K // 2, K - K // 2), functools.partial(gated_activation, config=model.config)
-    bufs = [[host_tensor(self.devs, n, dt) for n, dt in ((1, dtypes.uint32), (tokens * 2 * E // G, dtypes.float32),
-                                                          *((1 + k * tokens * (1 + tokens), dtypes.uint32) for k in self.ks))] for _ in blocks]
+    bufs = [[host_tensor(self.devs, sz, dt) for sz, dt in ((1, dtypes.uint32), (n * 2 * E // G, dtypes.float32),
+                                                           *((1 + max(k * tokens * (1 + tokens), 2 * K * chunk), dtypes.uint32) for k in self.ks))]
+            for _ in blocks]
     self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
-    self.scores = [b[1][0].uop.reshape(tokens, 2, E // G).unshard(2) for b in bufs]
+    self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
     routers = [b.ffn_gate_inp.weight.float().numpy() for b in blocks]
@@ -66,19 +71,19 @@ class Engine:
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
                   "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(slots, np.uint8),
-                  "victims": np.zeros(32 * tokens, np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
+                  "victims": np.zeros(max(32 * tokens, E), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
                   "bufs": np.array([[[v.ctypes.data for v in views] for _, views in b] for b in bufs], np.uint64)}
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
                   fill=FILL, decay=0.5 ** (1 / 8))
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos = UOp.variable("start_pos", 0, model.max_context - 1)
-    (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], tokens, dtypes.int32) for _ in range(2))
-    self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * tokens, dtypes.int32)  # (a step's [done | tokens | guesses])
-    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens})}
+    (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
+    self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * n, dtypes.int32)  # (a step's [done | tokens | guesses])
+    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, chunk} - {0})}
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
     self.cres, (self.cres_np,) = host_tensor(self.devs[0], max(tokens - 1, 1), dtypes.int32)  # ([done | guesses])
-    self.dx, self.v_row = Tensor.empty(tokens, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
+    self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
     self.chain_jit = TinyJit(self.run_chain) if draft is not None and tokens > 2 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
 
@@ -127,12 +132,13 @@ class Engine:
 
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
-    of the experts it gives in two parts, summed over the gpus"""
-    s = w(x[0]) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
-    scores = Tensor(self.scores[li])[:x.shape[1]].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
-                                                     .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
-    out = self.experts(0, h[0], self.host(li, 0, scores)).contiguous()  # (a buffer: part 2 waited for after it)
-    return (out + self.experts(1, h[0], self.host(li, 1, out))).sum(0).unsqueeze(0)
+    of the experts it gives in two parts (a chunk: in one, an entry a token's expert), summed over the gpus"""
+    T, s = x.shape[1], w(x[0]) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
+    scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
+                                                .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
+    if T > self.tokens: return self.experts(h[0], self.host(li, 0, scores), sum(self.ks) * T, 1).sum(0).unsqueeze(0)
+    out = self.experts(h[0], self.host(li, 0, scores), self.ks[0] * T, T).contiguous()  # (a buffer: part 2 waited for after it)
+    return (out + self.experts(h[0], self.host(li, 1, out), self.ks[1] * T, T)).sum(0).unsqueeze(0)
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
@@ -140,17 +146,18 @@ class Engine:
     if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).cast(dtypes.uint32))
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
-  def experts(self, i:int, h:Tensor, table:Tensor) -> Tensor:
-    """each gpu's units of the experts of part i's table (n slots, padded with slot 0, their weights a token's: j*T + t) on h (T, lat): (gpus,
-    T, lat). every token on every slot (its weights loaded once), the act in the q8 of the down gemv's input, the down gemv a token's sum"""
-    T, u, n, off = h.shape[0], self.units, self.ks[i] * h.shape[0], 2 * self.units * self.lat // self.block[0] * self.block[1]
-    slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + n + n * T].bitcast(dtypes.float32)
+  def experts(self, h:Tensor, table:Tensor, n:int, per:int) -> Tensor:
+    """each gpu's units of the n experts of a table (n slots, padded with slot 0, then their rows' weights) on h (T, lat): (gpus, T, lat). an
+    expert on per tokens: T (every token, its weights loaded once, a row's weight at j*T + t) or 1 (entry j*T + t token t's, a chunk's). the
+    act in the q8 of the down gemv's input, the down gemv a token's sum"""
+    T, u, off = h.shape[0], self.units, 2 * self.units * self.lat // self.block[0] * self.block[1]
+    slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + n + n * per].bitcast(dtypes.float32)
     if amd_custom_kernels_supported(h.device):
-      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, per=T)
-      return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T, per=T)
-    slots = slots.reshape(n, 1).expand(n, T).flatten()  # (a row a slot and token)
+      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, per=per)
+      return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T, per=per)
+    slots = slots.reshape(n, 1).expand(n, per).flatten()  # (a row a slot and token)
     down = self.gemv(slots, self.act(*self.gemv(slots, h, 2 * u, self.lat, 0).split(u, -1)), self.lat, u, off)
-    return (down * w.reshape(n * T, 1)).reshape(-1, n, T, self.lat).sum(1)
+    return (down * w.reshape(n * per, 1)).reshape(-1, n * per // T, T, self.lat).sum(1)
 
   def gemv(self, slots:Tensor, x:Tensor, out_f:int, in_f:int, off:int) -> Tensor:
     """(gpus, n, out_f): W @ x[k % rows] (or a gpu's x[k]) of the W at off bytes in slots[k] of each gpu's pool, decoded (no kernel)"""
@@ -175,7 +182,8 @@ class Engine:
     and the draft's guess after that (their logits kept)"""
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
-    io.tokens, io.victims_n, self.tok_np[:T], self.given_np[:T], self.res_np[0] = T, 32 * T, toks, ((given or []) + [-1] * T)[:T], 0
+    io.tokens, io.chunk, io.victims_n, self.tok_np[:T], self.given_np[:T], self.res_np[0] = T, T > self.tokens, 32 * T, toks, \
+      ((given or []) + [-1] * T)[:T], 0
     host_c().flags(ctypes.byref(io), 0)
     _, self.logits = self.jits[T](self.v_pos.bind(pos))
     t1 = time.perf_counter()
@@ -206,11 +214,18 @@ class Engine:
   def max_context(self) -> int: return self.model.max_context
   def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
 
+  def prefill(self, tokens:list[int], pos:int) -> int:
+    """tokens from pos on but the last fed in steps of a chunk (exact routing, every expert of a layer read in), the position after them"""
+    end = pos + (len(tokens) - 1 - pos) // self.chunk * self.chunk if self.chunk else pos
+    for p in range(pos, end, self.chunk): self.step(tokens[p:p + self.chunk], p, tokens[p + 1:p + 1 + self.chunk])
+    return end
+
   def generate(self, tokens:list[int], temperature:float=0.0):
-    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos a token a step, then a token a step or
-    (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first wrong one, the target's token
-    after them next, the recurrent states rolled back to after the kept ones"""
-    for pos in range(self.get_start_pos(tokens), len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
+    a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
+    wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
+    for pos in range(self.prefill(tokens, self.get_start_pos(tokens)), len(tokens)):
+      (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
     row = 0
     while len(tokens) + self.tok_np.size <= self.max_context:  # (a verify step's last token in the context)
@@ -259,7 +274,9 @@ if __name__ == "__main__":
   draft = Eagle3(d, lambda t: model.token_embd(t).float(), model.token_embd.weight.device, model.max_context) if (d:=getenv("DRAFT", "")) \
     else None
   # VERIFY=n: a verify step's tokens, the next and the draft's chain of n-1 guesses (an EVAL: its steps of n tokens)
-  eng = Engine(model, m, tokens=getenv("VERIFY", 2 if draft else 1), guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")))
+  # CHUNK=n: a prompt fed in steps of n tokens (0: a token a step)
+  eng = Engine(model, m, tokens=getenv("VERIFY", 2 if draft else 1), guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
+               chunk=getenv("CHUNK", 256))
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)

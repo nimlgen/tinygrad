@@ -10,7 +10,7 @@ def evaluate(eng, spec:str, late:Callable[[], bool]):
   stats:list[tuple[float, float]] = []
   for r in [json.loads(line) for line in open(path)][first:first + nseq]:
     ids, outs, n0, c0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats), eng.counters()
-    seq, T, at = ids + outs[:-1], max(eng.jits), 0  # (steps of T tokens: a verify step's numerics)
+    seq, T, at = ids + outs[:-1], eng.tokens, eng.prefill(ids, 0)  # (the prompt in chunks, then steps of T tokens: a verify step's numerics)
     while at < len(seq):
       if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
       n = T if len(seq) - at >= T else 1
@@ -34,7 +34,7 @@ def bench(eng, spec:str, late:Callable[[], bool]):
   steps, right, t_steps = 0, 0, 0.0
   for r in [json.loads(line) for line in open(path)][first:first + nseq]:
     toks, n = r["prompt_ids"] + r["output_ids"][:ntok], len(r["prompt_ids"])
-    for pos in range(n): _, (g,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
+    for pos in range(eng.prefill(toks[:n], 0), n): _, (g,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
     pos = n
     while pos + 2 < len(toks) and not late():
       st = time.perf_counter()
