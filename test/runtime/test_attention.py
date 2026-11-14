@@ -4,7 +4,7 @@ from tinygrad import Tensor, dtypes, nn, UOp, TinyJit
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, MLATransformerBlock, Indexer, IndexerConfig,
   HyperConnection, HCConfig, AttentionResidual, GatedResidual, PLELayer, PLEConfig, Transformer,
-  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, short_conv,
+  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, short_conv, topk_mask,
 )
 from tinygrad.llm.gguf import GGUFPackedTable
 from test.helpers import slow
@@ -136,6 +136,13 @@ class TestAttention(unittest.TestCase):
     expected = np.where([[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [0, 0, 1, 1]], 0., -np.inf)
     np.testing.assert_array_equal(indexer(x, q, (0,)).numpy(), expected[None, None])
 
+  def test_topk_mask(self):  # x >= its k-th largest (all of it if shorter), ties all in, on a symbolic length too
+    x = np.random.default_rng(0).standard_normal((3, 16)).astype(np.float32)
+    x[1, :6], x[2, 9:] = x[1, 6], -np.inf
+    def want(S:int) -> np.ndarray: return x[:, :S] >= np.sort(x[:, :S])[:, -min(5, S), None]
+    for S in (3, 5, 16): np.testing.assert_array_equal(topk_mask(Tensor(x[:, :S]), 5).numpy(), want(S), err_msg=f"{S=}")
+    np.testing.assert_array_equal(topk_mask(Tensor(x)[:, :UOp.variable("S", 1, 16).bind(9)], 5).pad_to((3, 16)).numpy()[:, :9], want(9))
+
   def test_indexer_no_kpool(self):
     # glm-dsa: every key is scored on its own (no k-pools) and the first rope_dim dims are rotated, interleaved
     idx = IndexerConfig(n_heads=1, head_dim=2, top_k=2, kpool=1, norm_eps=1e-6, rope_dim=2)
@@ -144,14 +151,15 @@ class TestAttention(unittest.TestCase):
     indexer.proj.weight = Tensor.ones(1, 2)
     x, q = Tensor([[[2., 0.], [2., 0.], [0., 2.], [0., 2.]]]), Tensor([[[1., -1.], [1., -1.], [1., -1.], [-1., 1.]]])
     indexer._init_state(x)
-    # reference: interleaved rope on q/k, relu scores, top-2 of the causal positions
+    # reference: interleaved rope on q and the layer normed k, relu scores, top-2 of the causal positions (ties at the second all in)
     pos = np.arange(4)
     cos, sin = np.cos(pos), np.sin(pos)  # rope_dim=2 -> one frequency, theta=10000**0
     def irope(v):
       return np.concatenate([v[:, 0::2]*cos[:, None] - v[:, 1::2]*sin[:, None], v[:, 0::2]*sin[:, None] + v[:, 1::2]*cos[:, None]], axis=-1)
-    scores = np.maximum(irope(q.numpy()[0]) @ irope(x.numpy()[0]).T, 0) / 2**0.5
+    k = (x.numpy()[0] - x.numpy()[0].mean(-1, keepdims=True)) / np.sqrt(x.numpy()[0].var(-1, keepdims=True) + 1e-6)
+    scores = np.maximum(irope(q.numpy()[0]) @ irope(k).T, 0)
     expected = np.full((4, 4), -np.inf)
-    for t in range(4): expected[t, np.argsort(scores[t, :t+1])[-2:]] = 0.0
+    for t in range(4): expected[t, :t+1][scores[t, :t+1] >= np.sort(scores[t, :t+1])[-2:][0]] = 0.0
     np.testing.assert_allclose(indexer(x, q, (0,), precompute_freqs_cis(2, 4, 10000.0)).numpy(), expected[None, None])
 
   def test_indexer_msa(self):

@@ -452,6 +452,18 @@ class PLELayer:
     conv, store = short_conv(self.conv_state, self.norm_conv(gated).flatten(2), self.conv1d["weight"], Tensor(pos).eq(0), n)
     return Tensor((gated + conv[:, :T].reshape(gated.shape)).contiguous().uop.after(store))
 
+def topk_mask(x:Tensor, k:int) -> Tensor:
+  """x >= its k-th largest on the last axis (all of it if shorter, ties all in): a radix select of the floats' bits in order, a byte a pass"""
+  u = x.float().bitcast(dtypes.uint32)
+  key = (u >> 31).eq(1).where(u ^ 0xFFFFFFFF, u | 0x80000000).unsqueeze(-1)
+  kth, need, byte = key[..., :1, :].zeros_like(), Tensor.full((*x.shape[:-1], 1), k), Tensor.arange(256, dtype=dtypes.uint32)
+  for shift in (24, 16, 8, 0):  # (ge: the keys under the bytes chosen so far with this byte >= each one)
+    ge = ((key & (0xFFFFFFFF << (shift + 8) & 0xFFFFFFFF)).eq(kth) & ((key >> shift) & 255 >= byte)).sum(-2)
+    b = ((ge >= need).sum(-1, keepdim=True) - 1).maximum(0)
+    need = need - (byte.cast(b.dtype) == b + 1).where(ge, 0).sum(-1, keepdim=True)
+    kth = kth | (b.cast(dtypes.uint32) << shift).unsqueeze(-1)
+  return key[..., 0] >= kth[..., 0]
+
 class Indexer:
   def __init__(self, config:TransformerConfig):
     self.idx, self.max_context = (idx:=unwrap(config.indexer)), config.max_context
@@ -471,6 +483,7 @@ class Indexer:
 
   def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None) -> Tensor:
     (B, T, _), idx, S = x.shape, self.idx, ssimplify(smax(start_pos) + x.shape[1])
+    P = round_up(S, idx.kpool)  # (the pools so far)
     k, iq = self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x)), self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
     if idx.msa or idx.qsa: iq = self.q_norm(iq)
     if idx.rope_dim:
@@ -480,12 +493,12 @@ class Indexer:
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
       kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
-      kg = _update_cache(self.cache_kg, kg, start_pos, 1).float().reshape(B, -1, idx.kpool, 2, idx.head_dim)
+      kg = _update_cache(self.cache_kg, kg, start_pos, 1)[:, :P].float().reshape(B, -1, idx.kpool, 2, idx.head_dim)
       k = ((kg[..., 1, :] + self.compressor_ape["weight"]).softmax(2) * kg[..., 0, :]).sum(2)  # (B, S, D)
     else:
-      k = _update_cache(self.cache_kg, k, start_pos, 1).float()  # (B, S, D)
+      k = _update_cache(self.cache_kg, k, start_pos, 1)[:, :P].float()  # (B, S, D)
     if idx.qsa:
-      k, rot = self.k_norm(k.reshape(B, -1, idx.kpool, idx.head_dim).mean(2)), unwrap(freqs)[:self.max_context:idx.kpool]
+      k, rot = self.k_norm(k.reshape(B, -1, idx.kpool, idx.head_dim).mean(2)), unwrap(freqs)[:self.max_context:idx.kpool][:P // idx.kpool]
       k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
     scores = iq @ k.transpose(-1, -2).unsqueeze(1)
     if idx.msa:   scores = scores.reshape(B, T, idx.n_heads, scores.shape[-1] // idx.kpool, idx.kpool).max(-1).transpose(1, 2)
@@ -496,9 +509,8 @@ class Indexer:
     k_pos = Tensor.arange(S)
     scores = ((Tensor.arange(scores.shape[-1]) + 1) * idx.kpool <= q_pos + 1).where(scores, -math.inf)
     if idx.msa: scores = (Tensor.arange(scores.shape[-1]) == q_pos // idx.kpool).where(math.inf, scores)
-    _, sel = scores.topk(idx.top_k // idx.kpool)
     # selected incomplete pools add only tail/future tokens, handled by the final tail and causal mask
-    picked = scores.zeros_like(dtype=dtypes.bool).scatter(-1, sel, True).repeat_interleave(idx.kpool, dim=-1)[..., :S]
+    picked = topk_mask(scores, idx.top_k // idx.kpool).repeat_interleave(idx.kpool, dim=-1)[..., :S]
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)
 
 
