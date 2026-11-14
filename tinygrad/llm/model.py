@@ -491,7 +491,7 @@ class Indexer:
       rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos))
       if not idx.qsa: k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
       iq = apply_rope(iq[..., :idx.rope_dim].transpose(1, 2), rot, idx.rope_interleave).transpose(1, 2).cat(iq[..., idx.rope_dim:], dim=-1)
-    if idx.kpool == 1 and not (idx.msa or idx.qsa) and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
+    if idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
       # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
       keys, w = _update_cache(self.cache_kg, k, start_pos, 1), self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5
       return topk_indices(indexer_scores(iq, keys, w, start_pos[0], S), idx.top_k, S).reshape(B, T, -1)
