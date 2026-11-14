@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap, round_up, dedup
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve, smin
 from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -658,7 +658,7 @@ def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, idx:UOp, start:int|U
   def load(x:UOp, d:UOp) -> UOp: return (d < D).where(x[d.minimum(D - 1)].load().float(), zero)  # (the rest's lanes past D: 0)
   def values(x:UOp) -> list[UOp]: return [v for c in range(0, DV, 8) for v in _vec_load(x[lane*DV + c], min(8, DV - c))]
   qf = [load(q[b, h, t], lane*DV + i) for i in range(DV)] + [load(q[b, h, t], d) for d in rest]
-  keys = (start + T).minimum(K)
+  keys = smin(start + T, K)
   step = UOp.range((keys + G*unroll - 1) // (G*unroll), 4, AxisType.LOOP)
   acc_reg, max_reg, sum_reg = _reg((DV,), 0), _reg((1,), -1e30), _reg((1,), 0)
   acc, m, l = [acc_reg.after(step)[i].load() for i in range(DV)], max_reg.after(step)[0].load(), sum_reg.after(step)[0].load()
