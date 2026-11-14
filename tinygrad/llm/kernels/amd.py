@@ -641,56 +641,60 @@ def topk_indices(scores:Tensor, k:int, valid:int|UOp) -> Tensor:
 # *** mla attention over each query's top-k positions: flash-decode's partials, a block a query row and head, the keys read by position
 
 @functools.cache
-def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, waves:int=4, unroll:int=2) -> UOp:
-  """out (B*T, H, P, V), stats (B*T, H, P, 2): of query row b*T + t (at position start + t) and head h, block p's softmax partial over its
-  slots of idx[b, t] (a wave every P*waves-th, a key a step of its online softmax) of the first start + T at or before the query. a key is
-  the cache's row (B, 1, N, D) at a slot's position, its value the row's first V; a lane holds dims [lane*V/32, ..) of the values (vector
-  loads) and V + lane + 32*i of the rest"""
+def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, heads:int, waves:int=4, unroll:int=2) -> UOp:
+  """out (B*T, H, P, V), stats (B*T, H, P, 2): of query row b*T + t (at position start + t) and each of a group of heads, block p's softmax
+  partial over its slots of idx[b, t] (a wave every P*waves-th, a key a step of each head's online softmax: a key read once for the group) of
+  the first start + T at or before the query. a key is the cache's row (B, 1, N, D) at a slot's position, its value the row's first V; a lane
+  holds dims [lane*V/32, ..) of the values (vector loads) and V + lane + 32*i of the rest"""
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
   N, P, V = cast(int, cache.shape[2]), cast(int, out.shape[2]), cast(int, out.shape[3])
   K = cast(int, idx[0].shape[2]) if idx else N  # (no positions: slot j is position j, every key there is)
   DV, DR, G = V // WARP_SIZE, -(-(D - V) // WARP_SIZE), P * waves
-  assert V % WARP_SIZE == 0
-  row, h, part = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(H, 1, AxisType.GLOBAL), UOp.range(P, 2, AxisType.GLOBAL)
+  assert V % WARP_SIZE == 0 and H % heads == 0
+  row, hg, part = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(H // heads, 1, AxisType.GLOBAL), UOp.range(P, 2, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(waves, 3, axis_type=AxisType.LOCAL)
-  b, t, zero = row // T, row % T, UOp.const(0, dtypes.float)
+  b, t, zero, hs = row // T, row % T, UOp.const(0, dtypes.float), [hg*heads + i for i in range(heads)]
   rest = [V + lane + WARP_SIZE*i for i in range(DR)]
   def load(x:UOp, d:UOp) -> UOp: return (d < D).where(x[d.minimum(D - 1)].load().float(), zero)  # (the rest's lanes past D: 0)
   def values(x:UOp) -> list[UOp]: return [v for c in range(0, DV, 8) for v in _vec_load(x[lane*DV + c], min(8, DV - c))]
-  qf = [load(q[b, h, t], lane*DV + i) for i in range(DV)] + [load(q[b, h, t], d) for d in rest]
+  qf = [[load(q[b, h, t], lane*DV + i) for i in range(DV)] + [load(q[b, h, t], d) for d in rest] for h in hs]
   keys = smin(start + T, K)
   step = UOp.range((keys + G*unroll - 1) // (G*unroll), 4, AxisType.LOOP)
-  acc_reg, max_reg, sum_reg = _reg((DV,), 0), _reg((1,), -1e30), _reg((1,), 0)
-  acc, m, l = [acc_reg.after(step)[i].load() for i in range(DV)], max_reg.after(step)[0].load(), sum_reg.after(step)[0].load()
+  acc_reg, max_reg, sum_reg = _reg((heads, DV), 0), _reg((heads,), -1e30), _reg((heads,), 0)
+  acc = [[acc_reg.after(step)[i, j].load() for j in range(DV)] for i in range(heads)]
+  m, l = [max_reg.after(step)[i].load() for i in range(heads)], [sum_reg.after(step)[i].load() for i in range(heads)]
   for u in range(unroll):  # (an online softmax step a key, a finite initial max)
     slot = (step*unroll + u)*G + part*waves + wave
     pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
     valid = (slot < keys) & (pos <= start + t) & (pos >= 0)
     row_k = cache[b, 0, valid.where(pos, 0).minimum(N - 1)]  # (a slot not a key's: the first key, never an unwritten row)
     kf = values(row_k) + [load(row_k, d) for d in rest]
-    s = valid.where(warp_reduce(sum((x*y for x, y in zip(qf, kf)), zero), full_wave=True) * scale, UOp.const(-1e30, dtypes.float))
-    mn = m.maximum(s)
-    alpha, beta = ((m - mn)*LOG2E).exp2(), valid.where(((s - mn)*LOG2E).exp2(), zero)
-    acc, l, m = [a*alpha + beta*v for a, v in zip(acc, kf[:DV])], l*alpha + beta, mn
-  update = UOp.group(acc_reg.store(UOp.stack(*acc)), max_reg[0].store(m), sum_reg[0].store(l)).end(step)
+    for i in range(heads):
+      s = valid.where(warp_reduce(sum((x*y for x, y in zip(qf[i], kf)), zero), full_wave=True) * scale, UOp.const(-1e30, dtypes.float))
+      mn = m[i].maximum(s)
+      alpha, beta = ((m[i] - mn)*LOG2E).exp2(), valid.where(((s - mn)*LOG2E).exp2(), zero)
+      acc[i], l[i], m[i] = [a*alpha + beta*v for a, v in zip(acc[i], kf[:DV])], l[i]*alpha + beta, mn
+  update = UOp.group(acc_reg.store(UOp.stack(*(a for ai in acc for a in ai)).reshape(heads, DV)), max_reg.store(UOp.stack(*m)),
+                     sum_reg.store(UOp.stack(*l))).end(step)
   acc_reg, max_reg, sum_reg = acc_reg.after(update), max_reg.after(update), sum_reg.after(update)
   # the block's waves merged through LDS
-  acc_lds = UOp.alloc((waves, V), dtypes.float, addrspace=AddrSpace.LOCAL)
-  ml_lds = UOp.alloc((waves, 2), dtypes.float, addrspace=AddrSpace.LOCAL)
-  stores = [acc_lds[wave, lane*DV + i].store(acc_reg[i].load()) for i in range(DV)]
-  stores += [ml_lds[wave, i].store(x) for i, x in enumerate((max_reg[0].load(), sum_reg[0].load()))]
+  acc_lds = UOp.alloc((waves, heads, V), dtypes.float, addrspace=AddrSpace.LOCAL)
+  ml_lds = UOp.alloc((waves, heads, 2), dtypes.float, addrspace=AddrSpace.LOCAL)
+  stores = [acc_lds[wave, i, lane*DV + j].store(acc_reg[i, j].load()) for i in range(heads) for j in range(DV)]
+  stores += [ml_lds[wave, i, k].store(x) for i in range(heads) for k, x in enumerate((max_reg[i].load(), sum_reg[i].load()))]
   acc_lds, ml_lds = acc_lds.after(*stores), ml_lds.after(*stores)
-  M = functools.reduce(UOp.maximum, (ml_lds[w, 0].load() for w in range(waves)))
-  ws = [((ml_lds[w, 0].load() - M)*LOG2E).exp2() for w in range(waves)]
   tid, final = wave*WARP_SIZE + lane, []
-  for i in range(-(-V // (waves*WARP_SIZE))):
-    d = tid + i*waves*WARP_SIZE
-    val = sum((w*acc_lds[x, d.minimum(V - 1)].load() for x, w in enumerate(ws)), zero)
-    final.append(out[row, h, part, d.valid(d < V)].store(val))
-  final += [stats[row, h, part, tid.valid(tid.eq(i))].store(x) for i, x in enumerate((M, sum((w*ml_lds[x, 1].load() for x, w in enumerate(ws)),
-                                                                                              zero)))]
-  return UOp.group(*final).end(lane, wave, part, h, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
+  for i, h in enumerate(hs):
+    M = functools.reduce(UOp.maximum, (ml_lds[w, i, 0].load() for w in range(waves)))
+    ws = [((ml_lds[w, i, 0].load() - M)*LOG2E).exp2() for w in range(waves)]
+    for c in range(-(-V // (waves*WARP_SIZE))):
+      d = tid + c*waves*WARP_SIZE
+      val = sum((w*acc_lds[x, i, d.minimum(V - 1)].load() for x, w in enumerate(ws)), zero)
+      final.append(out[row, h, part, d.valid(d < V)].store(val))
+    final += [stats[row, h, part, tid.valid(tid.eq(k))].store(x) for k, x in enumerate((M, sum((w*ml_lds[x, i, 1].load() for x, w in enumerate(ws)),
+                                                                                               zero)))]
+  return UOp.group(*final).end(lane, wave, part, hg, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
 
 def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
@@ -700,7 +704,8 @@ def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   stats = Tensor.empty(B*T, H, parts, 2, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
-  fxn = functools.partial(_mla_topk_partial, start=start, scale=scale)
+  # (a key read once for up to 3 heads: their queries and sums in a lane's registers)
+  fxn = functools.partial(_mla_topk_partial, start=start, scale=scale, heads=max(n for n in (1, 2, 3) if H % n == 0))
   partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
                                         fxn=fxn)[:2]
   out = Tensor.empty(B*T, H, 1, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
