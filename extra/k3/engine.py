@@ -209,7 +209,7 @@ class Engine:
     for pos in range(self.get_start_pos(tokens), len(tokens)): (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
     row = 0
-    while True:
+    while len(tokens) + self.tok_np.size <= self.max_context:  # (a verify step's last token in the context)
       tokens.append(t)
       self.model._cached_tokens = tokens[:-1]
       yield t
