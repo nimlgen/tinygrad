@@ -646,11 +646,12 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     arg=KernelInfo(name="expert_iq3_xxs_f16_wmma", opts_to_apply=(), estimates=estimates))
 
 def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, stride:int, offset:int=0,
-                 xrow:Tensor|None=None, act:Callable|None=None) -> Tensor:
+                 xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None) -> Tensor:
   """out[r] = W[tiles[r // 64]] @ x[xrow[r]] (or x[r]) in half: an IQ3_XXS expert's tile of 64 rows on the f16 tensor cores (RDNA4), x in half
-  (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]"""
+  (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output"""
   ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), 64 * tiles.shape[0]
-  out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
+  if out is None:
+    out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act)
   srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous().bitcast(dtypes.uint32), tiles.cast(dtypes.int32),
           *([] if xrow is None else [xrow.cast(dtypes.int32)]), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
