@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores, mla_topk_attention, kda_decode)
-from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig
+from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
   Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -665,37 +665,62 @@ class TestTopk(unittest.TestCase):
 
   def test_kda_decode(self): # a kda block's tokens in kda_decode (heads of 32) as the generic ops on the CPU: outputs, states, rollbacks
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA required")
-    ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=2, inner_size=64, kda=True, gate_lower_bound=-5.0,
-                    full_rank=(True, False))
-    cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=32,
-                            rope_theta=1e4, rope_dim=32, v_head_dim=32, max_context=16, ssm_layers=(True,), ssm=ssm)
-    rng, models = np.random.default_rng(0), [Transformer(cfg) for _ in range(2)]
-    for ps in zip(*(nn.state.get_parameters(m.blk[0]) for m in models)):
-      arr = rng.standard_normal(ps[0].shape).astype(np.float32) * 0.3
-      for p, dev in zip(ps, (Device.DEFAULT, "CPU")): p.replace(Tensor(arr, device=dev).cast(p.dtype))
-    xs = rng.standard_normal((4, 1, 8, 64)).astype(np.float32)
-    def steps(m:Transformer, dev:str) -> list[np.ndarray]:  # (a token from 0, verify steps rolled back to their first token, a chunk's rows)
-      blk, out = m.blk[0], []
-      blk.keep = 1
-      for x, T, pos in zip(xs, (1, 2, 2, 8), (0, 1, 2, 3)):
-        x = Tensor(x[:, :T], device=dev)
-        blk._init_state(x)
-        out.append(blk._attention(x, (pos,)).numpy())
-        if T == 2: m.rollback(1)
-      return out + [s.numpy() for s in blk._states()]
-    for got, want in zip(*(steps(m, dev) for m, dev in zip(models, (Device.DEFAULT, "CPU")))):
-      np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+    for batch, groups in ((1, 2), (2, 2), (1, 1)):
+      with self.subTest(batch=batch, groups=groups):
+        ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=groups, time_step_rank=2, inner_size=64, kda=True, gate_lower_bound=-5.0,
+                        full_rank=(True, False))
+        cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=32,
+                                rope_theta=1e4, rope_dim=32, v_head_dim=32, max_context=16, ssm_layers=(True,), ssm=ssm)
+        rng, models = np.random.default_rng(0), [Transformer(cfg) for _ in range(2)]
+        for ps in zip(*(nn.state.get_parameters(m.blk[0]) for m in models)):
+          arr = rng.standard_normal(ps[0].shape).astype(np.float32) * 0.3
+          for p, dev in zip(ps, (Device.DEFAULT, "CPU")): p.replace(Tensor(arr, device=dev).cast(p.dtype))
+        xs = rng.standard_normal((5, batch, 8, 64)).astype(np.float32)
+        def steps(m:Transformer, dev:str) -> list[np.ndarray]:  # (a token from 0, verify sizes 2/3/4 rolled back to slots 0/1/2, a chunk's rows)
+          blk, out = m.blk[0], []
+          blk.keep = 3
+          for x, T, pos in zip(xs, (1, 2, 3, 4, 8), (0, 1, 2, 4, 7)):
+            x = Tensor(x[:, :T], device=dev)
+            blk._init_state(x)
+            out.append(blk._attention(x, (pos,)).numpy())
+            if T in (2, 3, 4):
+              m.rollback(T-1)
+              out.extend(s.numpy().copy() for s in blk._states())
+          return out + [s.numpy() for s in blk._states()]
+        for got, want in zip(*(steps(m, dev) for m, dev in zip(models, (Device.DEFAULT, "CPU")))):
+          np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
   def test_kda_decode_q8(self): # kda_decode's q8 of its outputs as q8_quantize's of them
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA required")
-    rng, H, D, R = np.random.default_rng(2), 2, 32, 3
-    def t(*shape): return Tensor(rng.standard_normal(shape).astype(np.float32)).realize()
-    states = [t(1, H, D, D), *(t(1, R, H*D) for _ in range(3))]
-    pos = UOp.variable("start_pos", 0, 15).bind(4)
-    zq, _ = kda_decode(t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H), t(1, 1, H*D), [t(H*D, R+1) for _ in range(3)],
-                       t(H*D), t(H, 1), t(D), pos, -5.0, 1e-5, states)
-    Tensor.realize(*zq)
-    for got, want in zip(zq[1:], q8_quantize(zq[0], 1, H*D)): np.testing.assert_array_equal(got.numpy(), want.numpy())
+    for D in (32, 64, 128):
+      with self.subTest(dim=D):
+        rng, H, R, T = np.random.default_rng(2), 2, 3, 4
+        def t(*shape): return Tensor(rng.standard_normal(shape).astype(np.float32)).realize()
+        states = [t(1, H, D, D), *(t(1, R, H*D) for _ in range(3))]
+        pos = UOp.variable("start_pos", 0, 15).bind(4)
+        inputs = [*(t(1, T, H*D) for _ in range(4)), t(1, T, H), t(1, T, H*D)]
+        weights, dt, a, nw = [t(H*D, R+1) for _ in range(3)], t(H*D), t(H, 1), t(D)
+        zq:tuple[Tensor, ...] = ()
+        for token in range(T):
+          zq, states = kda_decode(*inputs, weights, dt, a, nw, pos+token, -5.0, 1e-5, states, token=token, z=zq)
+        Tensor.realize(*zq)
+        for got, want in zip(zq[1:], q8_quantize(zq[0], T, H*D)): np.testing.assert_array_equal(got.numpy(), want.numpy())
+
+class TestResidualMix(unittest.TestCase):
+  def test_mix_and_norm(self):
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA required")
+    rng = np.random.default_rng(3)
+    for B, T, streams, dim in ((1, 1, 1, 256), (2, 2, 3, 512), (1, 2, 4, 7168), (1, 3, 14, 256), (1, 4, 15, 256)):
+      with self.subTest(shape=(B, T, streams, dim)):
+        xs, wm, wn = (Tensor(rng.standard_normal(shape).astype(np.float32)).realize() for shape in ((B, T, streams, dim), (dim,), (dim,)))
+        scores = (xs.rmsnorm(eps=1e-5) * wm).sum(-1, keepdim=True)
+        expected = ((scores.softmax(2) * xs).sum(2)).rmsnorm(eps=1e-5) * wn
+        cfg = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=dim, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=dim,
+                                rope_theta=1e4, rope_dim=dim, v_head_dim=dim)
+        mix, norm = AttentionResidual(cfg), nn.RMSNorm(dim, 1e-5)
+        mix.weight, norm.weight = wm, wn
+        np.testing.assert_allclose(mix.mix(xs, norm).numpy(), expected.numpy(), rtol=1e-4, atol=1e-4)
+
 
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot

@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode
+  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode, RES_MAX_STREAMS
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.kernels.amd_gguf import q8_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
@@ -201,7 +201,8 @@ class AttentionResidual:
     self.weight, self.norm_eps, self.new_block = Tensor.zeros(config.dim), config.norm_eps, new_block
 
   def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None) -> Tensor:  # xs: (B, T, N, D) streams: (B, T, D), then the norm
-    if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
+    if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[2] <= RES_MAX_STREAMS and \
+       xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
       return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps)
     scores = (xs.rmsnorm(eps=self.norm_eps) * self.weight).sum(-1, keepdim=True)
     out = (scores.softmax(2) * xs).sum(2)
@@ -652,20 +653,22 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # input processing
     x = x.half()
-    if is_kda and not symbolic and (lb:=unwrap(self.config.ssm).gate_lower_bound) is not None and not unwrap(self.config.ssm).silu_gate and \
+    if is_kda and B == 1 and not symbolic and self.num_k_heads == self.num_v_heads and \
+       (lb:=unwrap(self.config.ssm).gate_lower_bound) is not None and not unwrap(self.config.ssm).silu_gate and \
        hasattr(self, "ssm_g") and self.head_k_dim == self.head_v_dim and self.head_k_dim % 32 == 0 and T - 1 <= len(self.kept) and \
        amd_custom_kernels_supported(x.device):
       # a token at a time, the rest of the block in one kernel: token t reads the states after t-1 and writes those after t (kept, the
       # last token's the block's)
       q, k, v, g, b = (f(x) for f in (self.attn_q, self.attn_k, self.attn_v, self.ssm_g, self.ssm_beta))
       f = self.ssm_f(x) if hasattr(self, "ssm_f") else self.ssm_f_b(self.ssm_f_a(x))
-      sts, conv_w = [[s[-1], *s[:-1]] for s in (self._states(), *self.kept[:T-1])], [w["weight"].flatten(1) for w in
-                                                                                    (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v)]
+      # (a kept recurrent state the kept buffer's slot t)
+      sts = [[self.recurrent_state, *self.conv_states], *[[self.kept_states, *s[:-1]] for s in self.kept[:T-1]]]
+      conv_w = [w["weight"].flatten(1) for w in (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v)]
       zq:tuple[Tensor, ...] = ()
       src = sts[0] if T > 1 else None
       for t in range(T):
         zq, src = kda_decode(q, k, v, g, b, f, conv_w, self.ssm_dt["bias"], self.ssm_a, unwrap(self.ssm_norm.weight), pos + t, lb,
-                             self.ssm_norm.eps, sts[(t + 1) % T], src, t, zq)
+                             self.ssm_norm.eps, sts[(t + 1) % T], src, t, zq, t % (T - 1) if T > 1 else 0, max(t - 1, 0))
       # (the out projection on the kernel's q8 of z)
       return q8_linear(self.ssm_out, zq[0], zq[1:]) if self.ssm_out.ggml_type in QUANT_SIZES else self.ssm_out(zq[0])
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)
@@ -703,7 +706,8 @@ class GatedDeltaNetBlock(FFNBlock):
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4), writes the kept ones
       state = Tensor(self.recurrent_state.uop.after(*conv_state_stores, *kept_stores))  # carry the conv writes into this graph
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos), self.kept_states[:len(kept)] if kept else None).transpose(1, 2)
+      # Pass the whole kept buffer: shrinking it would redirect the kernel's writes into a temporary.
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos), self.kept_states if kept else None).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)
