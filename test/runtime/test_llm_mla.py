@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, Device
-from tinygrad.llm.model import TransformerConfig, apply_rope, MLATransformerBlock, precompute_freqs_cis
+from tinygrad.llm.model import TransformerConfig, IndexerConfig, apply_rope, MLATransformerBlock, precompute_freqs_cis
 from tinygrad.llm.hf import e4m3fn_to_fnuz
 from test.runtime.test_llm_quantized import fp8_reference
 
@@ -12,6 +12,12 @@ class TestMLA(unittest.TestCase):
       "norm_eps": 1e-5, "vocab_size": 100, "head_dim": 16, "rope_theta": 10000.0, "rope_dim": 8, "max_context": 32,
       "kv_lora_rank": 16, "v_head_dim": 8,
     } | kwargs)
+
+  def test_rope_table_only_when_used(self): # no positions (mla_nope) and an indexer without rope: no table
+    for nope, indexer_rope, used in ((False, None, True), (True, None, False), (True, 0, False), (True, 4, True)):
+      config = self._make_config(mla_nope=nope, q_lora_rank=16, indexer=None if indexer_rope is None else IndexerConfig(2, 8, 4, rope_dim=indexer_rope))
+      (block:=MLATransformerBlock(config))._init_state(Tensor.empty(1, 1, config.dim))
+      self.assertEqual(block.freqs_cis is not None, used)
 
   def test_mla_attention_matches_naive(self):
     for interleave in (False, True):

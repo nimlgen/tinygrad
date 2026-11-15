@@ -556,7 +556,7 @@ class MLATransformerBlock(FFNBlock):
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
-    freqs = Tensor.stack(*(self.freqs_cis[p:p+T] for p in start_pos)) if not self.config.mla_nope else None
+    freqs = Tensor.stack(*(unwrap(self.freqs_cis)[p:p+T] for p in start_pos)) if not self.config.mla_nope else None
     if freqs is not None: q_rope = apply_rope(q_rope, freqs, self.config.rope_interleave)
     if 'weight_scale_inv' in self.attn_k_b:
       q_nope = fp8_matmul(q_nope, self.attn_k_b['weight'], self.attn_k_b['weight_scale_inv'], self.kv_b_block_size[::-1])
@@ -606,8 +606,9 @@ class MLATransformerBlock(FFNBlock):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, dtype=dtypes.half,
                                   device=x.device)
+      needs_rope = not self.config.mla_nope or (self.indexer is not None and self.indexer.idx.rope_dim > 0)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
-                                            device=x.device, yarn=self.config.yarn)
+                                          device=x.device, yarn=self.config.yarn) if needs_rope else None
     if self.indexer: self.indexer._init_state(x)
 
 class GatedDeltaNetBlock(FFNBlock):
