@@ -3,12 +3,13 @@
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
 import json, pathlib, tempfile, unittest
+from dataclasses import replace
 from types import SimpleNamespace
 import numpy as np
 from gguf import GGUFWriter, GGMLQuantizationType, quants
 from tinygrad import Tensor, Device, UOp, nn, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
-from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock
+from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
 from extra.k3.draft import Eagle3
 
@@ -146,13 +147,52 @@ class TestEngine(unittest.TestCase):
   def test_prefill(self):  # the chunks of a prompt but its last token (each with the tokens after it given), none without a chunk
     steps:list = []
     self.eng.step = lambda toks, pos, given: steps.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
-    self.assertEqual(self.eng.prefill(list(range(10)), 2), 6)
-    self.assertEqual(steps, [(2, [2, 3, 4, 5], [3, 4, 5, 6])])
+    self.assertEqual(self.eng.prefill(list(range(10)), 2), 9)
+    self.assertEqual(steps, [(2, [2, 3, 4, 5], [3, 4, 5, 6]), (6, [6, 7, 8], [7, 8, 9])])
     self.assertEqual(self.eng.prefill(list(range(9)), 0), 8)
-    self.assertEqual([s[0] for s in steps[1:]], [0, 4])
+    self.assertEqual([s[0] for s in steps[2:]], [0, 4])
+    self.eng.chunk = 8
+    self.assertEqual(self.eng.prefill(list(range(16)), 10), 10)  # the live rows fit, but their static chunk would cross the context
+    self.assertEqual(len(steps), 4)
     self.eng.chunk = 0
     self.assertEqual(self.eng.prefill(list(range(9)), 3), 3)
-    self.assertEqual(len(steps), 3)
+    self.assertEqual(len(steps), 4)
+
+  def test_partial_chunk(self): # live logits, recurrent states and cache prefixes, then decode over the padded rows
+    self.stub()
+    eng, folder, rng = self.eng, tempfile.mkdtemp(), np.random.default_rng(4)
+    eng.keep_logits = True
+    eng.draft = Eagle3(eagle(folder, rng), lambda t: eng.model.token_embd(t).float(), eng.devs, eng.model.max_context)
+    for b in eng.model.blk:
+      if isinstance(b, MLATransformerBlock):
+        b.indexer = Indexer(replace(b.config, indexer=IndexerConfig(2, 16, 4)))
+        for p in nn.state.get_parameters(b.indexer): p.replace(Tensor(rng.normal(0, 0.3, p.shape).astype(np.float32)).shard(eng.devs, p.uop.axis))
+        b._init_state(Tensor.empty(1, 1, DIM, device=eng.devs))
+    ids = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7, 2, 5, 9, 4]
+    def run(toks:list[int], pos:int, live:int|None=None) -> np.ndarray:
+      C = len(toks)
+      eng.tok_np[:C], eng.given_np[:C] = toks, (ids[pos + 1:pos + 1 + C] + [-1] * C)[:C]
+      return (eng.run(C, eng.v_pos.bind(pos)) if live is None else eng.jits[C](eng.v_pos.bind(pos), eng.v_live.bind(live)))[1].numpy()
+    def snapshot(n:int) -> list[np.ndarray]:
+      caches = [eng.draft.cache, *(b.cache_k for b in eng.model.blk if isinstance(b, MLATransformerBlock)),
+                *(b.indexer.cache_kg for b in eng.model.blk if isinstance(b, MLATransformerBlock) and b.indexer)]
+      return [s.numpy() for s in eng.model._states()] + [c.numpy()[..., :n, :] for c in caches]
+    def equal(a:list[np.ndarray], b:list[np.ndarray]):
+      for got, want in zip(a, b): np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+    with self.assertRaises(AssertionError): eng.step([1, 2, 3], 14)
+    for start, live in ((0, 1), (0, 3), (4, 1), (4, 3), (8, 2), (8, 4), (12, 3)):
+      with self.subTest(start=start, live=live):
+        out = [run([t], pos)[0] for pos, t in enumerate(ids[:start + live])]
+        want, states = np.stack(out[start:]), snapshot(start + live)
+        after = run([ids[start + live]], start + live)
+        states_after = snapshot(start + live + 1)
+        for pos, t in enumerate(ids[:start]): run([t], pos)
+        got = run(ids[start:start + live] + [0] * (4 - live), start, live)
+        np.testing.assert_allclose(got[:live], want, rtol=1e-3, atol=1e-3)
+        np.testing.assert_array_equal(got[:live].argmax(-1), want.argmax(-1))
+        equal(snapshot(start + live), states)
+        np.testing.assert_allclose(run([ids[start + live]], start + live), after, rtol=1e-3, atol=1e-3)
+        equal(snapshot(start + live + 1), states_after)
 
   def test_states_allocated(self):  # the blocks' caches and states and the draft's allocated by the engine, before its pool takes what's free
     model, folder = Transformer.from_gguf(self.trunk, shard=G)[0], tempfile.mkdtemp()

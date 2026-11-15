@@ -92,13 +92,14 @@ def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   sel = x.const_like(0).scatter(-1, cmp.sum(axis=-1).cast('int32'), vals)[:,:,n-k:].cast('int32')
   return x.gather(-1, sel), sel
 
-def short_conv(state:Tensor, x:Tensor, weight:Tensor, initial:Tensor, dilation:int=1) -> tuple[Tensor, UOp]:
+def short_conv(state:Tensor, x:Tensor, weight:Tensor, initial:Tensor, dilation:int=1, live:UOp|None=None) -> tuple[Tensor, UOp]:
   assert state.shape[1] == (weight.shape[1]-1)*dilation, f"state has {state.shape[1]} rows, expected {(weight.shape[1]-1)*dilation}"
   # assemble the conv window in a static-size buffer: [state | x rows | zero-pad], state is zeroed when initial
   T, T_pad = x.shape[1], x.max_shape[1]
   window = initial.where(0, state).cat(x.cast(state.dtype), dim=1).pad_to((x.shape[0], state.shape[1] + T_pad, x.shape[-1])).contiguous()
   # the last state.shape[1] rows before the padding become the next state
-  store = state.uop.store(window[:, T:T+state.shape[1]].uop)
+  end = T if live is None else live
+  store = state.uop.store(window[:, end:end+state.shape[1]].uop)
   return functools.reduce(lambda a,b: a+b, (window[:, i*dilation:i*dilation+T_pad] * weight[:, i] for i in range(weight.shape[1]))).silu(), store
 
 @dataclass(frozen=True)
@@ -334,17 +335,17 @@ class FFNBlock:
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor: raise NotImplementedError
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor: raise NotImplementedError
   def _indexer_mask(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None) -> Tensor|None:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
 
-  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None):
+  def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, live:UOp|None=None):
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None):
+    def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, live:UOp|None):
       if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
       res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
       attn_norm, ffn_norm = self.attn_norm, self.ffn_norm
@@ -356,11 +357,11 @@ class FFNBlock:
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask), mask
+        return self._attention(h, start_pos, mask, live), mask
       x, idx_mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(ffn_norm(h)), None))[0].contiguous()
       return (out, idx_mask) if idx_mask is not None else out
-    out = _run(x, start_pos, idx_mask)
+    out = _run(x, start_pos, idx_mask, live)
     return out if isinstance(out, tuple) else (out, None)
 
 class TransformerBlock(FFNBlock):
@@ -379,7 +380,7 @@ class TransformerBlock(FFNBlock):
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
     self.indexer = Indexer(config) if config.indexer else None
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
@@ -549,7 +550,7 @@ class MLATransformerBlock(FFNBlock):
     if config.attn_output_gate: self.attn_gate = Linear(config.dim, config.n_heads * config.v_head_dim, bias=False)
     if config.attn_head_gate: self.attn_gate = Linear(config.dim, config.n_heads, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
@@ -640,7 +641,7 @@ class GatedDeltaNetBlock(FFNBlock):
   def _kept(self, T:int|UOp) -> int: return min(self.keep, T-1) if isinstance(T, int) else 0
   def _states(self) -> list[Tensor]: return [*(self.conv_states if unwrap(self.config.ssm).kda else [self.conv_state]), self.recurrent_state]
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor:
     B, T, _ = x.shape
     assert len(start_pos) == 1, "independent positions are not supported for recurrent blocks"
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
@@ -653,7 +654,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # input processing
     x = x.half()
-    if is_kda and B == 1 and not symbolic and self.num_k_heads == self.num_v_heads and \
+    if is_kda and B == 1 and not symbolic and live is None and self.num_k_heads == self.num_v_heads and \
        (lb:=unwrap(self.config.ssm).gate_lower_bound) is not None and not unwrap(self.config.ssm).silu_gate and \
        hasattr(self, "ssm_g") and self.head_k_dim == self.head_v_dim and self.head_k_dim % 32 == 0 and T - 1 <= len(self.kept) and \
        amd_custom_kernels_supported(x.device):
@@ -684,7 +685,7 @@ class GatedDeltaNetBlock(FFNBlock):
     convs = (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v) if is_kda else (self.ssm_conv1d,)
     states, kept = self._states()[:-1], self.kept[:self._kept(T)]
     conv_ins = [proj(x) for proj in projs]
-    conv_outs, conv_state_stores = zip(*(short_conv(s, p, w["weight"].flatten(1), initial) for s, p, w in zip(states, conv_ins, convs)))
+    conv_outs, conv_state_stores = zip(*(short_conv(s, p, w["weight"].flatten(1), initial, live=live) for s, p, w in zip(states, conv_ins, convs)))
     # the kept conv states: the rows of [conv_state | x rows] after each token
     kept_stores = [ks.uop.store(initial.where(0, s).cat(p.cast(s.dtype), dim=1)[:, t+1:t+1+s.shape[1]].uop)
                    for t, kt in enumerate(kept) for ks, s, p in zip(kt, states, conv_ins)]
@@ -701,6 +702,10 @@ class GatedDeltaNetBlock(FFNBlock):
     q, k, v, beta = (z.transpose(1, 2).float() for z in (q, k, v, beta))
     q = q * self.head_k_dim**-0.5
     alpha = log_alpha.transpose(1, 2).exp()  # per-channel decay for kda, per-head otherwise (B, H, T, K|1)
+    # mask the fp32 coefficients to preserve the projections' fp16 rounding
+    if live is not None:
+      valid = (Tensor.arange(T_pad).to(x.device) < Tensor(live, device=x.device)).reshape(1, 1, T_pad)
+      beta, alpha = valid.where(beta, 0), valid.unsqueeze(-1).where(alpha, 1)
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):

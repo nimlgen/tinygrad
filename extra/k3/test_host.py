@@ -81,8 +81,8 @@ class TestStepIO(unittest.TestCase):
               "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
     self.gbuf = [[gpu_bufs() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
-    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T, chunk=chunk, nd=ND, entries=ENTRIES, shift=9,
-                       slots=SLOTS,
+    self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T, chunk=T if chunk else 0,
+                       nd=ND, entries=ENTRIES, shift=9, slots=SLOTS,
                        victims_n=32 * T, pf=3, tau=0.03, decay=0.5 ** (1 / 8), bufs=self.bufs.ctypes.data)
     for name, a in {**self.tables, **self.state}.items(): setattr(io, name, a.ctypes.data)
     self.drives = FakeDrives(self.sq, self.db, self.cq, slow)
@@ -193,6 +193,32 @@ class TestStepIO(unittest.TestCase):
         nt = rows.max() // 16 + 1  # (the tiles used)
         self.assertEqual(sorted(set((rows // 16).tolist())), list(range(nt)))
         for t in range(T): self.assertEqual(sorted(tslot[rows // 16].reshape(K, T)[:, t].tolist()), sorted(so[top[t]].tolist()))
+
+  def test_partial_chunk(self):
+    for C, live in ((40, 7), (256, 137)): self.check_partial_chunk(C, live)  # (137: its routes on threads)
+
+  def check_partial_chunk(self, C:int, live:int): # the table stays a whole chunk's, but only its live rows route and read
+    self.tearDown()
+    self.setUp(slots=L * E + 16, T=C, chunk=True)
+    self.io.tokens = live
+    self.step()
+    refs = 0
+    for li in range(L):
+      logits = np.concatenate([g["scores"][::ROWS][:live] for g in self.gbuf[li]], axis=1).astype(np.float64)
+      top = np.argsort(-(1 / (1 + np.exp(-logits)) + self.bias[li]), axis=1, kind="stable")[:, :K]
+      refs += len(np.unique(top))
+      n, NT = K * C, K * C // 16 + E
+      for g in self.gbuf[li]:
+        p = g["part1"][1:].view(np.int32)
+        rows, ws = p[17 * NT:17 * NT + n].reshape(K, C), p[17 * NT + n:].view(np.float32).reshape(K, C)
+        np.testing.assert_allclose(ws[:, :live].sum(0), 1, atol=1e-5)
+        np.testing.assert_equal(ws[:, live:], 0)
+        np.testing.assert_equal(rows[:, live:], 0)
+        np.testing.assert_equal(p[NT:17 * NT][rows[:, :live]], np.broadcast_to(np.arange(live), (K, live)))
+        so = self.state["slot_of"][li * E:(li + 1) * E]
+        for t in range(live): self.assertEqual(sorted(p[:NT][rows[:, t] // 16].tolist()), sorted(so[top[t]].tolist()))
+    self.assertEqual(self.io.refs, refs)
+    self.assertLessEqual(self.io.misses + self.io.guesses, L * K * live)
 
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
     self.io.tau, self.io.pf, self.io.fill = 0.2, 0, 4

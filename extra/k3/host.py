@@ -39,7 +39,8 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 # io_t: the host's state, the drives' queues and command tables, the counts (IO: name, c type, a pointer is an address). bufs: every layer's
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each
 # [ready | slots | weights], k1*T then (k-k1)*T entries: the union of the tokens' first k1 experts, then of the rest, an expert once, its
-# weight a token (entry i's at i*T + t, 0: not the token's), padded with slot 0
+# weight a token (entry i's at i*T + t, 0: not the token's), padded with slot 0. tokens: a step's (a chunk's live ones), chunk: the width of
+# a chunk's graph (0: not a chunk)
 IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens chunk nd entries shift slots victims_n nvict pf fill".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),
@@ -423,7 +424,7 @@ static void chunk_routes(const io_t *s, const uint64_t *b, int64_t li, int64_t r
 // expert, to n/16 + E), their rows' tokens | entry j*T + t's (token t's j-th) tile row | its weight]. then the counts and the decayed
 // use counts (a use a token). 0, -1 a read failed, -2 a timeout, -3 no victims
 static int64_t chunk(io_t *s, int64_t li) {
-  int64_t E = s->E, ng = s->ngpu, T = s->tokens, K = s->k, n = K * T, cnt[4096], at[4096], tile[4096], fill[4096], use[4096], nu = 0;
+  int64_t E = s->E, ng = s->ngpu, T = s->chunk, K = s->k, n = K * T, cnt[4096], at[4096], tile[4096], fill[4096], use[4096], nu = 0;
   int64_t NT = n / 16 + E, TS = 1, TR = TS + NT, ER = TR + 16 * NT, W = ER + n;
   static int64_t by[1 << 16];  // (the entries by expert)
   const uint64_t *b = s->bufs + li * NB * ng;
@@ -434,6 +435,7 @@ static int64_t chunk(io_t *s, int64_t li) {
   io_t exact = *s;
   exact.tau = exact.tauc = exact.beta = 0, exact.kmin = K;
   int32_t *so = s->slot_of + li * E, *part = BUF(B_PART1, 0, int32_t);
+  for (int64_t i = 0; i < n; i++) part[ER + i] = 0, ((float *)part)[W + i] = 0;
   chunk_routes(&exact, b, li, 0, part, T, ER, W, cnt);  // (an entry's expert in its row's place till the rows are known)
   for (int64_t e = 0; e < E; e++) if (cnt[e]) use[nu++] = e;
   if ((r = queue(s, li, nu, use, &s->misses))) return r;
@@ -447,8 +449,8 @@ static int64_t chunk(io_t *s, int64_t li) {
   if (poll_io(s) < 0) return -1;
   int64_t nt = 0;
   for (int64_t e = 0, r = 0; e < E; e++) at[e] = r, tile[e] = nt, fill[e] = 0, r += cnt[e], nt += (cnt[e] + 15) / 16;
-  for (int64_t i = 0; i < n; i++) {
-    int64_t e = part[ER + i], k = fill[e]++;
+  for (int64_t j = 0; j < K; j++) for (int64_t t = 0; t < s->tokens; t++) {
+    int64_t i = j * T + t, e = part[ER + i], k = fill[e]++;
     by[at[e] + k] = i, part[ER + i] = (int32_t)(tile[e] * 16 + k);
   }
   for (int64_t e = 0; e < E; e++) for (int64_t j = 0; j < (cnt[e] + 15) / 16; j++) {
@@ -503,7 +505,7 @@ int64_t step_io(io_t *s) {
   s->slowest = 0, npend = pend_at = 0;
   int64_t all[4096];  // (a chunk's first layer: all its experts, no guesses)
   for (int64_t e = 0; e < s->E; e++) all[e] = e;
-  if (s->chunk && (r = queue(s, 0, s->E, all, &s->misses))) return r;
+  if (s->chunk && s->tokens == s->chunk && (r = queue(s, 0, s->E, all, &s->misses))) return r;
   for (int64_t li = 0; li < s->layers; li++) {
     double t = now();
     r = s->chunk ? chunk(s, li) : layer(s, li);

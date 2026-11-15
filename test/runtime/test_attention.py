@@ -425,6 +425,28 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
         np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
         np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
 
+  def test_padded_chunk_matches_decode(self):
+    ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=2, inner_size=64, kda=True,
+                    gate_lower_bound=-5.0, full_rank=(True, False))
+    config = self._make_config(dim=64, max_context=16, ssm=ssm)
+    block, rng = GatedDeltaNetBlock(config, ssm), np.random.default_rng(19)
+    for p in nn.state.get_parameters(block): p.replace(Tensor(rng.normal(0, 0.2, p.shape).astype(np.float32)))
+    xs, live = Tensor(rng.normal(0, 0.3, (1, 12, 64)).astype(np.float32)), UOp.variable("live", 1, 8)
+    block._init_state(xs)
+    @TinyJit
+    def padded(x:Tensor, pos:UOp, count:UOp): return block._attention(x, (pos,), live=count).realize()
+    for start, n in ((0, 3), (2, 6), (0, 1), (3, 8)):
+      with self.subTest(start=start, live=n):
+        want = [self._run_attention(block, xs[:, i:i+1], i) for i in range(start + n)]
+        states = [s.numpy() for s in block._states()]
+        after = self._run_attention(block, xs[:, start+n:start+n+1], start+n)
+        for i in range(start): self._run_attention(block, xs[:, i:i+1], i)
+        # _run_attention applies the input norm, which the direct fused attention call needs too
+        got = padded(block.attn_norm(xs[:, start:start+8]).contiguous(), UOp.variable("pos", 0, 7).bind(start), live.bind(n)).numpy()
+        np.testing.assert_allclose(got[:, :n], np.concatenate(want[start:], axis=1), rtol=1e-3, atol=1e-3)
+        for s, w in zip(block._states(), states): np.testing.assert_allclose(s.numpy(), w, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(self._run_attention(block, xs[:, start+n:start+n+1], start+n), after, rtol=1e-3, atol=1e-3)
+
   def test_short_step_rollback(self):
     # a verify step of [next, wrong guess] then rollback(1) leaves the states as if only next was stepped
     for kda in (False, True):

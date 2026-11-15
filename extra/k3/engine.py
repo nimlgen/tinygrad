@@ -68,7 +68,7 @@ class Engine:
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
     model.save([])  # (and the two sets of saved recurrent states)
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
-    self.v_pos = UOp.variable("start_pos", 0, model.max_context - 1)
+    self.v_pos, self.v_live = UOp.variable("start_pos", 0, model.max_context - 1), UOp.variable("live", 1, max(chunk, 1))
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * n, dtypes.int32)  # (a step's [done | tokens | guesses])
     self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, chunk} - {0})}
@@ -101,35 +101,39 @@ class Engine:
 
   # *** the step's graph
 
-  def forward(self, tokens:Tensor, pos:UOp) -> tuple[Tensor, Tensor|None]:
+  def forward(self, tokens:Tensor, pos:UOp, live:UOp|None=None) -> tuple[Tensor, Tensor|None]:
     """the logits (T, vocab) after each of the tokens (1, T) at positions pos.., the hidden states (1, T, 3, dim) after the draft's blocks"""
     m, hidden = self.model, []
     x = m.token_embd(tokens.to(m.token_embd.weight.device)).float().unsqueeze(2)  # (the attention residuals' streams: (1, T, 1, dim))
     mask = None
     for i, b in enumerate(m.blk):
-      x, mask = b(x, (pos,), mask)
+      x, mask = b(x, (pos,), mask, live)
       if self.draft is not None and i in self.draft.layers: hidden.append(x[:, :, -1])
     return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*hidden, dim=2) if hidden else None
 
-  def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
+  def run(self, T:int, pos:UOp, live:UOp|None=None) -> tuple[Tensor, Tensor]:
     """the greedy token after each of the step's tokens and (a draft) its guess of the token after that (after the given one where there's
     one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits (kept, else done)"""
-    done, logits, *dx = self.outputs(T, pos)
+    done, logits, *dx = self.outputs(T, pos, live)
     Tensor.realize(done, logits, *dx)
     return done, logits
 
   def planned(self, T:int) -> int:
     """the most bytes on a gpu of the buffers of the step graph of T tokens, its schedule's (not run)"""
-    linear, _ = Tensor.linear_with_vars(*self.outputs(T, self.v_pos.bind(0)))
+    linear, _ = Tensor.linear_with_vars(*self.outputs(T, *self.binds(T, 0, T)))
     used = collections.Counter()
     for u in linear.toposort():
       if u.op is Ops.BUFFER and not all(b.is_allocated() for b in getattr(u.buffer, "bufs", [u.buffer])):
         for d in (u.device if isinstance(u.device, tuple) else (u.device,)): used[d] += u.nbytes()
     return max(used.values(), default=0)
 
-  def outputs(self, T:int, pos:UOp) -> list[Tensor]:
+  def binds(self, T:int, pos:int, live:int) -> tuple[UOp, ...]:
+    """the step graph's of T tokens variables: its position, a chunk's live tokens"""
+    return (self.v_pos.bind(pos), self.v_live.bind(live)) if T > self.tokens else (self.v_pos.bind(pos),)
+
+  def outputs(self, T:int, pos:UOp, live:UOp|None=None) -> list[Tensor]:
     """run's tensors: the done word, the logits (kept, else the done word) and the draft's hidden states (a chunk: its cache)"""
-    logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
+    logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos, live)
     out, dx = (toks:=logits.argmax(-1)), []
     if self.draft is not None:
       given = ((g:=self.given[:T].to(toks.device)) >= 0).where(g, toks).reshape(1, T)
@@ -207,8 +211,8 @@ class Engine:
   def warm(self):
     """every step's graph (and the rollback's) captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
     host_c().flags(ctypes.byref(self.io), 1)
-    for jit in self.jits.values():
-      for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
+    for T, jit in self.jits.items():
+      for _ in range(3): jit(*self.binds(T, 0, T))[0].tolist()
     for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
     for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
 
@@ -217,10 +221,14 @@ class Engine:
     and the draft's guess after that (their logits kept)"""
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
-    io.tokens, io.chunk, io.victims_n, self.tok_np[:T], self.given_np[:T], self.res_np[0] = T, T > self.tokens, 32 * T, toks, \
-      ((given or []) + [-1] * T)[:T], 0
+    C = self.chunk if T > self.tokens else T  # (a chunk's graph's width: a partial chunk's rows after its T padded)
+    assert T <= C and pos + C <= self.max_context
+    io.tokens, io.chunk, io.victims_n, self.res_np[0] = T, C if T > self.tokens else 0, 32 * T, 0
+    self.tok_np[:C], self.given_np[:C] = 0, -1
+    self.tok_np[:T], self.given_np[:T] = toks, ((given or []) + [-1] * T)[:T]
     host_c().flags(ctypes.byref(io), 0)
-    _, self.logits = self.jits[T](self.v_pos.bind(pos))
+    _, self.logits = self.jits[C](*self.binds(C, pos, T))
+    if self.keep_logits: self.logits = self.logits[:T]
     t1 = time.perf_counter()
     err = host_c().step_io(ctypes.byref(io))
     if err: host_c().flags(ctypes.byref(io), 1)  # (the gpus run the graph out: one killed waiting on a layer wedges)
@@ -250,11 +258,15 @@ class Engine:
   def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
 
   def prefill(self, tokens:list[int], pos:int) -> int:
-    """tokens from pos on but the last fed in steps of a chunk (exact routing, every expert of a layer read in), the position after them"""
+    """tokens from pos on but the last fed in steps of a chunk (exact routing, every expert of a layer read in), the last one partial (its
+    rows padded) unless it's under a quarter of a chunk (a token a step is faster), the position after them"""
     if not self.chunk: return pos
-    end = pos + (len(tokens) - 1 - pos) // self.chunk * self.chunk
-    for p in range(pos, end, self.chunk): self.step(tokens[p:p + self.chunk], p, tokens[p + 1:p + 1 + self.chunk])
-    return end
+    end = len(tokens) - 1
+    while pos < end and pos + self.chunk <= self.max_context:
+      if (n:=min(self.chunk, end - pos)) < self.chunk // 4: break
+      self.step(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
+      pos += n
+    return pos
 
   def generate(self, tokens:list[int], temperature:float=0.0):
     """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
