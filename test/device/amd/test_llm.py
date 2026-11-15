@@ -6,8 +6,8 @@ from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
-from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
-  Q4_K, IQ3_S, IQ3_XXS)
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, expert_tiles, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS,
+  SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
@@ -566,6 +566,24 @@ class TestExpertLinear(unittest.TestCase):
     dead = Tensor(np.array(self.sel[:2] + [-1], np.int32))  # (a tile of no expert: its rows not written, the others as before)
     got = expert_gemm(self.pool, dead, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
     np.testing.assert_allclose(got[:32], ref[:32], rtol=0.03, atol=0.03 * np.abs(ref).max())
+
+  def test_expert_tiles(self): # 64 row tiles an expert's (f16 WMMA), x's rows from a table (-1: x[0]) or its own: as the weights decoded apart
+    if not _is_rdna4(self.pool.device): self.skipTest("RDNA4 required")
+    tiles, off = Tensor(np.array(self.sel[:2] + [-1], np.int32)), 2 * self.UNITS * self.ROW_UP
+    x = self.rng.standard_normal((5, self.LAT)).astype(np.float32)
+    xr = self.rng.integers(-1, 5, 192).astype(np.int32)
+    out = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr)).float().numpy()
+    h = self.rng.standard_normal((192, self.UNITS)).astype(np.float32)
+    down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off).float().numpy()
+    def act(g, u): return g * (u / 25).tanh()
+    gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), act=act).float().numpy()
+    for t, s in enumerate(self.sel[:2]):
+      rows = slice(64 * t, 64 * t + 64)
+      ref = x[np.maximum(xr[rows], 0)].astype(np.float16).astype(np.float32) @ self.weight(s, 0, 2 * self.UNITS, self.LAT).T
+      np.testing.assert_allclose(out[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+      np.testing.assert_allclose(gu[rows], ref[:, :self.UNITS] * np.tanh(ref[:, self.UNITS:] / 25), rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+      ref = h[rows].astype(np.float16).astype(np.float32) @ self.weight(s, off, self.LAT, self.UNITS).T
+      np.testing.assert_allclose(down[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
 
   def test_live_rows(self): # the rows of weight 0 skipped: a slot's gate and up rows where all its tokens' are (0 out), the down rows' sums
     x, off, per = Tensor(self.rng.standard_normal((2, self.LAT)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP, 2
