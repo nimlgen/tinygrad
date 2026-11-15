@@ -5,7 +5,7 @@ from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores, mla_topk_attention)
-from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig
+from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
   Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -647,6 +647,30 @@ class TestTopk(unittest.TestCase):
       blk.cache_k.assign(Tensor(rng.standard_normal(blk.cache_k.shape).astype(np.float16))).realize()
       mask = np.where(np.arange(pos + T) <= pos + np.arange(T)[:, None], 0, -np.inf).astype(np.float32).reshape(1, 1, T, pos + T)
       np.testing.assert_allclose(blk._attention(x, (p,)).numpy(), blk._attention(x, (pos,), Tensor(mask)).numpy(), rtol=1e-4, atol=1e-4)
+
+  def test_kda_decode(self): # a kda block's tokens in kda_decode (heads of 32) as the generic ops on the CPU: outputs, states, rollbacks
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA required")
+    ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=2, inner_size=64, kda=True, gate_lower_bound=-5.0,
+                    full_rank=(True, False))
+    cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=32,
+                            rope_theta=1e4, rope_dim=32, v_head_dim=32, max_context=16, ssm_layers=(True,), ssm=ssm)
+    rng, models = np.random.default_rng(0), [Transformer(cfg) for _ in range(2)]
+    for ps in zip(*(nn.state.get_parameters(m.blk[0]) for m in models)):
+      arr = rng.standard_normal(ps[0].shape).astype(np.float32) * 0.3
+      for p, dev in zip(ps, (Device.DEFAULT, "CPU")): p.replace(Tensor(arr, device=dev).cast(p.dtype))
+    xs = rng.standard_normal((4, 1, 8, 64)).astype(np.float32)
+    def steps(m:Transformer, dev:str) -> list[np.ndarray]:  # (a token from 0, verify steps rolled back to their first token, a chunk's rows)
+      blk, out = m.blk[0], []
+      blk.keep = 1
+      for x, T, pos in zip(xs, (1, 2, 2, 8), (0, 1, 2, 3)):
+        x = Tensor(x[:, :T], device=dev)
+        blk._init_state(x)
+        out.append(blk._attention(x, (pos,)).numpy())
+        if T == 2: m.rollback(1)
+      return out + [s.numpy() for s in blk._states()]
+    for got, want in zip(*(steps(m, dev) for m, dev in zip(models, (Device.DEFAULT, "CPU")))):
+      np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+
 
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot

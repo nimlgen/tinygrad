@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm
+  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -651,6 +651,20 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # input processing
     x = x.half()
+    if is_kda and not symbolic and (lb:=unwrap(self.config.ssm).gate_lower_bound) is not None and not unwrap(self.config.ssm).silu_gate and \
+       hasattr(self, "ssm_g") and self.head_k_dim == self.head_v_dim and self.head_k_dim % 32 == 0 and T - 1 <= len(self.kept) and \
+       amd_custom_kernels_supported(x.device):
+      # a token at a time, the rest of the block in one kernel: token t reads the states after t-1 and writes those after t (kept, the
+      # last token's the block's)
+      q, k, v, g, b = (f(x) for f in (self.attn_q, self.attn_k, self.attn_v, self.ssm_g, self.ssm_beta))
+      f = self.ssm_f(x) if hasattr(self, "ssm_f") else self.ssm_f_b(self.ssm_f_a(x))
+      sts, conv_w = [[s[-1], *s[:-1]] for s in (self._states(), *self.kept[:T-1])], [w["weight"].flatten(1) for w in
+                                                                                    (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v)]
+      z, src = None, sts[0] if T > 1 else None
+      for t in range(T):
+        z, src = kda_decode(q, k, v, g, b, f, conv_w, self.ssm_dt["bias"], self.ssm_a, unwrap(self.ssm_norm.weight), pos + t, lb, self.ssm_norm.eps,
+                            sts[(t + 1) % T], src, t, z)
+      return self.ssm_out(unwrap(z))
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)

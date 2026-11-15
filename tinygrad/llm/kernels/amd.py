@@ -480,6 +480,68 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   call = _gated_delta_prefill_kernel(*params[:8], None if start_pos is None else start_pos.uop.unbound(), *params[8:]).call(*contig)
   return Tensor(contig[0].after(call))
 
+KDA_ROWS = 8  # the rows of a head's state a wave updates in kda_decode
+
+@functools.cache
+def _kda_decode_kernel(z:UOp, state:UOp, cq:UOp, ck:UOp, cv:UOp, q:UOp, k:UOp, v:UOp, gate:UOp, beta:UOp, wq:UOp, wk:UOp, wv:UOp,
+                       alpha:UOp, dt_bias:UOp, ssm_a:UOp, norm_w:UOp, start_pos:UOp, *src:UOp, lb:float, eps:float, token:int) -> UOp:
+  """a kda token (token's row of the step's inputs and of z), a workgroup a head: a thread a channel's short convs and silu of q, k and v and
+  its decay (to LDS, the convs' windows shifted into cq, ck, cv), then a wave KDA_ROWS rows of the state, a lane 32 apart columns of them:
+  the l2 norms of q and k, the delta rule on the rows (into state), the output's rms norm and sigmoid gate into z. the states read from
+  src (state, cq, ck, cv) if given, else in place (from k31's engine)"""
+  s_in, *c_in = src or (state, cq, ck, cv)
+  _, H, hv, hk = cast(tuple[int, int, int, int], state.shape)
+  R, W, zero, initial = cast(int, cq.shape[1]), hv // KDA_ROWS, UOp.const(0, dtypes.float), start_pos.eq(0)
+  assert hv == hk and hk % 32 == 0 and hv % KDA_ROWS == 0 and W*WARP_SIZE >= hk
+  head, wave, lane = UOp.range(H, 0, AxisType.GLOBAL), UOp.range(W, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  t = wave*WARP_SIZE + lane
+  tc, live = t.minimum(hk-1), t < hk
+  ch = head*hk + tc
+  def row(x:UOp, i:UOp) -> UOp: return x.reshape(-1)[token*(int(prod(x.shape))//int(z.shape[1])) + i]  # (token's row of the step's x)
+  wins = [[initial.where(0, c[0, i, ch].load().float()) for i in range(R)] + [row(x, ch).load().float()] for c, x in zip(c_in, (q, k, v))]
+  qv, kv, vv = (sum((wn[i] * w[ch, i].load().float() for i in range(R + 1)), zero).silu() for wn, w in zip(wins, (wq, wk, wv)))
+  al = (((row(alpha, ch).load().float() + dt_bias[ch].load().float()) * ssm_a[head, 0].load().float().abs()).sigmoid() * lb).exp()
+  lds = UOp.alloc((4, hk), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds = lds.after(UOp.group(*[lds[j, tc.valid(live)].store(x) for j, x in enumerate((qv, kv, vv, al))]).barrier())
+  # the next windows, once the thread read these
+  stores = [c.after(UOp.group(*[x for wn in wins for x in wn]))[0, i, ch.valid(live)].store(wn[i+1].cast(c.dtype))
+            for c, wn in zip((cq, ck, cv), wins) for i in range(R)]
+  cols, rows = [lane + 32*i for i in range(hk//32)], [wave*KDA_ROWS + j for j in range(KDA_ROWS)]
+  def l2(x:list[UOp]) -> list[UOp]:  # (x/sqrt(sum(x^2)+1e-6))
+    r = (warp_reduce(sum((e*e for e in x), zero), full_wave=True) + 1e-6).rsqrt()
+    return [e * r for e in x]
+  qn, kn = [e * hk**-0.5 for e in l2([lds[0, c].load() for c in cols])], l2([lds[1, c].load() for c in cols])
+  kq = warp_reduce(sum((x*y for x, y in zip(qn, kn)), zero), full_wave=True)
+  b, decay = row(beta, head).load().float().sigmoid(), [lds[3, c].load() for c in cols]
+  core = []
+  for r in rows:
+    decayed = [initial.where(0, s_in[0, head, r, c].load().float()) * d for c, d in zip(cols, decay)]
+    sk, sq = (warp_reduce(sum((d*x for d, x in zip(decayed, xs)), zero), full_wave=True) for xs in (kn, qn))
+    delta = (lds[2, r].load() - sk) * b
+    stores += [state[0, head, r, c].store((d + delta*x).cast(state.dtype)) for c, d, x in zip(cols, decayed, kn)]
+    core.append(sq + delta*kq)
+  # the head's outputs through LDS: their mean square, then a thread an output (every lane's store the same value: no lane gates)
+  cl, ss = UOp.alloc((hv,), dtypes.float, addrspace=AddrSpace.LOCAL), UOp.alloc((W,), dtypes.float, addrspace=AddrSpace.LOCAL)
+  cl = cl.after(bar:=UOp.group(*[cl[r].store(c) for r, c in zip(rows, core)], ss[wave].store(sum((c*c for c in core), zero))).barrier())
+  rs = (sum((ss.after(bar)[w].load() for w in range(1, W)), ss.after(bar)[0].load()) * (1/hv) + eps).rsqrt()
+  out = cl[tc].load() * rs * norm_w[tc].load().float() * row(gate, head*hv + tc).load().float().sigmoid()
+  stores.append(row(z, (head*hv + tc).valid(live)).store(out.cast(z.dtype)))
+  return UOp.group(*stores).end(lane, wave, head).sink(arg=KernelInfo(name="kda_decode", opts_to_apply=()))
+
+def kda_decode(q:Tensor, k:Tensor, v:Tensor, gate:Tensor, beta:Tensor, alpha:Tensor, conv_w:list[Tensor], dt_bias:Tensor, ssm_a:Tensor,
+               norm_w:Tensor, start_pos:UOp, lb:float, eps:float, states:list[Tensor], src:list[Tensor]|None=None, token:int=0,
+               z:Tensor|None=None) -> tuple[Tensor, list[Tensor]]:
+  """GatedDeltaNetBlock._attention's normed and gated outputs z (B, T, inner) for token of a step's T from the outputs of its linears (q, k, v,
+  gate, beta, the decay's alpha), in one kernel: z (the earlier tokens' rows those of z) and states [recurrent, conv q, k, v] it wrote in place
+  (read from src instead if given)"""
+  if z is None: z = Tensor.empty(*q.shape[:2], gate.shape[-1], dtype=dtypes.half, device=q.device, axis=None if gate.uop.axis is None else 2)
+  srcs = (z, Tensor(states[0].uop.after(start_pos)), *states[1:], q, k, v, gate, beta, *conv_w, alpha, dt_bias, ssm_a, norm_w)
+  contig = tuple(x.uop if x.uop.has_buffer_identity(after_ok=True) else x.uop.contiguous() for x in srcs)
+  ins = tuple(x.uop for x in src or ())
+  params = [UOp.placeholder_like(x, slot=i) for i, x in enumerate(contig + ins)]
+  call = _kda_decode_kernel(*params[:17], _unbind(start_pos), *params[17:], lb=lb, eps=eps, token=token).call(*contig, *ins)
+  return Tensor(contig[0].after(call)), [Tensor(x.after(call)) for x in contig[1:5]]
+
 # *** top-k: a radix select of the scores' bits a byte a pass, chunks of TOPK_KEYS keys a workgroup, then the positions compacted
 
 TOPK_KEYS, TOPK_THREADS, TOPK_BINS = 1024, 288, 257  # (a chunk's keys, a workgroup's threads: a count each of a byte's values and above them)
