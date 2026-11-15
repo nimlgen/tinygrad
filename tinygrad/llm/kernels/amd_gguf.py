@@ -522,24 +522,34 @@ def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:U
   type_words = QUANT_SIZES[ggml_type]//raw.dtype.itemsize
   slot = slots[token_block].cast(dtypes.int32)
   output_words, slot_base = in_features * type_words // GGML_BLOCK_SIZE, slot.maximum(0).cast(dtypes.int64)*stride + offset
-  group = UOp.range((slot >= 0).where(in_features // Q8_GROUP_SIZE, 0), 4, AxisType.LOOP)
-  block, subgroup = group // 8, group % 8
+  # Unroll a weight block to share its metadata; four output tiles limit the gathered projection's register budget.
+  unroll = math.gcd(in_features//Q8_GROUP_SIZE, 2 if gathered else 8)
+  group = UOp.range((slot >= 0).where(in_features // (unroll*Q8_GROUP_SIZE), 0), 4, AxisType.LOOP)
   accs = [UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in outputs]
   accs = [acc.after(acc.store(acc.const_like(0))) for acc in accs]
   vals = [[acc.after(group)[j].load() for j in range(8)] for acc in accs]
-  words = [(h*4 + ph, h*4 + 2 + ph) if rdna4 else tuple(h*4 + i for i in range(4)) for h in range(2)]
-  afrags, xds = [_i8_frag(tuple(xq[xr(inputs[0]), group, w].load() for w in ws)) for ws in words], [xd[xr(r), group].load() for r in rows]
-  for o, output in enumerate(outputs):
-    base = slot_base + output*output_words + block*type_words
-    if ggml_type in SMALL_BLOCK_QUANTS: base = base + subgroup*SMALL_BLOCK_QUANTS[ggml_type]
-    scale = _half(raw[base])
-    if ggml_type == IQ3_XXS: scale = scale * ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
-    dot = UOp.stack(*[UOp.const(0, dtypes.int32)]*8)
-    for afrag, ws in zip(afrags, words): dot = UOp.wmma(afrag, _i8_frag(tuple(_quant_word(raw, base, subgroup, w, ggml_type, grid) for w in ws)),
-                                                        dot, WMMA_ARG[0], 32)
-    d = UOp.alloc((8,), dtypes.int32, addrspace=AddrSpace.REG)
-    d = d.after(d.store(dot))
-    vals[o] = [v + xds[j] * scale * d[j].load().float() for j, v in enumerate(vals[o])]
+  for phase in range(unroll):
+    g = group*unroll + phase
+    block, subgroup = g // 8, g % 8
+    words = [(h*4 + ph, h*4 + 2 + ph) if rdna4 else tuple(h*4 + i for i in range(4)) for h in range(2)]
+    afrags = [_i8_frag(tuple(xq[xr(inputs[0]), g, w].load() for w in ws)) for ws in words]
+    if gathered: xds = [xd[xr(r), g].load() for r in rows]
+    else:
+      # Each lane loads its input row's scale; broadcast the eight accumulator rows within the wave.
+      lane_scale = xd[inputs[0], g].load()
+      shuffle = UOp.custom_function("__builtin_amdgcn_ds_bpermute({}, {})", shape=lane_scale.shape, dtype=dtypes.uint32, fmt=True)
+      xds = [shuffle.call(((r%16)*4).cast(dtypes.uint32), lane_scale.bitcast(dtypes.uint32)).bitcast(dtypes.float32) for r in rows]
+    for o, output in enumerate(outputs):
+      base = slot_base + output*output_words + block*type_words
+      if ggml_type in SMALL_BLOCK_QUANTS: base = base + subgroup*SMALL_BLOCK_QUANTS[ggml_type]
+      scale = _half(raw[base])
+      if ggml_type == IQ3_XXS: scale = scale * ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
+      dot = UOp.stack(*[UOp.const(0, dtypes.int32)]*8)
+      for afrag, ws in zip(afrags, words): dot = UOp.wmma(afrag, _i8_frag(tuple(_quant_word(raw, base, subgroup, w, ggml_type, grid) for w in ws)),
+                                                          dot, WMMA_ARG[0], 32)
+      d = UOp.alloc((8,), dtypes.int32, addrspace=AddrSpace.REG)
+      d = d.after(d.store(dot))
+      vals[o] = [v + xds[j] * scale * d[j].load().float() for j, v in enumerate(vals[o])]
   update = UOp.group(*(acc.store(UOp.stack(*v)) for acc, v in zip(accs, vals))).end(group)
   stores = [out[r.valid(slot >= 0), output].store(acc.after(update)[j].load()) for output, acc in zip(outputs, accs) for j, r in enumerate(rows)]
   # (the work of every block: a block's loop bound is data)

@@ -582,6 +582,21 @@ class TestExpertLinear(unittest.TestCase):
     ref = (ref * w[:, None]).reshape(-1, per, self.LAT).sum(0)
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
 
+  def test_expert_gemm_q8(self):
+    from tinygrad.llm.kernels.amd_gguf import Q8_0
+    for cols in (32, 64, 96, 256):  # partial blocks as well as fully unrolled blocks
+      weights = q8_0_linear(Tensor(self.rng.standard_normal((32, cols)).astype(np.float32)), self.pool.device)
+      pool, stride = weights.weight, 16 * cols // 32 * 34
+      slots = Tensor([1, 0], dtype=dtypes.int32)
+      x = Tensor(self.rng.standard_normal((32, cols)).astype(np.float32))
+      out = expert_gemm(pool, slots, x, 16, cols, Q8_0, stride).numpy()
+      ref = expert_linear(pool, slots, x, 16, cols, Q8_0, stride, per=16).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+      xr = Tensor(self.rng.permutation(32).astype(np.int32))
+      out = expert_gemm(pool, slots, x, 16, cols, Q8_0, stride, xrow=xr).numpy()
+      ref = expert_linear(pool, slots, x[xr], 16, cols, Q8_0, stride, per=16).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()
