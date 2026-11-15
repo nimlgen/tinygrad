@@ -51,9 +51,9 @@ def parts(weights:dict[str, np.ndarray], li:int, e:int, part:int) -> list[bytes]
   return [(gate[g*u:(g+1)*u].tobytes() + up[g*u:(g+1)*u].tobytes() + down[:, g*u//32*34:(g+1)*u//32*34].tobytes()).ljust(part, b'\0')
           for g in range(G)]
 
-def eagle(folder:str, rng:np.random.Generator) -> str:
+def eagle(folder:str, rng:np.random.Generator, lora:int=16) -> str:
   """a tiny random EAGLE-3 head (kimi-k3-eagle3.1-mla's layout) on the hidden states after blocks 0, 1, 2"""
-  H, nope, rope, vd, lora, ql, ff, p, a = 2, 8, 8, 8, 16, 16, 32, "layers.0.", "layers.0.self_attn."
+  H, nope, rope, vd, ql, ff, p, a = 2, 8, 8, 8, 16, 32, "layers.0.", "layers.0.self_attn."
   json.dump({"num_attention_heads": H, "qk_nope_head_dim": nope, "qk_rope_head_dim": rope, "v_head_dim": vd, "kv_lora_rank": lora,
              "rms_norm_eps": 1e-5, "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}, "rope_theta": 10000.0, "rope_scaling":
              {"factor": 4.0, "original_max_position_embeddings": 16, "beta_fast": 32, "beta_slow": 1, "mscale_all_dim": 1.0}},

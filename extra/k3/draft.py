@@ -5,7 +5,7 @@ import json, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
 class Eagle3:
@@ -61,11 +61,15 @@ class Eagle3:
     h, cache = self.keys(tokens, hid, pos, self.cache.uop if cache is None else cache)
     q = self.lin(self.norm(self.lin(h, a + "q_a_proj"), a + "q_a_layernorm"), a + "q_b_proj").reshape(1, T, self.H, -1).transpose(1, 2)
     q_pe = apply_rope(q[..., self.nope:], self.freqs_cis[pos:pos + T], interleaved=True)
-    k = Tensor(cache)[:, :, :pos + T].float()
     # absorbed: the nope scores (q_nope k_b) . latent, causal over the cache, the values v_b (attention . latent)
     qa = (q[..., :self.nope].half() @ self.k_b).float().cat(q_pe.float(), dim=-1)
-    mask = (self.positions[:pos + T].reshape(1, 1, 1, -1) > self.positions[pos:pos + T].reshape(1, 1, T, 1)).where(float("-inf"), 0)
-    attn = ((qa @ k.transpose(-1, -2)) * (self.mscale ** 2 / math.sqrt(self.nope + self.rope)) + mask).softmax(-1) @ k[..., :self.lora]
+    scale = self.mscale ** 2 / math.sqrt(self.nope + self.rope)
+    if amd_custom_kernels_supported(qa.device) and self.lora % 32 == 0:
+      attn = mla_topk_attention(qa, Tensor(cache), None, pos, self.lora, scale)
+    else:
+      k = Tensor(cache)[:, :, :pos + T].float()
+      mask = (self.positions[:pos + T].reshape(1, 1, 1, -1) > self.positions[pos:pos + T].reshape(1, 1, T, 1)).where(float("-inf"), 0)
+      attn = ((qa @ k.transpose(-1, -2)) * scale + mask).softmax(-1) @ k[..., :self.lora]
     x = self.lin((attn.half() @ self.v_b.transpose(-1, -2)).transpose(1, 2).reshape(1, T, -1), a + "o_proj") + hid
     m = self.norm(x, p + "post_attention_layernorm")
     x = x + self.lin(self.lin(m, p + "mlp.gate_proj").silu() * self.lin(m, p + "mlp.up_proj"), p + "mlp.down_proj")
