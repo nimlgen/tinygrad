@@ -6,6 +6,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
   indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
+from tinygrad.llm.kernels.amd_gguf import q8_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
 from tinygrad.helpers import unwrap, round_up, get_child
@@ -660,11 +661,13 @@ class GatedDeltaNetBlock(FFNBlock):
       f = self.ssm_f(x) if hasattr(self, "ssm_f") else self.ssm_f_b(self.ssm_f_a(x))
       sts, conv_w = [[s[-1], *s[:-1]] for s in (self._states(), *self.kept[:T-1])], [w["weight"].flatten(1) for w in
                                                                                     (self.ssm_conv1d_q, self.ssm_conv1d_k, self.ssm_conv1d_v)]
-      z, src = None, sts[0] if T > 1 else None
+      zq:tuple[Tensor, ...] = ()
+      src = sts[0] if T > 1 else None
       for t in range(T):
-        z, src = kda_decode(q, k, v, g, b, f, conv_w, self.ssm_dt["bias"], self.ssm_a, unwrap(self.ssm_norm.weight), pos + t, lb, self.ssm_norm.eps,
-                            sts[(t + 1) % T], src, t, z)
-      return self.ssm_out(unwrap(z))
+        zq, src = kda_decode(q, k, v, g, b, f, conv_w, self.ssm_dt["bias"], self.ssm_a, unwrap(self.ssm_norm.weight), pos + t, lb,
+                             self.ssm_norm.eps, sts[(t + 1) % T], src, t, zq)
+      # (the out projection on the kernel's q8 of z)
+      return q8_linear(self.ssm_out, zq[0], zq[1:]) if self.ssm_out.ggml_type in QUANT_SIZES else self.ssm_out(zq[0])
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)

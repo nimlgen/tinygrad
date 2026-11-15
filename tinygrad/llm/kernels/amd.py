@@ -483,12 +483,13 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
 KDA_ROWS = 8  # the rows of a head's state a wave updates in kda_decode
 
 @functools.cache
-def _kda_decode_kernel(z:UOp, state:UOp, cq:UOp, ck:UOp, cv:UOp, q:UOp, k:UOp, v:UOp, gate:UOp, beta:UOp, wq:UOp, wk:UOp, wv:UOp,
-                       alpha:UOp, dt_bias:UOp, ssm_a:UOp, norm_w:UOp, start_pos:UOp, *src:UOp, lb:float, eps:float, token:int) -> UOp:
+def _kda_decode_kernel(z:UOp, q8:UOp, scale:UOp, xsum:UOp, state:UOp, cq:UOp, ck:UOp, cv:UOp, q:UOp, k:UOp, v:UOp, gate:UOp, beta:UOp,
+                       wq:UOp, wk:UOp, wv:UOp, alpha:UOp, dt_bias:UOp, ssm_a:UOp, norm_w:UOp, start_pos:UOp, *src:UOp, lb:float, eps:float,
+                       token:int) -> UOp:
   """a kda token (token's row of the step's inputs and of z), a workgroup a head: a thread a channel's short convs and silu of q, k and v and
   its decay (to LDS, the convs' windows shifted into cq, ck, cv), then a wave KDA_ROWS rows of the state, a lane 32 apart columns of them:
-  the l2 norms of q and k, the delta rule on the rows (into state), the output's rms norm and sigmoid gate into z. the states read from
-  src (state, cq, ck, cv) if given, else in place (from k31's engine)"""
+  the l2 norms of q and k, the delta rule on the rows (into state), the output's rms norm and sigmoid gate into z and its q8 (q8_quantize's:
+  a wave a group). the states read from src (state, cq, ck, cv) if given, else in place (from k31's engine)"""
   s_in, *c_in = src or (state, cq, ck, cv)
   _, H, hv, hk = cast(tuple[int, int, int, int], state.shape)
   R, W, zero, initial = cast(int, cq.shape[1]), hv // KDA_ROWS, UOp.const(0, dtypes.float), start_pos.eq(0)
@@ -524,23 +525,37 @@ def _kda_decode_kernel(z:UOp, state:UOp, cq:UOp, ck:UOp, cv:UOp, q:UOp, k:UOp, v
   cl, ss = UOp.alloc((hv,), dtypes.float, addrspace=AddrSpace.LOCAL), UOp.alloc((W,), dtypes.float, addrspace=AddrSpace.LOCAL)
   cl = cl.after(bar:=UOp.group(*[cl[r].store(c) for r, c in zip(rows, core)], ss[wave].store(sum((c*c for c in core), zero))).barrier())
   rs = (sum((ss.after(bar)[w].load() for w in range(1, W)), ss.after(bar)[0].load()) * (1/hv) + eps).rsqrt()
-  out = cl[tc].load() * rs * norm_w[tc].load().float() * row(gate, head*hv + tc).load().float().sigmoid()
-  stores.append(row(z, (head*hv + tc).valid(live)).store(out.cast(z.dtype)))
+  out = (cl[tc].load() * rs * norm_w[tc].load().float() * row(gate, head*hv + tc).load().float().sigmoid()).cast(z.dtype)
+  stores.append(row(z, (head*hv + tc).valid(live)).store(out))
+  # (every lane of a quad its word, of a half its sum: the same values stored again, no lane gates)
+  value, g = out.float(), (token*H + head)*(hv//32) + wave
+  d = UOp.custom_function("({0}/127.0f)", shape=(), dtype=dtypes.float, fmt=True).call(warp_reduce(value.abs(), maximum=True, full_wave=True))
+  d = d.maximum(1e-8)
+  quant = UOp.custom_function("__builtin_nearbyintf({0}/{1})", shape=(), dtype=dtypes.float, fmt=True).call(value, d).clip(-127, 127)
+  word = quant.cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
+  for offset in (1, 2):
+    word |= UOp.custom_function(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f|offset<<10})", shape=(), dtype=dtypes.uint32, fmt=True).call(word)
+  stores += [q8.reshape(-1)[(g*8 + lane//4).valid(live)].store(word), scale.reshape(-1)[g.valid(live)].store(d),
+             xsum.reshape(-1)[(g*2 + lane//16).valid(live)].store(warp_reduce(quant.cast(dtypes.int8).float()))]
   return UOp.group(*stores).end(lane, wave, head).sink(arg=KernelInfo(name="kda_decode", opts_to_apply=()))
 
 def kda_decode(q:Tensor, k:Tensor, v:Tensor, gate:Tensor, beta:Tensor, alpha:Tensor, conv_w:list[Tensor], dt_bias:Tensor, ssm_a:Tensor,
                norm_w:Tensor, start_pos:UOp, lb:float, eps:float, states:list[Tensor], src:list[Tensor]|None=None, token:int=0,
-               z:Tensor|None=None) -> tuple[Tensor, list[Tensor]]:
-  """GatedDeltaNetBlock._attention's normed and gated outputs z (B, T, inner) for token of a step's T from the outputs of its linears (q, k, v,
-  gate, beta, the decay's alpha), in one kernel: z (the earlier tokens' rows those of z) and states [recurrent, conv q, k, v] it wrote in place
-  (read from src instead if given)"""
-  if z is None: z = Tensor.empty(*q.shape[:2], gate.shape[-1], dtype=dtypes.half, device=q.device, axis=None if gate.uop.axis is None else 2)
-  srcs = (z, Tensor(states[0].uop.after(start_pos)), *states[1:], q, k, v, gate, beta, *conv_w, alpha, dt_bias, ssm_a, norm_w)
+               z:tuple[Tensor, ...]=()) -> tuple[tuple[Tensor, ...], list[Tensor]]:
+  """GatedDeltaNetBlock._attention's normed and gated outputs z (B, T, inner) and their q8 (q8_quantize's) for token of a step's T from the
+  outputs of its linears (q, k, v, gate, beta, the decay's alpha), in one kernel: (z, its q8) (the earlier tokens' rows those of z) and the
+  states [recurrent, conv q, k, v] it wrote in place (read from src instead if given)"""
+  if not z:
+    T, inner, local = int(q.shape[1]), int(gate.shape[-1]), int(gate.uop.shard_shape[-1])
+    z = (Tensor.empty(*q.shape[:2], inner, dtype=dtypes.half, device=q.device, axis=None if gate.uop.axis is None else 2),
+         Tensor.empty(T, local//32, 8, dtype=dtypes.uint32, device=q.device), Tensor.empty(T, local//32, dtype=dtypes.float32, device=q.device),
+         Tensor.empty(T, local//32, 2, dtype=dtypes.float32, device=q.device))
+  srcs = (*z, Tensor(states[0].uop.after(start_pos)), *states[1:], q, k, v, gate, beta, *conv_w, alpha, dt_bias, ssm_a, norm_w)
   contig = tuple(x.uop if x.uop.has_buffer_identity(after_ok=True) else x.uop.contiguous() for x in srcs)
   ins = tuple(x.uop for x in src or ())
   params = [UOp.placeholder_like(x, slot=i) for i, x in enumerate(contig + ins)]
-  call = _kda_decode_kernel(*params[:17], _unbind(start_pos), *params[17:], lb=lb, eps=eps, token=token).call(*contig, *ins)
-  return Tensor(contig[0].after(call)), [Tensor(x.after(call)) for x in contig[1:5]]
+  call = _kda_decode_kernel(*params[:20], _unbind(start_pos), *params[20:], lb=lb, eps=eps, token=token).call(*contig, *ins)
+  return tuple(Tensor(x.after(call)) for x in contig[:4]), [Tensor(x.after(call)) for x in contig[4:8]]
 
 # *** top-k: a radix select of the scores' bits a byte a pass, chunks of TOPK_KEYS keys a workgroup, then the positions compacted
 

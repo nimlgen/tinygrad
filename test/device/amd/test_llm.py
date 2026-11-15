@@ -4,7 +4,7 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores, mla_topk_attention)
+                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, indexer_scores, mla_topk_attention, kda_decode)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS, SMALL_BLOCK_QUANTS,
   Q4_K, IQ3_S, IQ3_XXS)
@@ -671,6 +671,16 @@ class TestTopk(unittest.TestCase):
     for got, want in zip(*(steps(m, dev) for m, dev in zip(models, (Device.DEFAULT, "CPU")))):
       np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
+  def test_kda_decode_q8(self): # kda_decode's q8 of its outputs as q8_quantize's of them
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA required")
+    rng, H, D, R = np.random.default_rng(2), 2, 32, 3
+    def t(*shape): return Tensor(rng.standard_normal(shape).astype(np.float32)).realize()
+    states = [t(1, H, D, D), *(t(1, R, H*D) for _ in range(3))]
+    pos = UOp.variable("start_pos", 0, 15).bind(4)
+    zq, _ = kda_decode(t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H*D), t(1, 1, H), t(1, 1, H*D), [t(H*D, R+1) for _ in range(3)],
+                       t(H*D), t(H, 1), t(D), pos, -5.0, 1e-5, states)
+    Tensor.realize(*zq)
+    for got, want in zip(zq[1:], q8_quantize(zq[0], 1, H*D)): np.testing.assert_array_equal(got.numpy(), want.numpy())
 
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot

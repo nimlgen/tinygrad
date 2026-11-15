@@ -550,7 +550,8 @@ def expert_gemm(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_featur
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   return ret.reshape(ndev, n, out_features) if ndev > 1 else ret
 
-def q8_linear(layer:Linear, x:Tensor) -> Tensor:
+def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=()) -> Tensor:
+  """layer(x) on the q8 of x (xq: its q8, from the kernel that made x)"""
   assert layer.ggml_type in QUANT_SIZES
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
@@ -572,7 +573,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cdna=cdna)
-    srcs = (*q8_quantize(x, tokens, in_features), *extra)
+    srcs = (*(xq or q8_quantize(x, tokens, in_features)), *extra)
     out_shape += ((in_features+1023)//1024,)
   out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
