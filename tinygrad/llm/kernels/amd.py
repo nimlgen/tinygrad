@@ -961,9 +961,9 @@ def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int, streams:int, d
   return store.end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_partial", opts_to_apply=()))
 
 @functools.cache
-def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:int, dim:int, eps:float, norm_eps:float) -> UOp:
+def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:int, dim:int, eps:float, norm_eps:float, count:UOp|None) -> UOp:
   """y = rmsnorm(sum_s p_s xs_s) * wn, p the softmax over the streams of (rmsnorm(xs_s) * wm).sum(): a workgroup sums its token's partials
-  (the norm's sum of squares is p G p of the gram matrix G) and does its slice"""
+  (the norm's sum of squares is p G p of the gram matrix G) and does its slice. count: the streams mixed (the rest zero, left out)"""
   G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
   t, NP, zero = tw//G, streams*(streams+1)//2, UOp.const(0, dtypes.float)
   tot = UOp.alloc((NP + streams,), dtypes.float, addrspace=AddrSpace.LOCAL)
@@ -972,6 +972,7 @@ def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:in
   pair = {sr: j for j, sr in enumerate((s, r) for s in range(streams) for r in range(s, streams))}
   def gram(s:int, r:int) -> UOp: return tot[pair[min(s, r), max(s, r)]].load()
   score = [tot[NP + s].load() / (gram(s, s) * (1/dim) + eps).sqrt() for s in range(streams)]
+  if count is not None: score = [(s < count).where(sc, -math.inf) for s, sc in enumerate(score)]
   m = functools.reduce(UOp.maximum, score)
   e = [((sc - m) * math.log2(math.e)).exp2() for sc in score]
   esum = sum(e[1:], e[0])
@@ -980,12 +981,13 @@ def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:in
                                                          / esum * rn * wn[i].load().float()) for i in idx]) \
     .end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_norm", opts_to_apply=()))
 
-def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float) -> Tensor:
-  """rmsnorm(the mix of the residual streams xs (B, T, streams, dim) by wm) * wn: (B, T, dim)"""
+def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float, count:UOp|None=None) -> Tensor:
+  """rmsnorm(the mix of the residual streams xs (B, T, streams, dim) by wm) * wn: (B, T, dim), of its first count streams (the others zero)"""
   B, T, streams, dim = cast(tuple[int, int, int, int], xs.shape)
   assert 1 <= streams <= RES_MAX_STREAMS
   part = Tensor.empty(B*T*dim // (RES_WAVES*RES_PER*WARP_SIZE), streams*(streams+1)//2 + streams, dtype=dtypes.float32, device=xs.device)
   part = Tensor.custom_kernel(part, xs, wm, fxn=functools.partial(_res_mix_partial_kernel, tokens=B*T, streams=streams, dim=dim))[0]
   y = Tensor.empty(B, T, dim, dtype=dtypes.float32, device=xs.device)
-  fxn = functools.partial(_res_mix_norm_kernel, tokens=B*T, streams=streams, dim=dim, eps=eps, norm_eps=norm_eps)
-  return Tensor.custom_kernel(y, part, wn, xs, fxn=fxn)[0]
+  fxn = functools.partial(_res_mix_norm_kernel, tokens=B*T, streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
+                          count=None if count is None else _unbind(count))
+  return Tensor.custom_kernel(y, part, wn, xs if count is None else _carry(xs, count), fxn=fxn)[0]

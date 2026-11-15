@@ -6,13 +6,14 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import collections, ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
-from tinygrad import Tensor, TinyJit, UOp, dtypes, nn
-from tinygrad.helpers import DEBUG, getenv, prod
+from typing import Callable
+from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
+from tinygrad.helpers import DEBUG, getenv, prod, round_up
 from tinygrad.uop.ops import Ops
-from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
+from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum
-from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_gemm, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last
+from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_gemm, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3
 
@@ -24,7 +25,7 @@ SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
 
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False,
-               chunk:int=0):
+               chunk:int=0, window:int=0):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens or (a prompt's) chunk tokens, keeping their
     logits or not"""
@@ -35,7 +36,7 @@ class Engine:
     assert len(set(m["part_bytes"])) == 1 and len(set(m["units"])) == 1 and len(m["units"]) == G, "a part of every expert on each gpu"
     assert E <= 4096 and K <= 64 and tokens <= 8 and tokens * K <= 512 and 32 * tokens <= 1024 and (not chunk or E <= 1024), \
     "past the host's fixed arrays"
-    self.tokens, self.chunk, n = tokens, chunk, max(tokens, chunk)  # (n: a step's most tokens)
+    self.tokens, self.chunk, n = tokens, chunk, max(tokens, chunk, window)  # (n: a step's or a window's most tokens)
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: entry j*T+t is token t's j-th expert and its weight;
@@ -44,7 +45,7 @@ class Engine:
     part = [1 + max(2 * k * tokens, 2 * K * chunk + 17 * (K * chunk // 16 + E)) for k in self.ks]  # (a part's words)
     bufs = [[host_tensor(self.devs, sz, dt) for sz, dt in ((1, dtypes.uint32), (n * 2 * E // G, dtypes.float32), *((p, dtypes.uint32) for p in part))]
             for _ in blocks]
-    self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
+    self.bufs, self.tags, self.parts = bufs, [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
     self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
@@ -71,7 +72,7 @@ class Engine:
     self.v_pos, self.v_live = UOp.variable("start_pos", 0, model.max_context - 1), UOp.variable("live", 1, max(chunk, 1))
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * n, dtypes.int32)  # (a step's [done | tokens | guesses])
-    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, chunk} - {0})}
+    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens} | ({chunk} if chunk and not window else set()))}
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
     self.cres, (self.cres_np,) = host_tensor(self.devs[0], max(tokens - 1, 1), dtypes.int32)  # ([done | guesses])
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
@@ -81,8 +82,10 @@ class Engine:
     # the chunk's graph (planned on a pool of a slot, before it's captured)
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
     def pool(n:int) -> Tensor: return Tensor.zeros(G * n * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
-    self.pool = pool(1)
-    self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE - (self.planned(chunk) if chunk else 0)) // self.part
+    self.pool, self.W = pool(1), 0
+    if window: self.window_init(window)
+    planned = self.planned(chunk) if chunk and not window else 0
+    self.slots = slots = slots or (min(free_bytes(d) for d in self.devs) - SPARE - planned) // self.part
     self.pool = pool(slots)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
@@ -205,6 +208,179 @@ class Engine:
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // self.block[1] * self.block[0], self.qtype).reshape(-1, n, out_f, in_f)
     return (w * (x if x.ndim == 3 else x[Tensor.arange(n) % x.shape[0]]).unsqueeze(-2)).sum(-1)
 
+  # *** a prompt's window: the blocks a layer at a time over up to W tokens (layer major: a layer's experts read once a window). a layer's
+  # attention, the mixes and the shared experts in steps of a chunk, its tokens' routed experts once over the window. the residual streams of
+  # the window's tokens in a bank, a layer adds to its last one. the graphs are a kind's (blocks of the same buffers): a block's buffers its
+  # args, the first of the kind's block captures it
+
+  def window_init(self, W:int):
+    m, c, devs, E = self.model, self.model.config, self.devs, self.m["n_experts"]
+    self.W, S = W, 1 + sum(b.attn_res_score.new_block for b in m.blk)
+    self.bank = Tensor.zeros(1, W, S, c.dim, device=devs).contiguous().realize()
+    # the window's moe inputs and outputs: the experts' inputs, the router's logits, the shared experts' and the routed experts' outputs
+    self.win = {k: Tensor.zeros(W, n, device=devs).contiguous().realize() for k, n in (("h", self.lat), ("logits", E), ("shared", c.dim),
+                                                                                       ("out", self.lat))}
+    self.taps = Tensor.zeros(1, W, len(self.draft.layers) if self.draft else 1, c.dim, device=devs).contiguous().realize()
+    self.v_c0, self.v_wlive = UOp.variable("c0", 0, W - self.chunk), UOp.variable("wlive", 1, W)
+    self.v_n, self.v_s, self.v_tap = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1), UOp.variable("tap", 0, self.taps.shape[2] - 1)
+    self.kinds:dict[tuple, tuple[FFNBlock, Callable, list[Tensor]]] = {}  # (a kind's, and a stage of a block's: its args)
+    K, R = c.num_experts_per_tok, round_up(W * c.num_experts_per_tok + 63 * E, 64)  # (the window's routes: weights, rows, entries, tiles)
+    self.routes = [Tensor.zeros(*sh, dtype=dt, device=devs).contiguous().realize() for sh, dt in (((W, K), dtypes.float32), ((W * K,), dtypes.int32),
+                                                                                                 ((R,), dtypes.int32), ((R // 64,), dtypes.int32))]
+    self.tap_jit, self.fill_jit = TinyJit(self.tap), TinyJit(self.fill) if self.draft else None
+    self.route_jit, self.experts_jit, self.start_jit = TinyJit(self.window_route), TinyJit(self.window_experts), TinyJit(self.start)
+    # every kind's graphs captured on its first block (its buffers the args) on dry chunks at position 0 (the host's flags preset: slot 0)
+    moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
+    for b, (name, fxn) in itertools.product(m.blk, (("attend", self.attend), ("post", self.post))):
+      if name == "post" and b not in moe: continue
+      jit, args, first = self.kind(name, b, fxn)
+      if first is not b: continue
+      vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
+        (self.v_c0.bind(0), self.v_s.bind(0))
+      for _ in range(3): jit(*vs, *args)
+    li = self.m["layers"].index(m.blk.index(moe[0]))
+    for _ in range(3):
+      self.start_jit()
+      self.route_jit(self.v_wlive.bind(self.chunk), moe[0].exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+      self.experts_jit(self.pool, self.parts[0][li])
+      self.tap_jit(self.v_s.bind(0), self.v_tap.bind(0))
+      if self.fill_jit: self.fill_jit(self.v_pos.bind(0), self.v_c0.bind(0))
+
+  def scorer(self, b:FFNBlock) -> Tensor|Linear|None:  # (a moe block's router, the engine's)
+    return self.scorers[self.m["layers"].index(i)] if (i:=self.model.blk.index(b)) in self.m["layers"] else None
+
+  def kind(self, name:str, b:FFNBlock, fxn:Callable) -> tuple[Callable, list[Tensor], FFNBlock]:
+    """b's graph of a stage (its kind's), b's buffers and its router's (its args) and the kind's first block (the one it's captured on)"""
+    if (name, b) not in self.kinds:
+      seen:dict[UOp, None] = {}
+      for t in nn.state.get_state_dict([b, self.scorer(b)]).values():
+        for u in t.uop.toposort():
+          if u.op is Ops.BUFFER: seen.setdefault(u, None)
+      key = (name, type(b), tuple((u.shape, u.dtype, u.nbytes()) for u in seen))
+      if key not in self.kinds: self.kinds[key] = (b, TinyJit(functools.partial(fxn, b)), [])
+      self.kinds[(name, b)] = (*self.kinds[key][:2], [Tensor(u) for u in seen])
+    first, jit, args = self.kinds[(name, b)]
+    return jit, args, first
+
+  def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_) -> Tensor:
+    """a chunk's attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a moe's
+    parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s"""
+    C, bank = self.chunk, Tensor(self.bank.uop)
+    h = b.attn_res_score.mix(bank[:, c0:c0 + C], b.attn_norm, n)
+    a = b._attention(h, (pos,), b._indexer_mask(h, (pos,), None), live)
+    bank = Tensor(self.bank.uop.after(bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + a).uop))
+    x = b.ffn_res_score.mix(bank[:, c0:c0 + C], b.ffn_norm, s + 1)
+    if not hasattr(b, "ffn_gate_inp"): return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + b._feed_forward(x)).realize()
+    logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
+    logits = logits.reshape(C, len(self.devs), 2, -1)[:, :, 0].reshape(C, -1).contiguous()
+    logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
+    outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["shared"], b._shared(x)[0]), (self.win["logits"], logits)]
+    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + C].assign(v) for t, v in outs])[0]
+
+  def window_route(self, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor) -> Tensor:
+    """the gpus route the window's live tokens (its tiles of an expert's rows), the expert counts to the host (part 2, then the tag)"""
+    K, E = self.model.config.num_experts_per_tok, self.m["n_experts"]
+    routed = moe_route(Tensor(self.win["logits"].uop), bias, K, live=live)
+    kept = Tensor.realize(*(Tensor(t.uop).assign(v) for t, v in zip(self.routes, routed[:4])))
+    counted = Tensor(part2.uop)[1:1 + E].assign(routed[4].bitcast(dtypes.uint32))
+    ones = Tensor.ones(len(self.devs), 1, dtype=dtypes.uint32).contiguous().shard(self.devs, 0)  # (a gpu's tag)
+    return Tensor(tag.uop.after(counted.uop, kept.uop)).assign(ones).realize()
+
+  def window_experts(self, pool:Tensor, part1:Tensor) -> Tensor:
+    """the window's routed experts once the host gave their slots (part 1): each gpu its units of the experts in tiles of an expert's rows,
+    summed over the gpus"""
+    K, E, u, off = self.model.config.num_experts_per_tok, self.m["n_experts"], self.units, 2 * self.units * self.lat // self.block[0] * self.block[1]
+    w, pos, entries, tiles = (Tensor(t.uop) for t in self.routes)
+    slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
+    tslot, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
+    a = expert_tiles(pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, self.part, xrow=xrow, act=self.act)
+    y = expert_tiles(pool, tslot, a, self.lat, u, self.part, off)
+    out = (y[:, pos.maximum(0)].float() * w.reshape(1, -1, 1)).reshape(len(self.devs), -1, K, self.lat).sum(2)
+    return Tensor(self.win["out"].uop).assign(partial_sum(out)).realize()
+
+  def post(self, b:FFNBlock, c0:UOp, s:UOp, *_) -> Tensor:
+    """a chunk's routed and shared experts' outputs into the block's, added to stream s"""
+    C, bank = self.chunk, Tensor(self.bank.uop)
+    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + C].unsqueeze(0), Tensor(self.win["shared"].uop)[c0:c0 + C].unsqueeze(0))
+    return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + y).realize()
+
+  def tap(self, s:UOp, j:UOp) -> Tensor:  # (the draft's input: stream s after a block its tap j)
+    return Tensor(self.taps.uop)[:, :, j].assign(Tensor(self.bank.uop)[:, :, s]).realize()
+
+  def fill(self, pos:UOp, c0:UOp) -> Tensor:  # (the draft's cache of a chunk of the window)
+    C = self.chunk
+    return self.draft.fill(self.given[c0:c0 + C].reshape(1, C).to(self.devs), Tensor(self.taps.uop)[:, c0:c0 + C], pos).realize()
+
+  def start(self) -> Tensor:  # (the bank's streams: the window's tokens' embeddings, the rest zero)
+    emb = self.model.token_embd(self.tok[:self.W].reshape(1, self.W).to(self.devs)).float().unsqueeze(2)
+    return Tensor(self.bank.uop).assign(emb.pad(((0, 0), (0, 0), (0, self.bank.shape[2] - 1), (0, 0)))).realize()
+
+  def window(self, toks:list[int], pos:int, given:list[int]):
+    """the tokens at positions pos.. through every block, a layer at a time: the caches and states as after steps of them, the draft's cache"""
+    T, C = len(toks), self.chunk
+    assert T <= self.W and pos + round_up(T, C) <= self.max_context
+    self.tok_np[:T], self.given_np[:T] = toks, given
+    self.start_jit()
+    host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
+    self.layers(T, pos)
+    for c0 in range(0, T, C) if self.fill_jit else []: self.fill_jit(self.v_pos.bind(pos + c0), self.v_c0.bind(c0))
+    for d in self.devs: Device[d].synchronize()
+
+  def layers(self, T:int, pos:int):
+    """a window's blocks, a layer at a time, the host serving each moe layer's experts"""
+    chunks, n = [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)], 1
+    for i, b in enumerate(self.model.blk):
+      s = n - 1 + int(b.attn_res_score.new_block)
+      jit, args, _ = self.kind("attend", b, self.attend)
+      for c0, live in chunks: jit(self.v_pos.bind(pos + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
+      if hasattr(b, "ffn_gate_inp"):
+        li = self.m["layers"].index(i)
+        self.route_jit(self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+        self.serve(li)
+        self.experts_jit(self.pool, self.parts[0][li])
+        jit, args, _ = self.kind("post", b, self.post)
+        for c0, _ in chunks: jit(self.v_c0.bind(c0), self.v_s.bind(s), *args)
+      if self.draft and i in self.draft.layers: self.tap_jit(self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
+      n = s + 1
+
+  def serve(self, li:int):
+    """the host's part of layer li of a window: the experts its tokens route to read in (the missing ones into the least used slots but the
+    layer's, those read ahead waited for), their slots given to the gpus. then, when its tokens route to nearly all of its experts, the next
+    layer's read ahead while the gpus work"""
+    E, st, io, t0 = self.m["n_experts"], self.state, self.io, time.perf_counter()
+    tags, part1, part2 = (self.bufs[li][k][1] for k in (0, 2, 3))
+    while not all(t[0] == 1 for t in tags):
+      if any(t[0] == 2 for t in tags) or time.perf_counter() - t0 > 60: raise RuntimeError(f"window layer {li}: no counts from the gpus")
+    counts, t1 = part2[0][1:1 + E].copy(), time.perf_counter()
+    codes = li * E + np.nonzero(counts)[0]
+    self.read(codes, codes, wait=True)
+    io.t_gpu, io.t_reads = io.t_gpu + t1 - t0, io.t_reads + time.perf_counter() - t1
+    for p in part1: p[1:1 + E] = st["slot_of"][li * E:(li + 1) * E].view(np.uint32)
+    f = st["freq"][li * E:(li + 1) * E]
+    f[:] = f * io.decay + counts
+    if li + 1 < len(self.parts[0]) and len(codes) >= 0.9 * E: self.read((li + 1) * E + np.arange(E), codes, wait=False)
+
+  def read(self, codes:np.ndarray, busy:np.ndarray, wait:bool):
+    """the codes not cached read into the least used slots but those of busy's codes (in use or read): waited for (and those read ahead), or
+    not (read ahead)"""
+    st, io = self.state, self.io
+    reads = [np.ascontiguousarray(a, np.int64) for a in (codes[st["flying"][codes] > 0], codes[st["slot_of"][codes] < 0])]
+    if wait and len(reads[0]) and (err:=host_c().read_wait(ctypes.byref(io), len(reads[0]), reads[0].ctypes.data)):
+      raise RuntimeError(f"window reads failed {err}")
+    if not len(miss:=reads[1]): return
+    keep = np.zeros(self.slots, bool)
+    keep[st["slot_of"][busy][st["slot_of"][busy] >= 0]] = True
+    old = st["expert_in"]
+    keep |= (old >= 0) & (st["flying"][np.maximum(old, 0)] > 0)
+    victims = np.ascontiguousarray(np.argsort(np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0)),
+                                              kind="stable")[:len(miss)], np.int64)
+    st["slot_of"][old[victims][old[victims] >= 0]] = -1
+    st["slot_of"][miss], st["expert_in"][victims] = victims, miss
+    io.misses += len(miss)
+    if not wait: return host_c().read_async(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)
+    if (err:=host_c().read_codes(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)):
+      raise RuntimeError(f"window reads failed {err}")
+
   # *** the host's side
 
   def warm(self):
@@ -258,13 +434,14 @@ class Engine:
   def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
 
   def prefill(self, tokens:list[int], pos:int) -> int:
-    """tokens from pos on but the last fed in steps of a chunk (exact routing, every expert of a layer read in), the last one partial (its
-    rows padded) unless it's under a quarter of a chunk (a token a step is faster), the position after them"""
+    """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each) or steps of a chunk, the
+    last one partial (its rows padded), unless they're under a quarter of a chunk (a token a step is faster), the position after them"""
     if not self.chunk: return pos
     end = len(tokens) - 1
-    while pos < end and pos + self.chunk <= self.max_context:
-      if (n:=min(self.chunk, end - pos)) < self.chunk // 4: break
-      self.step(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
+    size = -(-(end - pos) // -(-(end - pos) // self.W)) if self.W and end > pos else self.chunk
+    while pos < end and pos + round_up(n:=min(size, end - pos), self.chunk) <= self.max_context:
+      if n < self.chunk // 4: break
+      (self.window if self.W else self.step)(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
       pos += n
     return pos
 
@@ -328,9 +505,9 @@ if __name__ == "__main__":
   draft = Eagle3(d, lambda t: model.token_embd(t).float(), model.token_embd.weight.device, model.max_context) if (d:=getenv("DRAFT", "")) \
     else None
   # VERIFY=n: a verify step's tokens, the next and the draft's chain of n-1 guesses (an EVAL: its steps of n tokens)
-  # CHUNK=n: a prompt fed in steps of n tokens (0: a token a step)
+  # CHUNK=n: a prompt fed in steps of n tokens (0: a token a step), WINDOW=n: in windows of up to n tokens (a layer at a time, chunks of CHUNK)
   eng = Engine(model, m, tokens=getenv("VERIFY", 2 if draft else 1), guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
-               chunk=getenv("CHUNK", 256))
+               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0))
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)

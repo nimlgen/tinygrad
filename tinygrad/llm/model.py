@@ -201,11 +201,13 @@ class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
     self.weight, self.norm_eps, self.new_block = Tensor.zeros(config.dim), config.norm_eps, new_block
 
-  def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None) -> Tensor:  # xs: (B, T, N, D) streams: (B, T, D), then the norm
+  def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None, count:UOp|None=None) -> Tensor:
+    # xs: (B, T, N, D) streams: (B, T, D), then the norm. count: the streams mixed, the rest (zero) left out
     if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[2] <= RES_MAX_STREAMS and \
        xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
-      return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps)
+      return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps, count)
     scores = (xs.rmsnorm(eps=self.norm_eps) * self.weight).sum(-1, keepdim=True)
+    if count is not None: scores = (Tensor.arange(xs.shape[2]).to(xs.device).reshape(-1, 1) < Tensor(count)).where(scores, -math.inf)
     out = (scores.softmax(2) * xs).sum(2)
     return out if norm is None else norm(out)
 
@@ -322,16 +324,19 @@ class FFNBlock:
     return out.sum(0) if out.ndim == x.ndim + 1 else out
 
   def _feed_forward(self, x:Tensor) -> Tensor:
-    if hasattr(self, 'ffn_gate_inp'):
-      # (the latent projections sharded on their outputs: gathered)
-      out = self._routed(x, allgather_last(self.ffn_routed_down(x)) if self.config.expert_latent_dim else x)
-      if self.config.expert_latent_dim: out = allgather_last(self.ffn_routed_up(self.ffn_routed_norm(out)))
-      if hasattr(self, 'ffn_gate_shexp'):
-        shexp = self.ffn_down_shexp(gated_activation(self.ffn_gate_shexp(x), self.ffn_up_shexp(x), self.config).contiguous())
-        if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
-        out = out + shexp
-      return out
+    if hasattr(self, 'ffn_gate_inp'): return self._expert_output(self._routed(x, self._expert_input(x)), self._shared(x))
     return self.ffn_down(gated_activation(self.ffn_gate(x), self.ffn_up(x), self.config))
+
+  # a moe's feed forward in parts (a prompt's window routes its tokens' experts between them): the routed experts' input, the shared experts'
+  # output and the routed experts' output out (the same rows) to the block's. the latent projections sharded on their outputs: gathered
+  def _expert_input(self, x:Tensor) -> Tensor: return allgather_last(self.ffn_routed_down(x)) if self.config.expert_latent_dim else x
+  def _shared(self, x:Tensor) -> Tensor|None:
+    if not hasattr(self, 'ffn_gate_shexp'): return None
+    shexp = self.ffn_down_shexp(gated_activation(self.ffn_gate_shexp(x), self.ffn_up_shexp(x), self.config).contiguous())
+    return shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid() if hasattr(self, 'ffn_gate_inp_shexp') else shexp
+  def _expert_output(self, out:Tensor, shexp:Tensor|None) -> Tensor:
+    if self.config.expert_latent_dim: out = allgather_last(self.ffn_routed_up(self.ffn_routed_norm(out)))
+    return out if shexp is None else out + shexp
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len

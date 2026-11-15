@@ -655,7 +655,7 @@ class TestMoeRoute(unittest.TestCase):
     logits, bias = rng.standard_normal((T, E)).astype(np.float32), (rng.standard_normal(E) * 0.1).astype(np.float32)
     logits[:, 100:140] = logits[:, :40]  # (ties)
     bias[100:140] = bias[:40]
-    w, pos, entries, tiles = (t.numpy() for t in moe_route(Tensor(logits), Tensor(bias), K, tile))
+    w, pos, entries, tiles, counts_gpu = (t.numpy() for t in moe_route(Tensor(logits), Tensor(bias), K, tile))
     sig = np.float32(1) / (np.float32(1) + np.exp(-logits))
     sel = np.lexsort((np.broadcast_to(np.arange(E), (T, E)), -(sig + bias)), axis=-1)[:, :K]
     top = np.take_along_axis(sig, sel, 1)
@@ -666,8 +666,16 @@ class TestMoeRoute(unittest.TestCase):
     np.testing.assert_equal(entries[pos], i)
     np.testing.assert_equal(tiles[pos // tile], sel.reshape(-1))
     counts = np.bincount(sel.reshape(-1), minlength=E)
+    np.testing.assert_equal(counts_gpu, counts)
     np.testing.assert_equal(np.sort(tiles[tiles >= 0]), np.repeat(np.arange(E), (counts + tile - 1) // tile))
     self.assertEqual((entries >= 0).sum(), T * K)
+    live = 211  # (the tokens from live on not routed: no rows, weight 0)
+    Tensor.realize(*(outs:=moe_route(Tensor(logits), Tensor(bias), K, tile, UOp.variable("live", 1, T).bind(live))))
+    w2, pos2, entries2, _, counts2 = (t.numpy() for t in outs)
+    np.testing.assert_equal(pos2.reshape(T, K)[live:], -1)
+    np.testing.assert_equal(w2[live:], 0)
+    np.testing.assert_equal(counts2, np.bincount(sel[:live].reshape(-1), minlength=E))
+    np.testing.assert_equal(np.sort(entries2[entries2 >= 0]), np.arange(live * K))
 
 class TestTopk(unittest.TestCase):
   def setUp(self):
