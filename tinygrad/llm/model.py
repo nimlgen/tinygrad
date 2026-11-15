@@ -670,7 +670,7 @@ class GatedDeltaNetBlock(FFNBlock):
       src = sts[0] if T > 1 else None
       for t in range(T):
         zq, src = kda_decode(q, k, v, g, b, f, conv_w, self.ssm_dt["bias"], self.ssm_a, unwrap(self.ssm_norm.weight), pos + t, lb,
-                             self.ssm_norm.eps, sts[(t + 1) % T], src, t, zq, t % (T - 1) if T > 1 else 0, max(t - 1, 0))
+                             self.ssm_norm.eps, sts[(t + 1) % T], src, t, zq, t if t < T - 1 else 0, max(t - 1, 0))
       # (the out projection on the kernel's q8 of z)
       return q8_linear(self.ssm_out, zq[0], zq[1:]) if self.ssm_out.ggml_type in QUANT_SIZES else self.ssm_out(zq[0])
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)

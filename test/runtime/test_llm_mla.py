@@ -15,7 +15,8 @@ class TestMLA(unittest.TestCase):
 
   def test_rope_table_only_when_used(self): # no positions (mla_nope) and an indexer without rope: no table
     for nope, indexer_rope, used in ((False, None, True), (True, None, False), (True, 0, False), (True, 4, True)):
-      config = self._make_config(mla_nope=nope, q_lora_rank=16, indexer=None if indexer_rope is None else IndexerConfig(2, 8, 4, rope_dim=indexer_rope))
+      indexer = None if indexer_rope is None else IndexerConfig(2, 8, 4, rope_dim=indexer_rope)
+      config = self._make_config(mla_nope=nope, q_lora_rank=16, indexer=indexer)
       (block:=MLATransformerBlock(config))._init_state(Tensor.empty(1, 1, config.dim))
       self.assertEqual(block.freqs_cis is not None, used)
 
