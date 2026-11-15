@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices, mla_topk_attention
+  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -199,12 +199,16 @@ class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
     self.weight, self.norm_eps, self.new_block = Tensor.zeros(config.dim), config.norm_eps, new_block
 
-  def mix(self, xs:Tensor) -> Tensor:
+  def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None) -> Tensor:  # xs: (B, T, N, D) streams: (B, T, D), then the norm
+    if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
+      return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps)
     scores = (xs.rmsnorm(eps=self.norm_eps) * self.weight).sum(-1, keepdim=True)
-    return (scores.softmax(2) * xs).sum(2)  # xs: (B, T, N, D) streams: (B, T, D)
+    out = (scores.softmax(2) * xs).sum(2)
+    return out if norm is None else norm(out)
 
-  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]]) -> tuple[Tensor, Tensor|None]:
-    out, aux = sublayer(self.mix(xs))
+  def __call__(self, xs:Tensor, sublayer:Callable[[Tensor], tuple[Tensor, Tensor|None]],
+               norm:Callable[[Tensor], Tensor]|None=None) -> tuple[Tensor, Tensor|None]:
+    out, aux = sublayer(self.mix(xs, norm))
     # (B, T, N+1, D) if new_block else (B, T, N, D)
     return (xs.cat(out.unsqueeze(2), dim=2) if self.new_block else xs[:, :, :-1].cat(xs[:, :, -1:] + out.unsqueeze(2), dim=2)), aux
 
@@ -340,15 +344,19 @@ class FFNBlock:
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:StartPos, idx_mask:Tensor|None):
       if hasattr(self, 'ple'): x = x + self.ple(x, start_pos)  # (B, T, hc, D)
+      res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
+      attn_norm, ffn_norm = self.attn_norm, self.ffn_norm
+      if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
+      elif self.config.attn_res_block_size:  # (the mixes do the norms)
+        res_attn = functools.partial(self.attn_res_score, norm=attn_norm)
+        res_ffn = functools.partial(self.ffn_res_score, norm=ffn_norm)
+        attn_norm = ffn_norm = lambda h: h
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
-        h = self.attn_norm(h)
+        h = attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
         return self._attention(h, start_pos, mask), mask
-      res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
-      if self.config.hc is not None: res_attn, res_ffn = self.hc_attn, self.hc_ffn
-      elif self.config.attn_res_block_size: res_attn, res_ffn = self.attn_res_score, self.ffn_res_score
       x, idx_mask = res_attn(x, attend)
-      out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h)), None))[0].contiguous()
+      out = res_ffn(x, lambda h: (self._feed_forward(ffn_norm(h)), None))[0].contiguous()
       return (out, idx_mask) if idx_mask is not None else out
     out = _run(x, start_pos, idx_mask)
     return out if isinstance(out, tuple) else (out, None)

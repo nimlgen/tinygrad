@@ -799,3 +799,54 @@ def partial_sum(x:Tensor) -> Tensor:
   fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
+
+# ******** the residual streams' mix and the sublayer's rmsnorm, in two kernels over slices of each token's streams ********
+
+RES_WAVES, RES_PER = 4, 2  # a workgroup's waves and the 32 wide groups of a wave
+def _res_slice(tokens:int, dim:int) -> tuple[int, UOp, UOp, UOp, UOp, list[UOp]]:
+  G = dim // (RES_WAVES * RES_PER * WARP_SIZE)  # (a token's workgroups)
+  tw, lane, wave = UOp.range(tokens*G, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, AxisType.WARP), UOp.range(RES_WAVES, 1, AxisType.LOCAL)
+  return G, tw, lane, wave, wave*WARP_SIZE + lane, [((tw%G*RES_WAVES + wave)*RES_PER + k)*WARP_SIZE + lane for k in range(RES_PER)]
+
+@functools.cache
+def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int, streams:int, dim:int) -> UOp:
+  """a workgroup's slice of its token's streams' gram matrix (upper triangle) and of their dots with the mix weight"""
+  G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
+  xv = [[xs.reshape(tokens, streams, dim)[tw//G, s, i].load() for i in idx] for s in range(streams)]
+  w, zero = [wm[i].load().float() for i in idx], UOp.const(0, dtypes.float)
+  vals = [sum((a*b for a, b in zip(xv[s], xv[r])), zero) for s in range(streams) for r in range(s, streams)] + \
+         [sum((a*b for a, b in zip(xv[s], w)), zero) for s in range(streams)]
+  red = UOp.alloc((RES_WAVES, len(vals)), dtypes.float, addrspace=AddrSpace.LOCAL)
+  red = red.after(UOp.group(*[red[wave, j].store(warp_reduce(v, full_wave=True)) for j, v in enumerate(vals)]).barrier())
+  col = tid.minimum(len(vals)-1)
+  store = part[tw, tid.valid(tid < len(vals))].store(sum((red[k, col].load() for k in range(1, RES_WAVES)), red[0, col].load()))
+  return store.end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_partial", opts_to_apply=()))
+
+@functools.cache
+def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:int, dim:int, eps:float, norm_eps:float) -> UOp:
+  """y = rmsnorm(sum_s p_s xs_s) * wn, p the softmax over the streams of (rmsnorm(xs_s) * wm).sum(): a workgroup sums its token's partials
+  (the norm's sum of squares is p G p of the gram matrix G) and does its slice"""
+  G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
+  t, NP, zero = tw//G, streams*(streams+1)//2, UOp.const(0, dtypes.float)
+  tot = UOp.alloc((NP + streams,), dtypes.float, addrspace=AddrSpace.LOCAL)
+  col = tid.minimum(NP + streams - 1)
+  tot = tot.after(tot[tid.valid(tid < NP + streams)].store(sum((part[t*G + g, col].load() for g in range(1, G)), part[t*G, col].load())).barrier())
+  pair = {sr: j for j, sr in enumerate((s, r) for s in range(streams) for r in range(s, streams))}
+  def gram(s:int, r:int) -> UOp: return tot[pair[min(s, r), max(s, r)]].load()
+  score = [tot[NP + s].load() / (gram(s, s) * (1/dim) + eps).sqrt() for s in range(streams)]
+  m = functools.reduce(UOp.maximum, score)
+  e = [((sc - m) * math.log2(math.e)).exp2() for sc in score]
+  esum = sum(e[1:], e[0])
+  rn = 1 / (sum((e[s] * e[r] * gram(s, r) for s in range(streams) for r in range(streams)), zero) / (esum * esum) * (1/dim) + norm_eps).sqrt()
+  return UOp.group(*[y.reshape(tokens, dim)[t, i].store(sum((e[s] * xs.reshape(tokens, streams, dim)[t, s, i].load() for s in range(streams)), zero)
+                                                         / esum * rn * wn[i].load().float()) for i in idx]) \
+    .end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_norm", opts_to_apply=()))
+
+def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float) -> Tensor:
+  """rmsnorm(the mix of the residual streams xs (B, T, streams, dim) by wm) * wn: (B, T, dim)"""
+  B, T, streams, dim = cast(tuple[int, int, int, int], xs.shape)
+  part = Tensor.empty(B*T*dim // (RES_WAVES*RES_PER*WARP_SIZE), streams*(streams+1)//2 + streams, dtype=dtypes.float32, device=xs.device)
+  part = Tensor.custom_kernel(part, xs, wm, fxn=functools.partial(_res_mix_partial_kernel, tokens=B*T, streams=streams, dim=dim))[0]
+  y = Tensor.empty(B, T, dim, dtype=dtypes.float32, device=xs.device)
+  fxn = functools.partial(_res_mix_norm_kernel, tokens=B*T, streams=streams, dim=dim, eps=eps, norm_eps=norm_eps)
+  return Tensor.custom_kernel(y, part, wn, xs, fxn=fxn)[0]
