@@ -6,7 +6,7 @@ from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
-from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, expert_tiles, moe_route, q8_0_linear, QUANT_SIZES,
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_SIZES,
   HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
@@ -553,20 +553,6 @@ class TestExpertLinear(unittest.TestCase):
     ref = expert_linear(self.pool, rep, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
 
-  def test_expert_gemm(self): # 16 row tiles an expert's (WMMA), x's rows from a table or its own: as the gemv's rows of a slot
-    tiles, off = Tensor(np.array(self.sel[:3], np.int32)), 2 * self.UNITS * self.ROW_UP
-    x, xr = Tensor(self.rng.standard_normal((5, self.LAT)).astype(np.float32)), Tensor(self.rng.integers(0, 5, 48).astype(np.int32))
-    out = expert_gemm(self.pool, tiles, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=xr).numpy()
-    ref = expert_linear(self.pool, tiles, x[xr], 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=16).numpy()
-    np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
-    h = Tensor(self.rng.standard_normal((48, self.UNITS)).astype(np.float32))
-    out = expert_gemm(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
-    ref = expert_linear(self.pool, tiles, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, per=16).numpy()
-    np.testing.assert_allclose(out, ref, rtol=0.03, atol=0.03 * np.abs(ref).max())
-    dead = Tensor(np.array(self.sel[:2] + [-1], np.int32))  # (a tile of no expert: its rows not written, the others as before)
-    got = expert_gemm(self.pool, dead, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
-    np.testing.assert_allclose(got[:32], ref[:32], rtol=0.03, atol=0.03 * np.abs(ref).max())
-
   def test_expert_tiles(self): # 64 row tiles an expert's (f16 WMMA), x's rows from a table (-1: x[0]) or its own: as the weights decoded apart
     if not _is_rdna4(self.pool.device): self.skipTest("RDNA4 required")
     tiles, off = Tensor(np.array(self.sel[:2] + [-1], np.int32)), 2 * self.UNITS * self.ROW_UP
@@ -599,21 +585,6 @@ class TestExpertLinear(unittest.TestCase):
     ref = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, per=per).numpy()
     ref = (ref * w[:, None]).reshape(-1, per, self.LAT).sum(0)
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
-
-  def test_expert_gemm_q8(self):
-    from tinygrad.llm.kernels.amd_gguf import Q8_0
-    for cols in (32, 64, 96, 256):  # partial blocks as well as fully unrolled blocks
-      weights = q8_0_linear(Tensor(self.rng.standard_normal((32, cols)).astype(np.float32)), self.pool.device)
-      pool, stride = weights.weight, 16 * cols // 32 * 34
-      slots = Tensor([1, 0], dtype=dtypes.int32)
-      x = Tensor(self.rng.standard_normal((32, cols)).astype(np.float32))
-      out = expert_gemm(pool, slots, x, 16, cols, Q8_0, stride).numpy()
-      ref = expert_linear(pool, slots, x, 16, cols, Q8_0, stride, per=16).numpy()
-      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
-      xr = Tensor(self.rng.permutation(32).astype(np.int32))
-      out = expert_gemm(pool, slots, x, 16, cols, Q8_0, stride, xrow=xr).numpy()
-      ref = expert_linear(pool, slots, x[xr], 16, cols, Q8_0, stride, per=16).numpy()
-      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
 
   def test_live_token_entries(self): # per=1: a zero-weight entry must skip its NaN weights even if the neighboring token's entry is live
     off = 2 * self.UNITS * self.ROW_UP

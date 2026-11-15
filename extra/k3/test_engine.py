@@ -79,16 +79,16 @@ class TestEngine(unittest.TestCase):
     # every expert in its slot, a code (layer * E + expert) a slot
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2, chunk=4)
-    pools = [b''.join(parts(weights, li, e, part)[g] for li in layers for e in range(E)) for g in range(G)]
+    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2, chunk=4, window=8)
+    pools = [b''.join(parts(weights, li, e, part)[g] for li in layers for e in range(E)).ljust(eng.slots * part, b'\0') for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
-    eng.state["slot_of"][:] = eng.state["expert_in"][:] = np.arange(len(layers) * E)
+    eng.state["slot_of"][:] = eng.state["expert_in"][:len(layers) * E] = np.arange(len(layers) * E)
 
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
   def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an
-    # entry j*T+t is token t's j-th expert and its weight), a chunk's in one
+    # entry j*T+t is token t's j-th expert and its weight)
     eng = self.eng
     tables:dict[int, list[Tensor]] = {}
     def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
@@ -96,18 +96,10 @@ class TestEngine(unittest.TestCase):
         sig = dep[:, 0].to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
-        T = sel.shape[0]
         def table(ks:slice) -> Tensor:  # (an entry a token's expert and weight, j*T+t)
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
                                                           w[:, ks].T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        def chunk() -> Tensor:  # (host.py's chunk table, a tile expert e's (T <= 16): token t's row of it 16*e + t)
-          n, NT, cpu = K * T, K * T // 16 + E, "CPU"
-          k, nt = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(NT).to(cpu)
-          tslot = (nt < E).where(nt + li * E, -1).cast(dtypes.int32)
-          ttok = Tensor.arange(T, dtype=dtypes.int32).to(cpu).reshape(1, T).expand(NT, T).pad(((0, 0), (0, 16 - T))).flatten()
-          return Tensor([1], dtype=dtypes.int32, device=cpu).cat(tslot, ttok, (sel.T.flatten() * 16 + k % T).cast(dtypes.int32)) \
-            .bitcast(dtypes.uint32).cat(w.T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
-        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))] if T <= eng.tokens else [chunk()]
+        tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]
 
@@ -129,34 +121,31 @@ class TestEngine(unittest.TestCase):
     self.eng.model.rollback(1)
     np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
 
-  def test_chunk(self):  # a prompt of 9 in two chunks of 4 then a token: the logits after it as a token a step's
+  def test_window(self):  # a prompt of 9: a window of its first 8 (two chunks), then a token: the logits after it as a token a step's
     self.stub()
     toks = [3, 5, 7, 1, 2, 9, 4, 6, 8]
     for pos, t in enumerate(toks): want = self.eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].numpy()[0]
-    for pos in (0, 4): self.eng.forward(Tensor([toks[pos:pos + 4]], dtype=dtypes.int32), pos)[0].realize()
+    self.eng.window(toks[:8], 0, toks[1:9])
     ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
-    np.testing.assert_allclose(ours, want, rtol=1e-4, atol=1e-4 * np.abs(want).max())
+    np.testing.assert_allclose(ours, want, rtol=1e-3, atol=1e-3 * np.abs(want).max())
 
-  def test_planned(self):  # the chunk graph's buffers planned (the pool sized after them), the steps after as without it
-    self.stub()
-    self.assertGreater(self.eng.planned(4), 0)
-    self.test_chunk()
-
-  def test_prefill(self):  # the chunks of a prompt but its last token (each with the tokens after it given), none without a chunk
-    steps:list = []
-    self.eng.step = lambda toks, pos, given: steps.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
+  def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
+    calls:list = []
+    self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
     self.assertEqual(self.eng.prefill(list(range(10)), 2), 9)
-    self.assertEqual(steps, [(2, [2, 3, 4, 5], [3, 4, 5, 6]), (6, [6, 7, 8], [7, 8, 9])])
-    self.assertEqual(self.eng.prefill(list(range(9)), 0), 8)
-    self.assertEqual([s[0] for s in steps[2:]], [0, 4])
-    self.eng.chunk = 8
-    self.assertEqual(self.eng.prefill(list(range(16)), 10), 10)  # the live rows fit, but their static chunk would cross the context
-    self.assertEqual(len(steps), 4)
-    self.eng.chunk = 0
+    self.assertEqual(calls, [(2, [2, 3, 4, 5, 6, 7, 8], [3, 4, 5, 6, 7, 8, 9])])
+    self.eng.W = 4
+    self.assertEqual(self.eng.prefill(list(range(12)), 0), 11)
+    self.assertEqual([(p, len(t)) for p, t, _ in calls[1:]], [(0, 4), (4, 4), (8, 3)])
+    self.eng.W = 8
+    self.assertEqual(self.eng.prefill(list(range(16)), 10), 10)  # the live rows fit, but their whole chunk would cross the context
+    self.assertEqual(len(calls), 4)
+    self.eng.W = 0
     self.assertEqual(self.eng.prefill(list(range(9)), 3), 3)
-    self.assertEqual(len(steps), 4)
+    self.assertEqual(len(calls), 4)
 
-  def test_partial_chunk(self): # live logits, recurrent states and cache prefixes, then decode over the padded rows
+  def test_window_states(self): # recurrent states, caches (the indexer's, the draft's) after a window as after its tokens a step each, then decode
+    # (on AMD a step's experts take q8 activations, a window's not: as close as those)
     self.stub()
     eng, folder, rng = self.eng, tempfile.mkdtemp(), np.random.default_rng(4)
     eng.keep_logits = True
@@ -166,30 +155,28 @@ class TestEngine(unittest.TestCase):
         b.indexer = Indexer(replace(b.config, indexer=IndexerConfig(2, 16, 4)))
         for p in nn.state.get_parameters(b.indexer): p.replace(Tensor(rng.normal(0, 0.3, p.shape).astype(np.float32)).shard(eng.devs, p.uop.axis))
         b._init_state(Tensor.empty(1, 1, DIM, device=eng.devs))
+    eng.window_init(8)  # (the window's graphs on the draft and the indexers)
     ids = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7, 2, 5, 9, 4]
-    def run(toks:list[int], pos:int, live:int|None=None) -> np.ndarray:
-      C = len(toks)
-      eng.tok_np[:C], eng.given_np[:C] = toks, (ids[pos + 1:pos + 1 + C] + [-1] * C)[:C]
-      return (eng.run(C, eng.v_pos.bind(pos)) if live is None else eng.jits[C](eng.v_pos.bind(pos), eng.v_live.bind(live)))[1].numpy()
+    def run(t:int, pos:int) -> np.ndarray:
+      eng.tok_np[:1], eng.given_np[:1] = [t], ids[pos + 1:pos + 2] or [-1]
+      return eng.run(1, eng.v_pos.bind(pos))[1].numpy()
     def snapshot(n:int) -> list[np.ndarray]:
       caches = [eng.draft.cache, *(b.cache_k for b in eng.model.blk if isinstance(b, MLATransformerBlock)),
                 *(b.indexer.cache_kg for b in eng.model.blk if isinstance(b, MLATransformerBlock) and b.indexer)]
       return [s.numpy() for s in eng.model._states()] + [c.numpy()[..., :n, :] for c in caches]
+    tol = 3e-2 if amd_custom_kernels_supported(eng.devs) else 1e-3
+    def close(got:np.ndarray, want:np.ndarray): np.testing.assert_allclose(got, want, rtol=tol, atol=tol * np.abs(want).max())
     def equal(a:list[np.ndarray], b:list[np.ndarray]):
-      for got, want in zip(a, b): np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
-    with self.assertRaises(AssertionError): eng.step([1, 2, 3], 14)
-    for start, live in ((0, 1), (0, 3), (4, 1), (4, 3), (8, 2), (8, 4), (12, 3)):
+      for got, want in zip(a, b): close(got, want)
+    for start, live in ((0, 1), (0, 3), (0, 6), (4, 3), (8, 5), (12, 3)):
       with self.subTest(start=start, live=live):
-        out = [run([t], pos)[0] for pos, t in enumerate(ids[:start + live])]
-        want, states = np.stack(out[start:]), snapshot(start + live)
-        after = run([ids[start + live]], start + live)
+        for pos, t in enumerate(ids[:start + live]): run(t, pos)
+        states, after = snapshot(start + live), run(ids[start + live], start + live)
         states_after = snapshot(start + live + 1)
-        for pos, t in enumerate(ids[:start]): run([t], pos)
-        got = run(ids[start:start + live] + [0] * (4 - live), start, live)
-        np.testing.assert_allclose(got[:live], want, rtol=1e-3, atol=1e-3)
-        np.testing.assert_array_equal(got[:live].argmax(-1), want.argmax(-1))
+        for pos, t in enumerate(ids[:start]): run(t, pos)
+        eng.window(ids[start:start + live], start, ids[start + 1:start + 1 + live])
         equal(snapshot(start + live), states)
-        np.testing.assert_allclose(run([ids[start + live]], start + live), after, rtol=1e-3, atol=1e-3)
+        close(run(ids[start + live], start + live), after)
         equal(snapshot(start + live + 1), states_after)
 
   def test_states_allocated(self):  # the blocks' caches and states and the draft's allocated by the engine, before its pool takes what's free
@@ -198,20 +185,6 @@ class TestEngine(unittest.TestCase):
     Engine(model, self.eng.m, slots=1, tokens=2, draft=draft)
     for t in (*(b.cache_k for b in model.blk if isinstance(b, MLATransformerBlock)), draft.cache, model.blk[0].kept[0][0]):
       self.assertTrue(all(b.is_allocated() for b in t.uop.base.buffer.bufs))
-
-  def test_draft_chunk(self):  # a chunk fills the draft's cache as its tokens a step each do (its guesses not made)
-    self.stub()
-    eng, folder = self.eng, tempfile.mkdtemp()
-    eng.draft = Eagle3(eagle(folder, np.random.default_rng(1)), lambda t: eng.model.token_embd(t).float(), eng.devs, eng.model.max_context)
-    toks, given = [3, 5, 7, 1], [5, 7, 1, 2]
-    for p, (t, g) in enumerate(zip(toks, given)):
-      eng.tok_np[:1], eng.given_np[:1] = [t], [g]
-      eng.run(1, UOp.variable("start_pos", 0, 15).bind(p))
-    want = eng.draft.cache.numpy()[..., :4, :]
-    eng.draft.cache.assign(eng.draft.cache.zeros_like()).realize()
-    eng.tok_np[:4], eng.given_np[:4] = toks, given
-    eng.run(4, UOp.variable("start_pos", 0, 15).bind(0))
-    np.testing.assert_allclose(eng.draft.cache.numpy()[..., :4, :], want, rtol=1e-2, atol=1e-2)
 
   def test_draft_step(self):  # a jitted verify step with the draft: its tokens and guesses as an unjitted one's
     self.stub()

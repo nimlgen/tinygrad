@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys, \
-  _carry, _unbind
+  _carry, _unbind, amd_custom_kernels_supported
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -501,81 +501,6 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[ggml_type]//raw.dtype.itemsize,
                             layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes)
 
-@functools.cache
-def _expert_i8_wmma_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, slots:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int,
-                           stride:int, offset:int, gathered:bool, rdna4:bool) -> UOp:
-  # out[r] = W[slots[r // 16]] @ x[r] (gathered: x[extra[0][r]]) on the int8 tensor cores: a token block of 16 rows an expert's, its weights'
-  # bytes (the decode gemv's words) times the q8 of x, a 32 input group's int32 dot scaled once (formats of a scale a group: Q8_0, IQ3_XXS).
-  # a lane's fragment: RDNA4 words (ph, ph+2) of a half group, RDNA3 all four; its accumulator rows ph*8 + j (RDNA3: 2j + ph). a block of slot
-  # -1 (no expert) skips its loop and stores nothing
-  assert ggml_type in (Q8_0, IQ3_XXS), f"{QUANT_NAMES[ggml_type]} has no int8 expert kernel"
-  xrow, grids = (extra[0], extra[1:]) if gathered else (None, extra)
-  layout = _wmma_layout(out, out_features, 16, 4 if gathered else 1, 32)  # (a gathered row's fragment for 4 output tiles)
-  _, token_block, _, lane, wave, ph, outputs, inputs, tokens = layout
-  rows = tokens[0] if rdna4 else tuple(token_block*16 + 2*j + ph for j in range(8))
-  grid = None
-  if grids:
-    grid = UOp.alloc((int(grids[0].numel()),), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-    tid, threads = wave*32+lane, layout[0]*32
-    grid = grid.after(*(grid[tid+i*threads].store(grids[0][tid+i*threads]) for i in range(int(grid.numel())//threads)))
-  def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.weakint)
-  type_words = QUANT_SIZES[ggml_type]//raw.dtype.itemsize
-  slot = slots[token_block].cast(dtypes.int32)
-  output_words, slot_base = in_features * type_words // GGML_BLOCK_SIZE, slot.maximum(0).cast(dtypes.int64)*stride + offset
-  # Unroll a weight block to share its metadata; four output tiles limit the gathered projection's register budget.
-  unroll = math.gcd(in_features//Q8_GROUP_SIZE, 2 if gathered else 8)
-  group = UOp.range((slot >= 0).where(in_features // (unroll*Q8_GROUP_SIZE), 0), 4, AxisType.LOOP)
-  accs = [UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in outputs]
-  accs = [acc.after(acc.store(acc.const_like(0))) for acc in accs]
-  vals = [[acc.after(group)[j].load() for j in range(8)] for acc in accs]
-  for phase in range(unroll):
-    g = group*unroll + phase
-    block, subgroup = g // 8, g % 8
-    words = [(h*4 + ph, h*4 + 2 + ph) if rdna4 else tuple(h*4 + i for i in range(4)) for h in range(2)]
-    afrags = [_i8_frag(tuple(xq[xr(inputs[0]), g, w].load() for w in ws)) for ws in words]
-    if gathered: xds = [xd[xr(r), g].load() for r in rows]
-    else:
-      # Each lane loads its input row's scale; broadcast the eight accumulator rows within the wave.
-      lane_scale = xd[inputs[0], g].load()
-      shuffle = UOp.custom_function("__builtin_amdgcn_ds_bpermute({}, {})", shape=lane_scale.shape, dtype=dtypes.uint32, fmt=True)
-      xds = [shuffle.call(((r%16)*4).cast(dtypes.uint32), lane_scale.bitcast(dtypes.uint32)).bitcast(dtypes.float32) for r in rows]
-    for o, output in enumerate(outputs):
-      base = slot_base + output*output_words + block*type_words
-      if ggml_type in SMALL_BLOCK_QUANTS: base = base + subgroup*SMALL_BLOCK_QUANTS[ggml_type]
-      scale = _half(raw[base])
-      if ggml_type == IQ3_XXS: scale = scale * ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
-      dot = UOp.stack(*[UOp.const(0, dtypes.int32)]*8)
-      for afrag, ws in zip(afrags, words): dot = UOp.wmma(afrag, _i8_frag(tuple(_quant_word(raw, base, subgroup, w, ggml_type, grid) for w in ws)),
-                                                          dot, WMMA_ARG[0], 32)
-      d = UOp.alloc((8,), dtypes.int32, addrspace=AddrSpace.REG)
-      d = d.after(d.store(dot))
-      vals[o] = [v + xds[j] * scale * d[j].load().float() for j, v in enumerate(vals[o])]
-  update = UOp.group(*(acc.store(UOp.stack(*v)) for acc, v in zip(accs, vals))).end(group)
-  stores = [out[r.valid(slot >= 0), output].store(acc.after(update)[j].load()) for output, acc in zip(outputs, accs) for j, r in enumerate(rows)]
-  # (the work of every block: a block's loop bound is data)
-  weights = cast(int, out.shape[0]) * out_features * in_features
-  estimates = Estimates(2*weights, weights*type_words*2//GGML_BLOCK_SIZE, weights*type_words*2//GGML_BLOCK_SIZE)
-  name = f"expert_{QUANT_NAMES[ggml_type]}_i8_wmma"
-  return UOp.group(*stores).end(*layout[1:3], lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=(), estimates=estimates))
-
-def _i8_frag(words:tuple[UOp, ...]) -> UOp:  # (an int8 fragment of the words' bytes)
-  return UOp.stack(*(((w >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8) for w in words for i in range(4)))
-
-def expert_gemm(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
-                xrow:Tensor|None=None) -> Tensor:
-  """out[k] = W[slots[k // 16]] @ x[xrow[k]] (or x[k]): expert_linear's experts in an int8 WMMA gemm of 16 row tiles, a tile an expert's (its
-  weights read once for its rows), on the q8 of x. out: (16*len(slots), out_features), a pool sharded over devices (ndev, .., out_features)"""
-  word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
-  ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), 16 * slots.shape[0]
-  out = Tensor.empty(ndev*n, out_features, dtype=dtypes.float32, device=pool.device, axis=0 if ndev > 1 else None)
-  fxn = functools.partial(_expert_i8_wmma_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
-                          stride=stride//word.itemsize, offset=offset//word.itemsize, gathered=xrow is not None, rdna4=_is_rdna4(x.device))
-  xq, xd, _ = q8_quantize(x.contiguous(), prod(x.uop.max_shard_shape) // in_features, in_features)
-  extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
-  srcs = (pool.bitcast(word), xq, xd, slots.cast(dtypes.int32), *([] if xrow is None else [xrow.cast(dtypes.int32)]), *extra)
-  ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
-  return ret.reshape(ndev, n, out_features) if ndev > 1 else ret
-
 def _iq3_signs(device:str|tuple[str, ...]|None) -> Tensor:
   """the sign masks of the halves of an IQ3_XXS grid word: (its 7 sign bits, the word's half of the 8, a pair of its bytes) a uint32's two"""
   def mask(bits:int, half:int, pair:int) -> int:
@@ -776,12 +701,31 @@ def _route_place_kernel(pos:UOp, entries:UOp, tiles:UOp, rank:UOp, counts:UOp, s
     stores.append(tiles[(f // tile + nt).cast(dtypes.weakint)].store((t*per + m).cast(dtypes.int32)).end(nt))
   return UOp.group(*stores).end(wg, wave, lane).sink(arg=KernelInfo(name="route_place", opts_to_apply=()))
 
+def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+  # moe_route in tensor ops: a selection's row its expert's tiles' start and the selections of the expert before it (in t*k + j order)
+  T, E = cast(tuple[int, int], logits.shape)
+  N, R = T*k, round_up(T*k + (tile-1)*E, tile)
+  sig = logits.float().sigmoid()
+  sel = (sig + bias.float()).topk(k)[1]
+  w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
+  ok = (Tensor.arange(T).reshape(T, 1) < (T if live is None else Tensor(live))).expand(T, k).reshape(N)
+  onehot = ok.unsqueeze(-1) & (sel.reshape(N, 1) == Tensor.arange(E).reshape(1, E))
+  counts = onehot.sum(0, dtype=dtypes.int32)
+  padded = (counts + tile - 1) // tile * tile
+  first = padded.cumsum() - padded
+  pos = ok.where((onehot.where(first.reshape(1, E) + onehot.cast(dtypes.int32).cumsum(0) - 1, 0)).sum(-1), -1).cast(dtypes.int32)
+  entries = Tensor.full((R + 1,), -1, dtype=dtypes.int32, device=logits.device).contiguous().scatter(0, ok.where(pos, R), Tensor.arange(N, dtype=dtypes.int32).to(logits.device))[:R]
+  start = Tensor.arange(R // tile).reshape(-1, 1) * tile
+  tiles = ((first.reshape(1, E) <= start) & (start < (first + padded).reshape(1, E))).where(Tensor.arange(E).reshape(1, E) + 1, 0).sum(-1) - 1
+  return ok.reshape(T, k).where(w, 0.0), pos, entries, tiles.cast(dtypes.int32), counts
+
 def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64, live:UOp|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
   """the tokens' (T, E) router logits routed exactly (route_topk) and sorted by expert into tiles of an expert's rows: their weights (T, k), pos
   (T*k): the row of token t's j-th expert (t*k + j, -1 past live), entries (R): a row's selection t*k + j (-1: padding), tiles (R/tile): a tile's
   expert (-1), counts (E): an expert's rows. live: the tokens routed (the rest weight 0)"""
   T, E = cast(tuple[int, int], logits.shape)
   N, R = T*k, round_up(T*k + (tile-1)*E, tile)
+  if not amd_custom_kernels_supported(logits.device) or E % 32: return _moe_route_tensors(logits, bias, k, tile, live)
   sel, w = Tensor.empty(T, k, dtype=dtypes.int32, device=logits.device), Tensor.empty(T, k, dtype=dtypes.float32, device=logits.device)
   sel, w = Tensor.custom_kernel(sel, w, _carry(logits.float().contiguous(), *([] if live is None else [live])), bias.float().contiguous(),
                                 fxn=functools.partial(_route_topk_kernel, k=k, live=T if live is None else _unbind(live)))[:2]
