@@ -6,8 +6,8 @@ from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
-from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, expert_tiles, q8_0_linear, QUANT_SIZES, HALFWORD_QUANTS,
-  SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_gemm, expert_tiles, moe_route, q8_0_linear, QUANT_SIZES,
+  HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
 
@@ -646,6 +646,28 @@ class TestExpertLinear(unittest.TestCase):
     out = expert_linear(pool, Tensor([last], dtype=dtypes.int32), Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
     ref = self.weight(0, 0, 2 * self.UNITS, self.LAT) @ x[0]
     np.testing.assert_allclose(out[0], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
+
+class TestMoeRoute(unittest.TestCase):
+  def test_route(self): # the host's route(): top k of sigmoid + bias (ties: the lower expert), weights over the k's sum; rows sorted into tiles
+    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
+    T, E, K, tile = 300, 896, 16, 64
+    rng = np.random.default_rng(0)
+    logits, bias = rng.standard_normal((T, E)).astype(np.float32), (rng.standard_normal(E) * 0.1).astype(np.float32)
+    logits[:, 100:140] = logits[:, :40]  # (ties)
+    bias[100:140] = bias[:40]
+    w, pos, entries, tiles = (t.numpy() for t in moe_route(Tensor(logits), Tensor(bias), K, tile))
+    sig = np.float32(1) / (np.float32(1) + np.exp(-logits))
+    sel = np.lexsort((np.broadcast_to(np.arange(E), (T, E)), -(sig + bias)), axis=-1)[:, :K]
+    top = np.take_along_axis(sig, sel, 1)
+    total = np.zeros(T, np.float32)
+    for j in range(K): total += top[:, j]
+    np.testing.assert_allclose(w, top / total[:, None], rtol=1e-6)
+    i = np.arange(T * K)
+    np.testing.assert_equal(entries[pos], i)
+    np.testing.assert_equal(tiles[pos // tile], sel.reshape(-1))
+    counts = np.bincount(sel.reshape(-1), minlength=E)
+    np.testing.assert_equal(np.sort(tiles[tiles >= 0]), np.repeat(np.arange(E), (counts + tile - 1) // tile))
+    self.assertEqual((entries >= 0).sum(), T * K)
 
 class TestTopk(unittest.TestCase):
   def setUp(self):

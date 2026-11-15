@@ -3,9 +3,9 @@ import functools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod, unwrap
+from tinygrad.helpers import prod, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.renderer import Estimates
 
@@ -689,3 +689,92 @@ def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=()) -> Tensor:
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
 
+
+# *** routing of many tokens: a token's top k in a wave, then a counting sort of the selections into tiles of an expert's rows
+
+@functools.cache
+def _route_topk_kernel(sel:UOp, w:UOp, logits:UOp, bias:UOp, k:int) -> UOp:
+  # a wave a token: the k experts of the largest sigmoid + bias, the largest first (ties: the lower expert), and their sigmoids over their sum
+  # added in that order: the host's exact route()
+  T, E = cast(tuple[int, int], logits.shape)
+  token, lane = UOp.range(T, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  def sigmoid(e:UOp) -> UOp: return _sys("(1.0f / (1.0f + __builtin_expf(-{0})))", dtypes.float, logits[token, e].load())
+  experts = [lane + 32*i for i in range(E // 32)]
+  keys, picks, total = [sigmoid(e) + bias[e].load() for e in experts], [], UOp.const(0.0, dtypes.float)
+  for _ in range(k):
+    top = warp_reduce(functools.reduce(UOp.maximum, keys), maximum=True, full_wave=True)
+    lowest = functools.reduce(UOp.minimum, [key.eq(top).where(e, E) for key, e in zip(keys, experts)]).cast(dtypes.float)
+    e = (-warp_reduce(-lowest, maximum=True, full_wave=True)).cast(dtypes.int32).cast(dtypes.weakint)
+    keys = [x.eq(e).where(-math.inf, key) for key, x in zip(keys, experts)]
+    picks.append((e, sigmoid(e)))
+    total = total + picks[-1][1]
+  stores = [st for r, (e, sg) in enumerate(picks) for st in (sel[token, UOp.const(r, dtypes.weakint).valid(lane.eq(0))].store(e.cast(dtypes.int32)),
+                                                             w[token, UOp.const(r, dtypes.weakint).valid(lane.eq(0))].store(sg / total))]
+  return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="route_topk", opts_to_apply=()))
+
+ROUTE_G, ROUTE_T = 64, 256  # the counting sort's workgroups and threads
+
+def _wave_scan(x:UOp, lane:UOp) -> UOp:  # (the inclusive prefix sums of x over the lanes of a wave)
+  for d in (1, 2, 4, 8, 16):
+    other = _sys("__builtin_amdgcn_ds_bpermute({1}, {0})", dtypes.int32, x, ((lane - d).maximum(0)*4).cast(dtypes.int32))
+    x = x + (lane >= d).where(other, UOp.const(0, dtypes.int32))
+  return x
+
+@functools.cache
+def _route_count_kernel(rank:UOp, counts:UOp, sel:UOp, experts:int) -> UOp:
+  # the rank of every selection among its expert's: a workgroup's in LDS, its base in the expert's global count
+  N, per = int(prod(rank.shape)), (experts + ROUTE_T - 1) // ROUTE_T
+  Q = (N + ROUTE_G*ROUTE_T - 1) // (ROUTE_G*ROUTE_T)
+  wg, t = UOp.range(ROUTE_G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T, 1, AxisType.LOCAL)
+  hist = UOp.alloc((per*ROUTE_T,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  hist = hist.after(UOp.group(*(hist[t*per + m].store(UOp.const(0, dtypes.int32)) for m in range(per))).barrier())
+  items = [(i, sel.reshape(-1)[i.minimum(N-1)].load().cast(dtypes.weakint)) for i in ((wg*Q + q)*ROUTE_T + t for q in range(Q))]
+  locs = [_sys("__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)", dtypes.int32, hist[e], (i < N).cast(dtypes.int32))
+          for i, e in items]
+  hist = hist.after(UOp.group(*locs).barrier())
+  base = UOp.alloc((per*ROUTE_T,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  base = base.after(UOp.group(*(base[t*per + m].store(_sys("__hip_atomic_fetch_add({0}, {1}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)",
+    dtypes.int32, counts[(t*per + m).minimum(experts-1)], (t*per + m < experts).where(hist[t*per + m].load(), 0))) for m in range(per))).barrier())
+  stores = [rank.reshape(-1)[i.valid(i < N)].store(base[e].load() + loc) for (i, e), loc in zip(items, locs)]
+  return UOp.group(*stores).end(wg, t).sink(arg=KernelInfo(name="route_count", opts_to_apply=()))
+
+@functools.cache
+def _route_place_kernel(pos:UOp, entries:UOp, tiles:UOp, rank:UOp, counts:UOp, sel:UOp, experts:int, tile:int) -> UOp:
+  # the experts' first rows (every workgroup scans the counts padded to tiles), every selection its row, the first workgroup the tiles' experts
+  N, per = int(prod(pos.shape)), (experts + ROUTE_T - 1) // ROUTE_T
+  Q = (N + ROUTE_G*ROUTE_T - 1) // (ROUTE_G*ROUTE_T)
+  wg, wave, lane = UOp.range(ROUTE_G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T // 32, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  t, zero = wave*32 + lane, UOp.const(0, dtypes.int32)
+  pads = [(t*per + m < experts).where((counts[(t*per + m).minimum(experts-1)].load() + (tile-1)) // tile * tile, zero) for m in range(per)]
+  total = functools.reduce(UOp.__add__, pads, zero)
+  incl = _wave_scan(total, lane)
+  sums = UOp.alloc((ROUTE_T // 32,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  sums = sums.after(sums[wave.valid(lane.eq(31))].store(incl).barrier())
+  before = functools.reduce(UOp.__add__, [(v < wave).where(sums[v].load(), zero) for v in range(ROUTE_T // 32)], zero) + incl - total
+  firsts = [before + functools.reduce(UOp.__add__, pads[:m], zero) for m in range(per)]
+  first = UOp.alloc((per*ROUTE_T,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  first = first.after(UOp.group(*(first[t*per + m].store(f) for m, f in enumerate(firsts))).barrier())
+  stores = []
+  for i in ((wg*Q + q)*ROUTE_T + t for q in range(Q)):
+    p = first[sel.reshape(-1)[i.minimum(N-1)].load().cast(dtypes.weakint)].load() + rank.reshape(-1)[i.minimum(N-1)].load()
+    stores += [pos.reshape(-1)[i.valid(i < N)].store(p), entries[p.cast(dtypes.weakint).valid(i < N)].store(i.cast(dtypes.int32))]
+  for m, f in enumerate(firsts):
+    nt = UOp.range(((t*per + m < experts) & wg.eq(0)).where(pads[m] // tile, 0), 2 + m, AxisType.LOOP)
+    stores.append(tiles[(f // tile + nt).cast(dtypes.weakint)].store((t*per + m).cast(dtypes.int32)).end(nt))
+  return UOp.group(*stores).end(wg, wave, lane).sink(arg=KernelInfo(name="route_place", opts_to_apply=()))
+
+def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+  """the tokens' (T, E) router logits routed exactly (route_topk) and sorted by expert into tiles of an expert's rows: their weights (T, k), pos
+  (T*k): the row of token t's j-th expert (t*k + j), entries (R): a row's selection t*k + j (-1: padding), tiles (R/tile): a tile's expert (-1)"""
+  T, E = cast(tuple[int, int], logits.shape)
+  N, R = T*k, round_up(T*k + (tile-1)*E, tile)
+  sel, w = Tensor.empty(T, k, dtype=dtypes.int32, device=logits.device), Tensor.empty(T, k, dtype=dtypes.float32, device=logits.device)
+  sel, w = Tensor.custom_kernel(sel, w, logits.float().contiguous(), bias.float().contiguous(), fxn=functools.partial(_route_topk_kernel, k=k))[:2]
+  counts = Tensor.zeros(E, dtype=dtypes.int32, device=logits.device).contiguous()
+  entries, tiles = (Tensor.full((n,), -1, dtype=dtypes.int32, device=logits.device).contiguous() for n in (R, R // tile))
+  rank = Tensor.empty(N, dtype=dtypes.int32, device=logits.device)
+  rank, counts = Tensor.custom_kernel(rank, counts, sel, fxn=functools.partial(_route_count_kernel, experts=E))[:2]
+  pos = Tensor.empty(N, dtype=dtypes.int32, device=logits.device)
+  pos, entries, tiles = Tensor.custom_kernel(pos, entries, tiles, rank, counts, sel,
+                                             fxn=functools.partial(_route_place_kernel, experts=E, tile=tile))[:3]
+  return w, pos, entries, tiles
