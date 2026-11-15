@@ -6,7 +6,7 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import collections, ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
-from tinygrad import Tensor, Device, TinyJit, UOp, dtypes, nn
+from tinygrad import Tensor, TinyJit, UOp, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock, gated_activation
@@ -206,7 +206,6 @@ class Engine:
 
   def warm(self):
     """every step's graph (and the rollback's) captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
-    assert all(Device[d].has_copy_queue for d in self.devs), "the host syncs run on the gpus' copy queues"
     host_c().flags(ctypes.byref(self.io), 1)
     for jit in self.jits.values():
       for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()

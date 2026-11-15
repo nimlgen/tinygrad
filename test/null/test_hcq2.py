@@ -192,15 +192,15 @@ class TestHCQ2Schedule(unittest.TestCase):
     y = (self.x + 1).contiguous()
     wait = UOp.custom_function("host_wait").call(table.uop, y.uop)
     b = unwrap(scheduled((y + Tensor(table.uop.after(wait)).float()).contiguous())[0])
-    (wait,) = [c for c in queues(b)[("NULL", "COPY:0")] if ins_name(c) == "host_wait"]
+    (wait,) = [c for c in queues(b)[("NULL", "COMPUTE:0")] if ins_name(c) == "host_wait"]
     for prio in rotations(b):
       host = defaultdict(int)
       self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0])
       host[word(wait.src[1])] = 1
       self.assertEqual([x for x in run(b, prio=prio, mem=host)[0] if isinstance(x, int)], [0, 1])
-    q = SimpleNamespace(log=[], wait=lambda d, v: q.log.append(("wait", d, v)))  # (its readers on other queues wait and flush)
+    q = SimpleNamespace(log=[], wait=lambda d, v: q.log.append(("wait", d, v)), memory_barrier=lambda: q.log.append(("memory_barrier",)))
     hcq2.HWQueue.q_rewrite.rewrite(wait, ctx=q)
-    self.assertEqual(q.log, [("wait", wait.src[1], UOp.const(1, dtypes.uint32))])
+    self.assertEqual(q.log, [("wait", wait.src[1], UOp.const(1, dtypes.uint32)), ("memory_barrier",)])
 
   def test_a_host_kernel_splits_the_batch(self):
     self.assertEqual(len(self.scheduled(((self.x + 1).contiguous().to("PYTHON") + 2).contiguous().to("NULL") + 3)), 2)
