@@ -166,10 +166,12 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(all(self.state["expert_in"][s] // E == li for s, w in zip(slots, ws) if w > 0))
     self.check_counts()
 
-  def test_chunk(self): # a prompt's chunk: each token's exact top k read (the first layer's every expert, then the guessed and the missed),
-    # entry j*T + t's tile row (an expert's entries in tiles of 16, a row its token), the same on every gpu
+  def test_chunk(self):
+    for T in (40, 137): self.check_chunk(T)  # (137: its routes on threads, the tokens split unevenly)
+
+  def check_chunk(self, T:int): # a prompt's chunk: each token's exact top k read (the first layer's every expert, then the guessed and the
+    # missed), entry j*T + t's tile row (an expert's entries in tiles of 16, a row its token), the same on every gpu
     self.tearDown()
-    T = 40
     self.setUp(slots=L * E + 16, T=T, chunk=True)  # (none evicted: every layer's slots checked after)
     self.step()
     self.check_tables()
