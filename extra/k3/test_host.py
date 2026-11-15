@@ -121,10 +121,11 @@ class TestStepIO(unittest.TestCase):
     self.assertEqual(io.used + io.wasted, io.guesses)
     self.assertEqual(int(self.state["guess"].sum()), 0)
 
-  def test_read_async(self): # reads on the guess queues, flying till reaped, waited for: each into its slot's pages
+  def test_read_ahead(self): # reads pending, queued as the drives have room (pump), waited for: each into its slot's pages
     codes, slots = np.arange(3 * E, 3 * E + 40, dtype=np.int64), np.arange(100, 140, dtype=np.int64)
     self.state["slot_of"][codes], self.state["expert_in"][slots] = slots, codes
-    host_c().read_async(ctypes.byref(self.io), len(codes), codes.ctypes.data, slots.ctypes.data)
+    host_c().read_ahead(ctypes.byref(self.io), len(codes), codes.ctypes.data)
+    self.assertEqual(host_c().pump(ctypes.byref(self.io)), 0)
     self.assertEqual(host_c().read_wait(ctypes.byref(self.io), len(codes), codes.ctypes.data), 0)
     self.assertEqual(int(self.state["flying"].sum()), 0)
     self.check_tables()

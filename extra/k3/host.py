@@ -482,19 +482,21 @@ int64_t read_codes(io_t *s, int64_t n, const int64_t *codes, const int64_t *slot
   return 0;
 }
 
-// n codes read into slots on the guess queues (each counted flying till its reads are reaped), not waited for
-void read_async(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots) {
-  submit(s, n, codes, slots, 1, 1);
-  ring(s);
+// n codes read ahead into their slots (slot_of): pending on the demand queues, queued as they have room (pump), not waited for
+void read_ahead(io_t *s, int64_t n, const int64_t *codes) {
+  for (int64_t i = 0; i < n; i++) pend[npend++ % NPEND] = codes[i];
+  poll_io(s);
 }
 
-// till the n codes' reads (read_async's) are in. 0, -1 a read failed, -2 a timeout
+// the reads ahead queued as the drives have room, the completions reaped. 0, -1 a read failed
+int64_t pump(io_t *s) { return poll_io(s); }
+
+// till every read ahead is queued and the n codes' reads are in. 0, -1 a read failed, -2 a timeout
 int64_t read_wait(io_t *s, int64_t n, const int64_t *codes) {
   double t0 = now();
   for (int64_t busy = 1; busy;) {
-    if (reap(s) < 0) return -1;
-    ring(s);
-    busy = 0;
+    if (poll_io(s) < 0) return -1;
+    busy = pend_at < npend;
     for (int64_t i = 0; i < n && !busy; i++) busy = s->flying[codes[i]] > 0;
     if (now() - t0 > 60) return stuck(s, "reads", 0, t0);
   }
@@ -539,7 +541,8 @@ def host_c() -> ctypes.CDLL:
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
   lib.read_codes.restype, lib.read_codes.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
-  lib.read_async.argtypes = [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
+  lib.read_ahead.argtypes = [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p]
+  lib.pump.restype, lib.pump.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
   lib.read_wait.restype, lib.read_wait.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p]
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib

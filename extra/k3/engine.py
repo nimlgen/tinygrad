@@ -245,6 +245,10 @@ class Engine:
       self.experts_jit(self.pool, self.parts[0][li])
       self.tap_jit(self.v_s.bind(0), self.v_tap.bind(0))
       if self.fill_jit: self.fill_jit(self.v_pos.bind(0), self.v_c0.bind(0))
+    for b in moe:  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait for it)
+      li = self.m["layers"].index(m.blk.index(b))
+      self.route_jit(self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+      self.experts_jit(self.pool, self.parts[0][li])
 
   def scorer(self, b:FFNBlock) -> Tensor|Linear|None:  # (a moe block's router, the engine's)
     return self.scorers[self.m["layers"].index(i)] if (i:=self.model.blk.index(b)) in self.m["layers"] else None
@@ -283,8 +287,8 @@ class Engine:
     routed = moe_route(Tensor(self.win["logits"].uop), bias, K, live=live)
     kept = Tensor.realize(*(Tensor(t.uop).assign(v) for t, v in zip(self.routes, routed[:4])))
     counted = Tensor(part2.uop)[1:1 + E].assign(routed[4].bitcast(dtypes.uint32))
-    ones = Tensor.ones(len(self.devs), 1, dtype=dtypes.uint32).contiguous().shard(self.devs, 0)  # (a gpu's tag)
-    return Tensor(tag.uop.after(counted.uop, kept.uop)).assign(ones).realize()
+    tag = Tensor(tag.uop.after(counted.uop, kept.uop))
+    return tag.assign(tag * 0 + 1).realize()
 
   def window_experts(self, pool:Tensor, part1:Tensor) -> Tensor:
     """the window's routed experts once the host gave their slots (part 1): each gpu its units of the experts in tiles of an expert's rows,
@@ -322,43 +326,56 @@ class Engine:
     self.tok_np[:T], self.given_np[:T] = toks, given
     self.start_jit()
     host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
-    self.layers(T, pos)
+    ahead = self.layers(T, pos)
     for c0 in range(0, T, C) if self.fill_jit else []: self.fill_jit(self.v_pos.bind(pos + c0), self.v_c0.bind(c0))
     for d in self.devs: Device[d].synchronize()
+    for li in ahead: self.counted(li)
 
-  def layers(self, T:int, pos:int):
-    """a window's blocks, a layer at a time, the host serving each moe layer's experts"""
-    chunks, n = [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)], 1
+  def layers(self, T:int, pos:int) -> list[int]:
+    """a window's blocks, a layer at a time. a moe layer's experts its tokens route to read in (the host waits for the gpus' counts), their
+    slots given to the gpus. when its tokens route to nearly all of a layer's experts, every next layer's are read ahead while the gpus work
+    (and not waited for: those layers' counted after the window). returns those"""
+    chunks, n, E, ahead = [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)], 1, self.m["n_experts"], []
     for i, b in enumerate(self.model.blk):
       s = n - 1 + int(b.attn_res_score.new_block)
       jit, args, _ = self.kind("attend", b, self.attend)
-      for c0, live in chunks: jit(self.v_pos.bind(pos + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
+      for c0, live in chunks:
+        jit(self.v_pos.bind(pos + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
+        self.pump()
       if hasattr(b, "ffn_gate_inp"):
         li = self.m["layers"].index(i)
         self.route_jit(self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-        self.serve(li)
+        codes = li * E + (np.arange(E) if ahead else np.nonzero(self.counted(li))[0])
+        t0 = time.perf_counter()
+        self.read(codes, codes, wait=True)
+        self.io.t_reads += time.perf_counter() - t0
+        for p in self.bufs[li][2][1]: p[1:1 + E] = self.state["slot_of"][li * E:(li + 1) * E].view(np.uint32)
         self.experts_jit(self.pool, self.parts[0][li])
+        if li + 1 < len(self.parts[0]) and (ahead or len(codes) >= 0.9 * E):
+          self.read((li + 1) * E + np.arange(E), codes, wait=False)
+          ahead.append(li + 1)
         jit, args, _ = self.kind("post", b, self.post)
-        for c0, _ in chunks: jit(self.v_c0.bind(c0), self.v_s.bind(s), *args)
+        for c0, _ in chunks:
+          jit(self.v_c0.bind(c0), self.v_s.bind(s), *args)
+          self.pump()
       if self.draft and i in self.draft.layers: self.tap_jit(self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
       n = s + 1
+    return ahead
 
-  def serve(self, li:int):
-    """the host's part of layer li of a window: the experts its tokens route to read in (the missing ones into the least used slots but the
-    layer's, those read ahead waited for), their slots given to the gpus. then, when its tokens route to nearly all of its experts, the next
-    layer's read ahead while the gpus work"""
-    E, st, io, t0 = self.m["n_experts"], self.state, self.io, time.perf_counter()
-    tags, part1, part2 = (self.bufs[li][k][1] for k in (0, 2, 3))
+  def pump(self):  # (the reads ahead queued as the drives have room)
+    if host_c().pump(ctypes.byref(self.io)): raise RuntimeError("window reads failed")
+
+  def counted(self, li:int) -> np.ndarray:
+    """layer li's expert counts of a window's tokens once the gpus give them, added to its decayed use counts"""
+    E, io, t0 = self.m["n_experts"], self.io, time.perf_counter()
+    tags = self.bufs[li][0][1]
     while not all(t[0] == 1 for t in tags):
       if any(t[0] == 2 for t in tags) or time.perf_counter() - t0 > 60: raise RuntimeError(f"window layer {li}: no counts from the gpus")
-    counts, t1 = part2[0][1:1 + E].copy(), time.perf_counter()
-    codes = li * E + np.nonzero(counts)[0]
-    self.read(codes, codes, wait=True)
-    io.t_gpu, io.t_reads = io.t_gpu + t1 - t0, io.t_reads + time.perf_counter() - t1
-    for p in part1: p[1:1 + E] = st["slot_of"][li * E:(li + 1) * E].view(np.uint32)
-    f = st["freq"][li * E:(li + 1) * E]
+    counts = self.bufs[li][3][1][0][1:1 + E].copy()
+    f = self.state["freq"][li * E:(li + 1) * E]
     f[:] = f * io.decay + counts
-    if li + 1 < len(self.parts[0]) and len(codes) >= 0.9 * E: self.read((li + 1) * E + np.arange(E), codes, wait=False)
+    io.t_gpu += time.perf_counter() - t0
+    return counts
 
   def read(self, codes:np.ndarray, busy:np.ndarray, wait:bool):
     """the codes not cached read into the least used slots but those of busy's codes (in use or read): waited for (and those read ahead), or
@@ -377,7 +394,7 @@ class Engine:
     st["slot_of"][old[victims][old[victims] >= 0]] = -1
     st["slot_of"][miss], st["expert_in"][victims] = victims, miss
     io.misses += len(miss)
-    if not wait: return host_c().read_async(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)
+    if not wait: return host_c().read_ahead(ctypes.byref(io), len(miss), miss.ctypes.data)
     if (err:=host_c().read_codes(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)):
       raise RuntimeError(f"window reads failed {err}")
 
