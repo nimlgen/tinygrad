@@ -13,7 +13,7 @@ class Eagle3:
     cfg = json.load(open(f"{path}/config.json"))
     self.H, self.nope, self.rope, self.vd, self.lora = (cfg[k] for k in ("num_attention_heads", "qk_nope_head_dim", "qk_rope_head_dim",
                                                                           "v_head_dim", "kv_lora_rank"))
-    self.eps, self.embed = cfg["rms_norm_eps"], embed
+    self.eps, self.embed, self.norm_output = cfg["rms_norm_eps"], embed, cfg.get("norm_output", False)
     self.layers = [i - 1 for i in cfg["eagle_config"]["eagle_aux_hidden_state_layer_ids"]]  # (the target's blocks it reads after)
     rs = cfg["rope_scaling"]
     yarn = YaRNConfig(factor=rs["factor"], orig_ctx_len=rs["original_max_position_embeddings"], beta_fast=rs["beta_fast"], beta_slow=rs["beta_slow"])
@@ -55,7 +55,7 @@ class Eagle3:
 
   def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:UOp|None=None) -> tuple[Tensor, Tensor, UOp]:
     """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states (or hid, its own of the step before: a chain of guesses)
-    -> (1, T, vocab) logits, (1, T, dim) its hidden states, its cache after their keys (a chain's next step's cache)"""
+    -> (1, T, vocab) logits, (1, T, dim) its feedback states (output-normed if configured), its cache after their keys (a chain's next step's cache)"""
     T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
     if hid is None: hid = self.fc(cast(Tensor, hidden))
     h, cache = self.keys(tokens, hid, pos, self.cache.uop if cache is None else cache)
@@ -73,4 +73,5 @@ class Eagle3:
     x = self.lin((attn.half() @ self.v_b.transpose(-1, -2)).transpose(1, 2).reshape(1, T, -1), a + "o_proj") + hid
     m = self.norm(x, p + "post_attention_layernorm")
     x = x + self.lin(self.lin(m, p + "mlp.gate_proj").silu() * self.lin(m, p + "mlp.up_proj"), p + "mlp.down_proj")
-    return self.lin(self.norm(x, "norm"), "lm_head"), x, cache
+    normed = self.norm(x, "norm")
+    return self.lin(normed, "lm_head"), normed if self.norm_output else x, cache
