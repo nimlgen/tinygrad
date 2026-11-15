@@ -140,11 +140,12 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -> tuple[Tensor, Tensor, Tensor]:
-  """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits)"""
-  groups = in_features//Q8_GROUP_SIZE
-  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
-  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
-  xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
+  """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits). its
+  buffers' slots are x's and the kernel's: the linears that read the same x share one q8"""
+  groups, slot = in_features//Q8_GROUP_SIZE, hash((x.uop.key, tokens, in_features, act)) % (1 << 62)
+  q, scale, xsum = (Tensor(UOp.alloc(shape, dt, slot+i, device=x.device, bind_on_realize=True))
+                    for i, (shape, dt) in enumerate((((tokens, groups, 8), dtypes.uint32), ((tokens, groups), dtypes.float32),
+                                                     ((tokens, groups, 2), dtypes.float32))))
   fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, act=act)
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
