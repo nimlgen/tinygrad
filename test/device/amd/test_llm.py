@@ -567,6 +567,21 @@ class TestExpertLinear(unittest.TestCase):
     got = expert_gemm(self.pool, dead, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
     np.testing.assert_allclose(got[:32], ref[:32], rtol=0.03, atol=0.03 * np.abs(ref).max())
 
+  def test_live_rows(self): # the rows of weight 0 skipped: a slot's gate and up rows where all its tokens' are (0 out), the down rows' sums
+    x, off, per = Tensor(self.rng.standard_normal((2, self.LAT)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP, 2
+    w = self.rng.standard_normal(len(self.sel) * per).astype(np.float32)
+    w[[0, 1, 6, 7, 9, 30, 31]] = 0  # (slots 0, 3 and 15 dead, a token of slot 4)
+    gu = expert_linear(self.pool, self.slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=per, live=Tensor(w)).numpy()
+    ref = expert_linear(self.pool, self.slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, per=per).numpy()
+    dead = (w.reshape(-1, per) == 0).all(1).repeat(per)
+    np.testing.assert_array_equal(gu[dead], 0)
+    np.testing.assert_allclose(gu[~dead], ref[~dead], rtol=1e-5, atol=1e-5)
+    h = Tensor(self.rng.standard_normal((len(self.sel) * per, self.UNITS)).astype(np.float32))
+    out = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=Tensor(w), rows=per, per=per).numpy()
+    ref = expert_linear(self.pool, self.slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, per=per).numpy()
+    ref = (ref * w[:, None]).reshape(-1, per, self.LAT).sum(0)
+    np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()

@@ -174,7 +174,7 @@ class Engine:
     T, u, off = h.shape[0], self.units, 2 * self.units * self.lat // self.block[0] * self.block[1]
     slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + n + n * T].bitcast(dtypes.float32)
     if amd_custom_kernels_supported(h.device):
-      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, per=T)
+      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, per=T, live=w)
       return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T, per=T)
     slots = slots.reshape(n, 1).expand(n, T).flatten()  # (a row a slot and token)
     down = self.gemv(slots, self.act(*self.gemv(slots, h, 2 * u, self.lat, 0).split(u, -1)), self.lat, u, off)

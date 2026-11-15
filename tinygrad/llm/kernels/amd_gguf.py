@@ -3,7 +3,7 @@ import functools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -150,7 +150,8 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False, tables:tuple[UOp, ...]=()) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False, tables:tuple[UOp, ...]=(),
+                   live:Callable|None=None) -> UOp:
   chunks = out.shape[2]
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
@@ -166,8 +167,14 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     fill = UOp.group(*[lt[(i:=lane+wave*32+k*rows*32).valid(i < n)].store(t[i.minimum(n-1)].load()) for lt, t in zip(lts, tables)
                        for n in [int(t.numel())] for k in range(-(-n//(rows*32)))]).barrier()
     tables = tuple(lt.after(fill) for lt in lts)
-  value = [(group < group_count).where(group_dot(token+t, output, group.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
-           for t in range(tokens)]
+  def dot(t:int, g:UOp) -> UOp:
+    return (g < group_count).where(group_dot(token+t, output, g.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
+  if live is None: value = [dot(t, group) for t in range(tokens)]
+  else:  # live(token, group): the group's dot is read and added at all (a loop of one or no iterations: the loads in it)
+    i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 4, AxisType.LOOP)
+    acc = _reg((tokens,), 0)
+    acc = acc.after(UOp.group(*[acc[t].store(acc.after(i)[t].load() + dot(t, group + i)) for t in range(tokens)]).end(i))
+    value = [acc[t].load() for t in range(tokens)]
   stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=True).cast(out.dtype)) for t,v in enumerate(value)]
   return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
@@ -232,7 +239,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp, o
 
 def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp, ...], out_features:int, in_features:int, ggml_type:int,
                        cdna:bool, gate:Callable|None=None, xtoken:Callable|None=None, name:str="linear_", w:UOp|None=None,
-                       tokens:int|None=None) -> UOp:
+                       tokens:int|None=None, live:UOp|None=None) -> UOp:
   # gate(token, base) -> base: moves the weight rows, xtoken(token) -> the activation row of an output row. w: output row t the sum over the
   # rows k = j*rows + t (out's rows) of their outputs weighted by w[k] (a row's groups go over its k)
   gpk = in_features//32
@@ -286,7 +293,12 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
   # (an expert gemv's tokens a slot share its weight loads)
   share = gate is None if tokens is None else tokens
   groups = gpk * (1 if w is None else cast(int, w.shape[0])//cast(int, out.shape[0]))
-  return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share, grids)
+  # live: a row's weights (w's layout), a group skipped where every token's is 0 (a table's padding, a token's left out experts)
+  def is_live(token:UOp, group:UOp) -> UOp:
+    T = cast(int, out.shape[0]) if w is not None else cast(int, tokens)
+    base = group//gpk*T if w is not None else token
+    return functools.reduce(lambda a, b: a | b, [unwrap(live)[base + t].load().ne(0) for t in range(T)])
+  return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share, grids, None if live is None else is_live)
 
 @functools.cache
 def _moe_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, sel:UOp, *grids:UOp,
@@ -320,23 +332,25 @@ def moe_linear(layer:ExpertWeights, sel:Tensor, x:Tensor) -> Tensor:
 @functools.cache
 def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *extra:UOp,
                           out_features:int, in_features:int, ggml_type:int, stride:int, offset:int, cdna:bool=False, weighted:bool=False,
-                          per:int=1) -> UOp:
+                          per:int=1, live:bool=False) -> UOp:
   # row k reads the weight rows at slots[k // per]*stride + offset words (64 bit: a pool can pass 2**31 words) and the activation row k % rows
-  # (a slot's per rows share their weight loads). weighted: extra[0] the rows' weights, their weighted sums out's rows
+  # (a slot's per rows share their weight loads). weighted: extra[0] the rows' weights, their weighted sums out's rows. live: extra[0] the
+  # rows' weights (unweighted), a slot's rows skipped where they're all 0
   def gate(row:UOp, base:UOp) -> UOp: return base.cast(dtypes.int64) + slots[row // per].cast(dtypes.int64)*stride + offset
   def xtoken(row:UOp) -> UOp: return row % xq.shape[0]
-  w, grids = (extra[0], extra[1:]) if weighted else (None, extra)
+  w, grids = (extra[0], extra[1:]) if weighted or live else (None, extra)
   return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken,
-                            "expert_" if w is None else "expert_sum_", w, per)
+                            "expert_sum_" if weighted else "expert_", w if weighted else None, per, w)
 
 def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
-                  act:Callable|None=None, split:bool=False, w:Tensor|None=None, rows:int=1, per:int=1) -> Tensor:
+                  act:Callable|None=None, split:bool=False, w:Tensor|None=None, rows:int=1, per:int=1, live:Tensor|None=None) -> Tensor:
   """out[k] = W[slots[k // per]] @ x[k % rows]: the quantized experts in the slots of a pool of raw gguf blocks, a slot every stride bytes, W at
   offset bytes in it (per: a slot's rows, e.g. the tokens', their weights loaded once). x: (rows, in_features), out: (per*len(slots),
   out_features). a pool sharded over devices is a pool on each, of its own experts or parts of them: out is (ndev, per*len(slots), out_features),
   each device's, and x is the same on each or each device's (ndev, rows, in_features). act: x is a gate and up expert_linear's split output,
   the gemv's input act(gate, up) (in its q8, one kernel). split: out's partial sums over the input's 1024 chunks, a last axis. w: out (rows,
-  out_features) the sums over the rows j*rows + t of their outputs weighted by w (w[j*rows + t])"""
+  out_features) the sums over the rows j*rows + t of their outputs weighted by w (w[j*rows + t]), the rows of weight 0 skipped. live: the rows'
+  weights (w's layout) of an unweighted one, a slot skipped where all of its rows' are 0"""
   word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
   assert stride % word.itemsize == 0 and offset % word.itemsize == 0, f"{QUANT_NAMES[ggml_type]} slots must be {word.itemsize} byte aligned"
   ndev = int(pool.shape[0]) // int(pool.uop.shard_shape[0])
@@ -344,9 +358,11 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
   n, groups = slots.shape[0]*per if w is None else rows, in_features//32 * (1 if w is None else slots.shape[0]*per//rows)
   out = Tensor.empty(ndev*n, out_features, (groups+31)//32, dtype=dtypes.float32, device=pool.device, axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_decode_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
-                          stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device), weighted=w is not None, per=per)
+                          stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device), weighted=w is not None, per=per,
+                          live=live is not None)
   extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
-  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), xrows, in_features, act), slots.cast(dtypes.int32), *([] if w is None else [w]), *extra)
+  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), xrows, in_features, act), slots.cast(dtypes.int32),
+          *([w] if w is not None else [live] if live is not None else []), *extra)
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   ret = ret if split else ret[..., 0] if ret.shape[-1] == 1 else ret.sum(-1)  # (a sum of one is a copy)
   return ret.reshape(ndev, n, *ret.shape[1:]) if ndev > 1 else ret
