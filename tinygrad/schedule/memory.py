@@ -53,9 +53,9 @@ def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None, arenas:dict|No
 
   # build replace_map: each buffer becomes a SHRINK/BITCAST into a shared per-device-lane arena
   for key, sz in arena_sizes.items():
-    if arenas is not None and key[1] == 0 and (key not in arenas or arenas[key].max_numel() < sz):
+    if arenas is not None and (key not in arenas or arenas[key].max_numel() < sz):
       arenas[key] = UOp.new_buffer(key[0], sz, dtypes.int8)
-  lanes = {key: arenas[key] if arenas is not None and key[1] == 0 else UOp.new_buffer(key[0], sz, dtypes.int8) for key, sz in arena_sizes.items()}
+  lanes = {key: arenas[key] if arenas is not None else UOp.new_buffer(key[0], sz, dtypes.int8) for key, sz in arena_sizes.items()}
   replace_map = {buf_uop:lanes[_key(buf_uop)][offset:offset+buf_uop.nbytes()].bitcast(buf_uop.dtype) for buf_uop, offset in offsets.items()}
 
   if DEBUG >= 1 and (omem:=sum(nbytes.values()) / 1e6) != (nmem:=sum(arena_sizes.values()) / 1e6):
