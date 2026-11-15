@@ -597,6 +597,27 @@ class TestExpertLinear(unittest.TestCase):
       ref = expert_linear(pool, slots, x[xr], 16, cols, Q8_0, stride, per=16).numpy()
       np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
 
+  def test_live_token_entries(self): # per=1: a zero-weight entry must skip its NaN weights even if the neighboring token's entry is live
+    off = 2 * self.UNITS * self.ROW_UP
+    weights = self.rng.uniform(0.1, 1, len(self.sel)).astype(np.float32)
+    weights[::3] = 0
+    raw = self.raw.copy().reshape(self.NSLOTS, -1)
+    for slot in np.array(self.sel)[weights == 0]:
+      raw[slot].reshape(-1, QUANT_SIZES[IQ3_XXS])[:, :2] = np.array([np.nan], np.float16).view(np.uint8)
+    pool = Tensor(raw.flatten()).realize()
+    for tokens, entries in ((1, 16), (2, 16), (4, 16), (2, 6)):  # six entries: 48 groups, a final half-wave
+      w, slots = Tensor(weights[:entries]), self.slots[:entries]
+      x = Tensor(self.rng.standard_normal((tokens, self.LAT)).astype(np.float32))
+      gu = expert_linear(pool, slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, live=w).numpy()
+      ref = expert_linear(self.pool, slots, x, 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART).numpy()
+      np.testing.assert_array_equal(gu[weights[:entries] == 0], 0)
+      np.testing.assert_allclose(gu[weights[:entries] != 0], ref[weights[:entries] != 0], rtol=1e-5, atol=1e-5)
+      h = Tensor(self.rng.standard_normal((entries, self.UNITS)).astype(np.float32))
+      out = expert_linear(pool, slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=tokens).numpy()
+      ref = expert_linear(self.pool, slots, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off).numpy()
+      ref = (ref * weights[:entries, None]).reshape(-1, tokens, self.LAT).sum(0)
+      np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3 * np.abs(ref).max())
+
   def test_pool_past_2_31_words(self): # a slot past 2**31 words of the pool (64 bit offsets), the pool's zeros up to its end
     nslots = (1 << 32) // self.PART + 2
     pool = Tensor.zeros(nslots * self.PART // 2, dtype=dtypes.uint16).contiguous().realize()

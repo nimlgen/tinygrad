@@ -88,7 +88,7 @@ class TestEngine(unittest.TestCase):
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
   def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an
-    # entry a token's: a union of the tokens' with an expert more than once), a chunk's in one (entry j*T + t token t's j-th)
+    # entry j*T+t is token t's j-th expert and its weight), a chunk's in one
     eng = self.eng
     tables:dict[int, list[Tensor]] = {}
     def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
@@ -97,11 +97,9 @@ class TestEngine(unittest.TestCase):
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
         T = sel.shape[0]
-        def table(ks:slice) -> Tensor:  # (an entry a token's expert, j*T + t: its weight the token's, the others' 0)
-          n, tok = (ks.stop - ks.start) * T, Tensor.arange((ks.stop - ks.start) * T).to("CPU").reshape(-1, 1) % T
-          wt = (tok == Tensor.arange(T).to("CPU")).where(w[:, ks].T.flatten().reshape(n, 1), 0).flatten()
+        def table(ks:slice) -> Tensor:  # (an entry a token's expert and weight, j*T+t)
           return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
-                                                                    wt.cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
+                                                          w[:, ks].T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
         def chunk() -> Tensor:  # (host.py's chunk table, a tile expert e's (T <= 16): token t's row of it 16*e + t)
           n, NT, cpu = K * T, K * T // 16 + E, "CPU"
           k, nt = Tensor.arange(n, dtype=dtypes.int32).to(cpu), Tensor.arange(NT).to(cpu)

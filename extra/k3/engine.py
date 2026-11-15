@@ -38,10 +38,10 @@ class Engine:
     self.tokens, self.chunk, n = tokens, chunk, max(tokens, chunk)  # (n: a step's most tokens)
     self.qtype, self.block = {n.upper(): t for t, n in QUANT_NAMES.items()}[m["expert_type"]], m["block"]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
-    # and the two parts of a step's slots and weights, [ready | slots | weights]: the union of the tokens' first k1 experts, then of the rest, their
-    # weights a token's (entry j's at j*T + t); a chunk's in part 1, a row a token's expert (chunk_experts)
+    # and the two parts of a step's slots and weights, [ready | slots | weights]: entry j*T+t is token t's j-th expert and its weight;
+    # a chunk's in part 1, a row a token's expert (chunk_experts)
     self.ks, self.act = (K // 2, K - K // 2), functools.partial(gated_activation, config=model.config)
-    part = [1 + max(k * tokens * (1 + tokens), 2 * K * chunk + 17 * (K * chunk // 16 + E)) for k in self.ks]  # (a part's words)
+    part = [1 + max(2 * k * tokens, 2 * K * chunk + 17 * (K * chunk // 16 + E)) for k in self.ks]  # (a part's words)
     bufs = [[host_tensor(self.devs, sz, dt) for sz, dt in ((1, dtypes.uint32), (n * 2 * E // G, dtypes.float32), *((p, dtypes.uint32) for p in part))]
             for _ in blocks]
     self.tags, self.parts = [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
@@ -174,15 +174,14 @@ class Engine:
 
   def experts(self, h:Tensor, table:Tensor, n:int) -> Tensor:
     """each gpu's units of the n experts of a table (n slots, padded with slot 0, their weights a token's: j*T + t) on h (T, lat): (gpus, T,
-    lat). every token on every slot (its weights loaded once), the act in the q8 of the down gemv's input, the down gemv a token's sum"""
+    lat). entry j*T+t is token t's j-th expert, the act in the q8 of the down gemv's input, the down gemv a token's sum"""
     T, u, off = h.shape[0], self.units, 2 * self.units * self.lat // self.block[0] * self.block[1]
-    slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + n + n * T].bitcast(dtypes.float32)
+    slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + 2 * n].bitcast(dtypes.float32)
     if amd_custom_kernels_supported(h.device):
-      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, per=T, live=w)
-      return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T, per=T)
-    slots = slots.reshape(n, 1).expand(n, T).flatten()  # (a row a slot and token)
+      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, self.qtype, self.part, split=True, live=w)
+      return expert_linear(self.pool, slots, gu, self.lat, u, self.qtype, self.part, off, act=self.act, w=w, rows=T)
     down = self.gemv(slots, self.act(*self.gemv(slots, h, 2 * u, self.lat, 0).split(u, -1)), self.lat, u, off)
-    return (down * w.reshape(n * T, 1)).reshape(-1, n, T, self.lat).sum(1)
+    return (down * w.reshape(n, 1)).reshape(-1, n // T, T, self.lat).sum(1)
 
   def chunk_experts(self, h:Tensor, table:Tensor) -> Tensor:
     """each gpu's units of a chunk's experts on h (T, lat): (gpus, T, lat). the table's tiles of 16 rows an expert's (a row a token's): the gate

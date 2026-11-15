@@ -295,9 +295,8 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
   groups = gpk * (1 if w is None else cast(int, w.shape[0])//cast(int, out.shape[0]))
   # live: a row's weights (w's layout), a group skipped where every token's is 0 (a table's padding, a token's left out experts)
   def is_live(token:UOp, group:UOp) -> UOp:
-    T = cast(int, out.shape[0]) if w is not None else cast(int, tokens)
-    base = group//gpk*T if w is not None else token
-    return functools.reduce(lambda a, b: a | b, [unwrap(live)[base + t].load().ne(0) for t in range(T)])
+    base = group//gpk*out.shape[0] + token if w is not None else token
+    return functools.reduce(lambda a, b: a | b, [unwrap(live)[base + t].load().ne(0) for t in range(cast(int, tokens))])
   return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share, grids, None if live is None else is_live)
 
 @functools.cache

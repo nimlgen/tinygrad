@@ -166,6 +166,43 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(all(self.state["expert_in"][s] // E == li for s, w in zip(slots, ws) if w > 0))
     self.check_counts()
 
+  def test_token_entries(self): # exact routing: each token's entries only, shared experts read once, no writes past either table
+    for T in (2, 4, 8):
+      self.tearDown()
+      self.setUp(slots=L * E, T=T)
+      self.io.tau, self.io.tauc, self.io.beta, self.io.pf, self.io.fill = 0, 0, 0, 0, 0
+      guards = []
+      for li in range(L):
+        for g in range(NGPU):
+          # Two tokens share all experts; the others choose their own, so both shared and distinct entries are exercised.
+          self.gbuf[li][g]["scores"][ROWS:2 * ROWS] = self.gbuf[li][g]["scores"][:ROWS]
+          for kind in ("part1", "part2"):
+            old = self.gbuf[li][g][kind]
+            buf = np.full(len(old) + 16, 0xa5a5a5a5, np.uint32)
+            self.keep.append(buf)
+            self.gbuf[li][g][kind] = buf[:len(old)]
+            self.bufs[li, BUFS.index(kind), g] = buf.ctypes.data
+            guards.append(buf[len(old):])
+      self.step()
+      refs = 0
+      for li in range(L):
+        logits = np.concatenate([g["scores"][::ROWS] for g in self.gbuf[li]], axis=1).astype(np.float64)
+        sig = 1 / (1 + np.exp(-logits))
+        top = np.argsort(-(sig + self.bias[li]), axis=1, kind="stable")[:, :K]
+        refs += len(np.unique(top))
+        expected = np.take_along_axis(sig, top, axis=1)
+        expected /= expected.sum(1, keepdims=True)
+        for g in range(NGPU):
+          slots, weights = self.parts(li, g)
+          codes = self.state["expert_in"][slots].reshape(K, T).T - li * E
+          weights = weights.reshape(K, T).T
+          for t in range(T):
+            order, want_order = np.argsort(codes[t]), np.argsort(top[t])
+            np.testing.assert_array_equal(codes[t, order], top[t, want_order])
+            np.testing.assert_allclose(weights[t, order], expected[t, want_order], rtol=1e-6)
+      self.assertEqual((self.io.refs, self.io.misses), (refs, refs))
+      for guard in guards: np.testing.assert_array_equal(guard, 0xa5a5a5a5)
+
   def test_chunk(self):
     for T in (40, 137): self.check_chunk(T)  # (137: its routes on threads, the tokens split unevenly)
 
