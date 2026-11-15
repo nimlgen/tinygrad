@@ -164,8 +164,8 @@ class Engine:
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
-    a gpu's tag set 1 after its scores, 0 on a NaN)"""
-    if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).cast(dtypes.uint32))
+    a gpu's tag set 1 after its scores, 2 on a NaN)"""
+    if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).where(1, 2).cast(dtypes.uint32))
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
   def experts(self, h:Tensor, table:Tensor, n:int) -> Tensor:
@@ -227,7 +227,7 @@ class Engine:
     t2 = time.perf_counter()
     while self.res_np[0] != 1:
       if time.perf_counter() - t2 > 60: raise RuntimeError("the step's graph didn't finish")
-    if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left"}[err])
+    if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left", -4: "NaN scores"}[err])
     ret = self.res_np[1:1 + (2 * T if self.draft is not None and T <= self.tokens else T)].tolist()
     self.times += (t1 - t0, time.perf_counter() - t2)
     return ret[:T], ret[T:] or ret

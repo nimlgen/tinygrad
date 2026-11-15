@@ -223,9 +223,10 @@ static int64_t queue(io_t *s, int64_t lj, int64_t n, const int64_t *experts, int
   return 0;
 }
 
-// waits for the gpus' tags of the layer li of buffers b, the reads go on. 0, -1 a read failed, -2 a timeout
+// waits for the gpus' tags of the layer li of buffers b, the reads go on. 0, -1 a read failed, -2 a timeout, -4 a gpu's scores are NaN
 static int64_t tags(io_t *s, const uint64_t *b, int64_t li, double t0) {
   for (int64_t g = 0; g < s->ngpu; g++) while (*BUF(B_TAG, g, volatile uint32_t) != 1) {
+    if (*BUF(B_TAG, g, volatile uint32_t) == 2) { fprintf(stderr, "NaN scores at layer %ld on gpu %ld\n", (long)li, (long)g); return -4; }
     if (poll_io(s) < 0) return -1;
     if (now() - t0 > 60) return stuck(s, "the gpus", li, t0);
   }

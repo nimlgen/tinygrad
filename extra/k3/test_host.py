@@ -139,6 +139,13 @@ class TestStepIO(unittest.TestCase):
         self.assertTrue(all((a == b).all() for a, b in zip(self.parts(li, 0), self.parts(li, 1))))
     self.check_counts()
 
+  def test_nan_scores(self): # a gpu's tag 2 (its scores NaN): the step fails at once, not after the wait's timeout
+    host_c().flags(ctypes.byref(self.io), 0)
+    for g, buf in enumerate(self.gbuf[0]): buf["tag"][0] = 2 if g == 1 else 1
+    st = time.perf_counter()
+    self.assertEqual(host_c().step_io(ctypes.byref(self.io)), -4)
+    self.assertLess(time.perf_counter() - st, 5)
+
   def test_small_cache(self): # (the slots go to later layers within a step: only the tables and counts)
     self.tearDown()
     self.setUp(slots=40)
