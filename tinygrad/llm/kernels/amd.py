@@ -597,17 +597,23 @@ def _topk_count_kernel(counts:UOp, scores:UOp, state:UOp, valid:UOp, shift:int) 
       hi, kth = 0xFFFFFFFF << (shift + 8) & 0xFFFFFFFF, state[row, 0].load().bitcast(dtypes.uint32)
       d = ((key & hi) > kth).where(257, (key & hi).eq(kth).where(d, 0))
     return (i < valid).where(d, 0)
-  # the chunk's digits in LDS two to a word, a thread counts the ones over its b, four words a load
-  W = TOPK_KEYS // 2
-  e = UOp.range(-(-W // TOPK_THREADS), 3)
-  m = e*TOPK_THREADS + b
-  L = UOp.alloc((W,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  L = L.after(L[m.valid(m < W)].store(digit(chunk*TOPK_KEYS + 2*m) | (digit(chunk*TOPK_KEYS + 2*m + 1) << 16)).end(e).barrier())
-  def over(j:UOp) -> UOp:
-    words = UOp(Ops.SHRINK, src=(L, j*4, UOp.const(4))).load()
-    return functools.reduce(UOp.__add__, [((words[x] & 0xFFFF) > b.cast(dtypes.uint32)).cast(dtypes.int) +
-                                          ((words[x] >> 16) > b.cast(dtypes.uint32)).cast(dtypes.int) for x in range(4)])
-  return counts[row, chunk, b.valid(b < TOPK_BINS)].store(_isum(W // 4, 4, over)).end(b, chunk, row) \
+  # each wave's histogram of the chunk's digits in LDS (0s not counted), then the waves' sums of the digits over b (a suffix scan, a thread a b)
+  waves, bins = TOPK_THREADS // WARP_SIZE, TOPK_BINS + 1
+  wave, lane = b // WARP_SIZE, b % WARP_SIZE
+  hist = UOp.alloc((waves, bins), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  e = UOp.range(-(-bins // WARP_SIZE), 3)
+  hist = hist.after(hist[wave, (col:=e*WARP_SIZE + lane).valid(col < bins)].store(0).end(e).barrier())
+  adds = [_sys("if ({1} != 0) __atomic_fetch_add({0}, 1, __ATOMIC_RELAXED);", dtypes.void, hist.reshape(-1).index(wave*bins + d), d)
+          for j in range(-(-TOPK_KEYS // TOPK_THREADS)) for i in [j*TOPK_THREADS + b]
+          for d in [(i < TOPK_KEYS).where(digit(chunk*TOPK_KEYS + i.minimum(TOPK_KEYS - 1)), 0)]]
+  hist = hist.after(UOp.group(*adds).barrier())
+  scan = UOp.alloc((2, TOPK_THREADS), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  scan = scan.after(scan[0, b].store((b < TOPK_BINS).where(sum(hist[w, (b + 1).minimum(TOPK_BINS)].load() for w in range(waves)), 0)).barrier())
+  for step in range(steps:=(TOPK_THREADS - 1).bit_length()):
+    off = 1 << step
+    more = (b + off < TOPK_THREADS).where(scan[step % 2, (b + off).minimum(TOPK_THREADS - 1)].load(), 0)
+    scan = scan.after(scan[(step + 1) % 2, b].store(scan[step % 2, b].load() + more).barrier())
+  return counts[row, chunk, b.valid(b < TOPK_BINS)].store(scan[steps % 2, b].load()).end(b, chunk, row) \
     .sink(arg=KernelInfo(name="topk_count", opts_to_apply=()))
 
 @functools.cache

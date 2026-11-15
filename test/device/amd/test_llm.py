@@ -623,6 +623,16 @@ class TestTopk(unittest.TestCase):
         for r in range(R):
           self.assertEqual(set(got[r, :min(2048, S)].tolist()), set(np.lexsort((np.arange(S), -s[r, :S]))[:2048].tolist()), f"{R=} {S=} {r=}")
 
+  def test_topk_long(self): # 262144 keys: a row of ties, one of -inf, one of +inf at the chunks' edges
+    R, N = 4, 262144
+    s = np.random.default_rng(41).standard_normal((R, N)).astype(np.float32)
+    s[0, :4000:3], s[1, :], s[2, 100:200] = 0.5, 0.25, -np.inf
+    s[3, [65535, 65536, 131071, 131072, N - 1]] = np.inf
+    v, x = UOp.variable("S", 1, N), Tensor(s).realize()
+    for S in (1, 2049, N - 3, N):
+      got = topk_indices(x, 2048, v.bind(S)).numpy()
+      for r in range(R): self.assertEqual(set(got[r, :min(2048, S)].tolist()), set(np.lexsort((np.arange(S), -s[r, :S]))[:2048].tolist()))
+
   def test_indexer_scores(self): # a row's (token t at start + t) score of each key: the heads' sum of w relu(q . key), -inf past the token
     rng = np.random.default_rng(0)
     for T, H, start in ((1, 32, 2999), (2, 32, 1000), (5, 4, 40)):
