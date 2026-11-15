@@ -777,6 +777,7 @@ class Transformer:
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
     self._rollbacks: dict[int, Callable] = {}
+    self._copies: dict[tuple[int, bool], Callable] = {}
 
   def forward(self, tokens:Tensor, temperature:Tensor, *start_pos:int|UOp) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
@@ -809,8 +810,14 @@ class Transformer:
       Tensor.realize(*[s for st in self._sets for s in st])
     keep = [(t, i) for t, i in self._saved if len(t) < len(tokens) and tokens[:len(t)] == t][-1:]
     i = next(j for j in range(2) if all(j != k for _, k in keep))
-    Tensor.realize(*[k.assign(s) for k, s in zip(self._sets[i], states)])
+    self._copy(i, save=True)
     self._saved = keep + [(tokens[:], i)]
+
+  def _copy(self, i:int, save:bool):
+    """the recurrent states into saved set i (save) or back from it"""
+    def copy(): Tensor.realize(*[k.assign(s) if save else s.assign(k) for k, s in zip(self._sets[i], self._states())])
+    if (i, save) not in self._copies: self._copies[i, save] = TinyJit(copy)  # (a copy a state, scheduled once)
+    self._copies[i, save]()
 
   def fork(self, tokens:list[int], start:int, step:int) -> int:
     """where (start and whole steps of a feed) tokens diverge from the tokens fed before, its states to be saved there for a later prompt that
@@ -1063,7 +1070,7 @@ class Transformer:
       self._saved = [(t, i) for t, i in self._saved if extends(t)]
       if not self._saved: return 0
       prompt, i = self._saved[-1]
-      Tensor.realize(*[s.assign(k) for s, k in zip(self._states(), self._sets[i])])
+      self._copy(i, save=False)
       self._cached_tokens = prompt[:]
       return len(prompt)
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))

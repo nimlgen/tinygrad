@@ -209,11 +209,12 @@ class Engine:
   # *** the host's side
 
   def warm(self):
-    """every step's graph (and the rollback's) captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
+    """every step's graph (and the rollback's, the saves') captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
     host_c().flags(ctypes.byref(self.io), 1)
     for T, jit in self.jits.items():
       for _ in range(3): jit(*self.binds(T, 0, T))[0].tolist()
     for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
+    for (i, save), _ in itertools.product(itertools.product(range(2), (True, False)), range(3)): self.model._copy(i, save)  # (and save's)
     for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
