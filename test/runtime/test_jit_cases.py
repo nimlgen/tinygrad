@@ -74,5 +74,18 @@ class TestJitCases(unittest.TestCase):
       f()
       self.assertEqual(out.item(), i*2)
 
+  def test_arenas_of_jits_never_run_at_once(self):
+    """jits that never run at the same time share their scratch's compute arena: one buffer, and a jit's outputs another jit takes never in it"""
+    def f(x): return ((x + 1).contiguous() * 2).contiguous().sum(0).realize()
+    def g(y): return ((y * 3).contiguous() - 1).contiguous().sum().realize()
+    arenas:dict = {}
+    fs, gs, fu, gu = TinyJit(f, arenas=arenas), TinyJit(g, arenas=arenas), TinyJit(f), TinyJit(g)
+    for i in range(5):
+      x = Tensor([[i, i + 1], [i + 2, i + 3]]).float().realize()
+      shared, unshared = gs(fs(x)), gu(fu(x))
+      self.assertEqual(shared.item(), unshared.item())
+      self.assertEqual(shared.item(), ((2*i + 4) * 2 + (2*i + 6) * 2) * 3 - 2)
+    self.assertEqual(len(arenas), 1)
+
 if __name__ == '__main__':
   unittest.main()
