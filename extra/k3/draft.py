@@ -5,7 +5,7 @@ import json, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
 class Eagle3:
@@ -64,7 +64,7 @@ class Eagle3:
     # absorbed: the nope scores (q_nope k_b) . latent, causal over the cache, the values v_b (attention . latent)
     qa = (q[..., :self.nope].half() @ self.k_b).float().cat(q_pe.float(), dim=-1)
     scale = self.mscale ** 2 / math.sqrt(self.nope + self.rope)
-    if amd_custom_kernels_supported(qa.device) and self.lora % 32 == 0:
+    if mla_topk_supported(qa.device, self.lora):
       attn = mla_topk_attention(qa, Tensor(cache), None, pos, self.lora, scale)
     else:
       k = Tensor(cache)[:, :, :pos + T].float()

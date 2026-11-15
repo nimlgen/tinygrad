@@ -786,6 +786,10 @@ def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|
                                                                                                zero)))]
   return UOp.group(*final).end(lane, wave, part, hg, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
 
+def mla_topk_supported(device:str|tuple[str, ...]|None, values:int) -> bool:
+  """mla_topk_attention's gpus and shapes: a value a lane's dims of a wave"""
+  return amd_custom_kernels_supported(device) and values % WARP_SIZE == 0
+
 def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
   idx (B, T, K) (of the first start + T slots, at or before the query; None: every position, causal), a row's value its first values dims"""
