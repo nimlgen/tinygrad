@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv, unwrap, round_up, dedup
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve, smin
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve, smin, sint
 from tinygrad.renderer.cstyle import HIPRenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
@@ -824,6 +824,11 @@ def _mailboxes(devs:tuple[str, ...]) -> tuple[Tensor, ...]:
     counters = [Buffer(d, (AR_GROUPS + 1) * 4, initial_value=bytes(AR_GROUPS * 4) + i.to_bytes(4, "little")) for i, d in enumerate(devs)]
   return multi(counters, dtypes.int32), *(multi([own[(d + k) % N] for d in range(N)], dtypes.uint64) for k in range(N))
 
+def _mailbox_shape(x:Tensor, n:sint) -> tuple[int, int]|None:
+  """the mailbox kernels' (T, EP) for n floats a gpu: small ones on RDNA4's gpus (system scope atomics over the peers' memory), else None"""
+  if not (isinstance(x.device, tuple) and isinstance(n, int) and amd_custom_kernels_supported(x.device) and _is_rdna4(x.device)): return None
+  return _ar_shape(n)
+
 def _ar_shape(n:int) -> tuple[int, int]|None:
   """(threads, values a thread) of a workgroup of an allreduce of n: small ones in narrow workgroups, larger in up to 24 of 256 threads"""
   for T, EP in (((128, 1),) if n <= 2048 else ()) + ((256, 1), (256, 2), (256, 4)):
@@ -883,12 +888,50 @@ def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int
 
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes"""
-  n = prod(x.shape[1:])
-  if not (isinstance(x.device, tuple) and x.uop.axis == 0 and isinstance(n, int) and (shape:=_ar_shape(n))
-          and amd_custom_kernels_supported(x.device) and _is_rdna4(x.device)): return x.sum(0)
+  if x.uop.axis != 0 or not (shape:=_mailbox_shape(x, n:=prod(x.shape[1:]))): return x.sum(0)
   fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
+
+@functools.cache
+def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:int, EP:int) -> UOp:
+  # Each GPU broadcasts its compact local slice once. Mailbox slots/epochs share the allreduce protocol; no padded zero vectors or sums.
+  N, G = len(mb), n // (T * EP)
+  wg, t = UOp.range(G, 0, AxisType.GLOBAL), UOp.range(T, 1, AxisType.LOCAL)
+  li = [t*EP+i for i in range(EP)]
+  els = [wg*T*EP+l for l in li]
+  epoch, me = (counter[wg].load()+1).cast(dtypes.uint32), counter[AR_GROUPS].load().cast(dtypes.weakint)
+  deadline = _sys("__builtin_readsteadycounter()", dtypes.uint64, epoch) + AR_TIMEOUT_MS*100000
+  par = (epoch & 1).cast(dtypes.weakint)
+  def reg(s:int|UOp, l:UOp) -> UOp: return ((wg*2+par)*(N+1)+s)*AR_WORDS+l
+  vals = [x.reshape(-1)[e].load() for e in els]
+  words = [(epoch.cast(dtypes.uint64)<<32) | v.bitcast(dtypes.uint32).cast(dtypes.uint64) for v in vals]
+  sent = [mb[k][reg(me, l)].store(v) for k in range(1, N) for l, v in zip(li, words)]
+  fenced = _sys('__builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");', dtypes.void, UOp.const(0, dtypes.int).after(*sent))
+  once = UOp.range((t < 32).where(1, 0).after(UOp.group(fenced).barrier()), next(UOp.unique_num), AxisType.LOOP)
+  pushed = _sys('__builtin_amdgcn_fence(__ATOMIC_RELEASE, "");', dtypes.void, once).end(once).barrier()
+  loop = UOp.loop(next(UOp.unique_num)).replace(src=(UOp(Ops.NOOP).after(pushed),))
+  got = [_sys("__hip_atomic_load({0}, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)", dtypes.uint64,
+              mb[0].after(loop).index(reg(s, l))) for s in range(N) for l in li]
+  stale = functools.reduce(lambda a,b: a | b, [me.ne(s) & (g>>32).cast(dtypes.uint32).ne(epoch)
+                                             for s in range(N) for g in got[s*EP:(s+1)*EP]])
+  kept = UOp.alloc((N*EP,), dtypes.uint64, addrspace=AddrSpace.REG)
+  stores = UOp.group(*[kept[i].store(g) for i,g in enumerate(got)])
+  kept = kept.after(stores.backedge(loop, stale & (_sys("__builtin_readsteadycounter()", dtypes.uint64, stale) < deadline)))
+  def value(i:int) -> UOp:
+    word = kept[i].load()
+    return (word>>32).cast(dtypes.uint32).eq(epoch).where(word.cast(dtypes.uint32).bitcast(dtypes.float32), math.nan)
+  outputs = [out.reshape(-1)[e//width*(N*width)+s*width+e%width].store(me.eq(s).where(v, value(s*EP+i)))
+             for s in range(N) for i,(e,v) in enumerate(zip(els, vals))]
+  done = counter.after(UOp.group(*outputs).barrier())[wg.valid(t.eq(0))].store(epoch.cast(dtypes.int32))
+  return UOp.group(*outputs, done).end(wg, t).sink(arg=KernelInfo(name="allgather", opts_to_apply=()))
+
+def allgather_last(x:Tensor) -> Tensor:
+  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes"""
+  if x.uop.axis != x.ndim-1 or not isinstance(devs:=x.device, tuple): return x
+  if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))): return Tensor(x.uop.copy_to_device(devs))
+  fxn = functools.partial(_allgather_kernel, n=n, width=x.max_shape[-1]//len(devs), T=shape[0], EP=shape[1])
+  return Tensor.custom_kernel(Tensor.empty(x.shape, dtype=x.dtype, device=x.device), x.contiguous(), *_mailboxes(x.device), fxn=fxn)[0]
 
 # ******** the residual streams' mix and the sublayer's rmsnorm, in two kernels over slices of each token's streams ********
 

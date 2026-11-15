@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode, RES_MAX_STREAMS
+  indexer_scores, topk_indices, mla_topk_attention, res_mix_norm, kda_decode, RES_MAX_STREAMS, allgather_last
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
 from tinygrad.llm.kernels.amd_gguf import q8_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
@@ -323,8 +323,9 @@ class FFNBlock:
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_inp'):
-      out = self._routed(x, self.ffn_routed_down(x) if self.config.expert_latent_dim else x)
-      if self.config.expert_latent_dim: out = self.ffn_routed_up(self.ffn_routed_norm(out))
+      # (the latent projections sharded on their outputs: gathered)
+      out = self._routed(x, allgather_last(self.ffn_routed_down(x)) if self.config.expert_latent_dim else x)
+      if self.config.expert_latent_dim: out = allgather_last(self.ffn_routed_up(self.ffn_routed_norm(out)))
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(gated_activation(self.ffn_gate_shexp(x), self.ffn_up_shexp(x), self.config).contiguous())
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
@@ -854,9 +855,10 @@ class Transformer:
         n_kv_heads = shard
       heads = n_heads if kv.get(f'{arch}.attention.kv_lora_rank') else n_kv_heads
       assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
-      # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
+      # shard MLA heads, routed experts and their latent projections (gathered after) while replicating the other latent projections, KV
+      # cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
-        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight')},
+        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'ffn_routed_down.weight', 'ffn_routed_up.weight')},
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
       if kda: rules.update({w: 0 for w in ('ssm_conv1d_q.weight', 'ssm_conv1d_k.weight', 'ssm_f.weight',
         'ssm_conv1d_v.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_beta.weight', 'ssm_f_b.weight', 'ssm_g.weight', 'ssm_g_b.weight', 'attn_gate.weight')})
