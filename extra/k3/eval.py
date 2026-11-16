@@ -3,6 +3,14 @@
 import json, sys, time
 from typing import Callable
 import numpy as np
+from tinygrad import Tensor
+
+def score(lg:np.ndarray, top:list) -> tuple[float, float]:
+  """logits lg against production's top 5 (logprob, token): top-1 agreement, KL(production's top 5 and the rest || ours)"""
+  lp = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum())
+  p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
+  rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
+  return float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))
 
 def evaluate(eng, spec:str, late:Callable[[], bool]):
   path, *nums = spec.split(":")
@@ -16,15 +24,32 @@ def evaluate(eng, spec:str, late:Callable[[], bool]):
       n = T if len(seq) - at >= T else 1
       eng.step(seq[at:at + n], at)
       for pos, lg in enumerate(eng.logits.numpy().astype(np.float64), at):
-        if pos < len(ids) - 1: continue
-        lp, top = lg - lg.max() - np.log(np.exp(lg - lg.max()).sum()), r["output_top"][pos - len(ids) + 1]
-        p, q = np.exp([x[0] for x in top]), lp[[x[1] for x in top]]
-        rest_p, rest_q = max(1 - p.sum(), 1e-12), max(1 - np.exp(q).sum(), 1e-12)
-        stats.append((float(lp.argmax() == top[0][1]), float((p * (np.log(p) - q)).sum() + rest_p * (np.log(rest_p) - np.log(rest_q)))))
+        if pos >= len(ids) - 1: stats.append(score(lg, r["output_top"][pos - len(ids) + 1]))
       at += n
     (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
     eng.report(c0, len(ids) + len(outs) - 2)
+
+def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128) -> list[tuple[float, float]]:
+  """WEVAL=corpus.jsonl:nseq:ntok:first: evaluate's completions through windows, every position's logits from the window's last streams (a
+  pass of the sequence, no steps), rows at a time"""
+  path, *nums = spec.split(":")
+  nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
+  m, stats = eng.model, []
+  for r in [json.loads(line) for line in open(path)][first:first + nseq]:
+    if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
+    ids, outs, n0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats)
+    seq = ids + outs[:-1]
+    for at in range(0, len(seq), eng.W):
+      toks = seq[at:at + eng.W]
+      eng.window(toks, at, (seq[at + 1:at + 1 + len(toks)] + [-1])[:len(toks)])
+      for r0 in range(0, len(toks), rows):
+        x = m.output_res_score.mix(Tensor(eng.win["bank"].uop)[:, r0:r0 + rows])
+        for pos, lg in enumerate(m.output(m.output_norm(x))[0].float().numpy()[:len(toks) - r0].astype(np.float64), at + r0):
+          if pos >= len(ids) - 1: stats.append(score(lg, r["output_top"][pos - len(ids) + 1]))
+    (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
+    print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}", flush=True)
+  return stats
 
 def bench(eng, spec:str, late:Callable[[], bool]):
   """BENCH=corpus.jsonl:nseq:ntok:first: verify steps of [the next, the draft's guess] over production completions teacher forced (the text

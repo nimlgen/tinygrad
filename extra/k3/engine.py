@@ -88,7 +88,10 @@ class Engine:
     self.tail = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part - lent
     self.slots = slots = self.tail + lent
     self.pool = pool(slots)
-    if window: self.win = self.window_state(self.tail)
+    if window:
+      self.win = self.window_state(self.tail)
+      self.experts_jit.reset()  # (captured again on the pool: the decoded experts' gather from it is of its size)
+      for b in (moe:=[b for b in model.blk if hasattr(b, "ffn_gate_inp")])[:1] * 2 + moe: self.dry(b)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -206,17 +209,17 @@ class Engine:
       vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
         (self.v_c0.bind(0), self.v_s.bind(0))
       for _ in range(3): self.graph(jit, *vs, *args)
-    li = self.m["layers"].index(m.blk.index(moe[0]))
     for _ in range(3):
       self.graph(self.start_jit)
-      self.graph(self.route_jit, self.v_wlive.bind(self.chunk), moe[0].exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-      self.graph(self.experts_jit, self.pool, self.parts[0][li])
+      self.dry(moe[0])
       self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
       if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_c0.bind(0))
-    for b in moe:  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait for it)
-      li = self.m["layers"].index(m.blk.index(b))
-      self.graph(self.route_jit, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-      self.graph(self.experts_jit, self.pool, self.parts[0][li])
+    for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
+
+  def dry(self, b:FFNBlock):  # (moe block b's route and experts on a dry chunk)
+    li = self.m["layers"].index(self.model.blk.index(b))
+    self.graph(self.route_jit, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+    self.graph(self.experts_jit, self.pool, self.parts[0][li])
 
   def window_state(self, at:int|None=None) -> dict[str, Tensor]:
     """the window's state: the bank of the residual streams, the moe's inputs and outputs (the routed experts' inputs and outputs, the shared
@@ -531,9 +534,9 @@ if __name__ == "__main__":
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
-  if (spec:=getenv("EVAL", "") or getenv("BENCH", "")):  # EVAL=/BENCH=corpus.jsonl:nseq:ntok:first (eval.py)
-    from extra.k3.eval import evaluate, bench
-    (evaluate if getenv("EVAL", "") else bench)(eng, spec, late)
+  if (spec:=getenv("EVAL", "") or getenv("WEVAL", "") or getenv("BENCH", "")):  # EVAL=/WEVAL=/BENCH=corpus.jsonl:nseq:ntok:first (eval.py)
+    from extra.k3.eval import evaluate, window_evaluate, bench
+    (evaluate if getenv("EVAL", "") else window_evaluate if getenv("WEVAL", "") else bench)(eng, spec, late)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
   if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()

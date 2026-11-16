@@ -12,6 +12,7 @@ from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
 from extra.k3.draft import Eagle3
+from extra.k3.eval import window_evaluate
 
 DIM, LAT, FF, E, K, G, VOCAB = 64, 32, 64, 8, 4, 2, 32
 CONFIG = TransformerConfig(num_blocks=3, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
@@ -128,6 +129,20 @@ class TestEngine(unittest.TestCase):
     self.eng.window(toks[:8], 0, toks[1:9])
     ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
     np.testing.assert_allclose(ours, want, rtol=1e-3, atol=1e-3 * np.abs(want).max())
+
+  def test_window_evaluate(self):  # a completion teacher forced through windows (two) scored against its token steps' top 5: as them
+    self.stub()
+    ids, outs, tops = [3, 5, 7], [1, 2, 9, 4, 6, 8, 2, 7, 3, 5], []
+    for pos, t in enumerate(ids + outs[:-1]):
+      lp = Tensor(self.eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].numpy()[0]).log_softmax().numpy()
+      if pos >= len(ids) - 1: tops.append([[float(lp[i]), int(i)] for i in np.argsort(-lp)[:5]])
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f:
+      f.write(json.dumps({"task_id": "toy", "prompt_ids": ids, "output_ids": outs, "output_top": tops}) + "\n")
+      f.flush()
+      stats = window_evaluate(self.eng, f"{f.name}:1:{len(outs)}", lambda: False)
+    self.assertEqual(len(stats), len(outs))
+    self.assertEqual([a for a, _ in stats], [1.0] * len(outs))
+    self.assertLess(max(k for _, k in stats), 1e-3)  # (on AMD the steps' experts take q8 activations)
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
