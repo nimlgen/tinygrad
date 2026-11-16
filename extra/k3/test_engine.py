@@ -179,6 +179,14 @@ class TestEngine(unittest.TestCase):
     self.assertEqual(Engine.proposal(eng, g, np.full(7, 0.3), 0, 0), g[:1])  # type: ignore[arg-type]
     self.assertEqual(Engine.proposal(eng, g, None, 0, 0), g)  # type: ignore[arg-type]
 
+  def test_generate_kept(self):  # a verify step's kept guesses are tokens, the step's guesses the next step's proposal
+    steps, seen = iter([([5], [6, 7], None), ([6, 9], [8, 3], None), ([8, 3], [1, 2], None)]), []
+    model = SimpleNamespace(fork=lambda *a: 0, save=lambda t: None, rollback=lambda n: None)
+    eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
+                          draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0)
+    self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
+    self.assertEqual(seen, [[6, 7], [8, 3]])
+
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
     self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
