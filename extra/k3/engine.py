@@ -836,24 +836,33 @@ class Engine:
     for pos in range(self.prefill(tokens, fork), len(tokens)):
       (t,), g, score = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
-    row = 0
-    while len(tokens) + self.tokens <= self.max_context:  # (a verify step's last token in the context)
-      tokens.append(t)
-      self.model._cached_tokens = tokens[:-1]
-      yield t
-      if self.draft is None:
-        (t,), _, _ = self.step([t], len(tokens) - 1)
-        continue
-      gs = self.proposal(g, score, len(tokens) - 1, row)
-      toks, g, score = self.step([t, *gs], len(tokens) - 1)
-      row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
-      self.verified += (1, len(gs), row)
-      if row < len(gs): self.model.rollback(row + 1)  # (before the kept ones are yielded: a request may stop at any)
-      for kept in gs[:row]:
-        tokens.append(kept)
-        self.model._cached_tokens = tokens[:]
-        yield kept
-      t = toks[row]
+    row, c0, v0, widths = 0, self.counters(), self.verified.copy(), collections.Counter()
+    try:
+      while len(tokens) + self.tokens <= self.max_context:  # (a verify step's last token in the context)
+        tokens.append(t)
+        self.model._cached_tokens = tokens[:-1]
+        yield t
+        if self.draft is None:
+          (t,), _, _ = self.step([t], len(tokens) - 1)
+          widths[1] += 1
+          continue
+        gs = self.proposal(g, score, len(tokens) - 1, row)
+        toks, g, score = self.step([t, *gs], len(tokens) - 1)
+        widths[len(toks)] += 1
+        row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
+        self.verified += (1, len(gs), row)
+        if row < len(gs): self.model.rollback(row + 1)  # (before the kept ones are yielded: a request may stop at any)
+        for kept in gs[:row]:
+          tokens.append(kept)
+          self.model._cached_tokens = tokens[:]
+          yield kept
+        t = toks[row]
+    finally:
+      if (n:=sum(widths.values())):  # (a request's decode: its verify steps' tokens, widths and split)
+        dt, _, refs, hits, *_, gpu, _, reads, _, _, after = (self.counters() - c0) / n
+        print(f"decode: {n} steps, {1 + (self.verified[2] - v0[2]) / n:.2f} tokens a step (widths {dict(sorted(widths.items()))}), "
+              f"{dt * 1e3:.1f} ms a step: {gpu * 1e3:.1f} waiting on the gpus, {reads * 1e3:.1f} on reads, {after * 1e3:.1f} after the last layer; "
+              f"{hits / max(refs, 1):.1%} of experts cached", flush=True)
 
   def counters(self) -> np.ndarray:
     io = self.io
