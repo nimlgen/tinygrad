@@ -1,5 +1,5 @@
 from __future__ import annotations
-import functools, math
+import functools, itertools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -374,24 +374,28 @@ def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, lanes:int):
   if out_features % (16*output_tiles): output_tiles = 1
   output_waves = 2 if out_features % (32*output_tiles) == 0 else 1
-  token_block, output_block = UOp.range(out.shape[0]//token_tile, 0), UOp.range(out_features//(16*output_tiles*output_waves), 1)
+  # the waves on more tokens (up to 4) share the workgroup's weights: a fragment dequantized once, through LDS
+  token_waves = next(n for n in (4, 2, 1) if out.shape[0] % (token_tile*n) == 0 and (2*output_tiles) % n == 0)
+  token_block = UOp.range(out.shape[0]//(token_tile*token_waves), 0)
+  output_block = UOp.range(out_features//(16*output_tiles*output_waves), 1)
   # lane is a hardware WARP range (like the flash kernel): the fragment math stays visible without being
   # range-split into nested loops, which would scramble the WMMA fragment layout
-  lane, wave = UOp.range(lanes, -1, axis_type=AxisType.WARP), UOp.range(output_waves, 3, axis_type=AxisType.LOCAL)
+  lane, wave = UOp.range(lanes, -1, axis_type=AxisType.WARP), UOp.range(output_waves*token_waves, 3, axis_type=AxisType.LOCAL)
   col, lane_group, rows = lane % 16, lane // 16, 256 // lanes
-  outputs = tuple((output_block*output_waves+wave)*(16*output_tiles) + tile*16 + col for tile in range(output_tiles))
-  inputs = tuple(token_block*token_tile + tile*16 + col for tile in range(token_tile//16))
-  tokens = tuple(tuple(token_block*token_tile + tile*16 + lane_group*rows + i for i in range(rows)) for tile in range(token_tile//16))
-  return output_waves, token_block, output_block, lane, wave, lane_group, outputs, inputs, tokens
+  first = (token_block*token_waves + wave // output_waves)*token_tile
+  outputs = tuple((output_block*output_waves + wave % output_waves)*(16*output_tiles) + tile*16 + col for tile in range(output_tiles))
+  inputs = tuple(first + tile*16 + col for tile in range(token_tile//16))
+  tokens = tuple(tuple(first + tile*16 + lane_group*rows + i for i in range(rows)) for tile in range(token_tile//16))
+  return output_waves*token_waves, token_block, output_block, lane, wave, lane_group, outputs, inputs, tokens
 
-def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups):
+def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, waves, kgroups):
   # RDNA4 and CDNA (kgroups > 1) own consecutive rows per lane group, matching tokens directly.
   if kgroups > 1:
     return [out[token, output].store(acc.after(update)[i].load()) for output,output_accs in zip(outputs, accs)
             for tile_tokens,acc in zip(tokens, output_accs) for i,token in enumerate(tile_tokens)]
   # the accumulator fragment halves are exchanged between lane pairs (l, l^16) through LDS (a ds_swizzle without CUSTOM)
   flat_accs = [acc for output_accs in accs for acc in output_accs]
-  lds = UOp.alloc((output_waves, 32, len(flat_accs)*8), dtypes.float32, addrspace=AddrSpace.LOCAL)
+  lds = UOp.alloc((waves, 32, len(flat_accs)*8), dtypes.float32, addrspace=AddrSpace.LOCAL)
   stores = [lds[wave, lane, a*8+i].store(acc.after(update)[i].load()) for a,acc in enumerate(flat_accs) for i in range(8)]
   lds = lds.after(*stores)
   def values(ai:int) -> tuple[UOp, ...]:
@@ -405,28 +409,41 @@ def _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, k
 
 def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, dequant, name, kgroups, lanes):
   x = x.reshape(out.shape[0], in_features)
-  output_waves, token_block, output_block, lane, wave, lane_group, outputs, input_tokens, tokens = layout
+  waves, token_block, output_block, lane, wave, lane_group, outputs, input_tokens, tokens = layout
   token_tile, output_tiles = len(tokens)*16, len(outputs)
   # IQ4_NL blocks are 32 wide: a device can hold part of a 256 weight row group
   output_words = in_features * type_words // GGML_BLOCK_SIZE
   accs = tuple(tuple(UOp.alloc((len(tokens[0]),), dtypes.float32, addrspace=AddrSpace.REG)
                      for tile in range(token_tile // 16)) for ot in range(output_tiles))
   accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in output_accs) for output_accs in accs)
-  group = UOp.range(in_features // Q8_GROUP_SIZE, 4, AxisType.LOOP)
-  block, subgroup = group // 8, group % 8
-  wmma_accs = [list(output_accs) for output_accs in accs]
+  # a step: steps groups of 32 inputs. the workgroup's waves on more tokens share its weight fragments (an output tile's half of a group, a
+  # lane's ks): each dequantized by one wave into LDS (two buffers by the step's parity: one barrier a step)
+  steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
+  step = UOp.range(in_features // Q8_GROUP_SIZE // steps, 4, AxisType.LOOP)
   ks = tuple(word*4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
-  for half in range(2):
-    afrags = tuple(UOp.stack(*(x[input_token, group*32 + half*16 + i].cast(dtypes.float16) for i in ks))
+  output_waves = 2 if out_features % (32*output_tiles) == 0 else 1  # (as _wmma_layout's)
+  frag_count = 2*output_tiles*output_waves
+  def frag(g:int, f:UOp|int) -> tuple[UOp, ...]:  # (fragment f of group g of the step: f // 2's output tile of the workgroup, f % 2 its half)
+    row = (output_block*output_waves + f // (2*output_tiles))*(16*output_tiles) + f // 2 % output_tiles*16 + lane % 16
+    return dequant(row*output_words + (step*steps + g)//8*type_words, (step*steps + g) % 8, f % 2)
+  if waves > output_waves:
+    lds = UOp.alloc((2, steps, frag_count, lanes, len(ks)), dtypes.float16, addrspace=AddrSpace.LOCAL)
+    staged = [lds[step % 2, g, f + wave, lane, i].store(v) for g, f in itertools.product(range(steps), range(0, frag_count, waves))
+              for i, v in enumerate(frag(g, f + wave))]
+    lds = lds.after(UOp.group(*staged).barrier())
+  wmma_accs = [list(output_accs) for output_accs in accs]
+  for g, half in itertools.product(range(steps), range(2)):
+    afrags = tuple(UOp.stack(*(x[input_token, (step*steps + g)*32 + half*16 + i].cast(dtypes.float16) for i in ks))
                    for input_token in input_tokens)
-    for output_tile,output in enumerate(outputs):
-      bfrag = UOp.stack(*dequant(output*output_words + block*type_words, subgroup, half))
+    for output_tile in range(output_tiles):
+      f = ((wave % output_waves)*output_tiles + output_tile)*2 + half
+      bfrag = UOp.stack(*(lds[step % 2, g, f, lane, i].load() for i in range(len(ks)))) if waves > output_waves else UOp.stack(*frag(g, f))
       for tile,afrag in enumerate(afrags):
-        previous = accs[output_tile][tile].after(group) if half == 0 else wmma_accs[output_tile][tile]
+        previous = accs[output_tile][tile].after(step) if g == half == 0 else wmma_accs[output_tile][tile]
         wmma_accs[output_tile][tile] = UOp.wmma(afrag, bfrag, previous, WMMA_ARG[0], lanes)
   update = UOp.group(*(acc.store(value) for output_accs,output_values in zip(accs, wmma_accs)
-                       for acc,value in zip(output_accs, output_values))).end(group)
-  stores = _wmma_stores(out, outputs, tokens, accs, update, lane, wave, output_waves, kgroups)
+                       for acc,value in zip(output_accs, output_values))).end(step)
+  stores = _wmma_stores(out, outputs, tokens, accs, update, lane, wave, waves, kgroups)
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
