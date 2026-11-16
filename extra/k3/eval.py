@@ -88,19 +88,20 @@ def bench(eng, specs:str, late:Callable[[], bool]):
   for spec in specs.split("+"):
     path, *nums = spec.split(":")
     nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
-    steps, right, firsts, t_steps, T = 0, 0, 0, 0.0, eng.tokens
+    steps, right, firsts, tokens, t_steps, T = 0, 0, 0, 0, 0.0, eng.tokens
     for r in [json.loads(line) for line in open(path)][first:first + nseq]:
       toks, n = r["prompt_ids"] + r["output_ids"][:ntok], len(r["prompt_ids"])
-      for pos in range(eng.prefill(toks[:n], 0), n): _, (g,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
+      for pos in range(eng.prefill(toks[:n], 0), n): _, (g,), (score,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
       pos, row = n, 0
       while pos + T < len(toks) and not late():
         st = time.perf_counter()
-        gs = eng.proposal(g, pos, row)
-        _, guesses = eng.step([toks[pos], *gs], pos, toks[pos + 1:pos + 1 + T])
+        gs = eng.proposal(g, score, pos, row)
+        _, guesses, scores = eng.step([toks[pos], *gs], pos, toks[pos + 1:pos + 1 + len(gs) + 1])
         t_steps, steps = t_steps + time.perf_counter() - st, steps + 1
         row = next((j for j, x in enumerate(gs) if x != toks[pos + 1 + j]), len(gs))
-        right, firsts = right + row, firsts + (row > 0)
+        right, firsts, tokens = right + row, firsts + (row > 0), tokens + len(gs) + 1
         if row < len(gs): eng.model.rollback(row + 1)
-        pos, g = pos + 1 + row, guesses[row]
-      print(f"{r['task_id']}: {steps} verify steps of {T}, {t_steps / steps * 1e3:.1f} ms a step, {firsts / steps:.1%} of the first guesses right, "
-            f"{1 + right / steps:.2f} tokens a step, {(steps + right) / t_steps:.2f} tok/s", flush=True)
+        pos, g, score = pos + 1 + row, guesses[row], scores[row]
+      print(f"{r['task_id']}: {steps} verify steps of {tokens / steps:.2f} tokens, {t_steps / steps * 1e3:.1f} ms a step, "
+            f"{firsts / steps:.1%} of the first guesses right, {1 + right / steps:.2f} tokens kept a step, {(steps + right) / t_steps:.2f} tok/s",
+            flush=True)

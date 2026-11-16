@@ -38,13 +38,13 @@ class Eagle3:
     self.cache = Tensor.empty(1, 1, max_context, self.lora + self.rope, dtype=dtypes.half, device=devs).realize()
     self.positions = Tensor.arange(max_context).to(devs).realize()  # (the causal mask's, on the gpus: a symbolic arange isn't)
 
-  width = 1  # (a row's guesses: the next ones a chain's)
+  width, scored = 1, False  # (a row's guesses: the next ones a chain's; no scores of them)
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
-  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, Tensor|None]:
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, None, Tensor]:
     """a step's guesses (T, 1) after each of its rows' next tokens (1, T) on the target's taps, the feedback states (a chain's)"""
     logits, x, _ = self(tokens, hidden, pos)
-    return logits[0].argmax(-1).reshape(-1, 1).cast(dtypes.int32), x
+    return logits[0].argmax(-1).reshape(-1, 1).cast(dtypes.int32), None, x
   def fc(self, hidden:Tensor) -> Tensor:  # (the target's hidden states (1, T, 3, dim) to the layer's)
     return self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
 
@@ -96,7 +96,7 @@ class DSpark:
     tl = cfg["transformer_layer_config"]
     self.H, self.KV, self.hd, self.L = tl["num_attention_heads"], tl["num_key_value_heads"], tl["head_dim"], tl["num_hidden_layers"]
     self.eps, self.window, self.mask_id, self.embed, self.head = tl["rms_norm_eps"], tl["sliding_window"], cfg["mask_token_id"], embed, head
-    self.width, self.max_context = width, max_context  # (a step's block of guesses after each row)
+    self.width, self.max_context, self.scored = width, max_context, True  # (a step's block of guesses after each row, scored: the confidence)
     assert cfg["sample_from_anchor"] and cfg["markov_head_type"] == "vanilla" and tl["rope_parameters"]["rope_type"] == "default"
     self.taps = [(i - 1, False) for i in cfg["aux_hidden_state_layer_ids"]]  # (the ids count the blocks done)
     self.freqs_cis = precompute_freqs_cis(self.hd, max_context, tl["rope_parameters"]["rope_theta"]).to(devs).realize()
@@ -124,14 +124,16 @@ class DSpark:
         stores.append(self.cache[l, i, :, :, pos:pos + T].uop.store(x.cast(dtypes.half).uop))
     return Tensor(self.cache.uop.after(*stores))
 
-  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, None]:
-    """a step's blocks of guesses (T, width) after each of its rows' next tokens (1, T) (the anchors, at positions pos+1..), the cache after
-    the rows' keys on the target's taps hidden (1, T, taps, dim) first: a row's block sees the rows up to it"""
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, Tensor, None]:
+    """a step's blocks of guesses (T, width) after each of its rows' next tokens (1, T) (the anchors, at positions pos+1..) and the confidence
+    each is right (given the ones before right), the cache after the rows' keys on the target's taps hidden (1, T, taps, dim) first: a row's
+    block sees the rows up to it"""
     T = tokens.shape[1]
     n = min(self.window + T, self.max_context)  # (the keys any block sees: from pos-window on)
     cache = self.fill(tokens, hidden, pos)
     apos = (Tensor.arange(T) + (pos + 1)).to(hidden.device)
-    return self(tokens[0], apos, self.width, (smax(pos + T - n, 0), n), cache=cache)[0], None
+    guesses, conf, _ = self(tokens[0], apos, self.width, (smax(pos + T - n, 0), n), cache=cache)
+    return guesses, conf, None
 
   def __call__(self, anchors:Tensor, apos:Tensor, k:int, keys:tuple[int|UOp, int], prev:Tensor|None=None,
                cache:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:

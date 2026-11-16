@@ -27,10 +27,12 @@ TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds 
 
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|None=None, logits:bool=False,
-               chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None):
+               chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=()):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
-    attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps)"""
+    attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
+    a scored draft's verify steps of fewer tokens too (their graphs captured), each step's the one its guesses' scores expect most tokens a
+    second of"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
     self.dump_taps = taps or []
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
@@ -74,8 +76,11 @@ class Engine:
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos, self.v_live = UOp.variable("start_pos", 0, model.max_context - 1), UOp.variable("live", 1, max(chunk, 1))
     (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
-    self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + n * (1 + max(self.width, 1)), dtypes.int32)  # ([done | tokens | guesses])
-    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens})}
+    # ([done | tokens | guesses | their scores (a scored draft's, f32)])
+    self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + n * (1 + 2 * max(self.width, 1)), dtypes.int32)
+    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, *widths})}
+    self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
+    self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}  # (measured: a step's seconds)
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
     self.cres, (self.cres_np,) = host_tensor(self.devs[0], max(tokens - 1, 1), dtypes.int32)  # ([done | guesses])
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
@@ -145,8 +150,8 @@ class Engine:
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
     out, dx = (toks:=logits.argmax(-1)), []
     if self.draft is not None:
-      guesses, x = self.draft.guess(((g:=self.given[:T].to(toks.device)) >= 0).where(g, toks).reshape(1, T), hidden, pos)
-      out = toks.cat(guesses.flatten())
+      guesses, scores, x = self.draft.guess(((g:=self.given[:T].to(toks.device)) >= 0).where(g, toks).reshape(1, T), hidden, pos)
+      out = toks.cat(guesses.flatten(), *([] if scores is None else [scores.flatten().float().bitcast(dtypes.int32)]))
       dx = [Tensor(self.dx.uop)[:T].assign(x[0].float())] if x is not None else []
     outs = Tensor(self.res.uop)[1:1 + out.shape[0]].assign(out.to(self.devs[0]).cast(dtypes.int32))
     done = Tensor(self.res.uop.after(outs.uop))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0]))
@@ -469,9 +474,9 @@ class Engine:
     for (i, save), _ in itertools.product(itertools.product(range(2), (True, False)), range(3)): self.model._copy(i, save)  # (and save's)
     for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
 
-  def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int]]:
-    """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each
-    and the draft's guess after that (their logits kept)"""
+  def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[list[int]], list[np.ndarray|None]]:
+    """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each,
+    the draft's guesses after that and their scores (a scored draft's: each right if the ones before are) (their logits kept)"""
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
     assert T in self.jits and pos + T <= self.max_context
@@ -486,14 +491,21 @@ class Engine:
     while self.res_np[0] != 1:
       if time.perf_counter() - t2 > 60: raise RuntimeError("the step's graph didn't finish")
     if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left", -4: "NaN scores"}[err])
-    ret, G = self.res_np[1:1 + T * (1 + self.width)].tolist(), self.width
+    ret, G = self.res_np[1:1 + T * (1 + 2 * self.width)], self.width
     self.times += (t1 - t0, time.perf_counter() - t2)
     self.costs["step"].append((time.perf_counter() - t0) / T)
-    return ret[:T], [ret[T + r * G:T + (r + 1) * G] for r in range(T)]
+    self.step_s[T].append(time.perf_counter() - t0)
+    scores = ret[T * (1 + G):].view(np.float32).reshape(T, G) if self.draft is not None and self.draft.scored else [None] * T
+    return ret[:T].tolist(), ret[T:T * (1 + G)].reshape(T, G).tolist(), list(scores)
 
-  def proposal(self, g:list[int], pos:int, row:int) -> list[int]:
-    """a verify step's guesses after the token at pos: the row's of the step before (guessed at its row), the draft's chain after them"""
-    return g[:self.tokens - 1] if len(g) >= self.tokens - 1 else [*g, *self.chain(g[-1], pos, row)]
+  def proposal(self, g:list[int], score:np.ndarray|None, pos:int, row:int) -> list[int]:
+    """a verify step's guesses after the token at pos: the row's of the step before (guessed at its row), the draft's chain after them. scored:
+    as many as the step of the widths that expects most tokens a second (by the scores, the steps' measured seconds: one not measured first)"""
+    n = self.tokens - 1
+    if score is not None and len(self.widths) > 1:
+      def rate(T:int) -> float: return (1 + np.cumprod(score[:T - 1]).sum()) / np.mean(s) if (s:=self.step_s[T]) else math.inf
+      n = max(self.widths, key=rate) - 1
+    return g[:n] if len(g) >= n else [*g, *self.chain(g[-1], pos, row)]
 
   def chain(self, g:int, pos:int, row:int) -> list[int]:
     """the draft's guesses after g (at pos+1, guessed at the step's row) for a verify step"""
@@ -534,7 +546,7 @@ class Engine:
       for pos in range(self.prefill(tokens[:fork + 1], start), fork): self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
       self.model.save(tokens[:fork])
     for pos in range(self.prefill(tokens, fork), len(tokens)):
-      (t,), (g,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+      (t,), (g,), (score,) = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
     self.model.save(tokens)
     row = 0
     while len(tokens) + self.tokens <= self.max_context:  # (a verify step's last token in the context)
@@ -542,10 +554,10 @@ class Engine:
       self.model._cached_tokens = tokens[:-1]
       yield t
       if self.draft is None:
-        (t,), _ = self.step([t], len(tokens) - 1)
+        (t,), _, _ = self.step([t], len(tokens) - 1)
         continue
-      gs = self.proposal(g, len(tokens) - 1, row)
-      toks, guesses = self.step([t, *gs], len(tokens) - 1)
+      gs = self.proposal(g, score, len(tokens) - 1, row)
+      toks, guesses, scores = self.step([t, *gs], len(tokens) - 1)
       row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
       self.verified += (1, len(gs), row)
       for g in gs[:row]:
@@ -553,7 +565,7 @@ class Engine:
         self.model._cached_tokens = tokens[:]
         yield g
       if row < len(gs): self.model.rollback(row + 1)
-      t, g = toks[row], guesses[row]
+      t, g, score = toks[row], guesses[row], scores[row]
 
   def counters(self) -> np.ndarray:
     io = self.io
@@ -583,13 +595,15 @@ if __name__ == "__main__":
   disks, m = open_store(list(model.token_embd.weight.device), getenv("STORE", 512 << 30))  # (k3's iq3_xxs store)
   # DRAFT=dir: the draft (eagle's head, dspark's blocks), speculative decoding with verify steps of VERIFY tokens (memory: fewer SLOTS)
   # VERIFY=n: a verify step's tokens, the next and the draft's n-1 guesses (eagle's: a chain) (an EVAL: its steps of n tokens)
+  # (VERIFY=n,n..: a scored draft's verify steps of any of them, each step's by the guesses' scores)
+  widths = [int(x) for x in str(getenv("VERIFY", "2")).split(",")]
   draft = load(d, lambda t: model.token_embd(t).float(), model.output, model.token_embd.weight.device, model.max_context,
-               getenv("VERIFY", 2) - 1) if (d:=getenv("DRAFT", "")) else None
+               max(widths) - 1) if (d:=getenv("DRAFT", "")) else None
   # CHUNK=n: a prompt fed in steps of n tokens (0: a token a step), WINDOW=n: in windows of up to n tokens (a layer at a time, chunks of CHUNK)
   # TAPS=b,b..: without a draft, the streams a window keeps after blocks b (bm: as the next block's attention residual mixes them), for a DUMP
   taps = [(int(t.rstrip("m")), t.endswith("m")) for t in getenv("TAPS", "").split(",") if t]
-  eng = Engine(model, m, tokens=getenv("VERIFY", 2 if draft else 1), guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
-               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps)
+  eng = Engine(model, m, tokens=max(widths) if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
+               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps, widths=tuple(widths))
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)

@@ -169,6 +169,16 @@ class TestEngine(unittest.TestCase):
         w = np.stack([h[j] for _, h in want])
         np.testing.assert_allclose(np.load(f"{out}/tap{n}.npy"), w, rtol=1e-3, atol=1e-3 * np.abs(w).max(), err_msg=n)
 
+  def test_proposal(self):  # a scored draft's verify step: the width whose expected tokens (by the scores) a measured second are most, one not
+    # measured first; unscored: every guess
+    eng = SimpleNamespace(tokens=8, widths=[2, 4, 8], step_s={2: [0.05], 4: [0.08], 8: []}, chain=None)
+    g, score = list(range(7)), np.full(7, 0.9)
+    self.assertEqual(Engine.proposal(eng, g, score, 0, 0), g)  # type: ignore[arg-type]
+    eng.step_s[8] = [0.14]  # (1.9 / .05 = 38, 3.44 / .08 = 43, 5.2 / .14 = 37 tokens a second)
+    self.assertEqual(Engine.proposal(eng, g, score, 0, 0), g[:3])  # type: ignore[arg-type]
+    self.assertEqual(Engine.proposal(eng, g, np.full(7, 0.3), 0, 0), g[:1])  # type: ignore[arg-type]
+    self.assertEqual(Engine.proposal(eng, g, None, 0, 0), g)  # type: ignore[arg-type]
+
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
     self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
