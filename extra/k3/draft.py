@@ -174,7 +174,7 @@ class DSpark:
       def flat(x:Tensor) -> Tensor: return x.permute(1, 0, 2, 3, 4).reshape(self.KV, A * G * k, -1)  # ((A, kv, G, k, d) -> (kv, A*G*k, d))
       def unflat(x:Tensor) -> Tensor: return x.reshape(self.KV, A, G, k, -1).permute(1, 0, 2, 3, 4)
       # one softmax over the context's keys and the block's: the context's in C chunks (their maxes, sums and values in parallel), then combined
-      C, N = 8, round_up(n, 8)
+      C, N = 32, round_up(n, 32)
       sc = (unflat(flat(q) @ kc.transpose(-1, -2)) / math.sqrt(self.hd) + mask[..., :n]).pad((None,) * 4 + ((0, N - n),), value=-math.inf)
       sc, sb = sc.reshape(A, self.KV, G, k, C, N // C), q @ kb.unsqueeze(2).transpose(-1, -2) / math.sqrt(self.hd) + mask[..., n:]
       cm = sc.max(-1).maximum(-1e30).contiguous()  # (a chunk of no keys: a finite max)
