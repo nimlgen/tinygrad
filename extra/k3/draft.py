@@ -8,6 +8,12 @@ from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
+def weight(t:Tensor, devs:tuple[str, ...], axis:int|None=None, q8:bool=True) -> Tensor|Linear:
+  """a checkpoint's weight (read once) split over devs on axis (None: a copy on each): a matrix in q8_0 where there's a kernel, else f16"""
+  if not q8 or len(t.shape) == 1 or t.shape[1] % (32 * len(devs)) or not amd_custom_kernels_supported(devs):  # (vectors, rows not of blocks)
+    return t.to(devs[0]).half().shard(devs, axis).realize()
+  return q8_0_linear(t.to(devs[0]), devs, axis)
+
 class Eagle3:
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int):
     cfg = json.load(open(f"{path}/config.json"))
@@ -21,11 +27,7 @@ class Eagle3:
     self.mscale = 0.1 * rs["mscale_all_dim"] * math.log(rs["factor"]) + 1.0
     self.freqs_cis = (precompute_freqs_cis(self.rope, max_context, cfg["rope_theta"], yarn=yarn) / self.mscale).to(devs).realize()
     st = nn.state.safe_load(f"{path}/model.safetensors")
-    def w(name:str, axis:int|None=None) -> Tensor|Linear:  # (read once)
-      if len(st[name].shape) == 1 or st[name].shape[1] % (32 * len(devs)) or not amd_custom_kernels_supported(devs):  # (vectors, rows not of blocks)
-        return st[name].to(devs[0]).half().shard(devs, axis).realize()
-      return q8_0_linear(st[name].to(devs[0]), devs, axis)
-    self.w = {k[:-len(".weight")]: w(k, axis) for k, axis in (
+    self.w = {k[:-len(".weight")]: weight(st[k], devs, axis) for k, axis in (
       *((k, None) for k in st if k.endswith("norm.weight") or k.startswith("fc_norm") or "_a_proj" in k or k == "fc.weight"),
       ("layers.0.self_attn.o_proj.weight", 1), ("layers.0.mlp.down_proj.weight", 1), ("layers.0.self_attn.q_b_proj.weight", 0),
       ("layers.0.mlp.gate_proj.weight", 0), ("layers.0.mlp.up_proj.weight", 0), ("lm_head.weight", 0))}
@@ -75,3 +77,85 @@ class Eagle3:
     x = x + self.lin(self.lin(m, p + "mlp.gate_proj").silu() * self.lin(m, p + "mlp.up_proj"), p + "mlp.down_proj")
     normed = self.norm(x, "norm")
     return self.lin(normed, "lm_head"), normed if self.norm_output else x, cache
+
+# the DSpark draft of K3.1 (Inferact/Kimi-K3.1-Pro-DSpark): a block of k guesses in one pass. its five GQA layers' keys and values of a position
+# are projected from one feature, the target's streams after five blocks (raw, concatenated, a linear and a norm); a block's queries are the
+# anchor (a known token at position a) and k-1 masks at a.., each attending causally to the block and to the context's positions before a in a
+# window. the j-th guesses t[a+j+1], its logits biased by a low-rank markov term of the token before it (the guess before, the anchor first).
+# shares the target's embedding and head. its context's keys and values in a cache of every position (layer, k/v, 1, kv heads, position, dim)
+class DSpark:
+  def __init__(self, path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
+               q8:bool=True):
+    cfg = json.load(open(f"{path}/config.json"))
+    tl = cfg["transformer_layer_config"]
+    self.H, self.KV, self.hd, self.L = tl["num_attention_heads"], tl["num_key_value_heads"], tl["head_dim"], tl["num_hidden_layers"]
+    self.eps, self.window, self.mask_id, self.embed, self.head = tl["rms_norm_eps"], tl["sliding_window"], cfg["mask_token_id"], embed, head
+    assert cfg["sample_from_anchor"] and cfg["markov_head_type"] == "vanilla" and tl["rope_parameters"]["rope_type"] == "default"
+    self.taps = [(i - 1, False) for i in cfg["aux_hidden_state_layer_ids"]]  # (the ids count the blocks done)
+    self.freqs_cis = precompute_freqs_cis(self.hd, max_context, tl["rope_parameters"]["rope_theta"]).to(devs).realize()
+    st = nn.state.safe_load(f"{path}/model.safetensors")
+    split = {"q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1}  # (by heads, by the mlp's rows)
+    self.w = {k[:-len(".weight")]: weight(v, devs, split.get(k.split(".")[-2]), q8 and "markov" not in k) for k, v in st.items()
+              if k.endswith(".weight")}
+    self.conf_b = st["confidence_head.proj.bias"].to(devs[0]).float().to(devs).realize()
+    self.cache = Tensor.zeros(self.L, 2, 1, self.KV, max_context, self.hd, dtype=dtypes.half).contiguous().shard(devs, 3).realize()
+
+  def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
+  def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
+  def kv(self, x:Tensor, a:str, freqs:Tensor) -> tuple[Tensor, Tensor]:  # (x (B, T, dim) -> keys, values (B, kv, T, hd), the keys roped)
+    B, T = x.shape[:2]
+    k = self.norm(self.lin(x, a + "k_proj").reshape(B, T, self.KV, self.hd), a + "k_norm").transpose(1, 2)
+    return apply_rope(k, freqs), self.lin(x, a + "v_proj").reshape(B, T, self.KV, self.hd).transpose(1, 2).float()
+
+  def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
+    """the cache after the context's keys and values of positions pos.. on the target's taps hidden (1, T, taps, dim)"""
+    T = hidden.shape[1]
+    c = self.norm(self.lin(hidden.reshape(1, T, -1), "fc"), "hidden_norm")
+    stores = []
+    for l in range(self.L):
+      for i, x in enumerate(self.kv(c, f"layers.{l}.self_attn.", self.freqs_cis[pos:pos + T])):
+        stores.append(self.cache[l, i, :, :, pos:pos + T].uop.store(x.cast(dtypes.half).uop))
+    return Tensor(self.cache.uop.after(*stores))
+
+  def __call__(self, anchors:Tensor, apos:Tensor, k:int, keys:tuple[int|UOp, int], prev:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
+    """A blocks of k guesses after anchors (A,) at positions apos (A,) on the cache's positions keys (start, n): their tokens (A, k), the
+    confidence each is right (A, k), its logits (A, k, vocab). prev (A, k): the tokens before the guesses taken as given (an evaluation's)"""
+    A, (k0, n) = anchors.shape[0], keys
+    qpos = apos.reshape(A, 1) + Tensor.arange(k).to(apos.device).reshape(1, k)  # (A, k)
+    freqs = self.freqs_cis[qpos.flatten()].reshape(A, k, -1)
+    # a query sees the context before its anchor in the window, its block causally
+    kp = (Tensor.arange(n).to(apos.device) + k0).reshape(1, 1, 1, n)
+    ctx = (kp < apos.reshape(A, 1, 1, 1)) & (kp > qpos.reshape(A, 1, k, 1) - self.window)
+    blk = Tensor.ones(k, k, dtype=dtypes.bool, device=apos.device).tril().reshape(1, 1, k, k)
+    mask = ctx.expand(A, 1, k, n).cat(blk.expand(A, 1, k, k), dim=-1).where(0.0, -math.inf)
+    x = self.embed(anchors.reshape(A, 1).pad(((0, 0), (0, k - 1)), value=self.mask_id)).float()  # (A, k, dim)
+    G = self.H // self.KV
+    for l in range(self.L):
+      a = f"layers.{l}.self_attn."
+      h = self.norm(x, f"layers.{l}.input_layernorm")
+      q = apply_rope(self.norm(self.lin(h, a + "q_proj").reshape(A, k, self.H, self.hd), a + "q_norm").transpose(1, 2), freqs)
+      kb, vb = self.kv(h, a, freqs)
+      kc, vc = (self.cache[l, i, :, :, k0:k0 + n].float().expand(A, self.KV, n, self.hd) for i in range(2))
+      keys_, vals = kc.cat(kb, dim=2), vc.cat(vb, dim=2)  # (A, kv, n + k, hd)
+      q = q.reshape(A, self.KV, G * k, self.hd)
+      att = ((q @ keys_.transpose(-1, -2)).reshape(A, self.H, k, n + k) / math.sqrt(self.hd) + mask).softmax(-1)
+      o = (att.reshape(A, self.KV, G * k, n + k) @ vals).reshape(A, self.H, k, self.hd).transpose(1, 2).reshape(A, k, -1)
+      x = x + self.lin(o, a + "o_proj")
+      m = self.norm(x, f"layers.{l}.post_attention_layernorm")
+      p = f"layers.{l}.mlp."
+      x = x + self.lin(self.lin(m, p + "gate_proj").silu() * self.lin(m, p + "up_proj"), p + "down_proj")
+    h = self.norm(x, "norm")
+    logits = self.head(h).float()  # (A, k, vocab)
+    def markov(t:Tensor) -> Tensor: return self.w["markov_head.markov_w1"][t].float()  # (the r-dim embedding of the token before a guess)
+    if prev is None:  # (greedy, a guess at a time: the next one's markov term on it)
+      t, outs, embs = anchors, [], []
+      for j in range(k):
+        embs.append(e:=markov(t))
+        outs.append(t:=(logits[:, j] + e.half() @ self.w["markov_head.markov_w2"].T).argmax(-1))
+      out, e = Tensor.stack(*outs, dim=1), Tensor.stack(*embs, dim=1)
+    else:
+      e = markov(prev)
+      logits = logits + (e.half() @ self.w["markov_head.markov_w2"].T).float()
+      out = logits.argmax(-1)
+    conf = (h.cat(e, dim=-1) @ self.w["confidence_head.proj"].float().T + self.conf_b).sigmoid()[..., 0]
+    return out.cast(dtypes.int32), conf, logits
