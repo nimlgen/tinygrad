@@ -173,7 +173,7 @@ class DSpark:
       p = f"layers.{l}.mlp."
       x = x + self.lin(self.lin(m, p + "gate_proj").silu() * self.lin(m, p + "up_proj"), p + "down_proj")
     h = self.norm(x, "norm")
-    logits = rows16(self.head, h).float()  # (A, k, vocab)
+    logits = rows16(self.head, h).float().contiguous()  # (A, k, vocab) (a buffer: the guesses' argmaxes read it, not recompute it)
     def markov(t:Tensor) -> Tensor: return self.markov(t).float()
     if prev is None:  # (greedy, a guess at a time: the next one's markov term on it)
       t, outs, embs = anchors, [], []
