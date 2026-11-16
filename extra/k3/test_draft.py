@@ -88,6 +88,12 @@ class TestDSpark(unittest.TestCase):
       np.testing.assert_allclose(rows16(f, x).numpy(), (x @ w.T).numpy(), rtol=1e-5)
       self.assertEqual(int(np.prod(seen[-1][:-1])), rows)
 
+  def test_head_not_a_parameter(self):  # the target's head isn't the draft's (an engine realizes a draft's parameters: a quantized head decoded)
+    devs, head = (Device.DEFAULT,), nn.Linear(DIM, VOCAB, bias=False)
+    with tempfile.TemporaryDirectory() as folder, patch("extra.k3.draft.amd_custom_kernels_supported", return_value=False):
+      d = DSpark(dspark(folder, np.random.default_rng(1)), lambda t: t, head, devs, 16)
+    self.assertNotIn(id(head.weight), {id(t) for t in nn.state.get_parameters(d)})
+
   def test_block(self):  # a block's guesses and logits as the reference's, on all the cache's positions or the window's slice of them
     rng, devs, N, k = np.random.default_rng(3), (Device.DEFAULT,), 12, 4
     emb, out = rng.normal(0, 0.3, (VOCAB, DIM)).astype(np.float16), rng.normal(0, 0.3, (VOCAB, DIM)).astype(np.float16)

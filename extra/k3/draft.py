@@ -104,7 +104,9 @@ class DSpark:
     cfg = json.load(open(f"{path}/config.json"))
     tl = cfg["transformer_layer_config"]
     self.H, self.KV, self.hd, self.L = tl["num_attention_heads"], tl["num_key_value_heads"], tl["head_dim"], tl["num_hidden_layers"]
-    self.eps, self.window, self.mask_id, self.embed, self.head = tl["rms_norm_eps"], tl["sliding_window"], cfg["mask_token_id"], embed, head
+    self.eps, self.window, self.mask_id, self.embed = tl["rms_norm_eps"], tl["sliding_window"], cfg["mask_token_id"], embed
+    # (the target's head in a closure: not the draft's parameters, an engine realizes those (a quantized head's decoded weights, its kernel lost))
+    self.head:Callable[[Tensor], Tensor] = lambda x: head(x)
     self.width, self.max_context, self.scored = width, max_context, True  # (a step's block of guesses after each row, scored: the confidence)
     assert cfg["sample_from_anchor"] and cfg["markov_head_type"] == "vanilla" and tl["rope_parameters"]["rope_type"] == "default"
     self.taps = [(i - 1, False) for i in cfg["aux_hidden_state_layer_ids"]]  # (the ids count the blocks done)
