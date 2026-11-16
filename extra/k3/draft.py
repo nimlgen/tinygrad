@@ -5,6 +5,7 @@ import json, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.uop.ops import smax
+from tinygrad.helpers import prod, round_up
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
@@ -89,6 +90,11 @@ class Eagle3:
 # anchor (a known token at position a) and k-1 masks at a.., each attending causally to the block and to the context's positions before a in a
 # window. the j-th guesses t[a+j+1], its logits biased by a low-rank markov term of the token before it (the guess before, the anchor first).
 # shares the target's embedding and head. its context's keys and values in a cache of every position (layer, k/v, 1, kv heads, position, dim)
+def rows16(f:Callable[[Tensor], Tensor], x:Tensor) -> Tensor:
+  """f(x) of a q8 linear (rows (..., in) -> (..., out)), its rows past the gemv kernel's 8 padded to the wmma kernel's 16s"""
+  if (n:=prod(x.shape[:-1])) <= 8 or n % 16 == 0: return f(x)
+  return f(x.reshape(n, x.shape[-1]).pad(((0, round_up(n, 16) - n), (0, 0))))[:n].reshape(*x.shape[:-1], -1)
+
 class DSpark:
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
                width:int=1, q8:bool=True):
@@ -111,7 +117,7 @@ class DSpark:
     self.cache = Tensor.zeros(self.L, 2, 1, self.KV, max_context, self.hd, dtype=dtypes.half).contiguous().shard(devs, 3).realize()
 
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
-  def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
+  def lin(self, x:Tensor, name:str) -> Tensor: return rows16(w, x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
   def kv(self, x:Tensor, a:str, freqs:Tensor) -> tuple[Tensor, Tensor]:  # (x (B, T, dim) -> keys, values (B, kv, T, hd), the keys roped)
     B, T = x.shape[:2]
     k = self.norm(self.lin(x, a + "k_proj").reshape(B, T, self.KV, self.hd), a + "k_norm").transpose(1, 2)
@@ -167,7 +173,7 @@ class DSpark:
       p = f"layers.{l}.mlp."
       x = x + self.lin(self.lin(m, p + "gate_proj").silu() * self.lin(m, p + "up_proj"), p + "down_proj")
     h = self.norm(x, "norm")
-    logits = self.head(h).float()  # (A, k, vocab)
+    logits = rows16(self.head, h).float()  # (A, k, vocab)
     def markov(t:Tensor) -> Tensor: return self.markov(t).float()
     if prev is None:  # (greedy, a guess at a time: the next one's markov term on it)
       t, outs, embs = anchors, [], []

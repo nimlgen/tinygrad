@@ -3,7 +3,7 @@ from unittest.mock import patch
 import numpy as np
 from tinygrad import Device, Tensor, TinyJit, UOp, dtypes, nn
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
-from extra.k3.draft import Eagle3, DSpark
+from extra.k3.draft import Eagle3, DSpark, rows16
 from extra.k3.test_engine import eagle, DIM, VOCAB
 
 class TestDraftFeedback(unittest.TestCase):
@@ -78,6 +78,16 @@ def dspark_ref(path:str, emb:np.ndarray, out:np.ndarray, toks:list[int], hidden:
   return got, logits
 
 class TestDSpark(unittest.TestCase):
+  def test_rows16(self):  # a linear's rows past 8 padded to 16s (its rows, then the result's, cut back): as unpadded
+    w, seen = Tensor(np.random.default_rng(2).normal(0, 1, (6, 4)).astype(np.float32)), []
+    def f(x:Tensor) -> Tensor:
+      seen.append(x.shape)
+      return x @ w.T
+    for shape, rows in (((2, 3, 4), 6), ((3, 5, 4), 16), ((4, 4, 4), 16), ((5, 7, 4), 48)):
+      x = Tensor(np.random.default_rng(3).normal(0, 1, shape).astype(np.float32))
+      np.testing.assert_allclose(rows16(f, x).numpy(), (x @ w.T).numpy(), rtol=1e-5)
+      self.assertEqual(int(np.prod(seen[-1][:-1])), rows)
+
   def test_block(self):  # a block's guesses and logits as the reference's, on all the cache's positions or the window's slice of them
     rng, devs, N, k = np.random.default_rng(3), (Device.DEFAULT,), 12, 4
     emb, out = rng.normal(0, 0.3, (VOCAB, DIM)).astype(np.float16), rng.normal(0, 0.3, (VOCAB, DIM)).astype(np.float16)
