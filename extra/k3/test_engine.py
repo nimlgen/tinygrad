@@ -82,10 +82,14 @@ class TestEngine(unittest.TestCase):
   def engine(self, slots:int) -> Engine:  # (the engine on the trunk, every expert in its slot: a code (layer * E + expert) a slot, of slots)
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    eng = Engine(Transformer.from_gguf(self.trunk, shard=G)[0], m, slots=slots, tokens=2, chunk=4, window=8)
-    pools = [b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E)).ljust(eng.slots * part, b'\0') for g in range(G)]
+    eng = Engine(Transformer.from_gguf(self.trunk, shard=G)[0], m, slots=slots + 2, tokens=2, chunk=4, window=8)  # (2: the caches')
+    # (the experts past the context's caches, the pool's first slots)
+    at = eng.slots_of(eng.cache_bytes)
+    pools = [(b'\0' * at * part + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part, b'\0')
+             for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
-    eng.state["slot_of"][:] = eng.state["expert_in"][:len(layers) * E] = np.arange(len(layers) * E)
+    eng.state["slot_of"][:] = at + np.arange(len(layers) * E)
+    eng.state["expert_in"][at:at + len(layers) * E] = np.arange(len(layers) * E)
     return eng
 
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
@@ -100,8 +104,9 @@ class TestEngine(unittest.TestCase):
         sig = dep[:, 0].to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
-        def table(ks:slice) -> Tensor:  # (an entry a token's expert and weight, j*T+t)
-          return Tensor([1], dtype=dtypes.uint32, device="CPU").cat((sel[:, ks].T.flatten() + li * E).cast(dtypes.int32).bitcast(dtypes.uint32),
+        def table(ks:slice) -> Tensor:  # (an entry a token's expert's slot and weight, j*T+t)
+          slots = Tensor(eng.state["slot_of"], device="CPU")[sel[:, ks].T.flatten() + li * E]
+          return Tensor([1], dtype=dtypes.uint32, device="CPU").cat(slots.bitcast(dtypes.uint32),
                                                           w[:, ks].T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
         tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))]
       return tables[li][i]
@@ -147,6 +152,15 @@ class TestEngine(unittest.TestCase):
     # (a window's rows symbolic: its kernels fused apart from a step's, a half's rounding apart, the toy's random weights amplify it; on AMD the
     # steps' experts take q8 activations. without its routed experts a window is 0.15 apart)
     self.assertLess(max(k for _, k in stats), 1e-2)
+
+  def test_grow(self):  # the caches' slots of a context's positions (in steps of a piece) pinned as it grows, their experts dropped
+    eng, st = self.eng, self.eng.state
+    st["expert_in"][0], st["slot_of"][len(st["slot_of"]) - 1] = len(st["slot_of"]) - 1, 0  # (an expert in the caches' first slot)
+    self.assertEqual(st["mask"].sum(), 0)
+    eng.grow(1)
+    self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.W, 1, -1, -1))
+    eng.grow(eng.W + 1)
+    self.assertEqual((eng.grown, st["mask"].sum()), (2 * eng.W, eng.slots_of(eng.cache_bytes)))
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     ids, eng, tol = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4), 3e-3

@@ -71,6 +71,7 @@ class Engine:
     # (the empty ones allocated too, else at their first use: the ones with a buffer, not the folded constants)
     for buf in (t.uop.base.buffer for t in states if t.uop.base.op in (Ops.BUFFER, Ops.UNSHARD)):
       for x in getattr(buf, "bufs", [buf]): x.ensure_allocated()
+    del states
     model.save([])  # (and the two sets of saved recurrent states)
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos, self.v_live = UOp.variable("start_pos", 0, model.max_context - 1), UOp.variable("live", 1, max(chunk, 1))
@@ -91,17 +92,32 @@ class Engine:
     def pool(n:int) -> Tensor: return Tensor.zeros(G * n * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
     self.pool, self.W = pool(1), 0
     if window: self.window_init(window)
+    # the context's caches (the mla blocks' latents, their indexers' keys, the draft's) lent from the pool's first slots, each a stripe of its
+    # max context's rows: a stripe's rows a context reached kept from the experts (grow), the rest the experts' (never read past the context)
+    owners = [(o, k) for b in model.blk for o, k in ((b, "cache_k"), (getattr(b, "indexer", None), "cache_kg")) if hasattr(o, k)]
+    self.caches = owners + ([(draft, "cache")] if draft is not None else [])
+    shapes = {str(i): (getattr(o, k).shape, getattr(o, k).dtype) for i, (o, k) in enumerate(self.caches)}
+    for o, k in self.caches: setattr(o, k, None)  # (freed, with the window's graphs on them: the pool's memory)
+    self.kinds = {}
+    if window and self.fill_jit: self.fill_jit.reset()
     # (the window's own state freed; lent: its compute state and a piece's, the slots of more pieces lent at a prefill)
     self.win, lent, self.layer = {}, self.slots_of(self.window_bytes) + self.slots_of(self.piece_bytes) if window else 0, 0
     self.tail = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part - lent
     self.slots = slots = self.tail + lent
     self.lent_from = self.tail
     self.pool = pool(slots)
+    caches, self.cache_bytes = self.lend(shapes, 0)
+    self.stripes = [(caches[i].uop.base.buffer.bufs[0].offset, caches[i].nbytes() // n) for i, (shape, _) in shapes.items()
+                    for n in [next(d for d in shape if d >= model.max_context)]]  # (a stripe's first byte, a position's bytes)
+    for i, (o, k) in enumerate(self.caches): setattr(o, k, caches[str(i)])
+    self.grown = 0
     if window:
       self.win = {**self.window_state(self.tail), **self.piece(self.slots - self.slots_of(self.piece_bytes))}
       self.lent_from = self.tail
       for _, experts in self.routes.values(): experts.reset()  # (captured again on the pool: the decoded experts' gather from it is of its size)
       for b in (moe:=[b for b in model.blk if hasattr(b, "ffn_gate_inp")])[:1] * 2 + moe: self.dry(b)
+      self.capture()  # (and the kinds', the draft's fill: on the caches' stripes)
+      for _ in range(3 if self.fill_jit else 0): self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -206,14 +222,24 @@ class Engine:
     self.v_c0, self.v_wlive = UOp.variable("c0", 0, W - self.chunk), UOp.variable("wlive", 1, W)
     self.v_n, self.v_s = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1)
     self.v_tap = UOp.variable("tap", 0, self.win["taps"].shape[2] - 1)
-    self.kinds:dict[tuple, tuple[FFNBlock, Callable, list[Tensor]]] = {}  # (a kind's, and a stage of a block's: its args)
     self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
     self.tap_jit, self.fill_jit = TinyJit(self.tap, arenas=self.arenas), TinyJit(self.fill, arenas=self.arenas) if self.draft else None
     # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
     self.routes = {t: (TinyJit(functools.partial(self.window_route, t), arenas=self.arenas),
                        TinyJit(functools.partial(self.window_experts, t), arenas=self.arenas)) for t in TILES}
     self.start_jit = TinyJit(self.start, arenas=self.arenas)
-    # every kind's graphs captured on its first block (its buffers the args) on dry chunks at position 0 (the host's flags preset: slot 0)
+    self.capture()
+    moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
+    for _ in range(3):
+      self.graph(self.start_jit, self.v_p0.bind(0))
+      self.dry(moe[0])
+      self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
+      if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
+    for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
+
+  def capture(self):
+    """every kind's graphs captured on its first block (its buffers the args) on dry chunks at position 0 (the host's flags preset: slot 0)"""
+    m, self.kinds = self.model, {}
     moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
     for b, (name, fxn) in itertools.product(m.blk, (("attend", self.attend), ("post", self.post))):
       if name == "post" and b not in moe: continue
@@ -222,12 +248,6 @@ class Engine:
       vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
         (self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_s.bind(0))
       for _ in range(3): self.graph(jit, *vs, *args)
-    for _ in range(3):
-      self.graph(self.start_jit, self.v_p0.bind(0))
-      self.dry(moe[0])
-      self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
-      if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
-    for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
 
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
@@ -266,6 +286,8 @@ class Engine:
 
   def scorer(self, b:FFNBlock) -> Tensor|Linear|None:  # (a moe block's router, the engine's)
     return self.scorers[self.m["layers"].index(i)] if (i:=self.model.blk.index(b)) in self.m["layers"] else None
+
+  kinds:dict[tuple, tuple[FFNBlock, Callable, list[Tensor]]] = {}  # (a kind's, and a stage of a block's: its args)
 
   def kind(self, name:str, b:FFNBlock, fxn:Callable) -> tuple[Callable, list[Tensor], FFNBlock]:
     """b's graph of a stage (its kind's), b's buffers and its router's (its args) and the kind's first block (the one it's captured on)"""
@@ -364,13 +386,27 @@ class Engine:
 
   def slots_of(self, n:int) -> int: return -(-n // self.part)  # (the pool's slots n bytes take)
 
+  def grow(self, n:int):
+    """the caches' rows of the first n positions (in steps of a window piece) kept from the experts: their slots' experts dropped (once read,
+    if in flight), the slots pinned (step_io's mask, read's keep)"""
+    if n <= self.grown: return
+    new, st = min(round_up(n, self.W or 8192), self.max_context), self.state
+    for first, row in self.stripes:
+      sl = np.arange(first + self.grown * row, first + new * row, self.part) // self.part
+      sl = np.unique(np.concatenate([sl, [(first + new * row - 1) // self.part]]))
+      c = np.ascontiguousarray((c:=st["expert_in"][sl])[c >= 0], np.int64)
+      if len(c) and (err:=host_c().read_wait(ctypes.byref(self.io), len(c), c.ctypes.data)): raise RuntimeError(f"reads failed {err}")
+      st["slot_of"][c], st["expert_in"][sl], st["mask"][sl] = -1, -1, 1
+    self.grown = new
+
   def pieces(self) -> int:  # (a read window's pieces: the pool past two layers' experts (the one routed, the one read ahead) lent)
-    return 1 + max(0, (self.tail - 2 * self.m["n_experts"]) // self.slots_of(self.piece_bytes))
+    return 1 + max(0, (self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"]) // self.slots_of(self.piece_bytes))
 
   def window(self, toks:list[int], pos:int, given:list[int]):
     """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
     a layer's experts read once a read window. the caches and states as after steps of them, the draft's cache"""
     T, C, W, t0 = len(toks), self.chunk, self.W, time.perf_counter()
+    self.grow(pos + round_up(T, C))
     assert T <= W * self.pieces() and pos + round_up(T, C) <= self.max_context
     self.tok_np[:T], self.given_np[:T] = toks, given
     ps, st = self.slots_of(self.piece_bytes), self.state
@@ -465,7 +501,7 @@ class Engine:
       raise RuntimeError(f"window reads failed {err}")
     if not len(miss:=reads[1]): return
     old, E = st["expert_in"], self.m["n_experts"]
-    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= self.layer * E) & (old < (self.layer + 2) * E))  # (a read window's layers' kept)
+    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= self.layer * E) & (old < (self.layer + 2) * E)) | (st["mask"] > 0)
     keep[st["slot_of"][busy][st["slot_of"][busy] >= 0]] = True
     keep |= (old >= 0) & (st["flying"][np.maximum(old, 0)] > 0)
     victims = np.ascontiguousarray(np.argsort(np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0)),
@@ -494,6 +530,7 @@ class Engine:
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
     assert T in self.jits and pos + T <= self.max_context
+    self.grow(pos + T)
     io.tokens, io.victims_n, self.res_np[0] = T, 32 * T, 0
     self.tok_np[:T], self.given_np[:T] = toks, ((given or []) + [-1] * T)[:T]
     host_c().flags(ctypes.byref(io), 0)
