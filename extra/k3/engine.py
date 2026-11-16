@@ -30,6 +30,7 @@ SESSION = 4096  # (a kept session's rows a short request that diverges from it e
 TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
 class Engine:
+  bank:DType = dtypes.half  # (a window's residual streams: in half, the attends read half the bytes)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=()):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
@@ -329,7 +330,7 @@ class Engine:
 
   def piece_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:  # (a piece's: the bank of its W tokens' residual streams, the draft's inputs)
     c, S = self.model.config, 1 + sum(b.attn_res_score.new_block for b in self.model.blk)
-    return {"bank": ((1, self.W, S, c.dim), dtypes.float), "taps": ((1, self.W, max(len(self.taps), 1), c.dim), dtypes.float)}
+    return {"bank": ((1, self.W, S, c.dim), self.bank), "taps": ((1, self.W, max(len(self.taps), 1), c.dim), dtypes.float)}
 
   def piece(self, at:int) -> dict[str, Tensor]: return self.lend(self.piece_shapes(), at)[0]  # (lent from the pool's slots from at on)
 

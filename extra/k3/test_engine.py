@@ -71,6 +71,7 @@ def eagle(folder:str, rng:np.random.Generator, lora:int=16) -> str:
 
 class TestEngine(unittest.TestCase):
   def setUp(self):
+    Engine.bank = dtypes.float  # (a window's streams in float: as steps' to their rounding; the half bank: test_window_pieces)
     rng = np.random.default_rng(0)
     weights = {n: (1 + rng.normal(0, 0.1, t.shape) if 'norm' in n or 'res_score' in n else rng.normal(0, 0.3, t.shape)).astype(np.float32)
                for n, t in nn.state.get_state_dict(Transformer(CONFIG)).items()}
@@ -169,7 +170,13 @@ class TestEngine(unittest.TestCase):
     self.assertEqual((eng.grown, st["mask"].sum()), (2 * eng.W, eng.slots_of(eng.cache_bytes) + eng.arena[1] - eng.arena[0]))
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
-    ids, eng, tol = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4), 3e-3
+    for bank, tol in ((dtypes.float, 3e-3), (dtypes.half, 1e-2)):  # (the streams in half: as close as their rounding)
+      with self.subTest(bank=bank):
+        Engine.bank = bank
+        self.pieces(tol)
+
+  def pieces(self, tol:float):
+    ids, eng = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4)
     self.eng, eng.keep_logits = eng, True
     self.stub()
     self.assertGreaterEqual(eng.pieces(), 2)
