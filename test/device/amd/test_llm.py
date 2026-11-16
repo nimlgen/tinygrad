@@ -6,7 +6,7 @@ from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
                                       _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
-from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_SIZES,
+from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_tiles, moe_route, q8_0_linear, head_linear, QUANT_SIZES,
   HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from test.runtime.test_llm_quantized import QuantLinearMixin
@@ -62,6 +62,22 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_q4_k_linear(self): self._test_quant_linear(12, 144)
   def test_iq4_linear(self): self._test_quant_linear(23, 136)
   def test_q5_linear(self): self._test_quant_linear(13, 176)
+  def test_head_linear(self):  # each head's rows on its own weights (an mla's absorbed v_b): as x @ w.T of the decoded weights in half
+    rng = np.random.default_rng(3)
+    for ggml_type, H, out_features, in_features in ((8, 4, 512, 128), (Q4_K, 3, 128, 512)):  # (Q8_0, Q4_K)
+      with self.subTest(ggml_type=ggml_type):
+        block = (34, 32) if ggml_type == 8 else (QUANT_SIZES[ggml_type], 256)  # (bytes, weights)
+        packed = rng.integers(0, 256, (H*out_features*in_features // block[1], block[0]), dtype=np.uint8)
+        packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
+        if ggml_type == Q4_K: packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
+        raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
+        w = ggml_data_to_tensor(raw, H*out_features*in_features, ggml_type).reshape(H, out_features, in_features)
+        x = rng.standard_normal((1, H, 128, in_features)).astype(np.float16)
+        got = head_linear(Tensor(x), w)
+        assert got is not None
+        want = x.astype(np.float32) @ w.numpy().astype(np.float16).astype(np.float32).transpose(0, 2, 1)
+        np.testing.assert_allclose(got.numpy(), want, rtol=3e-3, atol=2e-2)
+
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))

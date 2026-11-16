@@ -6,7 +6,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
   indexer_scores, topk_indices, mla_topk_attention, mla_topk_supported, res_mix_norm, kda_decode, RES_MAX_STREAMS, allgather_last
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
-from tinygrad.llm.kernels.amd_gguf import q8_linear, QUANT_SIZES
+from tinygrad.llm.kernels.amd_gguf import q8_linear, head_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
 from tinygrad.helpers import unwrap, round_up, get_child
@@ -537,6 +537,9 @@ class Indexer:
     return ((picked | (k_pos >= (q_pos + 1) // idx.kpool * idx.kpool)) & (k_pos <= q_pos)).where(0.0, -math.inf).cast(x.dtype)
 
 
+def _heads(x:Tensor, w:Tensor) -> Tensor:  # (x @ w.T of each head's own weights w (H, out, in): the tensor cores' kernel where there's one)
+  return y if (y:=head_linear(x, w)) is not None else x @ w.transpose(-1, -2)
+
 class MLATransformerBlock(FFNBlock):
   kv_b_block_size:tuple[int, int] = (128, 128)
   def __init__(self, config:TransformerConfig):
@@ -567,7 +570,7 @@ class MLATransformerBlock(FFNBlock):
     if freqs is not None: q_rope = apply_rope(q_rope, freqs, self.config.rope_interleave)
     if 'weight_scale_inv' in self.attn_k_b:
       q_nope = fp8_matmul(q_nope, self.attn_k_b['weight'], self.attn_k_b['weight_scale_inv'], self.kv_b_block_size[::-1])
-    else: q_nope = q_nope @ self.attn_k_b['weight'].transpose(-1, -2)
+    else: q_nope = _heads(q_nope, self.attn_k_b['weight'])
     q = q_nope.cat(q_rope, dim=-1)
 
     kv_a = self.attn_kv_a_mqa(x)
@@ -596,7 +599,7 @@ class MLATransformerBlock(FFNBlock):
       attn = attn.softmax(-1) @ k[..., :self.config.kv_lora_rank]
     if 'weight_scale_inv' in self.attn_v_b:
       attn = fp8_matmul(attn, self.attn_v_b['weight'], self.attn_v_b['weight_scale_inv'], self.kv_b_block_size)
-    else: attn = attn @ self.attn_v_b['weight'].transpose(-1, -2)
+    else: attn = _heads(attn, self.attn_v_b['weight'])
     attn = attn.transpose(1, 2).reshape(B, T, -1)
     if self.config.attn_head_gate: return self.attn_output(attn * self.attn_gate(x).sigmoid().repeat_interleave(self.config.v_head_dim, -1))
     return self.attn_output(attn * self.attn_gate(x).sigmoid() if self.config.attn_output_gate else attn)
