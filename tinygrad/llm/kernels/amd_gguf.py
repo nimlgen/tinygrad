@@ -3,7 +3,7 @@ import functools, itertools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys, \
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, PARTIALS, _reg, _sys, \
   _carry, _unbind, amd_custom_kernels_supported
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap, round_up
@@ -683,7 +683,8 @@ def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=(), rows:int|UOp|Non
   out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
-  # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce
+  # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce (PARTIALS: its caller's)
+  if splits > 1 and PARTIALS[0]: return result.reshape(splits, *x.shape[:-1], out_features)
   if splits > 1: result = partial_sum(result.reshape(splits, tokens, out_features))
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias

@@ -101,7 +101,7 @@ class Linear(nn.Linear):
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: padded to the max chunk size (static shapes), the kernel's rows those there are, the rest sliced off
       out = q8_linear(self, x.pad_to(x.max_shape), rows=cast(UOp, prod(x.shape[:-1])))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      return out.shrink(tuple((0, s) for s in (*out.shape[:out.ndim - x.ndim], *x.shape[:-1], self.out_features)))
     if isinstance(x.numel(), int): return super().__call__(x)
     # (a symbolic token count: the matmul on the max rows, static and its own kernel, as the quantized ones)
     return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
@@ -977,6 +977,34 @@ def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int
   # the next epoch, once every thread of the workgroup read the counter
   done = counter.after(UOp.group(*stores).barrier())[wg.valid(t.eq(0))].store(epoch.cast(dtypes.int32))
   return UOp.group(*stores, done).end(wg, t).sink(arg=KernelInfo(name="allreduce", opts_to_apply=()))
+
+PARTIALS = [False]  # (the row parallel quantized linears' partials (devices, ...) as they are: their caller sums them)
+
+def _per_device(x:Tensor) -> UOp:  # (the buffer of a kernel's output split over the devices, a device's part its mselect, after the kernel)
+  u = x.uop
+  if u.op is Ops.UNSHARD: return u.src[0]
+  assert u.op is Ops.AFTER and u.src[0].op is Ops.UNSHARD, f"not a split kernel output: {u.op}"
+  return u.src[0].src[0].after(*u.src[1:])
+
+@functools.cache
+def _cast_kernel(out:UOp, x:UOp) -> UOp:
+  o, s = out.flatten(), x.flatten()
+  i = UOp.range(o.shape[0], 0)
+  return o[i].store(s[i].load().cast(o.dtype)).end(i).sink(arg=KernelInfo(name="cast"))
+
+def reduce_scatter(p:Tensor) -> Tensor:
+  """the sum over the devices of their partials p (devices, R, ...) split on axis 0, split on its rows over the devices (R, ...): around the
+  ring, in step k device j adds its part of the rows of device j-k to what it got and sends it on (the parts in half, the sums in float)"""
+  devs, S = cast(tuple[str, ...], p.device), p.shape[1:]
+  n, size = len(devs), S[0] // len(devs)
+  local = _per_device(Tensor.custom_kernel(Tensor.empty(*p.shape, dtype=dtypes.half, device=devs, axis=0), p, fxn=_cast_kernel)[0])
+  def part(j:int, i:int) -> UOp: return local.mselect(j).reshape(S).shrink(((i * size, (i + 1) * size), *((0, s) for s in S[1:])))
+  got:dict[tuple[int, int], UOp] = {}
+  for k in range(1, n):
+    for j in range(n):
+      t = (j - k) % n
+      got[(t, (j + 1) % n)] = (part(j, t) if k == 1 else (got[(t, j)] + part(j, t)).contiguous()).copy_to_device(devs[(j + 1) % n])
+  return Tensor(UOp.mstack(*[(got[(t, t)] + part(t, t)).float().contiguous() for t in range(n)]).unshard(0))
 
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,

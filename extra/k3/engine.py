@@ -15,7 +15,7 @@ from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, IQ3_XXS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3, DSpark, load
@@ -395,20 +395,29 @@ class Engine:
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
     h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows))[:, :live]
-    a = b._attention(h, (pos,), b._indexer_mask(h, (pos,), None), live)
+    mask = b._indexer_mask(h, (pos,), None)
+    a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
     x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows))[:, :live]
-    if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, b._feed_forward(x)).realize()
+    if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["shared"], b._shared(x)[0]), (self.win["logits"], logits)]
     return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs])[0]
 
-  def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:  # (y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0)
+  def partials(self, f:Callable[[], Tensor]) -> Tensor:  # (f's output, its row parallel linears' partials (gpus, ...) as they are, if any)
+    PARTIALS[0] = True
+    try: return f()
+    finally: PARTIALS[0] = False
+
+  def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:
+    """y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0. y partials (gpus, 1, live, dim): their sum, each gpu
+    its rows' (reduce scattered)"""
     # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows. each gpu its own)
     bank, G, C = self.own(Tensor(self.win["bank"].uop), c0)[:, :, :, s], len(self.devs), self.chunk
-    return bank.assign((bank + y.pad_to((1, C, y.shape[2])).reshape(1, G, C // G, -1)).cast(bank.dtype))
+    y = reduce_scatter(y[:, 0].pad_to((G, C, y.shape[-1]))) if y.ndim == 4 else y.pad_to((1, C, y.shape[2]))
+    return bank.assign((bank + y.reshape(1, G, C // G, -1)).cast(bank.dtype))
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
