@@ -64,6 +64,8 @@ class Engine:
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
     weights = {id(t) for t in nn.state.get_parameters(model.blk)}  # (not realized here: some are decoded in the step's graph)
+    # (a draft holding the trunk's weights would realize them as its state: decoded, their quantized kernels lost)
+    assert not {id(t) for t in nn.state.get_parameters(draft)} & {id(t) for t in nn.state.get_parameters(model)}, "a draft with the trunk's weights"
     for b in model.blk: b._init_state(Tensor.empty(1, 1, model.config.dim, device=self.devs))
     Tensor.realize(*(states:=[t for t in nn.state.get_parameters([model.blk, draft]) if id(t) not in weights and t.numel()]))
     # (the empty ones allocated too, else at their first use: the ones with a buffer, not the folded constants)
