@@ -490,7 +490,7 @@ class Engine:
   def fill(self, pos:UOp, p0:UOp, c0:UOp, *_) -> Tensor:  # (the draft's cache of a chunk of the piece at p0 of the read window)
     C = self.chunk
     given = self.given[p0 + c0:p0 + c0 + C].reshape(1, C).to(self.devs)
-    return self.draft.fill(given, self.whole(self.own(Tensor(self.win["taps"].uop), c0).flatten(1, 2)), pos).realize()
+    return self.draft.fill(given, self.whole(self.own(Tensor(self.win["taps"].uop), c0).flatten(1, 2).cast(self.bank)).float(), pos).realize()
 
   def start(self, p0:UOp, *_) -> Tensor:  # (a piece's bank of streams: its tokens' embeddings, the rest zero. each gpu its rows of the chunks)
     G, C, bank = len(self.devs), self.chunk, Tensor(self.win["bank"].uop)
