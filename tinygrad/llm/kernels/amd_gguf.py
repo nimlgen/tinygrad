@@ -376,13 +376,15 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
   return tuple(range(4)) if kgroups == 1 else tuple(lane_group*(4//kgroups) + j for j in range(4//kgroups))
 
+def _output_waves(out_features:int, output_tiles:int) -> int: return 2 if output_tiles <= 2 and out_features % (32*output_tiles) == 0 else 1
+
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, lanes:int, heads:int=1, live:UOp|None=None):
   # heads: out's rows a head's in turn (a workgroup's one head's). live: a head's rows to compute (a symbolic count: the workgroups of those,
   # out the max's)
   if out_features % (16*output_tiles): output_tiles = 1
-  output_waves = 2 if out_features % (32*output_tiles) == 0 else 1
-  # the waves on more tokens (up to 4) share the workgroup's weights: a fragment dequantized once, through LDS
-  token_waves = next(n for n in (4, 2, 1) if out.shape[0] // heads % (token_tile*n) == 0 and (2*output_tiles) % n == 0)
+  output_waves = _output_waves(out_features, output_tiles)
+  # the waves on more tokens (up to 8) share the workgroup's weights: a fragment dequantized once, through LDS
+  token_waves = next(n for n in (8, 4, 2, 1) if out.shape[0] // heads % (token_tile*n) == 0 and (2*output_tiles) % n == 0)
   per, rows_head = token_tile*token_waves, out.shape[0] // heads
   blocks = rows_head // per if live is None else (live + per - 1) // per  # (a head's workgroups)
   token_block = UOp.range(heads*blocks, 0)
@@ -431,7 +433,7 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
   step = UOp.range(in_features // Q8_GROUP_SIZE // steps, 4, AxisType.LOOP)
   ks = tuple(word*4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
-  output_waves = 2 if out_features % (32*output_tiles) == 0 else 1  # (as _wmma_layout's)
+  output_waves = _output_waves(out_features, output_tiles)
   frag_count, head = 2*output_tiles*output_waves, input_tokens[0] // (out.shape[0] // heads)  # (a workgroup's rows one head's)
   def frag(g:int, f:UOp|int) -> tuple[UOp, ...]:  # (fragment f of group g of the step: f // 2's output tile of the workgroup, f % 2 its half)
     row = head*out_features + (output_block*output_waves + f // (2*output_tiles))*(16*output_tiles) + f // 2 % output_tiles*16 + lane % 16
@@ -459,8 +461,8 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int,
                                heads:int=1, live:UOp|None=None) -> UOp:
-  token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else \
-    (32 if out.shape[0] % 32 == 0 else 16, 2)
+  token_tile, output_tiles = (32, 4) if out.shape[0] % 256 == 0 and out_features % 64 == 0 else \
+    (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else (32 if out.shape[0] % 32 == 0 else 16, 2)
   layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads, live)
   word_indices = _wmma_words(layout[5], kgroups)
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
@@ -497,8 +499,9 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int, heads:int=1,
                                   live:UOp|None=None) -> UOp:
-  token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
-  layout = _wmma_layout(out, out_features, token_tile, 2, lanes, heads, live)
+  token_tile, output_tiles = (32, 4) if out.shape[0] % 256 == 0 and out_features % 64 == 0 else \
+    (64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16, 2)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads, live)
   output_waves, _, _, lane, wave, lane_group, _, _, _ = layout
   word_indices = _wmma_words(lane_group, kgroups)
   grid = None
