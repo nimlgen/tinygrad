@@ -352,14 +352,16 @@ class Engine:
     n = self.chunk // len(self.devs)
     return t[:, :, c0 // len(self.devs):c0 // len(self.devs) + n]
 
-  def whole(self, t:Tensor) -> Tensor:  # (t (1, R, ...) split on its rows, on every gpu: each gpu's rows copied to the others once)
+  def whole(self, t:Tensor) -> Tensor:  # (t (1, R, ...) split on its rows, on every gpu: each gpu's rows copied to the others once, a buffer)
     n = t.shape[1] // len(self.devs)
-    return Tensor.cat(*(t[:, i * n:(i + 1) * n] for i in range(len(self.devs))), dim=1)
+    return Tensor.cat(*(t[:, i * n:(i + 1) * n] for i in range(len(self.devs))), dim=1).contiguous()
 
-  def in_order(self, t:Tensor) -> Tensor:  # (a piece's (1, gpus, W/gpus, ...) on every gpu in its tokens' order (1, W, ...))
-    G, rest = len(self.devs), t.shape[3:]
-    w = self.whole(t.flatten(1, 2)).reshape(1, G, self.W // self.chunk, self.chunk // G, *rest)
-    return w.permute(0, 2, 1, 3, *range(4, 4 + len(rest))).reshape(1, self.W, *rest)
+  def in_order(self, t:Tensor, r0:int=0, n:int|None=None) -> Tensor:
+    """a piece's (1, gpus, W/gpus, ...) rows r0..r0+n on every gpu in its tokens' order (1, n, ...): their chunks' gathered"""
+    G, C, rest, n = len(self.devs), self.chunk, t.shape[3:], self.W - r0 if n is None else n
+    k0, k1 = r0 // C, -(-(r0 + n) // C)
+    w = self.whole(t[:, :, k0 * C // G:k1 * C // G].flatten(1, 2)).reshape(1, G, k1 - k0, C // G, *rest)
+    return w.permute(0, 2, 1, 3, *range(4, 4 + len(rest))).reshape(1, (k1 - k0) * C, *rest)[:, r0 - k0 * C:r0 - k0 * C + n]
 
   def lend(self, shapes:dict[str, tuple[tuple[int, ...], DType]], at:int) -> tuple[dict[str, Tensor], int]:
     """buffers of shapes on every gpu lent from the pool's slots from at on, and their bytes"""
@@ -396,19 +398,19 @@ class Engine:
     kernel's work the live rows'"""
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
-    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live].float()
+    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live]
     mask = b._indexer_mask(h, (pos,), None)
     a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
-    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live].float()
+    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["logits"], logits)]
     shared = self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)
-    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs],
-                          shared.assign(self.split(self.partials(lambda: b._shared(x)))))[0]
+    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs],
+                          shared.assign(self.split(self.partials(lambda: b._shared(x))).cast(shared.dtype)))[0]
 
   def partials(self, f:Callable[[], Tensor]) -> Tensor:  # (f's output, its row parallel linears' partials (gpus, ...) as they are, if any)
     PARTIALS[0] = True
