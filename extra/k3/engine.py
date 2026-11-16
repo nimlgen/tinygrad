@@ -761,11 +761,11 @@ class Engine:
     the tokens fed kept when tokens diverge from them early and are fewer (a short request: a title, a summary) and longer than one kept"""
     m = self.model
     def shared(a:list[int]) -> int: return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, a)))
+    if self.session is not None and m._cached_tokens != self.session[0] and \
+       round_up(len(m._cached_tokens) + self.tokens, max(self.chunk, 1)) > self.session[1] + self.B: self.session = None
     if self.session is not None and shared(kept:=self.session[0]) > shared(m._cached_tokens):
-      if round_up(len(m._cached_tokens) + self.tokens, max(self.chunk, 1)) <= (at:=self.session[1]) + self.B:
-        self.keep_jits[1](self.v_at.bind(at))
-        m._cached_tokens, m._saved = kept[:], self.session[2]
-      self.session = None
+      self.keep_jits[1](self.v_at.bind(self.session[1]))
+      m._cached_tokens, m._saved, self.session = kept[:], self.session[2], None
     elif len(tokens) < len(m._cached_tokens) and (at:=shared(m._cached_tokens)) + self.B <= self.max_context and len(tokens) - at < self.B // 2 \
          and len(m._cached_tokens) > (len(self.session[0]) if self.session else 0):
       self.keep_jits[0](self.v_at.bind(at))

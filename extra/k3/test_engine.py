@@ -281,6 +281,9 @@ class TestEngine(unittest.TestCase):
       start, got = serve(*turn)
       self.assertEqual(start, want[i][0])
       for g, w in zip(got, want[i][1]): np.testing.assert_equal(g, w)
+    serve(sides[0], [4] * 6)  # (a reply past the kept rows: the session gone, the next short request's kept)
+    serve(sides[1], [4])
+    self.assertEqual(self.eng.session[:2] if self.eng.session else None, (sides[0] + [4] * 6, 2))
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
