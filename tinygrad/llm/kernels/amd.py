@@ -970,8 +970,10 @@ def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int
   return UOp.group(*stores, done).end(wg, t).sink(arg=KernelInfo(name="allreduce", opts_to_apply=()))
 
 def partial_sum(x:Tensor) -> Tensor:
-  """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes"""
-  if x.uop.axis != 0 or not (shape:=_mailbox_shape(x, n:=prod(x.shape[1:]))): return x.sum(0)
+  """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,
+  larger float ones on the gpus in half (their copies half the bytes)"""
+  if x.uop.axis != 0 or not (shape:=_mailbox_shape(x, n:=prod(x.shape[1:]))):
+    return x.half().sum(0).cast(x.dtype) if x.dtype == dtypes.float32 and amd_custom_kernels_supported(x.device) else x.sum(0)
   fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
@@ -1010,9 +1012,12 @@ def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:
   return UOp.group(*outputs, done).end(wg, t).sink(arg=KernelInfo(name="allgather", opts_to_apply=()))
 
 def allgather_last(x:Tensor) -> Tensor:
-  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes"""
+  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes, larger float ones on the gpus copied
+  in half"""
   if x.uop.axis != x.ndim-1 or not isinstance(devs:=x.device, tuple): return x
-  if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))): return Tensor(x.uop.copy_to_device(devs))
+  if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))):
+    if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs): return Tensor(x.half().uop.copy_to_device(devs)).cast(x.dtype)
+    return Tensor(x.uop.copy_to_device(devs))
   fxn = functools.partial(_allgather_kernel, n=n, width=x.max_shape[-1]//len(devs), T=shape[0], EP=shape[1])
   return Tensor.custom_kernel(Tensor.empty(x.shape, dtype=x.dtype, device=x.device), x.contiguous(), *_mailboxes(x.device), fxn=fxn)[0]
 
