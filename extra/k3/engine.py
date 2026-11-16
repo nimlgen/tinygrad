@@ -11,6 +11,7 @@ from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
 from tinygrad.device import Buffer, MultiBuffer
+from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -18,6 +19,7 @@ from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, parti
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, IQ3_XXS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3, DSpark, load
+from extra.k3 import persist
 
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
 # routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: the next layer's experts guessed a layer. SLOTS: on a gpu
@@ -32,13 +34,14 @@ TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds 
 class Engine:
   bank:DType = dtypes.half  # (a window's residual streams: in half, the attends read half the bytes)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|None=None, logits:bool=False,
-               chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=()):
+               chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str=""):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
     a scored draft's verify steps of fewer tokens too (their graphs captured), each step's the one its guesses' scores expect most tokens a
-    second of"""
+    second of. source: the model's gguf (a start's graphs are kept for the next start of the same code, model and config: persist.py)"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
+    self.source, self.saved, self.fps, self.names = source, cast(dict, {}), cast(dict[str, dict[str, str]], {"window": {}, "steps": {}}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
@@ -66,8 +69,11 @@ class Engine:
     def scorer(w:Tensor) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
       w = w.reshape(2, G, E // G, -1).permute(1, 0, 2, 3).reshape(2 * E, -1).half()
       return q8_0_linear(w, self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0)
-    self.scorers = [scorer(Tensor.stack(router(li), guessed(min(li + 1, L - 1)))) for li in range(L)]
+    # (the scorers kept for the next start: of the gguf and the guess maps)
+    loaded = persist.load_scorers(self, guess)
+    self.scorers = loaded or [scorer(Tensor.stack(router(li), guessed(min(li + 1, L - 1)))) for li in range(L)]
     Tensor.realize(*(biases:=[b.exp_probs_b["bias"] for b in blocks]), *[s.weight if isinstance(s, Linear) else s for s in self.scorers])
+    if loaded is None: persist.save_scorers(self, guess, self.scorers)
     self.bias = list(Tensor.stack(*[t.float() for t in biases]).numpy())
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
@@ -154,6 +160,7 @@ class Engine:
                  f"the window's {(slots - self.tail) * self.part / 1e9:.2f} GB)")
       self.window_lend()
       self.stage(f"window graphs (their scratch {(self.arena[1] - self.arena[0]) * self.part / 1e9:.2f} GB, the pool's)")
+    else: self.restore()
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
@@ -284,7 +291,12 @@ class Engine:
     room = self.lend({"arena": (((self.tail - first) * self.part,), dtypes.int8)}, first)[0]["arena"].uop.base
     self.arenas.clear()
     self.arenas[key] = room
-    try: self.window_capture()
+    self.restore()
+    try:
+      self.window_capture()
+      if self.saved and not self.checked("window"):
+        self.window_capture()
+        self.checked("window")
     except MemoryError as e: raise MemoryError(f"the window's graphs' scratch past the pool's {room.max_numel() / 1e9:.2f} GB for it") from e
     if (need:=self.arenas[key].max_numel()) > room.max_numel():
       raise MemoryError(f"the window's graphs' scratch {need / 1e6:.1f} MB past the pool's {room.max_numel() / 1e6:.1f} MB for it")
@@ -311,6 +323,7 @@ class Engine:
     self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
     if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
     for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
+    self.fps["window"]["routes"] = persist.fingerprint(*(self.win[k].numpy() for k in ("w", "pos", "entries", "tiles")))
 
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
@@ -359,7 +372,8 @@ class Engine:
         for u in t.uop.toposort():
           if u.op is Ops.BUFFER: seen.setdefault(u, None)
       key = (name, type(b), tuple((u.shape, u.dtype, u.nbytes()) for u in seen))
-      if key not in self.kinds: self.kinds[key] = (b, self.wjit(functools.partial(fxn, b)), [])
+      if key not in self.kinds:
+        self.kinds[key] = (b, self.saved_graph(f"kind{sum(len(k) == 3 for k in self.kinds)}", self.wjit(functools.partial(fxn, b))), [])
       self.kinds[(name, b)] = (*self.kinds[key][:2], [Tensor(u) for u in seen])
     first, jit, args = self.kinds[(name, b)]
     return jit, args, first
@@ -602,18 +616,67 @@ class Engine:
   # *** the host's side
 
   def warm(self):
-    """every step's graph (and the rollback's, the saves') captured on dry steps: the host's flags preset (its tables still zero: no experts)"""
+    """every step's graph (and the rollback's, the saves') captured on dry steps (or the start's file's, checked by them): the host's flags
+    preset (its tables still zero: no experts). the graphs to the start's file, unless they're its"""
     host_c().flags(ctypes.byref(self.io), 1)
     self.t_stage = time.perf_counter()
+    self.dry_steps()
+    if self.saved and not self.checked("steps"): self.dry_steps()
+    if not self.saved and self.source:
+      persist.save(self, self.names, self.graphs(), self.fps)
+      self.stage("graphs kept for the next start")
+
+  def dry_steps(self):
     for T, jit in self.jits.items():
       jit(self.v_pos.bind(0))[0].tolist()
+      self.fps["steps"][f"step{T}"] = persist.fingerprint(self.res_np)
       self.stage(f"step graph of {T}")
     for n in range(1, self.tokens): self.model.rollback(n)  # (their jits captured too, after a verify step)
     for i, save in itertools.product(range(2), (True, False)): self.model._copy(i, save)  # (and save's)
-    if self.chain_jit: self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
+    if self.chain_jit:
+      self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
+      self.fps["steps"]["chain"] = persist.fingerprint(self.cres_np)
     for jit in self.keep_jits: jit(self.v_at.bind(0))  # (a kept session's copies)
     self.zero_jit(self.v_grown.bind(0))  # (and the caches' growth: its rows zeroed, there's no context yet)
     self.stage("rollbacks, saves, chain, session copies")
+
+  # *** a start's graphs kept (persist.py): every graph named
+
+  def graphs(self) -> dict[str, TinyJit]:
+    m = self.model
+    return {**{f"step{T}": j for T, j in self.jits.items()}, "keep": self.keep_jits[0], "unkeep": self.keep_jits[1], "zero": self.zero_jit,
+            **({"chain": self.chain_jit} if self.chain_jit else {}), **{f"rollback{n}": j for n, j in m._rollbacks.items()},
+            **{f"copy{i}{save}": j for (i, save), j in m._copies.items()},
+            **({"start": self.start_jit, "tap": self.tap_jit, "mix": self.mix_jit, **({"fill": self.fill_jit} if self.fill_jit else {}),
+                **{f"{name}{t}": j for t, r in self.routes.items() for name, j in zip(("route", "experts"), r)},
+                **{f"kind{i}": j for i, (_, j, _) in enumerate(v for k, v in self.kinds.items() if len(k) == 3)}} if self.W else {})}
+
+  def saved_graph(self, name:str, jit:TinyJit) -> TinyJit:  # (jit, the start's file's graph of the name if there's one)
+    if (captured:=self.saved.get("graphs", {}).get(name)) is not None: jit.captured, jit.cnt = captured, 2
+    return jit
+
+  def restore(self):
+    """the start's file's graphs into theirs (the model's rollbacks' and saves' made), else they're captured"""
+    self.names = persist.buffers(self)
+    self.saved = persist.load(self, self.names)
+    for name, jit in self.graphs().items(): self.saved_graph(name, jit)
+    for name, captured in self.saved.get("graphs", {}).items():
+      if name.startswith("rollback"): self.model._rollbacks[int(name[8:])] = _TinyJit(None, captured=captured)
+      if name.startswith("copy"): self.model._copies[(int(name[4]), name[5:] == "True")] = _TinyJit(None, captured=captured)
+
+  def checked(self, stage:str) -> bool:
+    """a stage's dry runs of the start's file's graphs as the ones it was saved with, else the file's dropped and the graphs of the stage and
+    after reset to capture (a window's: every graph)"""
+    if self.saved["fps"][stage] == self.fps[stage]: return True
+    print(f"start: the graphs file's {stage} not as saved: dropped, capturing", flush=True)
+    persist.discard(self)
+    window = {id(j) for k, j in self.graphs().items() if k.startswith(("start", "tap", "mix", "fill", "route", "experts", "kind"))}
+    for jit in self.graphs().values():
+      if jit.fxn is not None and (stage == "window" or id(jit) not in window): jit.reset()
+    self.saved, self.fps[stage] = {}, {}
+    self.model._rollbacks.clear()
+    self.model._copies.clear()
+    return False
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int], np.ndarray|None]:
     """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each,
@@ -775,7 +838,7 @@ if __name__ == "__main__":
   # TAPS=b,b..: without a draft, the streams a window keeps after blocks b (bm: as the next block's attention residual mixes them), for a DUMP
   taps = [(int(t.rstrip("m")), t.endswith("m")) for t in getenv("TAPS", "").split(",") if t]
   eng = Engine(model, m, tokens=max(widths) if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
-               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps, widths=tuple(widths))
+               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps, widths=tuple(widths), source=sys.argv[1])
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)

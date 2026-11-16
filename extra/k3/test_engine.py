@@ -81,15 +81,15 @@ class TestEngine(unittest.TestCase):
     self.ref, self.trunk, self.weights = Transformer.from_gguf(full)[0], trunk, weights
     self.eng = self.engine(2 * E)
 
-  def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=()) \
-      -> Engine:
+  def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=(),
+             source:str="") -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
     # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
     eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths)  # (96: the caches', the scratch's)
+                 widths=widths, source=source)  # (96: the caches', the scratch's)
     at = eng.arena[1]
     assert at <= 96
     pools = [(caches * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part,
