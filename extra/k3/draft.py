@@ -14,7 +14,7 @@ class Eagle3:
     self.H, self.nope, self.rope, self.vd, self.lora = (cfg[k] for k in ("num_attention_heads", "qk_nope_head_dim", "qk_rope_head_dim",
                                                                           "v_head_dim", "kv_lora_rank"))
     self.eps, self.embed, self.norm_output = cfg["rms_norm_eps"], embed, cfg.get("norm_output", False)
-    self.layers = [i - 1 for i in cfg["eagle_config"]["eagle_aux_hidden_state_layer_ids"]]  # (the target's blocks it reads after)
+    self.taps = [(i - 1, False) for i in cfg["eagle_config"]["eagle_aux_hidden_state_layer_ids"]]  # (the target's blocks it reads after, unmixed)
     rs = cfg["rope_scaling"]
     yarn = YaRNConfig(factor=rs["factor"], orig_ctx_len=rs["original_max_position_embeddings"], beta_fast=rs["beta_fast"], beta_slow=rs["beta_slow"])
     # deepseek's yarn: plain cos/sin (precompute_freqs_cis scales them by the concentration), the scores scaled by mscale^2 instead

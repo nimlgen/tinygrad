@@ -4,14 +4,14 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import collections, ctypes, functools, itertools, os, signal, sys, time
+import collections, ctypes, functools, itertools, math, os, signal, sys, time
 import numpy as np
 from typing import Callable
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.uop.ops import Ops
-from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, gated_activation
+from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, IQ3_XXS
@@ -27,11 +27,12 @@ TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds 
 
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False,
-               chunk:int=0, window:int=0):
+               chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
-    attention in chunks), keeping their logits or not"""
+    attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps)"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
+    self.dump_taps = taps or []
     blocks = [model.blk[b] for b in m["layers"] if b < len(model.blk)]
     L, E, K, G, self.lat, self.units, self.part = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], \
       m["units"][0], m["part_bytes"][0]
@@ -112,15 +113,23 @@ class Engine:
 
   # *** the step's graph
 
+  @property
+  def taps(self) -> list[tuple[int, bool]]: return self.draft.taps if self.draft is not None else self.dump_taps
+
+  def mixer(self, i:int) -> AttentionResidual:  # (the attention residual that next reads the streams after block i)
+    return self.model.blk[i + 1].attn_res_score if i + 1 < len(self.model.blk) else self.model.output_res_score
+
   def forward(self, tokens:Tensor, pos:UOp) -> tuple[Tensor, Tensor|None]:
-    """the logits (T, vocab) after each of the tokens (1, T) at positions pos.., the hidden states (1, T, 3, dim) after the draft's blocks"""
-    m, hidden = self.model, []
+    """the logits (T, vocab) after each of the tokens (1, T) at positions pos.., the draft's taps (1, T, taps, dim): after a block its last
+    stream (the block's sum so far) or (mixed) the streams as the next block's attention residual mixes them"""
+    m, hidden, taps = self.model, {}, self.draft.taps if self.draft is not None else []
     x = m.token_embd(tokens.to(m.token_embd.weight.device)).float().unsqueeze(2)  # (the attention residuals' streams: (1, T, 1, dim))
     mask = None
     for i, b in enumerate(m.blk):
       x, mask = b(x, (pos,), mask)
-      if self.draft is not None and i in self.draft.layers: hidden.append(x[:, :, -1])
-    return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*hidden, dim=2) if hidden else None
+      for t in taps:
+        if t[0] == i: hidden[t] = self.mixer(i).mix(x) if t[1] else x[:, :, -1]
+    return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*(hidden[t] for t in taps), dim=2) if taps else None
 
   def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
     """the greedy token after each of the step's tokens and (a draft) its guess of the token after that (after the given one where there's
@@ -200,7 +209,8 @@ class Engine:
     self.v_tap = UOp.variable("tap", 0, self.win["taps"].shape[2] - 1)
     self.kinds:dict[tuple, tuple[FFNBlock, Callable, list[Tensor]]] = {}  # (a kind's, and a stage of a block's: its args)
     self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
-    self.tap_jit, self.fill_jit = TinyJit(self.tap, arenas=self.arenas), TinyJit(self.fill, arenas=self.arenas) if self.draft else None
+    self.tap_jit, self.mix_jit = TinyJit(self.tap, arenas=self.arenas), TinyJit(self.tap_mix, arenas=self.arenas)
+    self.fill_jit = TinyJit(self.fill, arenas=self.arenas) if self.draft else None
     # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
     self.routes = {t: (TinyJit(functools.partial(self.window_route, t), arenas=self.arenas),
                        TinyJit(functools.partial(self.window_experts, t), arenas=self.arenas)) for t in TILES}
@@ -236,7 +246,7 @@ class Engine:
     shapes = {"bank": ((1, W, S, c.dim), f32), "h": ((W, self.lat), f32), "shared": ((W, c.dim), f32), "logits": ((W, E), f32),
               "out": ((W, self.lat), f32), "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32),
               "tiles": ((R // TILES[0],), i32),
-              "taps": ((1, W, len(self.draft.layers) if self.draft else 1, c.dim), f32), "act": ((R, self.units), dtypes.half),
+              "taps": ((1, W, max(len(self.taps), 1), c.dim), f32), "act": ((R, self.units), dtypes.half),
               "down": ((R, self.lat), dtypes.half)}
     state, off = {}, (at or 0) * self.part
     self.window_bytes = sum(round_up(prod(shape) * dt.itemsize, 256) for shape, dt in shapes.values())
@@ -332,6 +342,12 @@ class Engine:
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
     return Tensor(self.win["taps"].uop)[:, :, j].assign(Tensor(self.win["bank"].uop)[:, :, s]).realize()
 
+  def tap_mix(self, s:UOp, j:UOp, w:Tensor, *_) -> Tensor:  # (tap j: the streams up to s mixed by an attention residual's weight w)
+    bank = Tensor(self.win["bank"].uop)
+    scores = (bank.rmsnorm(eps=self.model.config.norm_eps) * w).sum(-1, keepdim=True)
+    scores = (Tensor.arange(bank.shape[2]).to(bank.device).reshape(-1, 1) <= Tensor(s)).where(scores, -math.inf)
+    return Tensor(self.win["taps"].uop)[:, :, j].assign((scores.softmax(2) * bank).sum(2)).realize()
+
   def fill(self, pos:UOp, c0:UOp, *_) -> Tensor:  # (the draft's cache of a chunk of the window)
     C = self.chunk
     return self.draft.fill(self.given[c0:c0 + C].reshape(1, C).to(self.devs), Tensor(self.win["taps"].uop)[:, c0:c0 + C], pos).realize()
@@ -394,7 +410,10 @@ class Engine:
         for c0, _ in chunks:
           self.graph(jit, self.v_c0.bind(c0), self.v_s.bind(s), *args)
           self.pump()
-      if self.draft and i in self.draft.layers: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
+      for j, (blk, mixed) in enumerate(self.taps):
+        if blk != i: continue
+        if mixed: self.graph(self.mix_jit, self.v_s.bind(s), self.v_tap.bind(j), self.mixer(i).weight)
+        else: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(j))
       n = s + 1
     return ahead
 
@@ -561,14 +580,17 @@ if __name__ == "__main__":
     else None
   # VERIFY=n: a verify step's tokens, the next and the draft's chain of n-1 guesses (an EVAL: its steps of n tokens)
   # CHUNK=n: a prompt fed in steps of n tokens (0: a token a step), WINDOW=n: in windows of up to n tokens (a layer at a time, chunks of CHUNK)
+  # TAPS=b,b..: without a draft, the streams a window keeps after blocks b (bm: as the next block's attention residual mixes them), for a DUMP
+  taps = [(int(t.rstrip("m")), t.endswith("m")) for t in getenv("TAPS", "").split(",") if t]
   eng = Engine(model, m, tokens=getenv("VERIFY", 2 if draft else 1), guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
-               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0))
+               chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps)
   eng.drives(disks)
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
   if (spec:=getenv("EVAL", "") or getenv("WEVAL", "") or getenv("BENCH", "")):  # EVAL=/WEVAL=/BENCH=corpus.jsonl:nseq:ntok:first (eval.py)
-    from extra.k3.eval import evaluate, window_evaluate, bench
-    (evaluate if getenv("EVAL", "") else window_evaluate if getenv("WEVAL", "") else bench)(eng, spec, late)
+    from extra.k3.eval import evaluate, window_evaluate, window_dump, bench
+    if (dump:=getenv("DUMP", "")): window_dump(eng, spec, late, dump)  # DUMP=dir with WEVAL=: the taps and the target's tokens (eval.py)
+    else: (evaluate if getenv("EVAL", "") else window_evaluate if getenv("WEVAL", "") else bench)(eng, spec, late)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
   if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()

@@ -1,6 +1,6 @@
 # EVAL=corpus.jsonl:nseq:ntok:first (engine.py): production completions teacher forced through an engine, each from position 0. per output
 # token the top-1 agreement with production and KL(production's top 5 and the rest || ours), per sequence and so far
-import json, sys, time
+import json, os, sys, time
 from typing import Callable
 import numpy as np
 from tinygrad import Tensor
@@ -50,6 +50,37 @@ def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128, size:i
     (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}", flush=True)
   return stats
+
+def window_dump(eng, spec:str, late:Callable[[], bool], out:str, rows:int=128):
+  """DUMP=dir with WEVAL's spec: every position of the completions (the prompts' too) through windows, for a draft's offline evaluation: the
+  engine's taps (a file each, (positions, dim) f32), the token, the target's greedy next token and its probability. meta.json: the sequences"""
+  path, *nums = spec.split(":")
+  nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
+  m, seqs = eng.model, [(r["task_id"], r["prompt_ids"] + r["output_ids"][:ntok], len(r["prompt_ids"])) for r in
+                        [json.loads(line) for line in open(path)][first:first + nseq]]
+  N, dim, names = sum(len(s) for _, s, _ in seqs), m.config.dim, [f"{b}{'m' if mixed else ''}" for b, mixed in eng.taps]
+  os.makedirs(out, exist_ok=True)
+  taps = [np.lib.format.open_memmap(f"{out}/tap{n}.npy", "w+", np.float32, (N, dim)) for n in names]
+  toks, nxt, p1 = (np.lib.format.open_memmap(f"{out}/{k}.npy", "w+", dt, (N,)) for k, dt in (("tokens", np.int32), ("next", np.int32),
+                                                                                                ("p1", np.float32)))
+  meta:dict = {"taps": names, "seqs": []}
+  at0 = 0
+  for task, seq, n_prompt in seqs:
+    if late(): sys.exit(f"deadline: {at0} positions")
+    for at in range(0, len(seq), eng.W):
+      toks_w = seq[at:at + eng.W]
+      eng.window(toks_w, at, (seq[at + 1:at + 1 + len(toks_w)] + [-1])[:len(toks_w)])
+      for j, t in enumerate(taps): t[at0 + at:at0 + at + len(toks_w)] = Tensor(eng.win["taps"].uop)[0, :len(toks_w), j].numpy()
+      for r0 in range(0, len(toks_w), rows):
+        lg = m.output(m.output_norm(m.output_res_score.mix(Tensor(eng.win["bank"].uop)[:, r0:r0 + rows])))[0].float()[:len(toks_w) - r0]
+        o = at0 + at + r0
+        nxt[o:o + lg.shape[0]], p1[o:o + lg.shape[0]] = lg.argmax(-1).numpy(), lg.softmax(-1).max(-1).numpy()
+    toks[at0:at0 + len(seq)] = seq
+    meta["seqs"].append({"task_id": task, "start": at0, "len": len(seq), "prompt": n_prompt})
+    at0 += len(seq)
+    print(f"{task}: {len(seq)} positions dumped", flush=True)
+  for a in (*taps, toks, nxt, p1): a.flush()
+  json.dump(meta, open(f"{out}/meta.json", "w"))
 
 def bench(eng, spec:str, late:Callable[[], bool]):
   """BENCH=corpus.jsonl:nseq:ntok:first: verify steps of [the next, the draft's guess] over production completions teacher forced (the text

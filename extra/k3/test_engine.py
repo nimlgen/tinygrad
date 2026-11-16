@@ -12,7 +12,7 @@ from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
 from extra.k3.draft import Eagle3
-from extra.k3.eval import window_evaluate
+from extra.k3.eval import window_evaluate, window_dump
 
 DIM, LAT, FF, E, K, G, VOCAB = 64, 32, 64, 8, 4, 2, 32
 CONFIG = TransformerConfig(num_blocks=3, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
@@ -143,6 +143,31 @@ class TestEngine(unittest.TestCase):
     self.assertEqual(len(stats), len(outs))
     self.assertEqual([a for a, _ in stats], [1.0] * len(outs))
     self.assertLess(max(k for _, k in stats), 1e-3)  # (on AMD the steps' experts take q8 activations)
+
+  def test_window_dump(self):  # the taps (a block's last stream, mixed ones: the last block's by the output's) and the target's next tokens of a
+    # dump through windows (two) as a token a step's
+    self.stub()
+    eng, taps, seq = self.eng, [(0, False), (1, True), (2, True), (1, False)], [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7]
+    eng.dump_taps = taps
+    eng.window_init(8)
+    eng.draft = SimpleNamespace(taps=taps)  # (forward's taps)
+    want = []
+    for pos, t in enumerate(seq):
+      lg, h = eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)
+      Tensor.realize(lg, h)  # (a step's graph once: it moves the states)
+      want.append((lg.numpy()[0], h.numpy()[0, 0]))
+    eng.draft = None
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as f, tempfile.TemporaryDirectory() as out:
+      f.write(json.dumps({"task_id": "toy", "prompt_ids": seq[:3], "output_ids": seq[3:]}) + "\n")
+      f.flush()
+      window_dump(eng, f"{f.name}:1:{len(seq)}", lambda: False, out)
+      self.assertEqual(json.load(open(f"{out}/meta.json")), {"taps": ["0", "1m", "2m", "1"], "seqs": [{"task_id": "toy", "start": 0,
+                                                                                                         "len": len(seq), "prompt": 3}]})
+      np.testing.assert_equal(np.load(f"{out}/tokens.npy"), seq)
+      np.testing.assert_equal(np.load(f"{out}/next.npy"), [lg.argmax() for lg, _ in want])
+      for j, n in enumerate(["0", "1m", "2m", "1"]):
+        w = np.stack([h[j] for _, h in want])
+        np.testing.assert_allclose(np.load(f"{out}/tap{n}.npy"), w, rtol=1e-3, atol=1e-3 * np.abs(w).max(), err_msg=n)
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
