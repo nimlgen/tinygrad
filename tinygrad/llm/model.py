@@ -201,11 +201,12 @@ class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
     self.weight, self.norm_eps, self.new_block = Tensor.zeros(config.dim), config.norm_eps, new_block
 
-  def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None, count:UOp|None=None) -> Tensor:
-    # xs: (B, T, N, D) streams: (B, T, D), then the norm. count: the streams mixed, the rest (zero) left out
+  def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None, count:UOp|None=None, rows:tuple[int|UOp, int]|None=None) -> Tensor:
+    # xs: (B, T, N, D) streams: (B, T, D), then the norm. count: the streams mixed, the rest (zero) left out. rows: (start, n) xs's rows mixed
     if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[2] <= RES_MAX_STREAMS and \
        xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
-      return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps, count)
+      return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps, count, rows)
+    if rows is not None: xs = xs[:, rows[0]:rows[0] + rows[1]]
     scores = (xs.rmsnorm(eps=self.norm_eps) * self.weight).sum(-1, keepdim=True)
     if count is not None: scores = (Tensor.arange(xs.shape[2]).to(xs.device).reshape(-1, 1) < Tensor(count)).where(scores, -math.inf)
     out = (scores.softmax(2) * xs).sum(2)

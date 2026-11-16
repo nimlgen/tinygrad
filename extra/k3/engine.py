@@ -261,10 +261,10 @@ class Engine:
     """a chunk's attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a moe's
     parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s"""
     C, bank = self.chunk, Tensor(self.win["bank"].uop)
-    h = b.attn_res_score.mix(bank[:, c0:c0 + C], b.attn_norm, n)
+    h = b.attn_res_score.mix(bank, b.attn_norm, n, (c0, C))
     a = b._attention(h, (pos,), b._indexer_mask(h, (pos,), None), live)
     bank = Tensor(self.win["bank"].uop.after(bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + a).uop))
-    x = b.ffn_res_score.mix(bank[:, c0:c0 + C], b.ffn_norm, s + 1)
+    x = b.ffn_res_score.mix(bank, b.ffn_norm, s + 1, (c0, C))
     if not hasattr(b, "ffn_gate_inp"): return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + b._feed_forward(x)).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(C, len(self.devs), 2, -1)[:, :, 0].reshape(C, -1).contiguous()
