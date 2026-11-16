@@ -684,7 +684,10 @@ def _route_topk_kernel(sel:UOp, w:UOp, logits:UOp, bias:UOp, k:int, live:UOp|int
     stores += [sel[token, at].store(ok.where(e.cast(dtypes.int32), -1)), w[token, at].store(ok.where(sg / total, 0.0))]
   return UOp.group(*stores).end(token, lane).sink(arg=KernelInfo(name="route_topk", opts_to_apply=()))
 
-ROUTE_G, ROUTE_T = 64, 256  # the counting sort's workgroups and threads
+ROUTE_G, ROUTE_T = 64, 256  # the counting sort's workgroups (up to) and threads
+def _route_grid(N:int) -> tuple[int, int]:  # (the workgroups of N selections, a thread's: none without a selection)
+  G = min(ROUTE_G, (N + ROUTE_T - 1) // ROUTE_T)
+  return G, (N + G*ROUTE_T - 1) // (G*ROUTE_T)
 
 @functools.cache
 def _route_init_kernel(counts:UOp, entries:UOp, tiles:UOp) -> UOp:  # (the counts 0, the rows and the tiles -1)
@@ -702,8 +705,8 @@ def _wave_scan(x:UOp, lane:UOp) -> UOp:  # (the inclusive prefix sums of x over 
 def _route_count_kernel(rank:UOp, counts:UOp, sel:UOp, experts:int) -> UOp:
   # the rank of every selection among its expert's: a workgroup's in LDS, its base in the expert's global count
   N, per = int(prod(rank.shape)), (experts + ROUTE_T - 1) // ROUTE_T
-  Q = (N + ROUTE_G*ROUTE_T - 1) // (ROUTE_G*ROUTE_T)
-  wg, t = UOp.range(ROUTE_G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T, 1, AxisType.LOCAL)
+  G, Q = _route_grid(N)
+  wg, t = UOp.range(G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T, 1, AxisType.LOCAL)
   hist = UOp.alloc((per*ROUTE_T,), dtypes.int32, addrspace=AddrSpace.LOCAL)
   hist = hist.after(UOp.group(*(hist[t*per + m].store(UOp.const(0, dtypes.int32)) for m in range(per))).barrier())
   items = [(i, (e:=sel.reshape(-1)[i.minimum(N-1)].load()).maximum(0).cast(dtypes.weakint), (i < N) & (e >= 0))
@@ -721,8 +724,8 @@ def _route_count_kernel(rank:UOp, counts:UOp, sel:UOp, experts:int) -> UOp:
 def _route_place_kernel(pos:UOp, entries:UOp, tiles:UOp, rank:UOp, counts:UOp, sel:UOp, experts:int, tile:int) -> UOp:
   # the experts' first rows (every workgroup scans the counts padded to tiles), every selection its row, the first workgroup the tiles' experts
   N, per = int(prod(pos.shape)), (experts + ROUTE_T - 1) // ROUTE_T
-  Q = (N + ROUTE_G*ROUTE_T - 1) // (ROUTE_G*ROUTE_T)
-  wg, wave, lane = UOp.range(ROUTE_G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T // 32, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  G, Q = _route_grid(N)
+  wg, wave, lane = UOp.range(G, 0, AxisType.GLOBAL), UOp.range(ROUTE_T // 32, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
   t, zero = wave*32 + lane, UOp.const(0, dtypes.int32)
   pads = [(t*per + m < experts).where((counts[(t*per + m).minimum(experts-1)].load() + (tile-1)) // tile * tile, zero) for m in range(per)]
   total = functools.reduce(UOp.__add__, pads, zero)
