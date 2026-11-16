@@ -4,7 +4,7 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import ctypes, functools, itertools, os, signal, sys, time
+import collections, ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
 from typing import Callable
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
@@ -48,6 +48,7 @@ class Engine:
             for _ in blocks]
     self.bufs, self.tags, self.parts = bufs, [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
     self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
+    self.cached = [host_tensor(self.devs, E, dtypes.int32) for _ in blocks]  # (a window's: the experts with a slot, decode's rule on few tokens)
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
     routers = [b.ffn_gate_inp.weight.float().numpy() for b in blocks]
@@ -79,6 +80,7 @@ class Engine:
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
     self.chain_jit = TinyJit(self.run_chain) if draft is not None and tokens > 2 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
+    self.costs = {k: collections.deque(maxlen=64) for k in ("step", "window")}  # (measured: a step's seconds a token, a window's tokens, seconds)
     # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states and the window's
     # graphs (captured on a pool of a slot), then the slots a window's state is lent (its own while it runs): slots of decode's otherwise
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
@@ -222,7 +224,7 @@ class Engine:
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
     for route, experts in self.routes.values():
-      self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+      self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], self.cached[li][0], Tensor(self.tags[li]), self.parts[1][li])
       self.graph(experts, self.pool, self.parts[0][li])
 
   def window_state(self, at:int|None=None) -> dict[str, Tensor]:
@@ -282,10 +284,12 @@ class Engine:
   def state_rows(self, tile:int) -> tuple[int, int]:  # (the state's rows, its tiles of tile rows: the largest tile size's)
     return (R:=max(map(self.rows, TILES))), R // tile
 
-  def window_route(self, tile:int, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
-    """the gpus route the window's live tokens (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the tag)"""
+  def window_route(self, tile:int, live:UOp, bias:Tensor, cached:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
+    """the gpus route the window's live tokens (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the tag). few
+    tokens (the small tiles): decode's rule on the experts cached (their reads, not the gpus, the window's time)"""
     K, E = self.model.config.num_experts_per_tok, self.m["n_experts"]
-    w, pos, entries, tiles, counts = moe_route(Tensor(self.win["logits"].uop), bias, K, tile, live=live)
+    kept = (Tensor(cached.uop), TAU, TAUC, BETA, K // 4) if tile == TILES[0] else None
+    w, pos, entries, tiles, counts = moe_route(Tensor(self.win["logits"].uop), bias, K, tile, live=live, kept=kept)
     R, NT = self.state_rows(tile)  # (the routes padded to the state's rows: the experts graph's tiles past them skipped)
     vals = {"w": w, "pos": pos, "entries": entries.pad((0, R - entries.shape[0]), value=-1), "tiles": tiles.pad((0, NT - tiles.shape[0]), value=-1)}
     kept = Tensor.realize(*(Tensor(self.win[k].uop)[:v.shape[0]].assign(v) for k, v in vals.items()))
@@ -338,7 +342,7 @@ class Engine:
 
   def window(self, toks:list[int], pos:int, given:list[int]):
     """the tokens at positions pos.. through every block, a layer at a time: the caches and states as after steps of them, the draft's cache"""
-    T, C = len(toks), self.chunk
+    T, C, t0 = len(toks), self.chunk, time.perf_counter()
     assert T <= self.W and pos + round_up(T, C) <= self.max_context
     self.tok_np[:T], self.given_np[:T] = toks, given
     st = self.state
@@ -349,6 +353,15 @@ class Engine:
     for c0 in range(0, T, C) if self.fill_jit else []: self.graph(self.fill_jit, self.v_pos.bind(pos + c0), self.v_c0.bind(c0))
     for d in self.devs: Device[d].synchronize()
     for li in ahead: self.counted(li)
+    self.costs["window"].append((T, time.perf_counter() - t0))
+
+  def steps_faster(self, n:int) -> bool:
+    """n tokens a step each faster than a window of them, by the times measured (a window's a line through its sizes'; none yet: under a
+    quarter of a chunk)"""
+    steps, windows = self.costs["step"], self.costs["window"]
+    if not steps or len({n for n, _ in windows}) < 2: return n < self.chunk // 4
+    b, a = np.polyfit(*zip(*windows), 1)
+    return n * float(np.mean(steps)) < a + b * n
 
   def layers(self, T:int, pos:int) -> list[int]:
     """a window's blocks, a layer at a time. a moe layer's experts its tokens route to read in (the host waits for the gpus' counts), their
@@ -363,8 +376,11 @@ class Engine:
         self.pump()
       if hasattr(b, "ffn_gate_inp"):
         li = self.m["layers"].index(i)
-        route, experts = self.routes[next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])]
-        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+        tile = next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])
+        if tile == TILES[0]:
+          for v in self.cached[li][1]: v[:] = self.state["slot_of"][li * E:(li + 1) * E] >= 0
+        route, experts = self.routes[tile]
+        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], self.cached[li][0], Tensor(self.tags[li]), self.parts[1][li])
         codes = li * E + (np.arange(E) if ahead else np.nonzero(self.counted(li))[0])
         t0 = time.perf_counter()
         self.read(codes, codes, wait=True)
@@ -451,6 +467,7 @@ class Engine:
     if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left", -4: "NaN scores"}[err])
     ret = self.res_np[1:1 + (2 * T if self.draft is not None else T)].tolist()
     self.times += (t1 - t0, time.perf_counter() - t2)
+    self.costs["step"].append((time.perf_counter() - t0) / T)
     return ret[:T], ret[T:] or ret
 
   def chain(self, g:int, pos:int, row:int) -> list[int]:
@@ -472,12 +489,12 @@ class Engine:
 
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
-    partial (its rows padded), unless they're under a quarter of a chunk (a token a step is faster), the position after them"""
+    partial (its rows padded), unless steps of them are faster (steps_faster), the position after them"""
     if not self.W: return pos
     end = len(tokens) - 1
     size = -(-(end - pos) // -(-(end - pos) // self.W)) if end > pos else self.W
     while pos < end and pos + round_up(n:=min(size, end - pos), self.chunk) <= self.max_context:
-      if n < self.chunk // 4: break
+      if self.steps_faster(n): break
       self.window(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
       pos += n
     return pos
@@ -487,7 +504,8 @@ class Engine:
     a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
     start = self.get_start_pos(tokens)
-    if (fork:=self.model.fork(tokens, start, self.chunk or 1)) > start:  # (where tokens diverge from the tokens fed before: its states saved)
+    # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
+    if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
       for pos in range(self.prefill(tokens[:fork + 1], start), fork): self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
       self.model.save(tokens[:fork])
     for pos in range(self.prefill(tokens, fork), len(tokens)):

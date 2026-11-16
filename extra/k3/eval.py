@@ -30,9 +30,9 @@ def evaluate(eng, spec:str, late:Callable[[], bool]):
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
     eng.report(c0, len(ids) + len(outs) - 2)
 
-def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128) -> list[tuple[float, float]]:
-  """WEVAL=corpus.jsonl:nseq:ntok:first: evaluate's completions through windows, every position's logits from the window's last streams (a
-  pass of the sequence, no steps), rows at a time"""
+def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128, size:int=0) -> list[tuple[float, float]]:
+  """WEVAL=corpus.jsonl:nseq:ntok:first: evaluate's completions through windows (of up to size tokens, else the engine's), every position's logits
+  from the window's last streams (a pass of the sequence, no steps), rows at a time"""
   path, *nums = spec.split(":")
   nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
   m, stats = eng.model, []
@@ -40,8 +40,8 @@ def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128) -> lis
     if late(): sys.exit(f"deadline: {len(stats)} tokens, top-1 agree and KL {np.mean(stats, 0) if stats else '-'}")
     ids, outs, n0 = r["prompt_ids"], r["output_ids"][:ntok], len(stats)
     seq = ids + outs[:-1]
-    for at in range(0, len(seq), eng.W):
-      toks = seq[at:at + eng.W]
+    for at in range(0, len(seq), size or eng.W):
+      toks = seq[at:at + (size or eng.W)]
       eng.window(toks, at, (seq[at + 1:at + 1 + len(toks)] + [-1])[:len(toks)])
       for r0 in range(0, len(toks), rows):
         x = m.output_res_score.mix(Tensor(eng.win["bank"].uop)[:, r0:r0 + rows])

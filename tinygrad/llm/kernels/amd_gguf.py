@@ -747,14 +747,22 @@ def _route_place_kernel(pos:UOp, entries:UOp, tiles:UOp, rank:UOp, counts:UOp, s
     stores.append(tiles[(f // tile + nt).cast(dtypes.weakint)].store((t*per + m).cast(dtypes.int32)).end(nt))
   return UOp.group(*stores).end(wg, wave, lane).sink(arg=KernelInfo(name="route_place", opts_to_apply=()))
 
-def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+def _kept(sel:Tensor, w:Tensor, cached:Tensor, tau:float, tauc:float, kmin:int) -> tuple[Tensor, Tensor]:
+  """of a token's selections (by key) the top kmin by weight and those of weight >= tauc that are >= tau or cached, the rest -1 of weight 0"""
+  k = sel.shape[-1]
+  heavier = (w.unsqueeze(-1) > w.unsqueeze(-2)) | ((w.unsqueeze(-1) == w.unsqueeze(-2)) & (Tensor.arange(k).reshape(k, 1) < Tensor.arange(k)))
+  keep = (heavier.sum(-2) < kmin) | ((w >= tauc) & ((w >= tau) | (cached[sel.maximum(0)] > 0)))
+  return keep.where(sel, -1), keep.where(w, 0.0)
+
+def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|None, kept:tuple|None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
   # moe_route in tensor ops: a selection's row its expert's tiles' start and the selections of the expert before it (in t*k + j order)
   T, E = cast(tuple[int, int], logits.shape)
   N, R = T*k, round_up(T*k + (tile-1)*E, tile)
   sig = logits.float().sigmoid()
-  sel = (sig + bias.float()).topk(k)[1]
+  sel = (sig + bias.float() + (0 if kept is None else kept[3] * kept[0].float())).topk(k)[1]
   w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
-  ok = (Tensor.arange(T).reshape(T, 1) < (T if live is None else Tensor(live))).expand(T, k).reshape(N)
+  if kept is not None: sel, w = _kept(sel, w, kept[0], kept[1], kept[2], kept[4])
+  ok = (Tensor.arange(T).reshape(T, 1) < (T if live is None else Tensor(live))).expand(T, k).reshape(N) & (sel >= 0).reshape(N)
   onehot = ok.unsqueeze(-1) & (sel.reshape(N, 1) == Tensor.arange(E).reshape(1, E))
   counts = onehot.sum(0, dtype=dtypes.int32)
   padded = (counts + tile - 1) // tile * tile
@@ -766,16 +774,21 @@ def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|Non
   tiles = ((first.reshape(1, E) <= start) & (start < (first + padded).reshape(1, E))).where(Tensor.arange(E).reshape(1, E) + 1, 0).sum(-1) - 1
   return ok.reshape(T, k).where(w, 0.0), pos, entries, tiles.cast(dtypes.int32), counts
 
-def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64, live:UOp|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64, live:UOp|None=None,
+              kept:tuple[Tensor, float, float, float, int]|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
   """the tokens' (T, E) router logits routed exactly (route_topk) and sorted by expert into tiles of an expert's rows: their weights (T, k), pos
-  (T*k): the row of token t's j-th expert (t*k + j, -1 past live), entries (R): a row's selection t*k + j (-1: padding), tiles (R/tile): a tile's
-  expert (-1), counts (E): an expert's rows. live: the tokens routed (the rest weight 0)"""
+  (T*k): the row of token t's j-th expert (t*k + j, -1 past live or left out), entries (R): a row's selection t*k + j (-1: padding), tiles
+  (R/tile): a tile's expert (-1), counts (E): an expert's rows. live: the tokens routed (the rest weight 0). kept: (cached (E,), tau, tauc, beta,
+  kmin) the decode's rule: the k by sigmoid + bias + beta a cached expert, of those the top kmin by weight and those of weight >= tauc that
+  are >= tau or cached (the rest left out, weight 0)"""
   T, E = cast(tuple[int, int], logits.shape)
   N, R = T*k, round_up(T*k + (tile-1)*E, tile)
-  if not amd_custom_kernels_supported(logits.device) or E % 32: return _moe_route_tensors(logits, bias, k, tile, live)
+  if not amd_custom_kernels_supported(logits.device) or E % 32: return _moe_route_tensors(logits, bias, k, tile, live, kept)
   sel, w = Tensor.empty(T, k, dtype=dtypes.int32, device=logits.device), Tensor.empty(T, k, dtype=dtypes.float32, device=logits.device)
-  sel, w = Tensor.custom_kernel(sel, w, _carry(logits.float().contiguous(), *([] if live is None else [live])), bias.float().contiguous(),
+  bias = bias.float() + (0 if kept is None else kept[3] * kept[0].float())
+  sel, w = Tensor.custom_kernel(sel, w, _carry(logits.float().contiguous(), *([] if live is None else [live])), bias.contiguous(),
                                 fxn=functools.partial(_route_topk_kernel, k=k, live=T if live is None else _unbind(live)))[:2]
+  if kept is not None: sel, w = (x.contiguous() for x in _kept(sel, w, kept[0], kept[1], kept[2], kept[4]))
   counts, entries, tiles = Tensor.custom_kernel(*(Tensor.empty(n, dtype=dtypes.int32, device=logits.device) for n in (E, R, R // tile)),
                                                 fxn=_route_init_kernel)
   rank = Tensor.empty(N, dtype=dtypes.int32, device=logits.device)
