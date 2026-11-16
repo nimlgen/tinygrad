@@ -97,18 +97,18 @@ def bench(eng, specs:str, late:Callable[[], bool], depth:str=""):
     for r in [json.loads(line) for line in open(path)][first:first + nseq]:
       toks, n = prefix + r["prompt_ids"] + r["output_ids"][:ntok], len(prefix) + len(r["prompt_ids"])
       t0 = time.perf_counter()
-      for pos in range(eng.prefill(toks[:n], 0), n): _, (g,), (score,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
+      for pos in range(eng.prefill(toks[:n], 0), n): _, g, score = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
       if prefix: print(f"{r['task_id']}: prompt of {n} tokens in {time.perf_counter() - t0:.0f} s", flush=True)
       pos, row = n, 0
       while pos + T < len(toks) and not late():
         st = time.perf_counter()
         gs = eng.proposal(g, score, pos, row)
-        _, guesses, scores = eng.step([toks[pos], *gs], pos, toks[pos + 1:pos + 1 + len(gs) + 1])
+        _, g, score = eng.step([toks[pos], *gs], pos, toks[pos + 1:pos + 1 + len(gs) + 1])
         t_steps, steps = t_steps + time.perf_counter() - st, steps + 1
         row = next((j for j, x in enumerate(gs) if x != toks[pos + 1 + j]), len(gs))
         right, firsts, tokens = right + row, firsts + (row > 0), tokens + len(gs) + 1
         if row < len(gs): eng.model.rollback(row + 1)
-        pos, g, score = pos + 1 + row, guesses[row], scores[row]
+        pos += 1 + row
       print(f"{r['task_id']}: {steps} verify steps of {tokens / steps:.2f} tokens, {t_steps / steps * 1e3:.1f} ms a step, "
             f"{firsts / steps:.1%} of the first guesses right, {1 + right / steps:.2f} tokens kept a step, {(steps + right) / t_steps:.2f} tok/s",
             flush=True)

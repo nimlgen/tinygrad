@@ -42,10 +42,10 @@ class Eagle3:
   width, scored = 1, False  # (a row's guesses: the next ones a chain's; no scores of them)
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
-  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, None, Tensor]:
-    """a step's guesses (T, 1) after each of its rows' next tokens (1, T) on the target's taps, the feedback states (a chain's)"""
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, None, Tensor]:
+    """a step's guess (1,) after row row's next token (of its rows' (1, T)) on the target's taps, every row's feedback state (a chain's)"""
     logits, x, _ = self(tokens, hidden, pos)
-    return logits[0].argmax(-1).reshape(-1, 1).cast(dtypes.int32), None, x
+    return pick(logits[0].argmax(-1), row).reshape(1).cast(dtypes.int32), None, x
   def fc(self, hidden:Tensor) -> Tensor:  # (the target's hidden states (1, T, 3, dim) to the layer's)
     return self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
 
@@ -90,6 +90,9 @@ class Eagle3:
 # anchor (a known token at position a) and k-1 masks at a.., each attending causally to the block and to the context's positions before a in a
 # window. the j-th guesses t[a+j+1], its logits biased by a low-rank markov term of the token before it (the guess before, the anchor first).
 # shares the target's embedding and head. its context's keys and values in a cache of every position (layer, k/v, 1, kv heads, position, dim)
+def pick(x:Tensor, row:Tensor|int) -> Tensor:  # (x's row row (a tensor's: in the graph), x (T, ...))
+  return (Tensor.arange(x.shape[0]).to(x.device).reshape(-1, *[1] * (x.ndim - 1)) == row).where(x, 0).sum(0)
+
 def rows16(f:Callable[[Tensor], Tensor], x:Tensor) -> Tensor:
   """f(x) of a q8 linear (rows (..., in) -> (..., out)), its rows past the gemv kernel's 8 padded to the wmma kernel's 16s"""
   if (n:=prod(x.shape[:-1])) <= 8 or n % 16 == 0: return f(x)
@@ -133,16 +136,15 @@ class DSpark:
         stores.append(self.cache[l, i, :, :, pos:pos + T].uop.store(x.cast(dtypes.half).uop))
     return Tensor(self.cache.uop.after(*stores))
 
-  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, Tensor, None]:
-    """a step's blocks of guesses (T, width) after each of its rows' next tokens (1, T) (the anchors, at positions pos+1..) and the confidence
-    each is right (given the ones before right), the cache after the rows' keys on the target's taps hidden (1, T, taps, dim) first: a row's
-    block sees the rows up to it"""
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, Tensor, None]:
+    """a step's block of guesses (width,) after row row's next token (of its rows' (1, T): the anchor, at position pos+row+1) and the confidence
+    each is right (given the ones before right), the cache after the rows' keys on the target's taps hidden (1, T, taps, dim) first"""
     T = tokens.shape[1]
-    n = min(self.window + T, self.max_context)  # (the keys any block sees: from pos-window on)
+    n = min(self.window + T, self.max_context)  # (the keys a block sees: from pos-window on)
     cache = self.fill(tokens, hidden, pos)
-    apos = (Tensor.arange(T) + (pos + 1)).to(hidden.device)
-    guesses, conf, _ = self(tokens[0], apos, self.width, (smax(pos + T - n, 0), n), cache=cache)
-    return guesses, conf, None
+    apos = pick((Tensor.arange(T) + (pos + 1)).to(hidden.device), row).reshape(1)
+    guesses, conf, _ = self(pick(tokens[0], row).reshape(1), apos, self.width, (smax(pos + T - n, 0), n), cache=cache)
+    return guesses[0], conf[0], None
 
   def __call__(self, anchors:Tensor, apos:Tensor, k:int, keys:tuple[int|UOp, int], prev:Tensor|None=None,
                cache:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
@@ -155,7 +157,7 @@ class DSpark:
     kp = (Tensor.arange(n).to(anchors.device) + k0).reshape(1, 1, 1, n)
     ctx = (kp < apos.reshape(A, 1, 1, 1)) & (kp > qpos.reshape(A, 1, k, 1) - self.window)
     blk = Tensor.ones(k, k, dtype=dtypes.bool, device=anchors.device).tril().reshape(1, 1, k, k)
-    mask = ctx.expand(A, 1, k, n).cat(blk.expand(A, 1, k, k), dim=-1).where(0.0, -math.inf)
+    mask = ctx.expand(A, 1, k, n).cat(blk.expand(A, 1, k, k), dim=-1).where(0.0, -math.inf).reshape(A, 1, 1, k, n + k)
     x = self.embed(anchors.reshape(A, 1).pad(((0, 0), (0, k - 1)), value=self.mask_id)).float()  # (A, k, dim)
     G = self.H // self.KV
     for l in range(self.L):
@@ -163,11 +165,15 @@ class DSpark:
       h = self.norm(x, f"layers.{l}.input_layernorm")
       q = apply_rope(self.norm(self.lin(h, a + "q_proj").reshape(A, k, self.H, self.hd), a + "q_norm").transpose(1, 2), freqs)
       kb, vb = self.kv(h, a, freqs)
-      kc, vc = (cache[l, i, :, :, k0:k0 + n].float().expand(A, self.KV, n, self.hd) for i in range(2))
-      keys_, vals = kc.cat(kb, dim=2), vc.cat(vb, dim=2)  # (A, kv, n + k, hd)
-      q = q.reshape(A, self.KV, G * k, self.hd)
-      att = ((q @ keys_.transpose(-1, -2)).reshape(A, self.H, k, n + k) / math.sqrt(self.hd) + mask).softmax(-1)
-      o = (att.reshape(A, self.KV, G * k, n + k) @ vals).reshape(A, self.H, k, self.hd).transpose(1, 2).reshape(A, k, -1)
+      # every block's queries on one copy of the context's keys (kv, n, hd), a block's own keys (A, kv, k, hd) apart
+      kc, vc = (cache[l, i, 0, :, k0:k0 + n].float() for i in range(2))
+      q = q.reshape(A, self.KV, G, k, self.hd)
+      def flat(x:Tensor) -> Tensor: return x.permute(1, 0, 2, 3, 4).reshape(self.KV, A * G * k, -1)  # ((A, kv, G, k, d) -> (kv, A*G*k, d))
+      def unflat(x:Tensor) -> Tensor: return x.reshape(self.KV, A, G, k, -1).permute(1, 0, 2, 3, 4)
+      scores = unflat(flat(q) @ kc.transpose(-1, -2)).cat(q @ kb.unsqueeze(2).transpose(-1, -2), dim=-1)  # (A, kv, G, k, n + k)
+      att = (scores / math.sqrt(self.hd) + mask).softmax(-1)
+      o = unflat(flat(att[..., :n]) @ vc) + att[..., n:] @ vb.unsqueeze(2)  # (A, kv, G, k, hd)
+      o = o.reshape(A, self.H, k, self.hd).transpose(1, 2).reshape(A, k, -1)
       x = x + self.lin(o, a + "o_proj")
       m = self.norm(x, f"layers.{l}.post_attention_layernorm")
       p = f"layers.{l}.mlp."

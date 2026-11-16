@@ -246,8 +246,8 @@ class TestEngine(unittest.TestCase):
     for _ in range(3): eng.jits[2](eng.v_pos.bind(0))
     np.testing.assert_equal(eng.res_np, want)
 
-  def test_dspark_step(self):  # a step's blocks (a row's after its next token, on the rows up to it, the keys of the draft's window of
-    # positions) as the draft's own on all its cache's positions: jitted steps of a token (a symbolic window), then a verify step
+  def test_dspark_step(self):  # a step's block (after the token after its kept rows, on the rows up to it, the keys of the draft's window of
+    # positions) as the draft's own on all its cache's positions: jitted steps of a token (a symbolic window), then verify steps
     from extra.k3.test_draft import dspark
     self.stub()
     eng, toks = self.eng, [3, 5, 7, 1, 2, 9, 4, 6, 8, 2]
@@ -263,7 +263,12 @@ class TestEngine(unittest.TestCase):
       np.testing.assert_equal(eng.res_np[2:4], want([toks[pos + 1]], pos), err_msg=f"position {pos}")
     eng.tok_np[:2], eng.given_np[:2] = toks[8:], [-1, -1]
     eng.run(2, eng.v_pos.bind(8))
-    np.testing.assert_equal(eng.res_np[3:7], want(eng.res_np[1:3].tolist(), 8))
+    kept = int(toks[9] == eng.res_np[1])  # (the step's second token right: the block after the target's token after it)
+    np.testing.assert_equal(eng.res_np[3:5], want([int(eng.res_np[1 + kept])], 8 + kept))
+    eng.model.rollback(1)  # (the step's first token kept: the next at 9, its second token the given one after its first, kept)
+    eng.tok_np[:2], eng.given_np[:2] = [int(eng.res_np[1]), 7], [7, -1]
+    eng.run(2, eng.v_pos.bind(9))
+    np.testing.assert_equal(eng.res_np[3:5], want([int(eng.res_np[2])], 10))
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_generate(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
