@@ -610,7 +610,8 @@ if __name__ == "__main__":
   if (spec:=getenv("EVAL", "") or getenv("WEVAL", "") or getenv("BENCH", "")):  # EVAL=/WEVAL=/BENCH=corpus.jsonl:nseq:ntok:first (eval.py)
     from extra.k3.eval import evaluate, window_evaluate, window_dump, bench
     if (dump:=getenv("DUMP", "")): window_dump(eng, spec, late, dump)  # DUMP=dir with WEVAL=: the taps and the target's tokens (eval.py)
-    else: (evaluate if getenv("EVAL", "") else window_evaluate if getenv("WEVAL", "") else bench)(eng, spec, late)
+    elif getenv("BENCH", ""): bench(eng, spec, late, getenv("DEPTH", ""))  # (DEPTH=corpus.jsonl:n: n tokens of text before each prompt)
+    else: (evaluate if getenv("EVAL", "") else window_evaluate)(eng, spec, late)
     sys.exit(0)
   # SERVE=port: master's openai server (and the model's chat template), else N tokens after the prompt
   if (port:=getenv("SERVE", 0)): LLMServer(('', port), eng, kv.get('general.name', 'k3'), tok, chat_template(tok)).serve_forever()

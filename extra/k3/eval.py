@@ -82,16 +82,23 @@ def window_dump(eng, spec:str, late:Callable[[], bool], out:str, rows:int=128):
   for a in (*taps, toks, nxt, p1): a.flush()
   json.dump(meta, open(f"{out}/meta.json", "w"))
 
-def bench(eng, specs:str, late:Callable[[], bool]):
+def bench(eng, specs:str, late:Callable[[], bool], depth:str=""):
   """BENCH=corpus.jsonl:nseq:ntok:first[+corpus..]: verify steps of [the next, the draft's guesses] over production completions teacher forced
-  (the text fixed: the steps' time and the guesses right don't move with what the engine would have written), each corpus's so far"""
+  (the text fixed: the steps' time and the guesses right don't move with what the engine would have written), each corpus's so far.
+  depth (DEPTH=corpus.jsonl:n): n tokens of that corpus's texts (its last rows first) before each prompt"""
+  prefix:list[int] = []
+  if depth:
+    dpath, dn = depth.split(":")
+    prefix = [t for line in open(dpath).readlines()[::-1] for r in [json.loads(line)] for t in r["prompt_ids"] + r["output_ids"]][:int(dn)]
   for spec in specs.split("+"):
     path, *nums = spec.split(":")
     nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
     steps, right, firsts, tokens, t_steps, T = 0, 0, 0, 0, 0.0, eng.tokens
     for r in [json.loads(line) for line in open(path)][first:first + nseq]:
-      toks, n = r["prompt_ids"] + r["output_ids"][:ntok], len(r["prompt_ids"])
+      toks, n = prefix + r["prompt_ids"] + r["output_ids"][:ntok], len(prefix) + len(r["prompt_ids"])
+      t0 = time.perf_counter()
       for pos in range(eng.prefill(toks[:n], 0), n): _, (g,), (score,) = eng.step(toks[pos:pos + 1], pos, toks[pos + 1:pos + 2])
+      if prefix: print(f"{r['task_id']}: prompt of {n} tokens in {time.perf_counter() - t0:.0f} s", flush=True)
       pos, row = n, 0
       while pos + T < len(toks) and not late():
         st = time.perf_counter()
