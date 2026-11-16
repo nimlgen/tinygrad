@@ -7,7 +7,7 @@
 # DEV=AMD PYTHONPATH=. python3 extra/k3/draft_eval.py dump_dir trunk.gguf dspark|eagle path [name]
 import json, sys, time
 import numpy as np
-from tinygrad import Tensor, Device
+from tinygrad import Tensor, Device, TinyJit
 from tinygrad.helpers import getenv
 from tinygrad.llm.gguf import gguf_parse, ggml_data_to_tensor
 from extra.k3.draft import DSpark, Eagle3
@@ -52,24 +52,32 @@ def run(draft_kind:str, path:str, dump:str, gguf:str) -> dict:
     names = [str(b) for b, _ in d.taps]
   print(f"{draft_kind} loaded in {time.perf_counter() - t0:.1f} s, taps {names}", flush=True)
   guesses, conf, anchors = [], [], []
+  @TinyJit
+  def fill(hid:Tensor) -> Tensor: return d.fill(None, hid, 0).realize()
+  @TinyJit
+  def block(at:Tensor, ap:Tensor, prev:Tensor) -> tuple[Tensor, Tensor]:  # (BATCH blocks, the tokens before their guesses given)
+    g, c, _ = d(at, ap, K, (0, L + K), prev)
+    Tensor.realize(g, c)
+    return g, c
   for s in meta["seqs"]:
     if time.perf_counter() - t0 > DEADLINE: break
     a0, n = s["start"], s["len"]
-    hid = Tensor(np.stack([tap[nm][a0:a0 + n] for nm in names], axis=1)[None]).to(dev)  # (1, n, taps, dim)
+    hid = np.stack([tap[nm][a0:a0 + n] for nm in names], axis=1)[None]  # (1, n, taps, dim)
     an = np.arange(max(s["prompt"] - 1, 1), n - 1)[::STRIDE]  # (anchors: a position, its block guesses the tokens after it)
     if draft_kind == "dspark":
-      d.fill(None, hid, 0).realize()
+      fill(Tensor(np.pad(hid, ((0, 0), (0, L - n), (0, 0), (0, 0)))).to(dev).realize())  # (every sequence L long: one graph)
       st = np.pad(toks[a0:a0 + n], (0, K))
       for b in range(0, len(an), BATCH):
         if time.perf_counter() - t0 > DEADLINE:
           an = an[:b]
           break
-        a = an[b:b + BATCH]
+        a = np.pad(an[b:b + BATCH], (0, BATCH - len(an[b:b + BATCH])), mode="edge")
         prev = np.stack([st[x:x + K] for x in a])  # (the text's tokens before each guess)
-        g, c, _ = d(Tensor(st[a].astype(np.int32)).to(dev), Tensor(a.astype(np.int32)).to(dev), K, (0, L + K), Tensor(prev.astype(np.int32)).to(dev))
-        guesses.append(g.numpy()), conf.append(c.numpy())
+        g, c = block(*(Tensor(x.astype(np.int32)).to(dev).realize() for x in (st[a], a, prev)))
+        m = min(BATCH, len(an) - b)
+        guesses.append(g.numpy()[:m]), conf.append(c.numpy()[:m])
     else:  # (eagle: row j takes t[j+1] on the target's taps after t[j], guesses t[j+2]: the first guess of the block after j+1)
-      lg, _, _ = d(Tensor(toks[a0 + 1:a0 + n].astype(np.int32)[None]).to(dev), hid[:, :n - 1], 0)
+      lg, _, _ = d(Tensor(toks[a0 + 1:a0 + n].astype(np.int32)[None]).to(dev), Tensor(hid[:, :n - 1]).to(dev), 0)
       first = lg[0].argmax(-1).numpy()
       guesses.append(np.pad(first[an - 1][:, None], ((0, 0), (0, K - 1)), constant_values=-1)), conf.append(np.zeros((len(an), K), np.float32))
     anchors.append(a0 + an)
