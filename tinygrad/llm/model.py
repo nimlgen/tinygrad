@@ -686,7 +686,7 @@ class GatedDeltaNetBlock(FFNBlock):
       return q8_linear(self.ssm_out, zq[0], zq[1:]) if self.ssm_out.ggml_type in QUANT_SIZES else self.ssm_out(zq[0])
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+    beta = self.ssm_beta(x).float().sigmoid().reshape(B, T, self.num_v_heads)  # (in float: a symbolic chunk's isn't fused, kept in half)
     alpha = (self.ssm_f(x) if hasattr(self, "ssm_f") else self.ssm_f_b(self.ssm_f_a(x))) if is_kda else self.ssm_alpha(x)
     g, a = (alpha.float() + self.ssm_dt["bias"]).reshape(B, T, self.num_v_heads, -1), self.ssm_a.reshape(self.num_v_heads, -1)
     # the decay: log_alpha = softplus(g) * A, or bounded by gate_lower_bound: sigmoid(g * |A|) * lb
