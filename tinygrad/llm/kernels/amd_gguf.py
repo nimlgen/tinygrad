@@ -21,7 +21,7 @@ QUANT_NAMES = {Q5_0: "q5_0", Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4
                IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
 
 def q8_0_linear(w:Tensor, devices:tuple[str, ...]|str, axis:int|None=None) -> Linear:
-  """w (out, in) as a Linear of ggml Q8_0 blocks (an f16 scale, 32 int8), split over devices on axis (None: a copy on each)"""
+  """w (out, in) as a Linear of ggml Q8_0 blocks (an f16 scale, 32 int8), split over devices on axis (None: a copy on each), its weight lazy"""
   out_features, in_features = cast(tuple[int, int], w.shape)
   blocks = w.float().reshape(out_features, in_features // 32, 32)
   d = blocks.abs().max(-1, keepdim=True) / 127
@@ -30,12 +30,12 @@ def q8_0_linear(w:Tensor, devices:tuple[str, ...]|str, axis:int|None=None) -> Li
   lin = Linear(in_features, out_features, bias=False)
   lin.ggml_type, lin.shard_axis = Q8_0, axis
   words = raw.flatten().bitcast(dtypes.uint16)  # (flat, a device's contiguous: as gguf_shard packs them)
-  if not isinstance(devices, tuple): lin.weight = words.to(devices).realize()
-  elif axis is None: lin.weight = words.shard(devices).realize()
+  if not isinstance(devices, tuple): lin.weight = words.to(devices)
+  elif axis is None: lin.weight = words.shard(devices)
   else:
     n = len(devices)
     local = raw.reshape(*raw.shape[:axis], n, -1, *raw.shape[axis+1:]).permute(axis, *range(axis), *range(axis+1, raw.ndim+1))
-    lin.weight = local.reshape(n, -1).bitcast(dtypes.uint16).shard(devices, 0).flatten().realize()
+    lin.weight = local.reshape(n, -1).bitcast(dtypes.uint16).shard(devices, 0).flatten()
   return lin
 
 def find_packed(decoded:Tensor, in_features:int) -> tuple[int, Tensor]|None:

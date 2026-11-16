@@ -62,9 +62,9 @@ class Engine:
     def guessed(li:int) -> np.ndarray: return np.load(f) if os.path.exists(f:=f"{guess}/guess-{m['layers'][li]}.npy") else routers[li]
     def scorer(w:np.ndarray) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
       w = Tensor(w.reshape(2, G, E // G, -1).transpose(1, 0, 2, 3).reshape(2 * E, -1).astype(np.float16))
-      return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0).realize()
+      return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0)
     self.scorers = [scorer(np.stack([r, guessed(min(li + 1, L - 1))])) for li, r in enumerate(routers)]
-    Tensor.realize(*(biases:=[b.exp_probs_b["bias"] for b in blocks]))  # (and the biases themselves: the window's routes take them)
+    Tensor.realize(*(biases:=[b.exp_probs_b["bias"] for b in blocks]), *[s.weight if isinstance(s, Linear) else s for s in self.scorers])
     self.bias = list(Tensor.stack(*[t.float() for t in biases]).numpy())
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
