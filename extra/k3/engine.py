@@ -48,7 +48,6 @@ class Engine:
             for _ in blocks]
     self.bufs, self.tags, self.parts = bufs, [b[0][0].uop.reshape(1, 1).unshard(0) for b in bufs], [[b[2 + i][0] for b in bufs] for i in range(2)]
     self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
-    self.cached = [host_tensor(self.devs, E, dtypes.int32) for _ in blocks]  # (a window's: the experts with a slot, decode's rule on few tokens)
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
     routers = [b.ffn_gate_inp.weight.float().numpy() for b in blocks]
@@ -224,7 +223,7 @@ class Engine:
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
     for route, experts in self.routes.values():
-      self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], self.cached[li][0], Tensor(self.tags[li]), self.parts[1][li])
+      self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
       self.graph(experts, self.pool, self.parts[0][li])
 
   def window_state(self, at:int|None=None) -> dict[str, Tensor]:
@@ -284,12 +283,11 @@ class Engine:
   def state_rows(self, tile:int) -> tuple[int, int]:  # (the state's rows, its tiles of tile rows: the largest tile size's)
     return (R:=max(map(self.rows, TILES))), R // tile
 
-  def window_route(self, tile:int, live:UOp, bias:Tensor, cached:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
-    """the gpus route the window's live tokens (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the tag). few
-    tokens (the small tiles): decode's rule on the experts cached (their reads, not the gpus, the window's time)"""
+  def window_route(self, tile:int, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
+    """the gpus route the window's live tokens exactly (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the
+    tag)"""
     K, E = self.model.config.num_experts_per_tok, self.m["n_experts"]
-    kept = (Tensor(cached.uop), TAU, TAUC, BETA, K // 4) if tile == TILES[0] else None
-    w, pos, entries, tiles, counts = moe_route(Tensor(self.win["logits"].uop), bias, K, tile, live=live, kept=kept)
+    w, pos, entries, tiles, counts = moe_route(Tensor(self.win["logits"].uop), bias, K, tile, live=live)
     R, NT = self.state_rows(tile)  # (the routes padded to the state's rows: the experts graph's tiles past them skipped)
     vals = {"w": w, "pos": pos, "entries": entries.pad((0, R - entries.shape[0]), value=-1), "tiles": tiles.pad((0, NT - tiles.shape[0]), value=-1)}
     kept = Tensor.realize(*(Tensor(self.win[k].uop)[:v.shape[0]].assign(v) for k, v in vals.items()))
@@ -376,11 +374,8 @@ class Engine:
         self.pump()
       if hasattr(b, "ffn_gate_inp"):
         li = self.m["layers"].index(i)
-        tile = next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])
-        if tile == TILES[0]:
-          for v in self.cached[li][1]: v[:] = self.state["slot_of"][li * E:(li + 1) * E] >= 0
-        route, experts = self.routes[tile]
-        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], self.cached[li][0], Tensor(self.tags[li]), self.parts[1][li])
+        route, experts = self.routes[next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])]
+        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
         codes = li * E + (np.arange(E) if ahead else np.nonzero(self.counted(li))[0])
         t0 = time.perf_counter()
         self.read(codes, codes, wait=True)

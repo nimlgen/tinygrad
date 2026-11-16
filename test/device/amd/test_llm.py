@@ -666,30 +666,6 @@ class TestMoeRoute(unittest.TestCase):
     np.testing.assert_equal(counts2, np.bincount(sel[:live].reshape(-1), minlength=E))
     np.testing.assert_equal(np.sort(entries2[entries2 >= 0]), np.arange(live * K))
 
-  def test_route_kept(self): # decode's rule (host.py route(), resident): cached experts' bonus, then the top kmin by weight and the rest
-    # of weight >= tauc that are >= tau or cached; the others left out (no row, weight 0), on the gpus as on the host and in tensor ops
-    T, E, K, tile, tau, tauc, beta, kmin = 64, 896, 16, 16, 0.065, 0.02, 0.07, 4
-    rng = np.random.default_rng(1)
-    logits, bias = rng.standard_normal((T, E)).astype(np.float32), (rng.standard_normal(E) * 0.1).astype(np.float32)
-    cached = (rng.random(E) < 0.3).astype(np.int32)
-    sig = np.float32(1) / (np.float32(1) + np.exp(-logits))
-    want_sel, want_w = np.full((T, K), -1), np.zeros((T, K), np.float32)
-    for t in range(T):
-      key = sig[t] + bias + beta * cached
-      sel = sorted(range(E), key=lambda e: (-key[e], e))[:K]
-      w = sig[t, sel] / np.float32(sum(sig[t, sel]))
-      order = sorted(range(K), key=lambda j: (-w[j], j))
-      for r, j in enumerate(order):
-        if r < kmin or (w[j] >= tauc and (w[j] >= tau or cached[sel[j]])): want_sel[t, j], want_w[t, j] = sel[j], w[j]
-    for device in ("CPU", Device.DEFAULT):
-      with self.subTest(device=device):
-        w, pos, entries, tiles, counts = (t.numpy() for t in moe_route(Tensor(logits, device=device), Tensor(bias, device=device), K, tile,
-                                                                        kept=(Tensor(cached, device=device), tau, tauc, beta, kmin)))
-        np.testing.assert_allclose(w, want_w, rtol=1e-5, atol=1e-7)
-        np.testing.assert_equal(pos >= 0, want_sel.reshape(-1) >= 0)
-        np.testing.assert_equal(tiles[pos[pos >= 0] // tile], want_sel.reshape(-1)[want_sel.reshape(-1) >= 0])
-        np.testing.assert_equal(counts, np.bincount(want_sel[want_sel >= 0], minlength=E))
-
 class TestTopk(unittest.TestCase):
   def setUp(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 or CDNA3/4 required")
