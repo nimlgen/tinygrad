@@ -75,7 +75,7 @@ class TestJitCases(unittest.TestCase):
       self.assertEqual(out.item(), i*2)
 
   def test_arenas_of_jits_never_run_at_once(self):
-    """jits that never run at the same time share their scratch's arenas: one buffer a lane, and a jit's outputs another jit takes never in it"""
+    """jits that never run at the same time share their scratch's compute arena: one buffer, and a jit's outputs another jit takes never in it"""
     def f(x): return ((x + 1).contiguous() * 2).contiguous().sum(0).realize()
     def g(y): return ((y * 3).contiguous() - 1).contiguous().sum().realize()
     arenas:dict = {}

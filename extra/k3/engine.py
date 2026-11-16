@@ -365,11 +365,7 @@ class Engine:
       n = s + 1
     return ahead
 
-  def graph(self, jit:Callable, *args) -> Tensor:
-    """a window graph on the window's state, once the gpus finished the graph before when it's another (the graphs share their scratch)"""
-    if jit is not getattr(self, "last", None):
-      for d in self.devs: Device[d].synchronize()
-      self.last = jit
+  def graph(self, jit:Callable, *args) -> Tensor:  # (a window graph on the window's state)
     return jit(*args, *self.win.values())
 
   def pump(self):  # (the reads ahead queued as the drives have room)
