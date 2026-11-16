@@ -331,12 +331,12 @@ class Engine:
     experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    return {"h": ((W, self.lat), f32), "shared": ((W, c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32), "w": ((W, K), f32),
+    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32), "w": ((W, K), f32),
             "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32), "act": ((R, self.units), dtypes.half),
             "down": ((R, self.lat), dtypes.half)}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
-    return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down") else t for k, t in self.lend(self.window_shapes(), at)[0].items()}
+    return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down", "shared") else t for k, t in self.lend(self.window_shapes(), at)[0].items()}
 
   def piece_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:
     """a piece's: the bank of its W tokens' residual streams, the draft's inputs. a gpu's rows: its part of every chunk (1, 1, W/gpus, ...)"""
@@ -394,30 +394,40 @@ class Engine:
     kernel's work the live rows'"""
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
-    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows))[:, :live]
+    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live].float()
     mask = b._indexer_mask(h, (pos,), None)
     a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
-    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows))[:, :live]
+    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live].float()
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
-    outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["shared"], b._shared(x)[0]), (self.win["logits"], logits)]
-    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs])[0]
+    outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["logits"], logits)]
+    shared = self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)
+    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs],
+                          shared.assign(self.split(self.partials(lambda: b._shared(x)))))[0]
 
   def partials(self, f:Callable[[], Tensor]) -> Tensor:  # (f's output, its row parallel linears' partials (gpus, ...) as they are, if any)
     PARTIALS[0] = True
     try: return f()
     finally: PARTIALS[0] = False
 
-  def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:
-    """y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0. y partials (gpus, 1, live, dim): their sum, each gpu
-    its rows' (reduce scattered)"""
+  def add(self, s:UOp, c0:UOp, y:Tensor, more:Tensor|None=None) -> Tensor:
+    """y (1, live, dim) (or its partials: split) and more (each gpu its rows) added to stream s of the bank's chunk at c0, its rows past live 0"""
     # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows. each gpu its own)
-    bank, G, C = self.own(Tensor(self.win["bank"].uop), c0)[:, :, :, s], len(self.devs), self.chunk
-    y = reduce_scatter(y[:, 0].pad_to((G, C, y.shape[-1]))) if y.ndim == 4 else y.pad_to((1, C, y.shape[2]))
-    return bank.assign((bank + y.reshape(1, G, C // G, -1)).cast(bank.dtype))
+    bank = self.own(Tensor(self.win["bank"].uop), c0)[:, :, :, s]
+    return bank.assign((bank + self.split(y) + (0 if more is None else more)).cast(bank.dtype))
+
+  def split(self, y:Tensor) -> Tensor:
+    """y (1, live, dim) a chunk's, or its partials (gpus, 1, live, dim) summed (reduce scattered): (1, gpus, chunk/gpus, dim), each gpu its rows
+    (the rows past live 0)"""
+    G, C = len(self.devs), self.chunk
+    if y.ndim == 4: return reduce_scatter(y[:, 0].pad_to((G, C, y.shape[-1]))).reshape(1, G, C // G, -1)
+    return self.kept(y.pad_to((1, C, y.shape[2])).reshape(1, G, C // G, -1))
+
+  def kept(self, t:Tensor) -> Tensor:  # (t (1, gpus, ...) on every gpu split on axis 1: each gpu keeps its own, nothing copied)
+    return Tensor(t.uop._shard(1, UOp.range(len(self.devs), 0, AxisType.DEVICE)).unshard(1))
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
@@ -465,8 +475,8 @@ class Engine:
 
   def post(self, b:FFNBlock, live:UOp, c0:UOp, s:UOp, *_) -> Tensor:
     """a chunk's live rows' routed and shared experts' outputs into the block's, added to stream s"""
-    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + live].unsqueeze(0), Tensor(self.win["shared"].uop)[c0:c0 + live].unsqueeze(0))
-    return self.add(s, c0, y).realize()
+    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + live].unsqueeze(0), None)
+    return self.add(s, c0, y, self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
     return Tensor(self.win["taps"].uop)[:, :, :, j].assign(Tensor(self.win["bank"].uop)[:, :, :, s].float()).realize()
@@ -486,8 +496,7 @@ class Engine:
     G, C, bank = len(self.devs), self.chunk, Tensor(self.win["bank"].uop)
     emb = self.model.token_embd(self.tok[p0:p0 + self.W].reshape(1, self.W).to(self.devs))
     emb = emb.reshape(1, self.W // C, G, C // G, -1).permute(0, 2, 1, 3, 4).reshape(1, G, self.W // G, 1, -1)
-    emb = Tensor(emb.uop._shard(1, UOp.range(G, 0, AxisType.DEVICE)).unshard(1))  # (each gpu its own rows, nothing copied)
-    return bank.assign(emb.pad(((0, 0), (0, 0), (0, 0), (0, bank.shape[3] - 1), (0, 0))).cast(bank.dtype)).realize()
+    return bank.assign(self.kept(emb).pad(((0, 0), (0, 0), (0, 0), (0, bank.shape[3] - 1), (0, 0))).cast(bank.dtype)).realize()
 
   def stage(self, name:str):  # (a start's stage: its seconds since the stage before)
     print(f"start: {name} {time.perf_counter() - self.t_stage:.1f} s", flush=True)

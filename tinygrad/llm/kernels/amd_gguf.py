@@ -3,8 +3,8 @@ import functools, itertools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, PARTIALS, _reg, _sys, \
-  _carry, _unbind, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys, \
+  _carry, _unbind, amd_custom_kernels_supported, PARTIALS
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops

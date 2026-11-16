@@ -994,7 +994,7 @@ def _cast_kernel(out:UOp, x:UOp) -> UOp:
 
 def reduce_scatter(p:Tensor) -> Tensor:
   """the sum over the devices of their partials p (devices, R, ...) split on axis 0, split on its rows over the devices (R, ...): around the
-  ring, in step k device j adds its part of the rows of device j-k to what it got and sends it on (the parts in half, the sums in float)"""
+  ring, in step k device j adds its part of the rows of device j-k to what it got and sends it on (in half, as partial_sum sums)"""
   devs, S = cast(tuple[str, ...], p.device), p.shape[1:]
   n, size = len(devs), S[0] // len(devs)
   local = _per_device(Tensor.custom_kernel(Tensor.empty(*p.shape, dtype=dtypes.half, device=devs, axis=0), p, fxn=_cast_kernel)[0])
@@ -1004,7 +1004,7 @@ def reduce_scatter(p:Tensor) -> Tensor:
     for j in range(n):
       t = (j - k) % n
       got[(t, (j + 1) % n)] = (part(j, t) if k == 1 else (got[(t, j)] + part(j, t)).contiguous()).copy_to_device(devs[(j + 1) % n])
-  return Tensor(UOp.mstack(*[(got[(t, t)] + part(t, t)).float().contiguous() for t in range(n)]).unshard(0))
+  return Tensor(UOp.mstack(*[(got[(t, t)] + part(t, t)).contiguous() for t in range(n)]).unshard(0)).cast(p.dtype)
 
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,
