@@ -1,4 +1,4 @@
-import functools, io, pathlib, re, struct
+import functools, io, itertools, pathlib, re, struct
 from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
@@ -284,7 +284,8 @@ def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:t
       parts = data.reshape(*shape[:axis], n, -1)
       packed[name] = parts.permute(axis, *range(axis), axis+1).shard(devices, 0)
   # TODO: shard copies the full tensor to every device
-  for t in packed.values(): t.realize()
+  # a block's tensors realized together
+  for _, names in itertools.groupby(packed, lambda k: k.split(".")[1] if k.startswith("blk.") else k): Tensor.realize(*(packed[k] for k in names))
   for d in devices: Device[d].allocator.free_cache()
   def decode(name:str, shape:tuple[int, ...], typ:int) -> Tensor:
     decoded = ggml_data_to_tensor(packed[name].flatten(), prod(shape), typ)
