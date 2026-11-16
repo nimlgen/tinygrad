@@ -58,12 +58,13 @@ class Engine:
     self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
-    routers = list(Tensor.stack(*[b.ffn_gate_inp.weight.float() for b in blocks]).numpy())
-    def guessed(li:int) -> np.ndarray: return np.load(f) if os.path.exists(f:=f"{guess}/guess-{m['layers'][li]}.npy") else routers[li]
-    def scorer(w:np.ndarray) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
-      w = Tensor(w.reshape(2, G, E // G, -1).transpose(1, 0, 2, 3).reshape(2 * E, -1).astype(np.float16))
-      return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0)
-    self.scorers = [scorer(np.stack([r, guessed(min(li + 1, L - 1))])) for li, r in enumerate(routers)]
+    routers = [b.ffn_gate_inp.weight.to(self.devs[0]).float() for b in blocks]
+    def guessed(li:int) -> Tensor:
+      return Tensor(np.load(f)).to(self.devs[0]) if os.path.exists(f:=f"{guess}/guess-{m['layers'][li]}.npy") else routers[li]
+    def scorer(w:Tensor) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
+      w = w.reshape(2, G, E // G, -1).permute(1, 0, 2, 3).reshape(2 * E, -1).half()
+      return q8_0_linear(w, self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0)
+    self.scorers = [scorer(Tensor.stack(r, guessed(min(li + 1, L - 1)))) for li, r in enumerate(routers)]
     Tensor.realize(*(biases:=[b.exp_probs_b["bias"] for b in blocks]), *[s.weight if isinstance(s, Linear) else s for s in self.scorers])
     self.bias = list(Tensor.stack(*[t.float() for t in biases]).numpy())
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
