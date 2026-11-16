@@ -202,6 +202,7 @@ class CallifyCtx:
   allocs: dict[UOp, UOp] = field(default_factory=dict)
   views: set[UOp] = field(default_factory=set)
   stores: list[UOp] = field(default_factory=list)
+  calls: dict[UOp, UOp] = field(default_factory=dict)
 
 def contiguous_mops_to_view(ctx:CallifyCtx|None, c:UOp, src:UOp):
   """MOPS(BUFFER) → SHRINK when movement ops collapse to a contiguous range."""
@@ -243,12 +244,15 @@ def canonicalize_alloc(ctx:CallifyCtx, b:UOp):
   if b.arg.slot >= 0 and b not in ctx.allocs: ctx.allocs[b] = b.replace(arg=replace(b.arg, slot=-1-len(ctx.allocs)))
   return ctx.allocs.get(b)
 
-def canonicalize_call_body(c:UOp):
-  return c.replace(src=(graph_rewrite(c.body, pm_canonicalize_alloc, init_ctx=CallifyCtx, bottom_up=True),)+c.src[1:])
+def canonicalize_call_body(ctx:CallifyCtx, c:UOp):
+  if c not in ctx.calls:
+    ret = c.replace(src=(graph_rewrite(c.body, pm_canonicalize_alloc, ctx=CallifyCtx(calls=ctx.calls), bottom_up=True),)+c.src[1:])
+    ctx.calls[c] = ctx.calls[ret] = ret
+  return ctx.calls[c]
 
 pm_canonicalize_alloc = PatternMatcher([
   # NOTE: lambda for late binding, canonicalize_call_body references pm_canonicalize_alloc
-  (UPat(Ops.CALL, name="c"), lambda c: canonicalize_call_body(c)),
+  (UPat(Ops.CALL, name="c"), lambda ctx,c: canonicalize_call_body(ctx, c)),
   (UPat(Ops.ALLOC, name="b"), canonicalize_alloc),
 ])
 
