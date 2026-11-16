@@ -64,7 +64,8 @@ class Engine:
       w = Tensor(w.reshape(2, G, E // G, -1).transpose(1, 0, 2, 3).reshape(2 * E, -1).astype(np.float16))
       return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0).realize()
     self.scorers = [scorer(np.stack([r, guessed(min(li + 1, L - 1))])) for li, r in enumerate(routers)]
-    self.bias = list(Tensor.stack(*[b.exp_probs_b["bias"].float() for b in blocks]).numpy())
+    Tensor.realize(*(biases:=[b.exp_probs_b["bias"] for b in blocks]))  # (and the biases themselves: the window's routes take them)
+    self.bias = list(Tensor.stack(*[t.float() for t in biases]).numpy())
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
     for li, b in enumerate(blocks):
@@ -116,8 +117,9 @@ class Engine:
     self.v_at = UOp.variable("at", 0, model.max_context - self.B)
     def rows0(t:Tensor) -> tuple[int, ...]: return tuple(self.B if j == next(j for j, d in enumerate(t.shape) if d >= model.max_context) else d
                                                          for j, d in enumerate(t.shape))
-    self.stash = [Tensor.empty(*rows0(t:=getattr(o, k)), dtype=t.dtype, device=self.devs, axis=t.uop.axis).realize() for o, k in self.caches]
-    self.stash_states = [s.clone().realize() for s in model._states()]
+    self.stash = [Tensor.empty(*rows0(t:=getattr(o, k)), dtype=t.dtype, device=self.devs, axis=t.uop.axis) for o, k in self.caches]
+    self.stash_states = [s.clone() for s in model._states()]
+    Tensor.realize(*self.stash, *self.stash_states)
     for o, k in self.caches: setattr(o, k, None)
     free = (lambda: min(free_bytes(d) for d in self.devs)) if not slots else (lambda: 0)  # (what's free on the gpus: sizing the pool by it)
     self.stage(f"states ({free() / 1e9:.2f} GB free before the pool)")
