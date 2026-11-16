@@ -7,11 +7,11 @@
 # DEV=AMD PYTHONPATH=. python3 extra/k3/draft_eval.py dump_dir trunk.gguf dspark|eagle path [name]
 import json, sys, time
 import numpy as np
-from tinygrad import Tensor, Device, TinyJit
+from tinygrad import Tensor, Device, TinyJit, nn
 from tinygrad.helpers import getenv
 from tinygrad.llm.gguf import gguf_parse, ggml_data_to_tensor
-from tinygrad.llm.kernels.amd_gguf import q8_0_linear
-from extra.k3.draft import DSpark, Eagle3
+from tinygrad.llm.kernels.amd import Linear
+from extra.k3.draft import DSpark, Eagle3, weight
 
 CLOSE, THINK = 163588, 39964  # (K3.1's "<|close|>think": the end of the thinking)
 K, STRIDE, BATCH, T2, DT = getenv("K", 7), getenv("STRIDE", 1), getenv("BATCH", 64), getenv("T2", 0.050), getenv("DT", 0.015)
@@ -23,8 +23,10 @@ def shared(path:str, dev:str) -> tuple:
   def dec(name:str) -> Tensor:
     data, shape, typ = entries[name]
     return ggml_data_to_tensor(data.to(dev), int(np.prod(shape)), typ).reshape(shape).half().realize()
-  emb, out = dec("token_embd.weight"), q8_0_linear(dec("output.weight"), dev)
-  return (lambda t: emb[t]), (lambda x: out(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1))
+  emb, out = nn.Embedding(1, 1), weight(dec("output.weight"), (dev,))
+  emb.weight = dec("token_embd.weight")
+  def head(x:Tensor) -> Tensor: return out(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1) if isinstance(out, Linear) else x.half() @ out.T
+  return emb, head
 
 def kinds(meta:dict, toks:np.ndarray) -> np.ndarray:
   """each position's kind of text: 0 prompt, 1 thinking, 2 answer, 3 an edit's completion"""

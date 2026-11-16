@@ -103,8 +103,10 @@ class DSpark:
     st = nn.state.safe_load(f"{path}/model.safetensors")
     # split by heads, by the mlp's rows, the markov term by the vocabulary (a guess at a time reads all of it)
     split = {"q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1, "markov_w2": 0}
-    self.w = {k[:-len(".weight")]: weight(v, devs, split.get(k.split(".")[-2]), q8 and k.startswith(("layers.", "fc."))) for k, v in st.items()
-              if k.endswith(".weight")}
+    self.w = {k[:-len(".weight")]: weight(v, devs, split.get(k.split(".")[-2]), q8 and k.startswith(("layers.", "fc.", "markov_head.markov_w2")))
+              for k, v in st.items() if k.endswith(".weight")}
+    self.markov = nn.Embedding(*st["markov_head.markov_w1.weight"].shape)  # (the r-dim embedding of the token before a guess)
+    self.markov.weight = cast(Tensor, self.w["markov_head.markov_w1"])
     self.conf_b = st["confidence_head.proj.bias"].to(devs[0]).float().to(devs).realize()
     self.cache = Tensor.zeros(self.L, 2, 1, self.KV, max_context, self.hd, dtype=dtypes.half).contiguous().shard(devs, 3).realize()
 
@@ -166,16 +168,16 @@ class DSpark:
       x = x + self.lin(self.lin(m, p + "gate_proj").silu() * self.lin(m, p + "up_proj"), p + "down_proj")
     h = self.norm(x, "norm")
     logits = self.head(h).float()  # (A, k, vocab)
-    def markov(t:Tensor) -> Tensor: return self.w["markov_head.markov_w1"][t].float()  # (the r-dim embedding of the token before a guess)
+    def markov(t:Tensor) -> Tensor: return self.markov(t).float()
     if prev is None:  # (greedy, a guess at a time: the next one's markov term on it)
       t, outs, embs = anchors, [], []
       for j in range(k):
         embs.append(e:=markov(t))
-        outs.append(t:=(logits[:, j] + e.half() @ self.w["markov_head.markov_w2"].T).argmax(-1))
+        outs.append(t:=(logits[:, j] + self.lin(e, "markov_head.markov_w2").float()).argmax(-1))
       out, e = Tensor.stack(*outs, dim=1), Tensor.stack(*embs, dim=1)
     else:
       e = markov(prev)
-      logits = logits + (e.half() @ self.w["markov_head.markov_w2"].T).float()
+      logits = logits + self.lin(e, "markov_head.markov_w2").float()
       out = logits.argmax(-1)
     conf = (h.cat(e, dim=-1) @ self.w["confidence_head.proj"].float().T + self.conf_b).sigmoid()[..., 0]
     return out.cast(dtypes.int32), conf, logits
