@@ -536,12 +536,13 @@ _IQ3_HALVES = UOp.custom_function("({{ typedef _Float16 h2 __attribute__((ext_ve
 
 @functools.cache
 def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_features:int, in_features:int, stride:int, offset:int,
-                       act:Callable|None) -> UOp:
-  # a workgroup: a tile's 64 rows and 256 outputs (act: 128, a wave's gate tile and its up tile), 8 waves of 2 output tiles. a group of 32 inputs
-  # at a time the tile's rows go through LDS (two buffers by its parity) and a wave decodes its outputs' weights to halves, the scales in them
+                       act:Callable|None, tile:int) -> UOp:
+  # a workgroup: a tile's rows (16, 32 or 64) and 256 outputs (act: 128, a wave's gate tile and its up tile), 8 waves of 2 output tiles. a group
+  # of 32 inputs at a time the tile's rows go through LDS (two buffers by its parity) and a wave decodes its outputs' weights to halves, the
+  # scales in them
   *rows_src, grid_src, sign_src = extra
   xrow = rows_src[0] if rows_src else None
-  waves, tile, type_words = 8, 64, QUANT_SIZES[IQ3_XXS]//2
+  waves, type_words = 8, QUANT_SIZES[IQ3_XXS]//2
   output_words = in_features * type_words // GGML_BLOCK_SIZE
   token_block, output_block = UOp.range(out.shape[0]//tile, 0), UOp.range(out_features//(32*waves), 1)
   lane, wave = UOp.range(32, -1, axis_type=AxisType.WARP), UOp.range(waves, 3, axis_type=AxisType.LOCAL)
@@ -597,13 +598,14 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     arg=KernelInfo(name="expert_iq3_xxs_f16_wmma", opts_to_apply=(), estimates=estimates))
 
 def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, stride:int, offset:int=0,
-                 xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None) -> Tensor:
-  """out[r] = W[tiles[r // 64]] @ x[xrow[r]] (or x[r]) in half: an IQ3_XXS expert's tile of 64 rows on the f16 tensor cores (RDNA4), x in half
-  (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output"""
-  ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), 64 * tiles.shape[0]
+                 xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64) -> Tensor:
+  """out[r] = W[tiles[r // tile]] @ x[xrow[r]] (or x[r]) in half: an IQ3_XXS expert's tile of rows (16, 32 or 64) on the f16 tensor cores (RDNA4),
+  x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output"""
+  ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), tile * tiles.shape[0]
   if out is None:
     out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
-  fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act)
+  fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act,
+                          tile=tile)
   srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous().bitcast(dtypes.uint32), tiles.cast(dtypes.int32),
           *([] if xrow is None else [xrow.cast(dtypes.int32)]), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]

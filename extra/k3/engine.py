@@ -23,6 +23,7 @@ from extra.k3.draft import Eagle3
 # (default: what's free but SPARE bytes)
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
+TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
 class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|None=None, logits:bool=False,
@@ -90,7 +91,7 @@ class Engine:
     self.pool = pool(slots)
     if window:
       self.win = self.window_state(self.tail)
-      self.experts_jit.reset()  # (captured again on the pool: the decoded experts' gather from it is of its size)
+      for _, experts in self.routes.values(): experts.reset()  # (captured again on the pool: the decoded experts' gather from it is of its size)
       for b in (moe:=[b for b in model.blk if hasattr(b, "ffn_gate_inp")])[:1] * 2 + moe: self.dry(b)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
@@ -198,7 +199,9 @@ class Engine:
     self.kinds:dict[tuple, tuple[FFNBlock, Callable, list[Tensor]]] = {}  # (a kind's, and a stage of a block's: its args)
     self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
     self.tap_jit, self.fill_jit = TinyJit(self.tap, arenas=self.arenas), TinyJit(self.fill, arenas=self.arenas) if self.draft else None
-    self.route_jit, self.experts_jit = TinyJit(self.window_route, arenas=self.arenas), TinyJit(self.window_experts, arenas=self.arenas)
+    # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
+    self.routes = {t: (TinyJit(functools.partial(self.window_route, t), arenas=self.arenas),
+                       TinyJit(functools.partial(self.window_experts, t), arenas=self.arenas)) for t in TILES}
     self.start_jit = TinyJit(self.start, arenas=self.arenas)
     # every kind's graphs captured on its first block (its buffers the args) on dry chunks at position 0 (the host's flags preset: slot 0)
     moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
@@ -216,19 +219,21 @@ class Engine:
       if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_c0.bind(0))
     for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
 
-  def dry(self, b:FFNBlock):  # (moe block b's route and experts on a dry chunk)
+  def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
-    self.graph(self.route_jit, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-    self.graph(self.experts_jit, self.pool, self.parts[0][li])
+    for route, experts in self.routes.values():
+      self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+      self.graph(experts, self.pool, self.parts[0][li])
 
   def window_state(self, at:int|None=None) -> dict[str, Tensor]:
     """the window's state: the bank of the residual streams, the moe's inputs and outputs (the routed experts' inputs and outputs, the shared
     experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs, the draft's inputs. at: lent from
     the pool's slots from at on, else buffers of its own"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
-    S, R, f32, i32 = 1 + sum(b.attn_res_score.new_block for b in self.model.blk), round_up(W * K + 63 * E, 64), dtypes.float32, dtypes.int32
+    S, R, f32, i32 = 1 + sum(b.attn_res_score.new_block for b in self.model.blk), max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
     shapes = {"bank": ((1, W, S, c.dim), f32), "h": ((W, self.lat), f32), "shared": ((W, c.dim), f32), "logits": ((W, E), f32),
-              "out": ((W, self.lat), f32), "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // 64,), i32),
+              "out": ((W, self.lat), f32), "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32),
+              "tiles": ((R // TILES[0],), i32),
               "taps": ((1, W, len(self.draft.layers) if self.draft else 1, c.dim), f32), "act": ((R, self.units), dtypes.half),
               "down": ((R, self.lat), dtypes.half)}
     state, off = {}, (at or 0) * self.part
@@ -272,39 +277,47 @@ class Engine:
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["shared"], b._shared(x)[0]), (self.win["logits"], logits)]
     return Tensor.realize(*[Tensor(t.uop)[c0:c0 + C].assign(v) for t, v in outs])[0]
 
-  def window_route(self, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
-    """the gpus route the window's live tokens (its tiles of an expert's rows), the expert counts to the host (part 2, then the tag)"""
+  def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
+    return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
+  def state_rows(self, tile:int) -> tuple[int, int]:  # (the state's rows, its tiles of tile rows: the largest tile size's)
+    return (R:=max(map(self.rows, TILES))), R // tile
+
+  def window_route(self, tile:int, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
+    """the gpus route the window's live tokens (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the tag)"""
     K, E = self.model.config.num_experts_per_tok, self.m["n_experts"]
-    routed = moe_route(Tensor(self.win["logits"].uop), bias, K, live=live)
-    kept = Tensor.realize(*(Tensor(self.win[k].uop).assign(v) for k, v in zip(("w", "pos", "entries", "tiles"), routed[:4])))
-    counted = Tensor(part2.uop)[1:1 + E].assign(routed[4].bitcast(dtypes.uint32))
+    w, pos, entries, tiles, counts = moe_route(Tensor(self.win["logits"].uop), bias, K, tile, live=live)
+    R, NT = self.state_rows(tile)  # (the routes padded to the state's rows: the experts graph's tiles past them skipped)
+    vals = {"w": w, "pos": pos, "entries": entries.pad((0, R - entries.shape[0]), value=-1), "tiles": tiles.pad((0, NT - tiles.shape[0]), value=-1)}
+    kept = Tensor.realize(*(Tensor(self.win[k].uop)[:v.shape[0]].assign(v) for k, v in vals.items()))
+    counted = Tensor(part2.uop)[1:1 + E].assign(counts.bitcast(dtypes.uint32))
     tag = Tensor(tag.uop.after(counted.uop, kept.uop))
     return tag.assign(tag * 0 + 1).realize()
 
-  def window_experts(self, pool:Tensor, part1:Tensor, *_) -> Tensor:
+  def window_experts(self, tile:int, pool:Tensor, part1:Tensor, *_) -> Tensor:
     """the window's routed experts once the host gave their slots (part 1): each gpu its units of the experts in tiles of an expert's rows,
     summed over the gpus"""
     K, E, u, off = self.model.config.num_experts_per_tok, self.m["n_experts"], self.units, 2 * self.units * self.lat // self.block[0] * self.block[1]
-    w, pos, entries, tiles = (Tensor(self.win[k].uop) for k in ("w", "pos", "entries", "tiles"))
+    w, pos, entries, h1, h2 = (Tensor(self.win[k].uop) for k in ("w", "pos", "entries", "act", "down"))
+    tiles = Tensor(self.win["tiles"].uop)[:self.state_rows(tile)[1]]
     slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
     tslot, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
-    a = self.tiles(pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, 0, Tensor(self.win["act"].uop), xrow=xrow, act=self.act)
-    y = self.tiles(pool, tslot, a, self.lat, u, off, Tensor(self.win["down"].uop))
+    a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, 0, h1, xrow=xrow, act=self.act)
+    y = self.tiles(tile, pool, tslot, a, self.lat, u, off, h2)
     out = (y.reshape(len(self.devs), -1, self.lat)[:, pos.maximum(0)].float() * w.reshape(1, -1, 1)).reshape(len(self.devs), -1, K, self.lat).sum(2)
     return Tensor(self.win["out"].uop).assign(partial_sum(out)).realize()
 
-  def tiles(self, pool:Tensor, tslot:Tensor, x:Tensor, out_f:int, in_f:int, off:int, out:Tensor, xrow:Tensor|None=None,
+  def tiles(self, tile:int, pool:Tensor, tslot:Tensor, x:Tensor, out_f:int, in_f:int, off:int, out:Tensor, xrow:Tensor|None=None,
             act:Callable|None=None) -> Tensor:
-    """(gpus, 64 * tiles, out_f) into out: each gpu's units of the experts at off bytes in the slots of tiles of 64 rows, on their rows of x
+    """(gpus, tile * tiles, out_f) into out: each gpu's units of the experts at off bytes in the slots of tiles of tile rows, on their rows of x
     (xrow: its rows, -1 its first), act(gate, up) of the outputs' halves: the AMD tensor cores' expert tiles for IQ3_XXS, else decoded"""
     if amd_custom_kernels_supported(x.device) and self.qtype == IQ3_XXS:
-      return expert_tiles(pool, tslot, x, out_f, in_f, self.part, off, xrow=xrow, act=act, out=out)
+      return expert_tiles(pool, tslot, x, out_f, in_f, self.part, off, xrow=xrow, act=act, out=out, tile=tile)
     NT, size, isz = tslot.shape[0], out_f * in_f // self.block[0] * self.block[1], self.word.itemsize
     w = pool.reshape(len(self.devs), -1, self.part // isz)[:, tslot.maximum(0)][..., off // isz:(off + size) // isz].bitcast(dtypes.uint8)
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // self.block[1] * self.block[0], self.qtype).reshape(-1, NT, out_f, in_f)
-    y = (x if xrow is None else x[xrow.maximum(0)]).reshape(-1, NT, 64, in_f) @ w.transpose(-1, -2)
+    y = (x if xrow is None else x[xrow.maximum(0)]).reshape(-1, NT, tile, in_f) @ w.transpose(-1, -2)
     y = (y if act is None else act(*y.split(out_f // 2, -1))).cast(out.dtype)
-    return Tensor(out.uop).assign(y.reshape(out.shape)).reshape(len(self.devs), NT * 64, -1)
+    return Tensor(out.uop).assign(y.reshape(out.shape)).reshape(len(self.devs), NT * tile, -1)
 
   def post(self, b:FFNBlock, c0:UOp, s:UOp, *_) -> Tensor:
     """a chunk's routed and shared experts' outputs into the block's, added to stream s"""
@@ -350,13 +363,14 @@ class Engine:
         self.pump()
       if hasattr(b, "ffn_gate_inp"):
         li = self.m["layers"].index(i)
-        self.graph(self.route_jit, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+        route, experts = self.routes[next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])]
+        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
         codes = li * E + (np.arange(E) if ahead else np.nonzero(self.counted(li))[0])
         t0 = time.perf_counter()
         self.read(codes, codes, wait=True)
         self.io.t_reads += time.perf_counter() - t0
         for p in self.bufs[li][2][1]: p[1:1 + E] = self.state["slot_of"][li * E:(li + 1) * E].view(np.uint32)
-        self.graph(self.experts_jit, self.pool, self.parts[0][li])
+        self.graph(experts, self.pool, self.parts[0][li])
         if li + 1 < len(self.parts[0]) and (ahead or len(codes) >= 0.9 * E):
           self.read((li + 1) * E + np.arange(E), codes, wait=False)
           ahead.append(li + 1)

@@ -569,23 +569,25 @@ class TestExpertLinear(unittest.TestCase):
     ref = expert_linear(self.pool, rep, h, self.LAT, self.UNITS, IQ3_XXS, self.PART, off, w=w, rows=per).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4 * np.abs(ref).max())
 
-  def test_expert_tiles(self): # 64 row tiles an expert's (f16 WMMA), x's rows from a table (-1: x[0]) or its own: as the weights decoded apart
+  def test_expert_tiles(self): # tiles of rows an expert's (16 or 64, f16 WMMA), x's rows from a table (-1: x[0]) or its own: as the weights decoded
     if not _is_rdna4(self.pool.device): self.skipTest("RDNA4 required")
-    tiles, off = Tensor(np.array(self.sel[:2] + [-1], np.int32)), 2 * self.UNITS * self.ROW_UP
-    x = self.rng.standard_normal((5, self.LAT)).astype(np.float32)
-    xr = self.rng.integers(-1, 5, 192).astype(np.int32)
-    out = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr)).float().numpy()
-    h = self.rng.standard_normal((192, self.UNITS)).astype(np.float32)
-    down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off).float().numpy()
-    def act(g, u): return g * (u / 25).tanh()
-    gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), act=act).float().numpy()
-    for t, s in enumerate(self.sel[:2]):
-      rows = slice(64 * t, 64 * t + 64)
-      ref = x[np.maximum(xr[rows], 0)].astype(np.float16).astype(np.float32) @ self.weight(s, 0, 2 * self.UNITS, self.LAT).T
-      np.testing.assert_allclose(out[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
-      np.testing.assert_allclose(gu[rows], ref[:, :self.UNITS] * np.tanh(ref[:, self.UNITS:] / 25), rtol=2e-2, atol=2e-3 * np.abs(ref).max())
-      ref = h[rows].astype(np.float16).astype(np.float32) @ self.weight(s, off, self.LAT, self.UNITS).T
-      np.testing.assert_allclose(down[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+    for tile in (16, 64):
+      with self.subTest(tile=tile):
+        tiles, off, n = Tensor(np.array(self.sel[:2] + [-1], np.int32)), 2 * self.UNITS * self.ROW_UP, 3 * tile
+        x = self.rng.standard_normal((5, self.LAT)).astype(np.float32)
+        xr = self.rng.integers(-1, 5, n).astype(np.int32)
+        out = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), tile=tile).float().numpy()
+        h = self.rng.standard_normal((n, self.UNITS)).astype(np.float32)
+        down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off, tile=tile).float().numpy()
+        def act(g, u): return g * (u / 25).tanh()
+        gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), act=act, tile=tile).float().numpy()
+        for t, s in enumerate(self.sel[:2]):
+          rows = slice(tile * t, tile * t + tile)
+          ref = x[np.maximum(xr[rows], 0)].astype(np.float16).astype(np.float32) @ self.weight(s, 0, 2 * self.UNITS, self.LAT).T
+          np.testing.assert_allclose(out[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+          np.testing.assert_allclose(gu[rows], ref[:, :self.UNITS] * np.tanh(ref[:, self.UNITS:] / 25), rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+          ref = h[rows].astype(np.float16).astype(np.float32) @ self.weight(s, off, self.LAT, self.UNITS).T
+          np.testing.assert_allclose(down[rows], ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
 
   def test_live_rows(self): # the rows of weight 0 skipped: a slot's gate and up rows where all its tokens' are (0 out), the down rows' sums
     x, off, per = Tensor(self.rng.standard_normal((2, self.LAT)).astype(np.float32)), 2 * self.UNITS * self.ROW_UP, 2
