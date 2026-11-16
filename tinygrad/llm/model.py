@@ -810,7 +810,7 @@ class Transformer:
     blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
     assert all(1 <= n <= len(b.kept) for b in blocks), f"rollback({n}) after a step that kept {[len(b.kept) for b in blocks]}"
     def copy(): Tensor.realize(*[s.assign(k) for b in blocks for s, k in zip(b._states(), b.kept[n-1])])
-    if n not in self._rollbacks: self._rollbacks[n] = TinyJit(copy)  # (a copy a state, scheduled once)
+    if n not in self._rollbacks: self._rollbacks[n] = TinyJit(copy, capture_first=True)  # (a copy a state, scheduled once)
     self._rollbacks[n]()
 
   def _states(self) -> list[Tensor]: return [s for b in self.blk if isinstance(b, GatedDeltaNetBlock) for s in b._states()]
@@ -829,7 +829,7 @@ class Transformer:
   def _copy(self, i:int, save:bool):
     """the recurrent states into saved set i (save) or back from it"""
     def copy(): Tensor.realize(*[k.assign(s) if save else s.assign(k) for k, s in zip(self._sets[i], self._states())])
-    if (i, save) not in self._copies: self._copies[i, save] = TinyJit(copy)  # (a copy a state, scheduled once)
+    if (i, save) not in self._copies: self._copies[i, save] = TinyJit(copy, capture_first=True)  # (a copy a state, scheduled once)
     self._copies[i, save]()
 
   def fork(self, tokens:list[int], start:int, step:int) -> int:

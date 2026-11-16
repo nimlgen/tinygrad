@@ -598,8 +598,8 @@ class Engine:
     for T, jit in self.jits.items():
       jit(self.v_pos.bind(0))[0].tolist()
       self.stage(f"step graph of {T}")
-    for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
-    for (i, save), _ in itertools.product(itertools.product(range(2), (True, False)), range(3)): self.model._copy(i, save)  # (and save's)
+    for n in range(1, self.tokens): self.model.rollback(n)  # (their jits captured too, after a verify step)
+    for i, save in itertools.product(range(2), (True, False)): self.model._copy(i, save)  # (and save's)
     if self.chain_jit: self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
     for jit in self.keep_jits: jit(self.v_at.bind(0))  # (a kept session's copies)
     self.stage("rollbacks, saves, chain, session copies")
