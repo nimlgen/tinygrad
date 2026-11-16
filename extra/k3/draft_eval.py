@@ -14,6 +14,7 @@ from extra.k3.draft import DSpark, Eagle3
 
 CLOSE, THINK = 163588, 39964  # (K3.1's "<|close|>think": the end of the thinking)
 K, STRIDE, BATCH, T2, DT = getenv("K", 7), getenv("STRIDE", 1), getenv("BATCH", 64), getenv("T2", 0.050), getenv("DT", 0.015)
+DEADLINE = getenv("DEADLINE", 50.0)  # (seconds: the anchors guessed by then reported)
 
 def shared(path:str, dev:str) -> tuple:
   """the target's embedding and head, decoded on dev from the trunk gguf"""
@@ -52,6 +53,7 @@ def run(draft_kind:str, path:str, dump:str, gguf:str) -> dict:
   print(f"{draft_kind} loaded in {time.perf_counter() - t0:.1f} s, taps {names}", flush=True)
   guesses, conf, anchors = [], [], []
   for s in meta["seqs"]:
+    if time.perf_counter() - t0 > DEADLINE: break
     a0, n = s["start"], s["len"]
     hid = Tensor(np.stack([tap[nm][a0:a0 + n] for nm in names], axis=1)[None]).to(dev)  # (1, n, taps, dim)
     an = np.arange(max(s["prompt"] - 1, 1), n - 1)[::STRIDE]  # (anchors: a position, its block guesses the tokens after it)
@@ -59,6 +61,9 @@ def run(draft_kind:str, path:str, dump:str, gguf:str) -> dict:
       d.fill(None, hid, 0).realize()
       st = np.pad(toks[a0:a0 + n], (0, K))
       for b in range(0, len(an), BATCH):
+        if time.perf_counter() - t0 > DEADLINE:
+          an = an[:b]
+          break
         a = an[b:b + BATCH]
         prev = np.stack([st[x:x + K] for x in a])  # (the text's tokens before each guess)
         g, c, _ = d(Tensor(st[a].astype(np.int32)).to(dev), Tensor(a.astype(np.int32)).to(dev), K, (0, L + K), Tensor(prev.astype(np.int32)).to(dev))
