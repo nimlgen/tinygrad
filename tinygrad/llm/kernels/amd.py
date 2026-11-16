@@ -980,14 +980,10 @@ def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int
 
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,
-  larger ones a slice a device: every device's slice j copied to device j and summed there, the sums copied to the others (float ones on the gpus
-  in half: their copies half the bytes)"""
+  larger float ones on the gpus in half (their copies half the bytes)"""
   if not all(isinstance(d, int) for d in x.shape): return partial_sum(x.pad_to(x.max_shape)).shrink(tuple((0, d) for d in x.shape[1:]))
   if x.uop.axis != 0 or not (shape:=_mailbox_shape(x, n:=prod(x.shape[1:]))):
-    if x.uop.axis != 0 or not isinstance(devs:=x.device, tuple) or n % len(devs): return x.sum(0)
-    y, w = (x.half() if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs) else x).reshape(len(devs), n), n // len(devs)
-    sums = [y[:, j*w:(j+1)*w].to(d).sum(0) for j, d in enumerate(devs)]
-    return allgather_last(Tensor(UOp.mstack(*(s.uop for s in sums)).unshard(0))).reshape(x.shape[1:]).cast(x.dtype)
+    return x.half().sum(0).cast(x.dtype) if x.dtype == dtypes.float32 and amd_custom_kernels_supported(x.device) else x.sum(0)
   fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
