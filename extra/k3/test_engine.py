@@ -230,8 +230,7 @@ class TestEngine(unittest.TestCase):
     steps, seen = iter([([5], [6, 7], None), ([6, 9], [8, 3], None), ([8, 3], [1, 2], None)]), []
     model = SimpleNamespace(fork=lambda *a: 0, save=lambda t: None, rollback=lambda n: None)
     eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
-                          draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0,
-                          resume=lambda t: None)
+                          draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0)
     self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
     self.assertEqual(seen, [[6, 7], [8, 3]])
 
@@ -252,12 +251,36 @@ class TestEngine(unittest.TestCase):
     for pos, t in enumerate(A): eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].realize()
     m._cached_tokens, want = A[:], state()
     eng.resume(S)
-    self.assertEqual(eng.session, (A, 2))
+    self.assertEqual(eng.session, (A, 2, m._saved))
     for pos, t in enumerate(S[2:], 2): eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].realize()  # (the short request's)
     m._cached_tokens = S[:]
     eng.resume(A + [6])
     self.assertEqual((eng.session, m._cached_tokens, eng.get_start_pos(A + [6])), (None, A, len(A)))
     for got, w in zip(state(), want): np.testing.assert_equal(got, w)
+
+  def test_session_fork(self):  # a server's requests: a conversation's turns (its replies rendered again: the prompt's states), short requests
+    # between them (two in a row): each turn fed from where it would have been without them, its states, caches, logits as without them
+    P, G = [3, 5, 7, 1, 2, 9, 4, 6], [8, 2]
+    turns, sides = [(P, G), (P + [7, 1, 5], [3]), (P + [7, 1, 5, 3, 6], [])], [[3, 5, 1, 1, 6], [3, 5, 2, 6]]
+    def serve(tokens:list[int], gen:list[int]) -> tuple[int, list[np.ndarray]]:  # (LLMServer's get_start_pos, then generate's, its steps)
+      eng, m = self.eng, self.eng.model
+      eng.get_start_pos(tokens)
+      start = eng.get_start_pos(tokens)
+      fork = m.fork(tokens, start, 1)
+      for pos, t in enumerate(tokens[start:] + gen, start):
+        logits = eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].numpy()
+        if pos + 1 in (fork, len(tokens)): m.save(tokens[:pos + 1])
+      m._cached_tokens = tokens + gen
+      return start, [getattr(o, k).numpy() for o, k in eng.caches] + [s.numpy() for s in m._states()] + [logits]
+    self.stub()
+    want = [serve(*turn) for turn in turns]
+    self.eng = self.engine(2 * E)
+    self.stub()
+    for i, turn in enumerate(turns):
+      for side in sides[:i]: serve(side, [4])
+      start, got = serve(*turn)
+      self.assertEqual(start, want[i][0])
+      for g, w in zip(got, want[i][1]): np.testing.assert_equal(g, w)
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []

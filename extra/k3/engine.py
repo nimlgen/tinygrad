@@ -122,12 +122,12 @@ class Engine:
     shapes = {str(i): (getattr(o, k).uop.shard_shape, getattr(o, k).dtype) for i, (o, k) in enumerate(self.caches)}
     axes = [getattr(o, k).uop.axis for o, k in self.caches]
     # a kept session (a long one a short request diverges from early): copies of the caches' rows that request may write, its recurrent states
-    self.B, self.session = min(SESSION, model.max_context // 2), cast(tuple[list[int], int]|None, None)
+    self.B, self.session = min(SESSION, model.max_context // 2), cast(tuple[list[int], int, list[tuple[list[int], int]]]|None, None)
     self.v_at = UOp.variable("at", 0, model.max_context - self.B)
     def rows0(t:Tensor) -> tuple[int, ...]: return tuple(self.B if j == next(j for j, d in enumerate(t.shape) if d >= model.max_context) else d
                                                          for j, d in enumerate(t.shape))
     self.stash = [Tensor.empty(*rows0(t:=getattr(o, k)), dtype=t.dtype, device=self.devs, axis=t.uop.axis) for o, k in self.caches]
-    self.stash_states = [s.empty_like() for s in model._states()]
+    self.stash_states = [s.empty_like() for s in self.session_states()]
     Tensor.realize(*self.stash, *self.stash_states)
     for o, k in self.caches: setattr(o, k, None)
     free = (lambda: min(free_bytes(d) for d in self.devs)) if not slots else (lambda: 0)  # (what's free on the gpus: sizing the pool by it)
@@ -739,18 +739,21 @@ class Engine:
 
   @property
   def max_context(self) -> int: return self.model.max_context
-  def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
+  def get_start_pos(self, tokens:list[int]) -> int:
+    self.resume(tokens)
+    return self.model.get_start_pos(tokens)
 
   def session_rows(self, i:int, at:UOp) -> Tensor:  # (cache i's rows of a kept session's at..)
     o, k = self.caches[i]
     return getattr(o, k).shrink(tuple((at, at + self.B) if j == self.stripes[i][0] else None for j in range(getattr(o, k).ndim)))
 
+  def session_states(self) -> list[Tensor]: return [*self.model._states(), *itertools.chain(*self.model._sets)]
   def keep(self, at:UOp):  # (a session's rows at.. and recurrent states into the copies)
-    states = zip(self.stash_states, self.model._states())
+    states = zip(self.stash_states, self.session_states())
     Tensor.realize(*[c.assign(self.session_rows(i, at)) for i, c in enumerate(self.stash)], *[c.assign(s) for c, s in states])
 
   def unkeep(self, at:UOp):  # (and back)
-    states = zip(self.stash_states, self.model._states())
+    states = zip(self.stash_states, self.session_states())
     Tensor.realize(*[self.session_rows(i, at).assign(c) for i, c in enumerate(self.stash)], *[s.assign(c) for c, s in states])
 
   def resume(self, tokens:list[int]):
@@ -761,12 +764,12 @@ class Engine:
     if self.session is not None and shared(kept:=self.session[0]) > shared(m._cached_tokens):
       if round_up(len(m._cached_tokens) + self.tokens, max(self.chunk, 1)) <= (at:=self.session[1]) + self.B:
         self.keep_jits[1](self.v_at.bind(at))
-        m._cached_tokens, m._saved = kept[:], []
+        m._cached_tokens, m._saved = kept[:], self.session[2]
       self.session = None
     elif len(tokens) < len(m._cached_tokens) and (at:=shared(m._cached_tokens)) + self.B <= self.max_context and len(tokens) - at < self.B // 2 \
          and len(m._cached_tokens) > (len(self.session[0]) if self.session else 0):
       self.keep_jits[0](self.v_at.bind(at))
-      self.session = (m._cached_tokens[:], at)
+      self.session = (m._cached_tokens[:], at, m._saved[:])
 
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
@@ -785,7 +788,6 @@ class Engine:
     """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
     a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
-    self.resume(tokens)
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
     if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
