@@ -1022,13 +1022,13 @@ def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:
   return UOp.group(*outputs, done).end(wg, t).sink(arg=KernelInfo(name="allgather", opts_to_apply=()))
 
 def allgather_last(x:Tensor) -> Tensor:
-  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes, larger float ones on the gpus copied
-  in half"""
+  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes, else each shard copied to the other
+  devices once (larger float ones on the gpus in half)"""
   if x.uop.axis != x.ndim-1 or not isinstance(devs:=x.device, tuple): return x
   if not all(isinstance(d, int) for d in x.shape): return allgather_last(x.pad_to(x.max_shape)).shrink(tuple((0, d) for d in x.shape))
   if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))):
-    if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs): return Tensor(x.half().uop.copy_to_device(devs)).cast(x.dtype)
-    return Tensor(x.uop.copy_to_device(devs))
+    w, y = x.shape[-1] // len(devs), x.half() if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs) else x
+    return Tensor.cat(*(y[..., i*w:(i+1)*w] for i in range(len(devs))), dim=-1).cast(x.dtype)
   fxn = functools.partial(_allgather_kernel, n=n, width=x.max_shape[-1]//len(devs), T=shape[0], EP=shape[1])
   return Tensor.custom_kernel(Tensor.empty(x.shape, dtype=x.dtype, device=x.device), x.contiguous(), *_mailboxes(x.device), fxn=fxn)[0]
 
