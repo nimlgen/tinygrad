@@ -80,12 +80,14 @@ class TestEngine(unittest.TestCase):
     self.ref, self.trunk, self.weights = Transformer.from_gguf(full)[0], trunk, weights
     self.eng = self.engine(2 * E)
 
-  def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0') -> Engine:
+  def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=()) \
+      -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches (the pool's first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
-    eng = Engine(model, m, slots=slots + 2, tokens=2, chunk=4, window=8, draft=draft(model) if draft else None)  # (2: the caches')
+    eng = Engine(model, m, slots=slots + 2, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
+                 widths=widths)  # (2: the caches')
     at = eng.slots_of(eng.cache_bytes)
     assert at <= 2
     pools = [(caches * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part,
@@ -316,6 +318,17 @@ class TestEngine(unittest.TestCase):
     eng.tok_np[:2], eng.given_np[:2] = [int(eng.res_np[1]), 7], [7, -1]
     eng.run(2, eng.v_pos.bind(9))
     np.testing.assert_equal(eng.res_np[3:5], want([int(eng.res_np[2])], 10))
+
+  @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
+  def test_generate_dspark(self):  # a scored draft's verify steps of widths 2 and 4 (a server's): the target's greedy tokens, its guesses kept
+    from extra.k3.test_draft import dspark
+    path = dspark(tempfile.mkdtemp(), np.random.default_rng(5), window=6)
+    self.eng = eng = self.engine(2 * E, lambda m: DSpark(path, lambda t: m.token_embd(t).float(), m.output, m.token_embd.weight.device,
+                                                         m.max_context, width=3), tokens=4, widths=(2, 4))
+    eng.warm()
+    want, tok = [], 3
+    for pos in range(10): want.append(tok:=int(self.want(tok, pos).argmax()))
+    self.assertEqual([t for _, t in zip(range(10), eng.generate([3]))], want)
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_generate(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
