@@ -465,8 +465,11 @@ class Engine:
       rows.assign(rows.zeros_like()).realize()
     self.grown = new
 
-  def pieces(self) -> int:  # (a read window's pieces: the pool past two layers' experts (the one routed, the one read ahead) lent)
-    return 1 + max(0, (self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"]) // self.slots_of(self.piece_bytes))
+  def pieces(self) -> int:
+    """a read window's pieces: lent below the window's state, past the caches' stripes and the scratch (their rows pinned as they grow, the
+    rest the experts'), the pool past them and two layers' experts (the one routed, the one read ahead)"""
+    free = min(self.tail - self.arena[1], self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"])
+    return 1 + max(0, free // self.slots_of(self.piece_bytes))
 
   def window(self, toks:list[int], pos:int, given:list[int]):
     """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
@@ -479,6 +482,7 @@ class Engine:
     # (the pieces' states: the first the always lent one, the rest lent below the compute state's slots, their experts dropped)
     banks = [{k: self.win[k] for k in ("bank", "taps")}] + [self.piece(self.tail - i * ps) for i in range(1, -(-T // W))]
     self.lent_from = self.tail - (len(banks) - 1) * ps
+    assert self.lent_from >= self.arena[1] and not st["mask"][self.lent_from:self.tail].any(), "a piece over the caches or the scratch"
     st["slot_of"][(c:=st["expert_in"][self.lent_from:])[c >= 0]], st["expert_in"][self.lent_from:] = -1, -1
     pieces = [(p0, min(W, T - p0), bank) for p0, bank in zip(range(0, T, W), banks)]
     for p0, _, bank in pieces:
