@@ -144,6 +144,12 @@ class TestJit(unittest.TestCase):
     add.reset()
     _simple_test(add, N=20)
 
+  def test_jit_bound_variable(self):
+    @TinyJit
+    def f(a): return (a[:UOp.variable("j", 1, 10).bind(3)] + 1).sum().realize()
+    a = Tensor([float(i) for i in range(10)]).realize()
+    for _ in range(4): self.assertEqual(f(a).item(), 6.0)
+
   def test_simple_jit_norealize(self):
     @TinyJit
     def add(a, b): return (a+b)

@@ -53,9 +53,10 @@ class CapturedJit(Generic[ReturnType]):
   _linear: UOp
   expected_names: list[int|str]
   expected_input_info: list[tuple[UOp, tuple[Variable, ...], DType, str]]  # (view, variables, dtype, device) per input
+  fixed_vars: dict[str, int] = field(default_factory=dict)
   _linears: dict[tuple[UOp, ...], tuple[UOp, dict[UOp, UOp]]] = field(default_factory=dict)  # aliased inputs -> (linked linear with copies, staging)
 
-  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info)
+  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info, self.fixed_vars)
 
   @functools.cached_property
   def _jit_bufs(self) -> set[UOp]: return {u for u in self._linear.toposort() if u.op is Ops.BUFFER}
@@ -74,7 +75,7 @@ class CapturedJit(Generic[ReturnType]):
 
     linear, staging = self._linears[aliased]
     if DEBUG >= 1 and len(linear.src) >= 10: print(f"jit execs {len(linear.src)} calls")
-    run_linear(linear, var_vals, input_uops=[staging.get(u, u) for u in input_uops], jit=True)
+    run_linear(linear, {**self.fixed_vars, **var_vals}, input_uops=[staging.get(u, u) for u in input_uops], jit=True)
     for t,u,vals in self._symbolic_ret: t.uop = u.substitute({v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, walk=True)
     return self.ret
 
@@ -109,7 +110,7 @@ class _TinyJit(Generic[ReturnType]):
     self.prune, self.arenas, self.first = prune, arenas, int(capture_first)
     self.cnt: int = 2 if self.fxn is None else self.first
 
-  def add_linear(self, linear:UOp): self._linears.append(linear)
+  def add_linear(self, linear:UOp, var_vals:dict[str, int]): self._linears.append((linear, var_vals))
 
   def reset(self):
     assert self.fxn is not None, "can't reset without function"
@@ -135,7 +136,7 @@ class _TinyJit(Generic[ReturnType]):
       # jit capture
       assert self.fxn is not None
       if capturing: raise RuntimeError(f"having TinyJit inside another TinyJit is not supported {len(capturing)=} {capturing=}")
-      self._linears: list[UOp] = []
+      self._linears: list[tuple[UOp, dict[str, int]]] = []
       capturing.append(self)
       try:
         ret = self.fxn(*args, **kwargs)
@@ -146,13 +147,14 @@ class _TinyJit(Generic[ReturnType]):
       if DEBUG >= 1: print(f"JIT captured {len(self._linears)} linears with {len(input_buf_uops)} inputs")
 
       # combine all captured linears into one, memory plan, and compile
-      big_linear = UOp(Ops.LINEAR, src=tuple(flatten([l.src for l in self._linears])))
+      big_linear = UOp(Ops.LINEAR, src=tuple(flatten([l.src for l,_ in self._linears])))
+      fixed_vars = {k:v for k,v in merge_dicts([vv for _,vv in self._linears]).items() if k not in var_vals}
       del self._linears
 
       if self.prune:
         big_linear, onetime_linear = prune_linear(big_linear, set(input_buf_uops))
         if DEBUG >= 1: print(f"pruned from {len(big_linear.src) + len(onetime_linear.src)} -> {len(big_linear.src)} kernels")
-        run_linear(onetime_linear, var_vals)
+        run_linear(onetime_linear, {**fixed_vars, **var_vals})
         del onetime_linear
 
       # hold all buffers with real storage reachable from live Tensors (e.g. lazy .grad created during capture) and all buffers with
@@ -164,7 +166,7 @@ class _TinyJit(Generic[ReturnType]):
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec
       del big_linear, held_bufs
-      self.captured = CapturedJit(ret, linear, names, expected_input_info)
+      self.captured = CapturedJit(ret, linear, names, expected_input_info, fixed_vars)
       ret = self.captured(input_buf_uops, var_vals)
     elif self.cnt >= 2:
       # jit exec
