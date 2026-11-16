@@ -65,7 +65,7 @@ class Eagle3:
 
   def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:UOp|None=None) -> tuple[Tensor, Tensor, UOp]:
     """(1, T) tokens at positions pos.., (1, T, 3, dim) the target's hidden states (or hid, its own of the step before: a chain of guesses)
-    -> (1, T, vocab) logits, (1, T, dim) its feedback states (output-normed if configured), its cache after their keys (a chain's next step's cache)"""
+    -> (1, T, vocab) logits, (1, T, dim) its feedback states (output-normed if configured), its cache after their keys (a chain's next step's)"""
     T, p, a = tokens.shape[1], "layers.0.", "layers.0.self_attn."
     if hid is None: hid = self.fc(cast(Tensor, hidden))
     h, cache = self.keys(tokens, hid, pos, self.cache.uop if cache is None else cache)
