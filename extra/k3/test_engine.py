@@ -384,6 +384,22 @@ class TestEngine(unittest.TestCase):
     eng.run(2, eng.v_pos.bind(9))
     np.testing.assert_equal(eng.res_np[3:5], want([int(eng.res_np[2])], 10))
 
+  def test_window_dspark(self):  # the draft's cache after a window (its taps split on their rows over the gpus, a chunk's gathered) as after steps
+    from extra.k3.test_draft import dspark
+    path, ids = dspark(tempfile.mkdtemp(), np.random.default_rng(5), window=6), [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 1]
+    self.eng = eng = self.engine(2 * E, lambda m: DSpark(path, lambda t: m.token_embd(t).float(), m.output, m.token_embd.weight.device,
+                                                         m.max_context, width=2))
+    self.stub()
+    eng.grow(16)
+    assert eng.fill_jit is not None and len(eng.taps) > 1
+    for pos, t in enumerate(ids[:10]):
+      eng.tok_np[:1], eng.given_np[:1] = [t], [ids[pos + 1]]
+      eng.run(1, eng.v_pos.bind(pos))
+    want = eng.draft.cache.numpy()[..., :10, :].astype(np.float32)
+    eng.window(ids[:10], 0, ids[1:11])
+    tol = 3e-2 if amd_custom_kernels_supported(eng.devs) else 3e-3
+    np.testing.assert_allclose(eng.draft.cache.numpy()[..., :10, :].astype(np.float32), want, rtol=tol, atol=tol * np.abs(want).max())
+
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_generate_dspark(self):  # a scored draft's verify steps of widths 2 and 4 (a server's): the target's greedy tokens, its guesses kept
     from extra.k3.test_draft import dspark
