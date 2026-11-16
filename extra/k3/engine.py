@@ -649,10 +649,10 @@ class Engine:
       toks, g, score = self.step([t, *gs], len(tokens) - 1)
       row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
       self.verified += (1, len(gs), row)
-      for g in gs[:row]:
-        tokens.append(g)
+      for kept in gs[:row]:
+        tokens.append(kept)
         self.model._cached_tokens = tokens[:]
-        yield g
+        yield kept
       if row < len(gs): self.model.rollback(row + 1)
       t = toks[row]
 
