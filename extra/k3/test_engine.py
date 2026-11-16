@@ -202,9 +202,10 @@ class TestEngine(unittest.TestCase):
                                                                                                          "len": len(seq), "prompt": 3}]})
       np.testing.assert_equal(np.load(f"{out}/tokens.npy"), seq)
       np.testing.assert_equal(np.load(f"{out}/next.npy"), [lg.argmax() for lg, _ in want])
+      tol = 3e-2 if amd_custom_kernels_supported(eng.devs) else 1e-3  # (as test_window_states: a window's kernels apart from a step's)
       for j, n in enumerate(["0", "1m", "2m", "1"]):
         w = np.stack([h[j] for _, h in want])
-        np.testing.assert_allclose(np.load(f"{out}/tap{n}.npy"), w, rtol=1e-3, atol=1e-3 * np.abs(w).max(), err_msg=n)
+        np.testing.assert_allclose(np.load(f"{out}/tap{n}.npy"), w, rtol=tol, atol=tol * np.abs(w).max(), err_msg=n)
 
   def test_proposal(self):  # a scored draft's verify step: the width whose expected tokens (by the scores) a measured second are most, one not
     # measured first; unscored: every guess
