@@ -374,7 +374,7 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
 
 # kgroups: groups of 16 lanes that split k in a 16x16x16 fragment, RDNA3 copies a and b in both halves
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
-  return tuple(range(4)) if kgroups == 1 else tuple(lane_group + kgroups*j for j in range(4//kgroups))
+  return tuple(range(4)) if kgroups == 1 else tuple(lane_group*(4//kgroups) + j for j in range(4//kgroups))
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, lanes:int, heads:int=1, live:UOp|None=None):
   # heads: out's rows a head's in turn (a workgroup's one head's). live: a head's rows to compute (a symbolic count: the workgroups of those,
