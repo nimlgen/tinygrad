@@ -91,14 +91,14 @@ class Engine:
                                                                   for _ in range(2))
     # ([done | tokens | guesses | their scores (a scored draft's, f32)])
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + n * (1 + 2 * max(self.width, 1)), dtypes.int32)
-    self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, *widths})}
-    self.keep_jits = (TinyJit(self.keep), TinyJit(self.unkeep))
+    self.jits = {T: TinyJit(functools.partial(self.run, T), capture_first=True) for T in sorted({1, tokens, *widths})}
+    self.keep_jits = (TinyJit(self.keep, capture_first=True), TinyJit(self.unkeep, capture_first=True))
     self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
     self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}  # (measured: a step's seconds)
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
     self.cres, (self.cres_np,) = host_tensor(self.devs[0], max(tokens - 1, 1), dtypes.int32)  # ([done | guesses])
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
-    self.chain_jit = TinyJit(self.run_chain) if draft is not None and draft.width < tokens - 1 else None
+    self.chain_jit = TinyJit(self.run_chain, capture_first=True) if draft is not None and draft.width < tokens - 1 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
     self.window_s:collections.deque = collections.deque(maxlen=64)  # (measured: a window's tokens, seconds)
     # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states and the window's
@@ -258,12 +258,12 @@ class Engine:
     self.v_n, self.v_s = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1)
     self.v_tap = UOp.variable("tap", 0, self.piece_shapes()["taps"][0][2] - 1)
     self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
-    self.tap_jit, self.mix_jit = TinyJit(self.tap, arenas=self.arenas), TinyJit(self.tap_mix, arenas=self.arenas)
-    self.fill_jit = TinyJit(self.fill, arenas=self.arenas) if self.draft else None
+    self.wjit = functools.partial(TinyJit, arenas=self.arenas, capture_first=True)
+    self.tap_jit, self.mix_jit = self.wjit(self.tap), self.wjit(self.tap_mix)
+    self.fill_jit = self.wjit(self.fill) if self.draft else None
     # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
-    self.routes = {t: (TinyJit(functools.partial(self.window_route, t), arenas=self.arenas),
-                       TinyJit(functools.partial(self.window_experts, t), arenas=self.arenas)) for t in TILES}
-    self.start_jit = TinyJit(self.start, arenas=self.arenas)
+    self.routes = {t: (self.wjit(functools.partial(self.window_route, t)), self.wjit(functools.partial(self.window_experts, t))) for t in TILES}
+    self.start_jit = self.wjit(self.start)
 
   def window_lend(self):
     """the window's state lent from the pool's last slots, its graphs captured on it, their scratch (one arena) lent from the pool's first slots
@@ -299,13 +299,11 @@ class Engine:
       if first is not b: continue
       vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
         (self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_s.bind(0))
-      for _ in range(3): self.graph(jit, *vs, *args)
-    for _ in range(3):
-      self.graph(self.start_jit, self.v_p0.bind(0))
-      self.dry(moe[0])
-      self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
-      if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
-    for b in moe[1:]: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
+      self.graph(jit, *vs, *args)
+    self.graph(self.start_jit, self.v_p0.bind(0))
+    self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
+    if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
+    for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
 
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
@@ -354,7 +352,7 @@ class Engine:
         for u in t.uop.toposort():
           if u.op is Ops.BUFFER: seen.setdefault(u, None)
       key = (name, type(b), tuple((u.shape, u.dtype, u.nbytes()) for u in seen))
-      if key not in self.kinds: self.kinds[key] = (b, TinyJit(functools.partial(fxn, b), arenas=self.arenas), [])
+      if key not in self.kinds: self.kinds[key] = (b, self.wjit(functools.partial(fxn, b)), [])
       self.kinds[(name, b)] = (*self.kinds[key][:2], [Tensor(u) for u in seen])
     first, jit, args = self.kinds[(name, b)]
     return jit, args, first
@@ -596,12 +594,12 @@ class Engine:
     host_c().flags(ctypes.byref(self.io), 1)
     self.t_stage = time.perf_counter()
     for T, jit in self.jits.items():
-      for _ in range(3): jit(self.v_pos.bind(0))[0].tolist()
+      jit(self.v_pos.bind(0))[0].tolist()
       self.stage(f"step graph of {T}")
     for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
     for (i, save), _ in itertools.product(itertools.product(range(2), (True, False)), range(3)): self.model._copy(i, save)  # (and save's)
-    for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
-    for jit, _ in itertools.product(self.keep_jits, range(3)): jit(self.v_at.bind(0))  # (a kept session's copies)
+    if self.chain_jit: self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
+    for jit in self.keep_jits: jit(self.v_at.bind(0))  # (a kept session's copies)
     self.stage("rollbacks, saves, chain, session copies")
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int], np.ndarray|None]:
