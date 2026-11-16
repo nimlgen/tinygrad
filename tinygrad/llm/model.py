@@ -819,7 +819,7 @@ class Transformer:
     kept ones tokens extend: get_start_pos restores the deepest a prompt extends"""
     if not (states:=self._states()): return
     if not self._sets:
-      self._sets = [[s.clone() for s in states] for _ in range(2)]
+      self._sets = [[s.empty_like() for s in states] for _ in range(2)]
       Tensor.realize(*[s for st in self._sets for s in st])
     keep = [(t, i) for t, i in self._saved if len(t) < len(tokens) and tokens[:len(t)] == t][-1:]
     i = next(j for j in range(2) if all(j != k for _, k in keep))
