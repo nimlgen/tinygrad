@@ -271,6 +271,9 @@ class Engine:
     self.tail = self.lent_from = self.slots - self.slots_of(self.window_bytes) - self.slots_of(self.piece_bytes)
     self.win = {**self.window_state(self.tail), **self.piece(self.slots - self.slots_of(self.piece_bytes))}
     first, key = self.slots_of(self.cache_bytes), (self.devs, 0)
+    if first >= self.tail:
+      raise MemoryError(f"the pool's {self.slots * self.part / 1e9:.2f} GB under the caches' {self.cache_bytes / 1e9:.2f} GB and the window's "
+                        f"{(self.slots - self.tail) * self.part / 1e9:.2f} GB: no room for the window's graphs' scratch (a smaller CTX or WINDOW)")
     room = self.lend({"arena": (((self.tail - first) * self.part,), dtypes.int8)}, first)[0]["arena"].uop.base
     self.arenas.clear()
     self.arenas[key] = room
