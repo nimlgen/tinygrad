@@ -101,18 +101,19 @@ def _prepare_jit_inputs(args, kwargs):
   return input_buf_uops, var_vals, names, expected_input_info
 
 class _TinyJit(Generic[ReturnType]):
-  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False, arenas:dict|None=None):
+  def __init__(self, fxn:Callable[..., ReturnType]|None, captured:CapturedJit|None=None, prune=False, arenas:dict|None=None,
+               capture_first=False):
     assert fxn or captured, "need either a function or a CapturedJit"
     self.fxn = fxn
     self.captured: CapturedJit|None = captured
-    self.cnt: int = 2 if self.fxn is None else 0
-    self.prune, self.arenas = prune, arenas
+    self.prune, self.arenas, self.first = prune, arenas, int(capture_first)
+    self.cnt: int = 2 if self.fxn is None else self.first
 
   def add_linear(self, linear:UOp): self._linears.append(linear)
 
   def reset(self):
     assert self.fxn is not None, "can't reset without function"
-    self.cnt = 0
+    self.cnt = self.first
     self.captured = None
 
   def __reduce__(self):
@@ -178,7 +179,8 @@ class _TinyJit(Generic[ReturnType]):
 
 # overload signatures support both @TinyJit and @TinyJit(prune=True) syntax
 @overload
-def TinyJit(fxn:Callable[..., ReturnType], *, prune:bool=False) -> _TinyJit[ReturnType]: ...
+def TinyJit(fxn:Callable[..., ReturnType], *, prune:bool=False, arenas:dict|None=None, capture_first:bool=False) -> _TinyJit[ReturnType]: ...
 @overload
-def TinyJit(fxn:None=None, *, prune:bool=False) -> Callable[[Callable[..., ReturnType]], _TinyJit[ReturnType]]: ...
+def TinyJit(fxn:None=None, *, prune:bool=False, arenas:dict|None=None,
+            capture_first:bool=False) -> Callable[[Callable[..., ReturnType]], _TinyJit[ReturnType]]: ...
 def TinyJit(fxn=None, **kwargs): return (lambda f: _TinyJit(f, **kwargs)) if fxn is None else _TinyJit(fxn, **kwargs)
