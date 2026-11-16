@@ -76,14 +76,17 @@ class TestEngine(unittest.TestCase):
     folder = tempfile.mkdtemp()
     write(full:=pathlib.Path(folder)/'full.gguf', weights, True)
     write(trunk:=pathlib.Path(folder)/'trunk.gguf', weights, False)
-    self.ref, model, self.trunk = Transformer.from_gguf(full)[0], Transformer.from_gguf(trunk, shard=G)[0], trunk
-    # every expert in its slot, a code (layer * E + expert) a slot
+    self.ref, self.trunk, self.weights = Transformer.from_gguf(full)[0], trunk, weights
+    self.eng = self.engine(2 * E)
+
+  def engine(self, slots:int) -> Engine:  # (the engine on the trunk, every expert in its slot: a code (layer * E + expert) a slot, of slots)
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    self.eng = eng = Engine(model, m, slots=len(layers) * E, tokens=2, chunk=4, window=8)
-    pools = [b''.join(parts(weights, li, e, part)[g] for li in layers for e in range(E)).ljust(eng.slots * part, b'\0') for g in range(G)]
+    eng = Engine(Transformer.from_gguf(self.trunk, shard=G)[0], m, slots=slots, tokens=2, chunk=4, window=8)
+    pools = [b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E)).ljust(eng.slots * part, b'\0') for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
     eng.state["slot_of"][:] = eng.state["expert_in"][:len(layers) * E] = np.arange(len(layers) * E)
+    return eng
 
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
@@ -144,6 +147,20 @@ class TestEngine(unittest.TestCase):
     # (a window's rows symbolic: its kernels fused apart from a step's, a half's rounding apart, the toy's random weights amplify it; on AMD the
     # steps' experts take q8 activations. without its routed experts a window is 0.15 apart)
     self.assertLess(max(k for _, k in stats), 1e-2)
+
+  def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
+    ids, eng, tol = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4), 3e-3
+    self.eng, eng.keep_logits = eng, True
+    self.stub()
+    self.assertGreaterEqual(eng.pieces(), 2)
+    def run(t:int, pos:int) -> np.ndarray:
+      eng.tok_np[:1], eng.given_np[:1] = [t], ids[pos + 1:pos + 2] or [-1]
+      return eng.run(1, eng.v_pos.bind(pos))[1].numpy()
+    for pos, t in enumerate(ids[:11]): run(t, pos)
+    states, want = [s.numpy() for s in eng.model._states()], run(ids[11], 11)
+    eng.window(ids[:11], 0, ids[1:12])
+    for got, w in zip([s.numpy() for s in eng.model._states()], states): np.testing.assert_allclose(got, w, rtol=tol, atol=tol * np.abs(w).max())
+    np.testing.assert_allclose(run(ids[11], 11), want, rtol=tol, atol=tol * np.abs(want).max())
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []

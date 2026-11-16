@@ -8,6 +8,7 @@ import collections, ctypes, functools, itertools, os, signal, sys, time
 import numpy as np
 from typing import Callable
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
+from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.uop.ops import Ops
@@ -71,7 +72,9 @@ class Engine:
     model.save([])  # (and the two sets of saved recurrent states)
     # a step's graph for each count of tokens, their tokens and the draft's given tokens in host memory
     self.v_pos, self.v_live = UOp.variable("start_pos", 0, model.max_context - 1), UOp.variable("live", 1, max(chunk, 1))
-    (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], n, dtypes.int32) for _ in range(2))
+    # (a read window's tokens: up to the context's)
+    (self.tok, (self.tok_np,)), (self.given, (self.given_np,)) = (host_tensor(self.devs[0], max(n, model.max_context), dtypes.int32)
+                                                                  for _ in range(2))
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + 2 * n, dtypes.int32)  # (a step's [done | tokens | guesses])
     self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens})}
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
@@ -86,12 +89,15 @@ class Engine:
     def pool(n:int) -> Tensor: return Tensor.zeros(G * n * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
     self.pool, self.W = pool(1), 0
     if window: self.window_init(window)
-    self.win, lent = {}, -(-self.window_bytes // self.part) if window else 0  # (the window's own state freed)
+    # (the window's own state freed; lent: its compute state and a piece's, the slots of more pieces lent at a prefill)
+    self.win, lent, self.layer = {}, self.slots_of(self.window_bytes) + self.slots_of(self.piece_bytes) if window else 0, 0
     self.tail = slots or (min(free_bytes(d) for d in self.devs) - SPARE) // self.part - lent
     self.slots = slots = self.tail + lent
+    self.lent_from = self.tail
     self.pool = pool(slots)
     if window:
-      self.win = self.window_state(self.tail)
+      self.win = {**self.window_state(self.tail), **self.piece(self.slots - self.slots_of(self.piece_bytes))}
+      self.lent_from = self.tail
       for _, experts in self.routes.values(): experts.reset()  # (captured again on the pool: the decoded experts' gather from it is of its size)
       for b in (moe:=[b for b in model.blk if hasattr(b, "ffn_gate_inp")])[:1] * 2 + moe: self.dry(b)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
@@ -193,7 +199,8 @@ class Engine:
     its last slots)"""
     m = self.model
     self.W, S = W, 1 + sum(b.attn_res_score.new_block for b in m.blk)
-    self.win = self.window_state()
+    self.win = {**self.window_state(), **self.piece()}
+    self.v_p0 = UOp.variable("p0", 0, self.max_context - 1)  # (a piece's first token in the read window)
     self.v_c0, self.v_wlive = UOp.variable("c0", 0, W - self.chunk), UOp.variable("wlive", 1, W)
     self.v_n, self.v_s = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1)
     self.v_tap = UOp.variable("tap", 0, self.win["taps"].shape[2] - 1)
@@ -214,10 +221,10 @@ class Engine:
         (self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_s.bind(0))
       for _ in range(3): self.graph(jit, *vs, *args)
     for _ in range(3):
-      self.graph(self.start_jit)
+      self.graph(self.start_jit, self.v_p0.bind(0))
       self.dry(moe[0])
       self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
-      if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_c0.bind(0))
+      if self.fill_jit: self.graph(self.fill_jit, self.v_pos.bind(0), self.v_p0.bind(0), self.v_c0.bind(0))
     for b in moe: self.dry(b)  # (and once on every moe layer's host buffers: their first use maps them on each gpu, a first window would wait)
 
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
@@ -227,25 +234,33 @@ class Engine:
       self.graph(experts, self.pool, self.parts[0][li])
 
   def window_state(self, at:int|None=None) -> dict[str, Tensor]:
-    """the window's state: the bank of the residual streams, the moe's inputs and outputs (the routed experts' inputs and outputs, the shared
-    experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs, the draft's inputs. at: lent from
-    the pool's slots from at on, else buffers of its own"""
+    """the window's compute state (a piece of W tokens'): the moe's inputs and outputs (the routed experts' inputs and outputs, the shared
+    experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs. at: lent from the pool's slots
+    from at on, else buffers of its own"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
-    S, R, f32, i32 = 1 + sum(b.attn_res_score.new_block for b in self.model.blk), max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    shapes = {"bank": ((1, W, S, c.dim), f32), "h": ((W, self.lat), f32), "shared": ((W, c.dim), f32), "logits": ((W, E), f32),
-              "out": ((W, self.lat), f32), "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32),
-              "tiles": ((R // TILES[0],), i32),
-              "taps": ((1, W, len(self.draft.layers) if self.draft else 1, c.dim), f32), "act": ((R, self.units), dtypes.half),
+    R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
+    shapes = {"h": ((W, self.lat), f32), "shared": ((W, c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32), "w": ((W, K), f32),
+              "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32), "act": ((R, self.units), dtypes.half),
               "down": ((R, self.lat), dtypes.half)}
+    state, self.window_bytes = self.lend(shapes, at)
+    return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down") else t for k, t in state.items()}
+
+  def piece(self, at:int|None=None) -> dict[str, Tensor]:
+    """a piece's state: the bank of its W tokens' residual streams, the draft's inputs. at: lent from the pool's slots from at on"""
+    c, S = self.model.config, 1 + sum(b.attn_res_score.new_block for b in self.model.blk)
+    shapes = {"bank": ((1, self.W, S, c.dim), dtypes.float), "taps": ((1, self.W, len(self.draft.layers) if self.draft else 1, c.dim), dtypes.float)}
+    state, self.piece_bytes = self.lend(shapes, at)
+    return state
+
+  def lend(self, shapes:dict[str, tuple[tuple[int, ...], DType]], at:int|None) -> tuple[dict[str, Tensor], int]:
+    """buffers of shapes on every gpu, lent from the pool's slots from at on (else their own), and their bytes"""
     state, off = {}, (at or 0) * self.part
-    self.window_bytes = sum(round_up(prod(shape) * dt.itemsize, 256) for shape, dt in shapes.values())
     for k, (shape, dt) in shapes.items():
       n = prod(shape) * dt.itemsize
       (mb:=MultiBuffer.__new__(MultiBuffer)).bufs = [(Buffer(d, n, base=p, offset=off) if at is not None else Buffer(d, n)).allocate()
                                                      for d, p in zip(self.devs, self.pool.uop.buffer.bufs)]
-      t = Tensor(UOp.from_buffer(mb, dt, self.devs)).reshape(shape)
-      state[k], off = Tensor(t.uop.unshard(0)) if k in ("act", "down") else t, off + round_up(n, 256)
-    return state
+      state[k], off = Tensor(UOp.from_buffer(mb, dt, self.devs)).reshape(shape), off + round_up(n, 256)
+    return state, off - (at or 0) * self.part
 
   def scorer(self, b:FFNBlock) -> Tensor|Linear|None:  # (a moe block's router, the engine's)
     return self.scorers[self.m["layers"].index(i)] if (i:=self.model.blk.index(b)) in self.m["layers"] else None
@@ -282,7 +297,7 @@ class Engine:
   def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:  # (y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0)
     # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows)
     bank, C = Tensor(self.win["bank"].uop), self.chunk
-    return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + y.pad_to((1, C, y.shape[2])))
+    return bank[:, c0:c0 + C, s].assign((bank[:, c0:c0 + C, s] + y.pad_to((1, C, y.shape[2]))).cast(bank.dtype))
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
@@ -333,29 +348,47 @@ class Engine:
     return self.add(s, c0, y).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
-    return Tensor(self.win["taps"].uop)[:, :, j].assign(Tensor(self.win["bank"].uop)[:, :, s]).realize()
+    return Tensor(self.win["taps"].uop)[:, :, j].assign(Tensor(self.win["bank"].uop)[:, :, s].float()).realize()
 
-  def fill(self, pos:UOp, c0:UOp, *_) -> Tensor:  # (the draft's cache of a chunk of the window)
+  def fill(self, pos:UOp, p0:UOp, c0:UOp, *_) -> Tensor:  # (the draft's cache of a chunk of the piece at p0 of the read window)
     C = self.chunk
-    return self.draft.fill(self.given[c0:c0 + C].reshape(1, C).to(self.devs), Tensor(self.win["taps"].uop)[:, c0:c0 + C], pos).realize()
+    given = self.given[p0 + c0:p0 + c0 + C].reshape(1, C).to(self.devs)
+    return self.draft.fill(given, Tensor(self.win["taps"].uop)[:, c0:c0 + C].float(), pos).realize()
 
-  def start(self, *_) -> Tensor:  # (the bank's streams: the window's tokens' embeddings, the rest zero)
-    emb = self.model.token_embd(self.tok[:self.W].reshape(1, self.W).to(self.devs)).float().unsqueeze(2)
-    return Tensor(self.win["bank"].uop).assign(emb.pad(((0, 0), (0, 0), (0, self.win["bank"].shape[2] - 1), (0, 0)))).realize()
+  def start(self, p0:UOp, *_) -> Tensor:  # (a piece's bank of streams: its tokens' embeddings, the rest zero)
+    emb = self.model.token_embd(self.tok[p0:p0 + self.W].reshape(1, self.W).to(self.devs)).unsqueeze(2)
+    bank = Tensor(self.win["bank"].uop)
+    return bank.assign(emb.pad(((0, 0), (0, 0), (0, bank.shape[2] - 1), (0, 0))).cast(bank.dtype)).realize()
+
+  def slots_of(self, n:int) -> int: return -(-n // self.part)  # (the pool's slots n bytes take)
+
+  def pieces(self) -> int:  # (a read window's pieces: the pool past two layers' experts (the one routed, the one read ahead) lent)
+    return 1 + max(0, (self.tail - 2 * self.m["n_experts"]) // self.slots_of(self.piece_bytes))
 
   def window(self, toks:list[int], pos:int, given:list[int]):
-    """the tokens at positions pos.. through every block, a layer at a time: the caches and states as after steps of them, the draft's cache"""
-    T, C, t0 = len(toks), self.chunk, time.perf_counter()
-    assert T <= self.W and pos + round_up(T, C) <= self.max_context
+    """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
+    a layer's experts read once a read window. the caches and states as after steps of them, the draft's cache"""
+    T, C, W, t0 = len(toks), self.chunk, self.W, time.perf_counter()
+    assert T <= W * self.pieces() and pos + round_up(T, C) <= self.max_context
     self.tok_np[:T], self.given_np[:T] = toks, given
-    st = self.state
-    st["slot_of"][(c:=st["expert_in"][self.tail:])[c >= 0]], st["expert_in"][self.tail:] = -1, -1  # (the lent slots the window's)
-    self.graph(self.start_jit)
+    ps, st = self.slots_of(self.piece_bytes), self.state
+    # (the pieces' states: the first the always lent one, the rest lent below the compute state's slots, their experts dropped)
+    banks = [{k: self.win[k] for k in ("bank", "taps")}] + [self.piece(self.tail - i * ps) for i in range(1, -(-T // W))]
+    self.lent_from = self.tail - (len(banks) - 1) * ps
+    st["slot_of"][(c:=st["expert_in"][self.lent_from:])[c >= 0]], st["expert_in"][self.lent_from:] = -1, -1
+    pieces = [(p0, min(W, T - p0), bank) for p0, bank in zip(range(0, T, W), banks)]
+    for p0, _, bank in pieces:
+      self.win.update(bank)
+      self.graph(self.start_jit, self.v_p0.bind(p0))
     host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
-    ahead = self.layers(T, pos)
-    for c0 in range(0, T, C) if self.fill_jit else []: self.graph(self.fill_jit, self.v_pos.bind(pos + c0), self.v_c0.bind(c0))
+    ahead = self.layers(pieces, pos)
+    for p0, n, bank in pieces if self.fill_jit else []:
+      self.win.update(bank)
+      for c0 in range(0, n, C): self.graph(self.fill_jit, self.v_pos.bind(pos + p0 + c0), self.v_p0.bind(p0), self.v_c0.bind(c0))
     for d in self.devs: Device[d].synchronize()
     for li in ahead: self.counted(li)
+    self.win.update(banks[0])
+    self.lent_from = self.tail
     self.costs["window"].append((T, time.perf_counter() - t0))
 
   def steps_faster(self, n:int) -> bool:
@@ -366,35 +399,40 @@ class Engine:
     b, a = np.polyfit(*zip(*windows), 1)
     return n * float(np.mean(steps)) < a + b * n
 
-  def layers(self, T:int, pos:int) -> list[int]:
-    """a window's blocks, a layer at a time. a moe layer's experts its tokens route to read in (the host waits for the gpus' counts), their
-    slots given to the gpus. when its tokens route to nearly all of a layer's experts, every next layer's are read ahead while the gpus work
-    (and not waited for: those layers' counted after the window). returns those"""
-    chunks, n, E, ahead = [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)], 1, self.m["n_experts"], []
+  def layers(self, pieces:list[tuple[int, int, dict[str, Tensor]]], pos:int) -> list[int]:
+    """a read window's blocks, a layer at a time over its pieces. a moe layer's experts a piece's tokens route to read in (the host waits for
+    the gpus' counts), their slots given to the gpus, kept till the layer's done. when a piece's tokens route to nearly all of a layer's
+    experts, every next layer's are read ahead while the gpus work (and not waited for: those layers' counted after the window). returns
+    those"""
+    n, E, K, ahead = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, []
+    def chunks(T:int) -> list[tuple[int, int]]: return [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)]
     for i, b in enumerate(self.model.blk):
       s = n - 1 + int(b.attn_res_score.new_block)
-      jit, args, _ = self.kind("attend", b, self.attend)
-      for c0, live in chunks:
-        self.graph(jit, self.v_pos.bind(pos + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
-        self.pump()
-      if hasattr(b, "ffn_gate_inp"):
-        li = self.m["layers"].index(i)
-        route, experts = self.routes[next(t for t in TILES if T * self.model.config.num_experts_per_tok <= t * E or t == TILES[-1])]
-        self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-        codes = li * E + (np.arange(E) if ahead else np.nonzero(self.counted(li))[0])
-        t0 = time.perf_counter()
-        self.read(codes, codes, wait=True)
-        self.io.t_reads += time.perf_counter() - t0
-        for p in self.bufs[li][2][1]: p[1:1 + E] = self.state["slot_of"][li * E:(li + 1) * E].view(np.uint32)
-        self.graph(experts, self.pool, self.parts[0][li])
-        if li + 1 < len(self.parts[0]) and (ahead or len(codes) >= 0.9 * E):
-          self.read((li + 1) * E + np.arange(E), codes, wait=False)
-          ahead.append(li + 1)
-        jit, args, _ = self.kind("post", b, self.post)
-        for c0, live in chunks:
-          self.graph(jit, self.v_live.bind(live), self.v_c0.bind(c0), self.v_s.bind(s), *args)
+      for p0, T, bank in pieces:
+        self.win.update(bank)
+        jit, args, _ = self.kind("attend", b, self.attend)
+        for c0, live in chunks(T):
+          self.graph(jit, self.v_pos.bind(pos + p0 + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
           self.pump()
-      if self.draft and i in self.draft.layers: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
+        if hasattr(b, "ffn_gate_inp"):
+          self.layer = li = self.m["layers"].index(i)
+          route, experts = self.routes[next(t for t in TILES if T * K <= t * E or t == TILES[-1])]
+          for t in self.bufs[li][0][1]: t[0] = 0  # (the tag: this piece's counts)
+          self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+          codes = li * E + (np.arange(E) if li in ahead else np.nonzero(self.counted(li))[0])
+          t0 = time.perf_counter()
+          self.read(codes, codes, wait=True)
+          self.io.t_reads += time.perf_counter() - t0
+          for p in self.bufs[li][2][1]: p[1:1 + E] = self.state["slot_of"][li * E:(li + 1) * E].view(np.uint32)
+          self.graph(experts, self.pool, self.parts[0][li])
+          if li + 1 < len(self.parts[0]) and li + 1 not in ahead and (li in ahead or len(codes) >= 0.9 * E):
+            self.read((li + 1) * E + np.arange(E), codes, wait=False)
+            ahead.append(li + 1)
+          jit, args, _ = self.kind("post", b, self.post)
+          for c0, live in chunks(T):
+            self.graph(jit, self.v_live.bind(live), self.v_c0.bind(c0), self.v_s.bind(s), *args)
+            self.pump()
+        if self.draft and i in self.draft.layers: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
       n = s + 1
     return ahead
 
@@ -424,9 +462,9 @@ class Engine:
     if wait and len(reads[0]) and (err:=host_c().read_wait(ctypes.byref(io), len(reads[0]), reads[0].ctypes.data)):
       raise RuntimeError(f"window reads failed {err}")
     if not len(miss:=reads[1]): return
-    keep = np.arange(self.slots) >= self.tail
+    old, E = st["expert_in"], self.m["n_experts"]
+    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= self.layer * E) & (old < (self.layer + 2) * E))  # (a read window's layers' kept)
     keep[st["slot_of"][busy][st["slot_of"][busy] >= 0]] = True
-    old = st["expert_in"]
     keep |= (old >= 0) & (st["flying"][np.maximum(old, 0)] > 0)
     victims = np.ascontiguousarray(np.argsort(np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0)),
                                               kind="stable")[:len(miss)], np.int64)
@@ -492,7 +530,8 @@ class Engine:
     partial (its rows padded), unless steps of them are faster (steps_faster), the position after them"""
     if not self.W: return pos
     end = len(tokens) - 1
-    size = -(-(end - pos) // -(-(end - pos) // self.W)) if end > pos else self.W
+    P = self.W * self.pieces()  # (a read window's most tokens)
+    size = -(-(end - pos) // -(-(end - pos) // P)) if end > pos else P
     while pos < end and pos + round_up(n:=min(size, end - pos), self.chunk) <= self.max_context:
       if self.steps_faster(n): break
       self.window(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])

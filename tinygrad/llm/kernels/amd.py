@@ -1045,7 +1045,7 @@ def _res_slice(tokens:int|UOp, dim:int) -> tuple[int, UOp, UOp, UOp, UOp, list[U
 def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int|UOp, streams:int, dim:int, start:int|UOp) -> UOp:
   """a workgroup's slice of its token's streams' gram matrix (upper triangle) and of their dots with the mix weight"""
   G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
-  xv = [[xs.reshape(-1, streams, dim)[start + tw//G, s, i].load() for i in idx] for s in range(streams)]
+  xv = [[xs.reshape(-1, streams, dim)[start + tw//G, s, i].load().float() for i in idx] for s in range(streams)]
   w, zero = [wm[i].load().float() for i in idx], UOp.const(0, dtypes.float)
   vals = [sum((a*b for a, b in zip(xv[s], xv[r])), zero) for s in range(streams) for r in range(s, streams)] + \
          [sum((a*b for a, b in zip(xv[s], w)), zero) for s in range(streams)]
@@ -1074,7 +1074,7 @@ def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int|UOp, stream
   esum = sum(e[1:], e[0])
   rn = 1 / (sum((e[s] * e[r] * gram(s, r) for s in range(streams) for r in range(streams)), zero) / (esum * esum) * (1/dim) + norm_eps).sqrt()
   x = xs.reshape(-1, streams, dim)
-  return UOp.group(*[y.reshape(-1, dim)[t, i].store(sum((e[s] * x[start + t, s, i].load() for s in range(streams)), zero)
+  return UOp.group(*[y.reshape(-1, dim)[t, i].store(sum((e[s] * x[start + t, s, i].load().float() for s in range(streams)), zero)
                                                          / esum * rn * wn[i].load().float()) for i in idx]) \
     .end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_norm", opts_to_apply=()))
 
