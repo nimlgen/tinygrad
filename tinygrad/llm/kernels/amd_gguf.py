@@ -731,7 +731,8 @@ def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|Non
   padded = (counts + tile - 1) // tile * tile
   first = padded.cumsum() - padded
   pos = ok.where((onehot.where(first.reshape(1, E) + onehot.cast(dtypes.int32).cumsum(0) - 1, 0)).sum(-1), -1).cast(dtypes.int32)
-  entries = Tensor.full((R + 1,), -1, dtype=dtypes.int32, device=logits.device).contiguous().scatter(0, ok.where(pos, R), Tensor.arange(N, dtype=dtypes.int32).to(logits.device))[:R]
+  entries = Tensor.full((R + 1,), -1, dtype=dtypes.int32, device=logits.device).contiguous()
+  entries = entries.scatter(0, ok.where(pos, R), Tensor.arange(N, dtype=dtypes.int32).to(logits.device))[:R]
   start = Tensor.arange(R // tile).reshape(-1, 1) * tile
   tiles = ((first.reshape(1, E) <= start) & (start < (first + padded).reshape(1, E))).where(Tensor.arange(E).reshape(1, E) + 1, 0).sum(-1) - 1
   return ok.reshape(T, k).where(w, 0.0), pos, entries, tiles.cast(dtypes.int32), counts
