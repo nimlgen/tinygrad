@@ -211,7 +211,7 @@ class Engine:
       jit, args, first = self.kind(name, b, fxn)
       if first is not b: continue
       vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
-        (self.v_c0.bind(0), self.v_s.bind(0))
+        (self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_s.bind(0))
       for _ in range(3): self.graph(jit, *vs, *args)
     for _ in range(3):
       self.graph(self.start_jit)
@@ -264,19 +264,25 @@ class Engine:
     return jit, args, first
 
   def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_) -> Tensor:
-    """a chunk's attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a moe's
-    parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s"""
-    C, bank = self.chunk, Tensor(self.win["bank"].uop)
-    h = b.attn_res_score.mix(bank, b.attn_norm, n, (c0, C))
+    """a chunk's live rows' attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a
+    moe's parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s. the rows symbolic: a
+    kernel's work the live rows'"""
+    bank = Tensor(self.win["bank"].uop)
+    h = b.attn_res_score.mix(bank, b.attn_norm, n, (c0, live))
     a = b._attention(h, (pos,), b._indexer_mask(h, (pos,), None), live)
-    bank = Tensor(self.win["bank"].uop.after(bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + a).uop))
-    x = b.ffn_res_score.mix(bank, b.ffn_norm, s + 1, (c0, C))
-    if not hasattr(b, "ffn_gate_inp"): return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + b._feed_forward(x)).realize()
+    bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
+    x = b.ffn_res_score.mix(bank, b.ffn_norm, s + 1, (c0, live))
+    if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, b._feed_forward(x)).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
-    logits = logits.reshape(C, len(self.devs), 2, -1)[:, :, 0].reshape(C, -1).contiguous()
+    logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["shared"], b._shared(x)[0]), (self.win["logits"], logits)]
-    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + C].assign(v) for t, v in outs])[0]
+    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs])[0]
+
+  def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:  # (y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0)
+    # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows)
+    bank, C = Tensor(self.win["bank"].uop), self.chunk
+    return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + y.pad_to((1, C, y.shape[2])))
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
@@ -321,11 +327,10 @@ class Engine:
     y = (y if act is None else act(*y.split(out_f // 2, -1))).cast(out.dtype)
     return Tensor(out.uop).assign(y.reshape(out.shape)).reshape(len(self.devs), NT * tile, -1)
 
-  def post(self, b:FFNBlock, c0:UOp, s:UOp, *_) -> Tensor:
-    """a chunk's routed and shared experts' outputs into the block's, added to stream s"""
-    C, bank = self.chunk, Tensor(self.win["bank"].uop)
-    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + C].unsqueeze(0), Tensor(self.win["shared"].uop)[c0:c0 + C].unsqueeze(0))
-    return bank[:, c0:c0 + C, s].assign(bank[:, c0:c0 + C, s] + y).realize()
+  def post(self, b:FFNBlock, live:UOp, c0:UOp, s:UOp, *_) -> Tensor:
+    """a chunk's live rows' routed and shared experts' outputs into the block's, added to stream s"""
+    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + live].unsqueeze(0), Tensor(self.win["shared"].uop)[c0:c0 + live].unsqueeze(0))
+    return self.add(s, c0, y).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
     return Tensor(self.win["taps"].uop)[:, :, j].assign(Tensor(self.win["bank"].uop)[:, :, s]).realize()
@@ -386,8 +391,8 @@ class Engine:
           self.read((li + 1) * E + np.arange(E), codes, wait=False)
           ahead.append(li + 1)
         jit, args, _ = self.kind("post", b, self.post)
-        for c0, _ in chunks:
-          self.graph(jit, self.v_c0.bind(c0), self.v_s.bind(s), *args)
+        for c0, live in chunks:
+          self.graph(jit, self.v_live.bind(live), self.v_c0.bind(c0), self.v_s.bind(s), *args)
           self.pump()
       if self.draft and i in self.draft.layers: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(self.draft.layers.index(i)))
       n = s + 1

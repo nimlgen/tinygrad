@@ -99,10 +99,12 @@ class Linear(nn.Linear):
         self.use_custom_quant = supported = False  # not a supported quant format
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
-      # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
-      out = q8_linear(self, x.pad_to(x.max_shape))
+      # symbolic token count: padded to the max chunk size (static shapes), the kernel's rows those there are, the rest sliced off
+      out = q8_linear(self, x.pad_to(x.max_shape), rows=cast(UOp, prod(x.shape[:-1])))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
-    return super().__call__(x)
+    if isinstance(x.numel(), int): return super().__call__(x)
+    # (a symbolic token count: the matmul on the max rows, static and its own kernel, as the quantized ones)
+    return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -423,7 +425,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 
 @functools.cache
 def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
-                                kept:UOp|None=None) -> UOp:
+                                kept:UOp|None=None, live:UOp|None=None) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -439,7 +441,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
-  token = UOp.range(tokens, 2, AxisType.LOOP)
+  token = UOp.range(tokens if live is None else live, 2, AxisType.LOOP)  # (live: the tokens there are, the rest padding)
   keys = tuple(k[bh, token, col].load() for col in cols)
   queries = tuple(q[bh, token, col].load() for col in cols)
   updates, stores = [], []
@@ -460,8 +462,9 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
-                        kept:Tensor|None=None) -> Tensor:
-  """the scan's outputs; state updated in place, kept (n, *state.shape) the states after each of the first n tokens"""
+                        kept:Tensor|None=None, live:int|UOp|None=None) -> Tensor:
+  """the scan's outputs; state updated in place, kept (n, *state.shape) the states after each of the first n tokens. live: the tokens scanned
+  (a symbolic count, the rest padding: their outputs garbage)"""
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
@@ -474,10 +477,12 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
     state = Tensor(state.uop.after(start_pos.uop))
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
   assert kept is None or kept.uop.contiguous_view_offset() is not None, "kept states must be contiguous"
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq, *([] if kept is None else [kept]))
+  srcs = (core, _carry(q.contiguous(), *([] if live is None else [live])), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(),
+          state, kq, *([] if kept is None else [kept]))
   contig = tuple(x.uop if x.uop.op is Ops.AFTER or x is kept else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params[:8], None if start_pos is None else start_pos.uop.unbound(), *params[8:]).call(*contig)
+  call = _gated_delta_prefill_kernel(*params[:8], None if start_pos is None else start_pos.uop.unbound(), *params[8:],
+                                     **({} if live is None else {"live": _unbind(live)})).call(*contig)
   return Tensor(contig[0].after(call))
 
 KDA_ROWS = 8  # the rows of a head's state a wave updates in kda_decode
@@ -791,7 +796,7 @@ def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
                              dtype=dtypes.float, fmt=True).call(x, (src*4).cast(dtypes.int32))
 
 @functools.cache
-def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float) -> UOp:
+def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, rows:int|UOp) -> UOp:
   """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its slots of
   idx[b, t] (or every position) of the first start + T at or before it, on the f16 tensor cores (RDNA4). a workgroup a row: its heads in two
   tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (two buffers by its parity). a tile's 4 waves each the scores of
@@ -801,7 +806,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
   K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
   assert H <= 32 and D == 2*DW and D % 64 == 0 and V % 64 == 0
-  row, lane, wave = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(8, 1, AxisType.LOCAL)
+  row, lane, wave = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(8, 1, AxisType.LOCAL)
   b, t, tid, tile, part, ph, col = row // T, row % T, wave*WARP_SIZE + lane, wave // 4, wave % 4, lane // 16, lane % 16
   ks = [4*ph + i for i in range(4)] + [8 + 4*ph + i for i in range(4)]  # (a lane's 8 of a fragment's 16 inputs)
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
@@ -855,13 +860,17 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   return UOp.group(*stores).end(lane, wave, row).sink(arg=KernelInfo(name="mla_wmma", opts_to_apply=()))
 
 def mla_wmma_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
-  """mla_topk_attention on the f16 tensor cores (RDNA4, up to 32 heads a device): the queries and probabilities in half, sums in float"""
+  """mla_topk_attention on the f16 tensor cores (RDNA4, up to 32 heads a device): the queries and probabilities in half, sums in float. a symbolic
+  T: the buffers its max's, the rows those there are"""
   B, H, T, _ = q.shape
-  out = Tensor.empty(B*T, H, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
+  N = T if isinstance(T, int) else T.vmax
+  out = Tensor.empty(B*N, H, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
-  out = Tensor.custom_kernel(out, q.contiguous(), cache.bitcast(dtypes.uint32), *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
-                             fxn=functools.partial(_mla_wmma_kernel, start=start, scale=scale))[0]
-  return out.reshape(B, T, H, values).transpose(1, 2)
+  if idx is not None and not isinstance(T, int): idx = idx.pad_to(idx.max_shape)
+  out = Tensor.custom_kernel(out, _carry(q.pad_to(q.max_shape).contiguous(), T), cache.bitcast(dtypes.uint32),
+                             *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
+                             fxn=functools.partial(_mla_wmma_kernel, start=start, scale=scale, rows=_unbind(B*T)))[0]
+  return out.reshape(B, N, H, values)[:, :T].transpose(1, 2)
 def mla_topk_supported(device:str|tuple[str, ...]|None, values:int) -> bool:
   """mla_topk_attention's gpus and shapes: a value a lane's dims of a wave"""
   return amd_custom_kernels_supported(device) and values % WARP_SIZE == 0
@@ -871,7 +880,7 @@ def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
   idx (B, T, K) (of the first start + T slots, at or before the query; None: every position, causal), a row's value its first values dims"""
   B, H, T, D = q.shape
   local = q.uop.shard_shape[1] if q.uop.axis == 1 else H
-  if _is_rdna4(q.device) and isinstance(T, int) and T >= 16 and local <= 32 and D % 64 == 0 and values % 64 == 0:
+  if _is_rdna4(q.device) and q.max_shape[2] >= 16 and local <= 32 and D % 64 == 0 and values % 64 == 0:
     return mla_wmma_attention(q, cache, idx, start, values, scale)  # (a chunk's rows: the tensor cores)
   parts = 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
@@ -972,6 +981,7 @@ def _allreduce_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, T:int, EP:int
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,
   larger float ones on the gpus in half (their copies half the bytes)"""
+  if not all(isinstance(d, int) for d in x.shape): return partial_sum(x.pad_to(x.max_shape)).shrink(tuple((0, d) for d in x.shape[1:]))
   if x.uop.axis != 0 or not (shape:=_mailbox_shape(x, n:=prod(x.shape[1:]))):
     return x.half().sum(0).cast(x.dtype) if x.dtype == dtypes.float32 and amd_custom_kernels_supported(x.device) else x.sum(0)
   fxn = functools.partial(_allreduce_kernel, n=n, T=shape[0], EP=shape[1])
@@ -1015,6 +1025,7 @@ def allgather_last(x:Tensor) -> Tensor:
   """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes, larger float ones on the gpus copied
   in half"""
   if x.uop.axis != x.ndim-1 or not isinstance(devs:=x.device, tuple): return x
+  if not all(isinstance(d, int) for d in x.shape): return allgather_last(x.pad_to(x.max_shape)).shrink(tuple((0, d) for d in x.shape))
   if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))):
     if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs): return Tensor(x.half().uop.copy_to_device(devs)).cast(x.dtype)
     return Tensor(x.uop.copy_to_device(devs))
@@ -1025,13 +1036,13 @@ def allgather_last(x:Tensor) -> Tensor:
 
 RES_WAVES, RES_PER = 4, 2  # a workgroup's waves and the 32 wide groups of a wave
 RES_MAX_STREAMS = 14  # streams*(streams+3)//2 partials must fit the workgroup's 128 threads
-def _res_slice(tokens:int, dim:int) -> tuple[int, UOp, UOp, UOp, UOp, list[UOp]]:
+def _res_slice(tokens:int|UOp, dim:int) -> tuple[int, UOp, UOp, UOp, UOp, list[UOp]]:
   G = dim // (RES_WAVES * RES_PER * WARP_SIZE)  # (a token's workgroups)
   tw, lane, wave = UOp.range(tokens*G, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, AxisType.WARP), UOp.range(RES_WAVES, 1, AxisType.LOCAL)
   return G, tw, lane, wave, wave*WARP_SIZE + lane, [((tw%G*RES_WAVES + wave)*RES_PER + k)*WARP_SIZE + lane for k in range(RES_PER)]
 
 @functools.cache
-def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int, streams:int, dim:int, start:int|UOp) -> UOp:
+def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int|UOp, streams:int, dim:int, start:int|UOp) -> UOp:
   """a workgroup's slice of its token's streams' gram matrix (upper triangle) and of their dots with the mix weight"""
   G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
   xv = [[xs.reshape(-1, streams, dim)[start + tw//G, s, i].load() for i in idx] for s in range(streams)]
@@ -1045,7 +1056,7 @@ def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int, streams:int, d
   return store.end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_partial", opts_to_apply=()))
 
 @functools.cache
-def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:int, dim:int, eps:float, norm_eps:float, count:UOp|None,
+def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int|UOp, streams:int, dim:int, eps:float, norm_eps:float, count:UOp|None,
                          start:int|UOp) -> UOp:
   """y = rmsnorm(sum_s p_s xs_s) * wn, p the softmax over the streams of (rmsnorm(xs_s) * wm).sum(): a workgroup sums its token's partials
   (the norm's sum of squares is p G p of the gram matrix G) and does its slice. count: the streams mixed (the rest zero, left out)"""
@@ -1063,7 +1074,7 @@ def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int, streams:in
   esum = sum(e[1:], e[0])
   rn = 1 / (sum((e[s] * e[r] * gram(s, r) for s in range(streams) for r in range(streams)), zero) / (esum * esum) * (1/dim) + norm_eps).sqrt()
   x = xs.reshape(-1, streams, dim)
-  return UOp.group(*[y.reshape(tokens, dim)[t, i].store(sum((e[s] * x[start + t, s, i].load() for s in range(streams)), zero)
+  return UOp.group(*[y.reshape(-1, dim)[t, i].store(sum((e[s] * x[start + t, s, i].load() for s in range(streams)), zero)
                                                          / esum * rn * wn[i].load().float()) for i in idx]) \
     .end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_norm", opts_to_apply=()))
 
@@ -1072,11 +1083,13 @@ def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float, cou
   rows: (start, n) the mix of xs's rows start.. (B 1, read in place)"""
   B, T, streams, dim = cast(tuple[int, int, int, int], xs.shape)
   assert 1 <= streams <= RES_MAX_STREAMS and (rows is None or B == 1)
-  start, T = rows or (0, T)
-  part = Tensor.empty(B*T*dim // (RES_WAVES*RES_PER*WARP_SIZE), streams*(streams+1)//2 + streams, dtype=dtypes.float32, device=xs.device)
-  fxn = functools.partial(_res_mix_partial_kernel, tokens=B*T, streams=streams, dim=dim, start=_unbind(start))
-  part = Tensor.custom_kernel(part, _carry(xs, start), wm, fxn=fxn)[0]
-  y = Tensor.empty(B, T, dim, dtype=dtypes.float32, device=xs.device)
-  fxn = functools.partial(_res_mix_norm_kernel, tokens=B*T, streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
+  start, n = rows or (0, T)
+  N = n if isinstance(n, int) else n.vmax  # (a symbolic n: the buffers its max's, its rows those there are)
+  part = Tensor.empty(B*N*dim // (RES_WAVES*RES_PER*WARP_SIZE), streams*(streams+1)//2 + streams, dtype=dtypes.float32, device=xs.device)
+  fxn = functools.partial(_res_mix_partial_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, start=_unbind(start))
+  part = Tensor.custom_kernel(part, _carry(xs, start, n), wm, fxn=fxn)[0]
+  y = Tensor.empty(B, N, dim, dtype=dtypes.float32, device=xs.device)
+  fxn = functools.partial(_res_mix_norm_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
                           count=None if count is None else _unbind(count), start=_unbind(start))
-  return Tensor.custom_kernel(y, part, wn, _carry(xs, start, *([] if count is None else [count])), fxn=fxn)[0]
+  y = Tensor.custom_kernel(y, part, wn, _carry(xs, start, n, *([] if count is None else [count])), fxn=fxn)[0]
+  return y if isinstance(n, int) else y[:, :n]

@@ -512,7 +512,9 @@ class Indexer:
     if idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
       # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
       keys, w = _update_cache(self.cache_kg, k, start_pos, 1), self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5
-      return topk_indices(indexer_scores(iq, keys, w, start_pos[0], S), idx.top_k, S).reshape(B, T, -1)
+      # (a symbolic T: the kernels on its max rows, the rest sliced off)
+      iq, w = iq.pad_to(iq.max_shape), w.pad_to(w.max_shape)
+      return topk_indices(indexer_scores(iq, keys, w, start_pos[0], S), idx.top_k, S).reshape(B, iq.shape[1], -1)[:, :T]
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
       kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
@@ -538,7 +540,8 @@ class Indexer:
 
 
 def _heads(x:Tensor, w:Tensor) -> Tensor:  # (x @ w.T of each head's own weights w (H, out, in): the tensor cores' kernel where there's one)
-  return y if (y:=head_linear(x, w)) is not None else x @ w.transpose(-1, -2)
+  if (y:=head_linear(x, w)) is not None: return y
+  return (x.pad_to(x.max_shape) @ w.transpose(-1, -2))[:, :, :x.shape[2]]  # (a symbolic T: the matmul on its max rows, static)
 
 class MLATransformerBlock(FFNBlock):
   kv_b_block_size:tuple[int, int] = (128, 128)
@@ -721,7 +724,8 @@ class GatedDeltaNetBlock(FFNBlock):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3/4), writes the kept ones
       state = Tensor(self.recurrent_state.uop.after(*conv_state_stores, *kept_stores))  # carry the conv writes into this graph
       # Pass the whole kept buffer: shrinking it would redirect the kernel's writes into a temporary.
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos), self.kept_states if kept else None).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(pos), self.kept_states if kept else None,
+                                 T if symbolic else None).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-2)

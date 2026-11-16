@@ -4,7 +4,8 @@ import numpy as np
 from tinygrad import Tensor, UOp, dtypes, nn, function, Device, TinyJit
 from tinygrad.helpers import DEV
 from tinygrad.llm.kernels.amd import (Linear, ExpertWeights, amd_custom_kernels_supported, flash_attention, gated_delta_prefill,
-                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode)
+                                      _is_rdna4, _is_cdna, topk_indices, partial_sum, allgather_last, indexer_scores, mla_topk_attention, kda_decode,
+                                      _mailbox_shape)
 from tinygrad.llm.model import MLATransformerBlock, TransformerConfig, IndexerConfig, Transformer, SSMConfig, AttentionResidual
 from tinygrad.llm.kernels.amd_gguf import (q8_quantize, expert_linear, expert_tiles, moe_route, q8_0_linear, head_linear, QUANT_SIZES,
   HALFWORD_QUANTS, SMALL_BLOCK_QUANTS, Q4_K, IQ3_S, IQ3_XXS)
@@ -73,10 +74,11 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         raw = Tensor(np.pad(packed.flatten(), (4, 0))).contiguous().realize()[4:]
         w = ggml_data_to_tensor(raw, H*out_features*in_features, ggml_type).reshape(H, out_features, in_features)
         x = rng.standard_normal((1, H, 128, in_features)).astype(np.float16)
-        got = head_linear(Tensor(x), w)
-        assert got is not None
         want = x.astype(np.float32) @ w.numpy().astype(np.float16).astype(np.float32).transpose(0, 2, 1)
-        np.testing.assert_allclose(got.numpy(), want, rtol=3e-3, atol=2e-2)
+        for T, n in ((128, 128), (UOp.variable("rows", 1, 128).bind(77), 77)):  # (a symbolic count of rows: those there are)
+          got = head_linear(Tensor(x)[:, :, :T], w)
+          assert got is not None
+          np.testing.assert_allclose(got.pad_to((1, H, 128, out_features)).numpy()[:, :, :n], want[:, :, :n], rtol=3e-3, atol=2e-2)
 
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
@@ -839,7 +841,7 @@ class TestPartialSum(unittest.TestCase):
       for i in range(4): np.testing.assert_array_equal(Tensor(y.uop.mselect(i)).numpy().view(np.uint32), ref.view(np.uint32))
 
 class TestAllgather(unittest.TestCase):
-  def test_allgather_last(self): # a last axis shard on every gpu whole (4 RDNA4 gpus: their mailboxes, else a copy), bitwise, over replays
+  def test_allgather_last(self): # a last axis shard on every gpu whole (4 RDNA4 gpus: their mailboxes, else a copy in half), over replays
     for ndev in (2, 4):
       devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(ndev))
       for shape in ((1, 3584), (2, 7168), (3, 72)):
@@ -847,7 +849,9 @@ class TestAllgather(unittest.TestCase):
         gather = TinyJit(lambda x: allgather_last(x * 2).contiguous().realize())
         for _ in range(3): y = gather(x)
         self.assertIsNone(y.uop.axis)
-        for i in range(ndev): np.testing.assert_array_equal(Tensor(y.uop.mselect(i)).numpy(), p * 2)
+        # (the mailboxes' bitwise, a copy's in half)
+        want = p * 2 if _mailbox_shape(x, int(np.prod(x.uop.max_shard_shape))) else (p * 2).astype(np.float16).astype(np.float32)
+        for i in range(ndev): np.testing.assert_array_equal(Tensor(y.uop.mselect(i)).numpy(), want)
       self.assertIs(allgather_last(z:=Tensor.ones(4, 8).shard(devs, 0)), z)  # (not sharded on its last axis: as it is)
 
 if __name__ == "__main__": unittest.main()

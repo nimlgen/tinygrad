@@ -371,18 +371,22 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
 def _wmma_words(lane_group:UOp, kgroups:int) -> tuple[UOp|int, ...]:
   return tuple(range(4)) if kgroups == 1 else tuple(lane_group + kgroups*j for j in range(4//kgroups))
 
-def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, lanes:int, heads:int=1):
+def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int, lanes:int, heads:int=1, live:UOp|None=None):
+  # heads: out's rows a head's in turn (a workgroup's one head's). live: a head's rows to compute (a symbolic count: the workgroups of those,
+  # out the max's)
   if out_features % (16*output_tiles): output_tiles = 1
   output_waves = 2 if out_features % (32*output_tiles) == 0 else 1
   # the waves on more tokens (up to 4) share the workgroup's weights: a fragment dequantized once, through LDS
   token_waves = next(n for n in (4, 2, 1) if out.shape[0] // heads % (token_tile*n) == 0 and (2*output_tiles) % n == 0)
-  token_block = UOp.range(out.shape[0]//(token_tile*token_waves), 0)
+  per, rows_head = token_tile*token_waves, out.shape[0] // heads
+  blocks = rows_head // per if live is None else (live + per - 1) // per  # (a head's workgroups)
+  token_block = UOp.range(heads*blocks, 0)
   output_block = UOp.range(out_features//(16*output_tiles*output_waves), 1)
   # lane is a hardware WARP range (like the flash kernel): the fragment math stays visible without being
   # range-split into nested loops, which would scramble the WMMA fragment layout
   lane, wave = UOp.range(lanes, -1, axis_type=AxisType.WARP), UOp.range(output_waves*token_waves, 3, axis_type=AxisType.LOCAL)
   col, lane_group, rows = lane % 16, lane // 16, 256 // lanes
-  first = (token_block*token_waves + wave // output_waves)*token_tile
+  first = token_block // blocks * rows_head + token_block % blocks * per + wave // output_waves * token_tile
   outputs = tuple((output_block*output_waves + wave % output_waves)*(16*output_tiles) + tile*16 + col for tile in range(output_tiles))
   inputs = tuple(first + tile*16 + col for tile in range(token_tile//16))
   tokens = tuple(tuple(first + tile*16 + lane_group*rows + i for i in range(rows)) for tile in range(token_tile//16))
@@ -423,7 +427,7 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
   step = UOp.range(in_features // Q8_GROUP_SIZE // steps, 4, AxisType.LOOP)
   ks = tuple(word*4 + b for word in _wmma_words(lane_group, kgroups) for b in range(4))
   output_waves = 2 if out_features % (32*output_tiles) == 0 else 1  # (as _wmma_layout's)
-  frag_count, head = 2*output_tiles*output_waves, token_block*(waves // output_waves * token_tile) // (out.shape[0] // heads)
+  frag_count, head = 2*output_tiles*output_waves, input_tokens[0] // (out.shape[0] // heads)  # (a workgroup's rows one head's)
   def frag(g:int, f:UOp|int) -> tuple[UOp, ...]:  # (fragment f of group g of the step: f // 2's output tile of the workgroup, f % 2 its half)
     row = head*out_features + (output_block*output_waves + f // (2*output_tiles))*(16*output_tiles) + f // 2 % output_tiles*16 + lane % 16
     return dequant(row*output_words + (step*steps + g)//8*type_words, (step*steps + g) % 8, f % 2)
@@ -449,10 +453,10 @@ def _quant_linear_wmma(out, x, out_features, in_features, type_words, layout, de
 
 @functools.cache
 def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int,
-                               heads:int=1) -> UOp:
+                               heads:int=1, live:UOp|None=None) -> UOp:
   token_tile, output_tiles = (64, 1 if out_features <= 1024 else 2) if out.shape[0] % 64 == 0 else \
     (32 if out.shape[0] % 32 == 0 else 16, 2)
-  layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads, live)
   word_indices = _wmma_words(layout[5], kgroups)
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
@@ -465,12 +469,12 @@ def _q5_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_fea
 
 @functools.cache
 def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:int, in_features:int, kgroups:int, lanes:int,
-                                heads:int=1) -> UOp:
+                                heads:int=1, live:UOp|None=None) -> UOp:
   token_tile = 32 if out_features <= 1024 and out.shape[0] % 32 == 0 else 64 if out.shape[0] % 64 == 0 and \
     out_features <= 6144 else 128 if out.shape[0] % 128 == 0 else \
     32 if out.shape[0] % 32 == 0 else 16
   output_tiles = 1 if out_features <= 1024 else 2 if out_features <= 6144 else 1 if out_features < 8192 else 2
-  layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads)
+  layout = _wmma_layout(out, out_features, token_tile, output_tiles, lanes, heads, live)
   output_waves, _, _, lane, wave, lane_group, _, _, _ = layout
   word_indices = _wmma_words(lane_group, kgroups)
   local_lut = UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -486,9 +490,10 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
 
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
-                                  out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int, heads:int=1) -> UOp:
+                                  out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int, heads:int=1,
+                                  live:UOp|None=None) -> UOp:
   token_tile = 64 if out.shape[0] % 64 == 0 else 32 if out.shape[0] % 32 == 0 else 16
-  layout = _wmma_layout(out, out_features, token_tile, 2, lanes, heads)
+  layout = _wmma_layout(out, out_features, token_tile, 2, lanes, heads, live)
   output_waves, _, _, lane, wave, lane_group, _, _, _ = layout
   word_indices = _wmma_words(lane_group, kgroups)
   grid = None
@@ -622,17 +627,20 @@ def _wmma_kernel(ggml_type:int, device) -> tuple[Callable[..., UOp], tuple[Tenso
 def head_linear(x:Tensor, w:Tensor) -> Tensor|None:
   """x (1, H, T, in) @ w.T of a head's own weights w (H, out, in) of packed ggml weights, on the f16 tensor cores (T a multiple of 64), else None"""
   B, H, T, I = x.shape
-  if B != 1 or not isinstance(T, int) or not isinstance(I, int) or T % 64 or not amd_custom_kernels_supported(x.device): return None
+  N = x.max_shape[2]  # (a symbolic T: the kernel's rows those there are a head, its buffers the max's)
+  if B != 1 or not isinstance(I, int) or N % 64 or not amd_custom_kernels_supported(x.device): return None
   if (found:=find_packed(w, I)) is None: return None
   ggml_type, raw = found
   fxn, extra = _wmma_kernel(ggml_type, x.device)
   heads, out_features = (x.uop.shard_shape[1] if x.uop.axis == 1 else H), int(w.shape[1])
-  out = Tensor.empty(H*T, out_features, dtype=dtypes.float32, device=x.device, axis=None if x.uop.axis is None else 0)
-  fxn = functools.partial(fxn, out_features=out_features, in_features=I, heads=heads)
-  return Tensor.custom_kernel(out, raw, x.cast(dtypes.float16).reshape(H*T, I).contiguous(), *extra, fxn=fxn)[0].reshape(B, H, T, out_features)
+  out = Tensor.empty(H*N, out_features, dtype=dtypes.float32, device=x.device, axis=None if x.uop.axis is None else 0)
+  fxn = functools.partial(fxn, out_features=out_features, in_features=I, heads=heads, **({} if isinstance(T, int) else {"live": _unbind(T)}))
+  x = _carry(x.cast(dtypes.float16).pad_to(x.max_shape).reshape(H*N, I).contiguous(), *([] if isinstance(T, int) else [T]))
+  return Tensor.custom_kernel(out, raw, x, *extra, fxn=fxn)[0].reshape(B, H, N, out_features)[:, :, :T]
 
-def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=()) -> Tensor:
-  """layer(x) on the q8 of x (xq: its q8, from the kernel that made x)"""
+def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=(), rows:int|UOp|None=None) -> Tensor:
+  """layer(x) on the q8 of x (xq: its q8, from the kernel that made x). rows: a symbolic count of x's rows (its max shape's) computed (the
+  tensor cores' kernel; the rest garbage)"""
   assert layer.ggml_type in QUANT_SIZES
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
@@ -646,7 +654,8 @@ def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=()) -> Tensor:
   cdna = _is_cdna(x.device)
   if tokens % 16 == 0 and local_out % 16 == 0:
     fxn, extra = _wmma_kernel(layer.ggml_type, x.device)
-    srcs = (x.cast(dtypes.float16).contiguous(), *extra)
+    if rows is not None: fxn = functools.partial(fxn, live=_unbind(rows))
+    srcs = (_carry(x.cast(dtypes.float16).contiguous(), *([] if rows is None else [rows])), *extra)
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cdna=cdna)
     srcs = (*(xq or q8_quantize(x, tokens, in_features)), *extra)
