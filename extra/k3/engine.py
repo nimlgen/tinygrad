@@ -137,7 +137,9 @@ class Engine:
     self.stripes = [(a, caches[i].uop.base.buffer.bufs[0].offset, row, prod(shape[:a]), shape[a] * row) for i, (shape, dt) in shapes.items()
                     for a in [next(j for j, d in enumerate(shape) if d >= model.max_context)] for row in [prod(shape[a + 1:]) * dt.itemsize]]
     for i, (o, k) in enumerate(self.caches): setattr(o, k, caches[str(i)] if axes[i] is None else Tensor(caches[str(i)].uop.unshard(axes[i])))
-    self.grown = 0
+    # (the caches grow by a step of rows, zeroed in a graph: a step's rows at a position)
+    self.grown, self.grow_step = 0, min(window or 8192, model.max_context)
+    self.v_grown, self.zero_jit = UOp.variable("grown", 0, model.max_context - self.grow_step), TinyJit(self.zero, capture_first=True)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -460,16 +462,20 @@ class Engine:
     """the caches' rows of the first n positions (in steps of a window piece) kept from the experts: their slots' experts dropped (once read,
     if in flight), the slots pinned (step_io's mask, read's keep), the rows zeroed (they were experts': a cache's keys past a context masked)"""
     if n <= self.grown: return
-    new, st = min(round_up(n, self.W or 8192), self.max_context), self.state
+    new, st = min(round_up(n, self.grow_step), self.max_context), self.state
     for (a, first, row, blocks, size), (o, k) in zip(self.stripes, self.caches):
       starts = first + np.arange(blocks) * size
       sl = np.unique(np.concatenate([np.arange((s + self.grown * row) // self.part, (s + new * row - 1) // self.part + 1) for s in starts]))
       c = np.ascontiguousarray((c:=st["expert_in"][sl])[c >= 0], np.int64)
       if len(c) and (err:=host_c().read_wait(ctypes.byref(self.io), len(c), c.ctypes.data)): raise RuntimeError(f"reads failed {err}")
       st["slot_of"][c], st["expert_in"][sl], st["mask"][sl] = -1, -1, 1
-      rows = getattr(o, k).shrink(tuple((self.grown, new) if j == a else None for j in range(getattr(o, k).ndim)))
-      rows.assign(rows.zeros_like()).realize()
+    for g in range(self.grown, new, self.grow_step): self.zero_jit(self.v_grown.bind(min(g, self.max_context - self.grow_step)))
     self.grown = new
+
+  def zero(self, g:UOp):  # (every cache's step of rows at g zeroed)
+    rows = [getattr(o, k).shrink(tuple((g, g + self.grow_step) if j == a else None for j in range(getattr(o, k).ndim)))
+            for (a, *_), (o, k) in zip(self.stripes, self.caches)]
+    Tensor.realize(*[r.assign(r.zeros_like()) for r in rows])
 
   def pieces(self) -> int:
     """a read window's pieces: lent below the window's state, past the caches' stripes and the scratch (their rows pinned as they grow, the
@@ -605,6 +611,7 @@ class Engine:
     for i, save in itertools.product(range(2), (True, False)): self.model._copy(i, save)  # (and save's)
     if self.chain_jit: self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
     for jit in self.keep_jits: jit(self.v_at.bind(0))  # (a kept session's copies)
+    self.zero_jit(self.v_grown.bind(0))  # (and the caches' growth: its rows zeroed, there's no context yet)
     self.stage("rollbacks, saves, chain, session copies")
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int], np.ndarray|None]:
