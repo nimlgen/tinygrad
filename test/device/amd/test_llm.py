@@ -65,9 +65,9 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_q5_linear(self): self._test_quant_linear(13, 176)
   def test_head_linear(self):  # each head's rows on its own weights (an mla's absorbed v_b): as x @ w.T of the decoded weights in half
     rng = np.random.default_rng(3)
-    for ggml_type, H, out_features, in_features in ((8, 4, 512, 128), (Q4_K, 3, 128, 512)):  # (Q8_0, Q4_K)
+    for ggml_type, H, out_features, in_features in ((8, 4, 512, 128), (6, 4, 512, 128), (Q4_K, 3, 128, 512)):  # (Q8_0, Q5_0: k_b, Q4_K: v_b)
       with self.subTest(ggml_type=ggml_type):
-        block = (34, 32) if ggml_type == 8 else (QUANT_SIZES[ggml_type], 256)  # (bytes, weights)
+        block = {8: (34, 32), 6: (22, 32)}.get(ggml_type, (QUANT_SIZES[ggml_type], 256))  # (bytes, weights)
         packed = rng.integers(0, 256, (H*out_features*in_features // block[1], block[0]), dtype=np.uint8)
         packed[:, :2] = np.array([0.001], dtype=np.float16).view(np.uint8)
         if ggml_type == Q4_K: packed[:, 2:4] = np.array([0.0002], dtype=np.float16).view(np.uint8)
@@ -80,6 +80,7 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
           assert got is not None
           np.testing.assert_allclose(got.pad_to((1, H, 128, out_features)).numpy()[:, :, :n], want[:, :, :n], rtol=3e-3, atol=2e-2)
 
+  def test_q5_0_linear(self): self._test_quant_linear(6, 176, in_features=288, out_features=16, token_counts=(1, 3, 16))
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
   def test_q6_linear_odd_blocks(self): self._test_quant_linear(14, 210, in_features=768, out_features=3, token_counts=(1, 3, 16))
   def test_q2_k_linear(self): self._test_quant_linear(10, 84, in_features=768, token_counts=(1, 3, 16))

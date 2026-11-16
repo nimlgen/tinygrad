@@ -11,13 +11,13 @@ from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.renderer import Estimates
 
 GGML_BLOCK_SIZE, Q8_GROUP_SIZE = 256, 32
-Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 8, 10, 11, 12, 13, 14
+Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K = 6, 8, 10, 11, 12, 13, 14
 IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS = 17, 18, 20, 21, 22, 23
-QUANT_SIZES = {Q8_0: 272, Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210, IQ2_XS: 74,
+QUANT_SIZES = {Q5_0: 176, Q8_0: 272, Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, Q6_K: 210, IQ2_XS: 74,
                IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136}  # bytes per 256 weights
-HALFWORD_QUANTS = (Q8_0, Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
-SMALL_BLOCK_QUANTS = {Q8_0: 17, IQ4_NL: 9}
-QUANT_NAMES = {Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
+HALFWORD_QUANTS = (Q5_0, Q8_0, Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
+SMALL_BLOCK_QUANTS = {Q5_0: 11, Q8_0: 17, IQ4_NL: 9}
+QUANT_NAMES = {Q5_0: "q5_0", Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
                IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
 
 def q8_0_linear(w:Tensor, devices:tuple[str, ...]|str, axis:int|None=None) -> Linear:
@@ -200,6 +200,9 @@ def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:
   def byte(offset): return _load_byte(raw, base, offset)
   def word(offset): return _load_u32(raw, base, offset, stream=ggml_type == Q6_K)
   if ggml_type == Q8_0: return _load_u32(raw, base, 2+i*4, stream=True)
+  if ggml_type == Q5_0:  # (weight j: its low nibble byte j%16 of qs (the high half past 16), its fifth bit bit j of qh)
+    high = (word(2) >> (4*i)) & 15
+    return ((word(6+(i%4)*4) >> (4*(i//4))) & 0x0f0f0f0f) | (((high & 1) | ((high & 2) << 7) | ((high & 4) << 14) | ((high & 8) << 21)) << 4)
   if ggml_type in (Q4_K, Q5_K):
     offset = (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8
     weights = (_amd_load(raw[base+offset], 8)[i] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
@@ -283,6 +286,8 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
         else:
           scale = ((byte(96+j%8) >> ((j//8)*4)) & 15) | (((byte(104+j%4) >> ((j//4)*2)) & 3) << 4)
           total += (dots[half].float() - 4*xs[token, group, half]) * (scale.cast(dtypes.int32)-32).float() * _half(raw[base+54])
+    elif ggml_type == Q5_0:  # (the offset 16 via the activation sums)
+      total = ((dots[0]+dots[1]).float() - 16*(xs[token, group, 0].load()+xs[token, group, 1].load())) * _half(raw[base])
     elif ggml_type in (IQ2_XS, IQ2_S):
       scales = byte((66 if ggml_type == IQ2_XS else 74)+subgroup)
       total = sum(dots[h].float() * (((scales >> (h*4)) & 15).float()+0.5) for h in range(2)) * 0.25 * _half(raw[base])
@@ -514,6 +519,7 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
       scale, zero = _half(raw[base+54])*(sc.cast(dtypes.int32)-32).float(), 4
     elif ggml_type == Q6_K:
       scale, zero = _half(raw[base+104])*byte(192+subgroup*2+half).cast(dtypes.uint8).bitcast(dtypes.int8).float(), 32
+    elif ggml_type == Q5_0: scale, zero = _half(raw[base]), 16
     else:
       scale = _half(raw[base])
       if ggml_type in (IQ2_XS, IQ2_S):
