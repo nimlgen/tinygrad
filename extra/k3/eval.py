@@ -105,3 +105,4 @@ def bench(eng, specs:str, late:Callable[[], bool]):
       print(f"{r['task_id']}: {steps} verify steps of {tokens / steps:.2f} tokens, {t_steps / steps * 1e3:.1f} ms a step, "
             f"{firsts / steps:.1%} of the first guesses right, {1 + right / steps:.2f} tokens kept a step, {(steps + right) / t_steps:.2f} tok/s",
             flush=True)
+    print("  ms a step of tokens: " + ", ".join(f"{T} {np.mean(v) * 1e3:.1f} ({len(v)})" for T, v in eng.step_s.items() if v), flush=True)
