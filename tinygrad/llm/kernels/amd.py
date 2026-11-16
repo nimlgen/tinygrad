@@ -1032,64 +1032,51 @@ def allgather_last(x:Tensor) -> Tensor:
   fxn = functools.partial(_allgather_kernel, n=n, width=x.max_shape[-1]//len(devs), T=shape[0], EP=shape[1])
   return Tensor.custom_kernel(Tensor.empty(x.shape, dtype=x.dtype, device=x.device), x.contiguous(), *_mailboxes(x.device), fxn=fxn)[0]
 
-# ******** the residual streams' mix and the sublayer's rmsnorm, in two kernels over slices of each token's streams ********
+# ******** the residual streams' mix and the sublayer's rmsnorm, a workgroup a token ********
 
-RES_WAVES, RES_PER = 4, 2  # a workgroup's waves and the 32 wide groups of a wave
-RES_MAX_STREAMS = 14  # streams*(streams+3)//2 partials must fit the workgroup's 128 threads
-def _res_slice(tokens:int|UOp, dim:int) -> tuple[int, UOp, UOp, UOp, UOp, list[UOp]]:
-  G = dim // (RES_WAVES * RES_PER * WARP_SIZE)  # (a token's workgroups)
-  tw, lane, wave = UOp.range(tokens*G, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, AxisType.WARP), UOp.range(RES_WAVES, 1, AxisType.LOCAL)
-  return G, tw, lane, wave, wave*WARP_SIZE + lane, [((tw%G*RES_WAVES + wave)*RES_PER + k)*WARP_SIZE + lane for k in range(RES_PER)]
+RES_PER = 8  # a thread's neighboring columns
+RES_MAX_STREAMS = 14  # (2*streams sums of a token, by the first wave's lanes)
 
 @functools.cache
-def _res_mix_partial_kernel(part:UOp, xs:UOp, wm:UOp, tokens:int|UOp, streams:int, dim:int, start:int|UOp) -> UOp:
-  """a workgroup's slice of its token's streams' gram matrix (upper triangle) and of their dots with the mix weight"""
-  G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
-  xv = [[xs.reshape(-1, streams, dim)[start + tw//G, s, i].load().float() for i in idx] for s in range(streams)]
-  w, zero = [wm[i].load().float() for i in idx], UOp.const(0, dtypes.float)
-  vals = [sum((a*b for a, b in zip(xv[s], xv[r])), zero) for s in range(streams) for r in range(s, streams)] + \
-         [sum((a*b for a, b in zip(xv[s], w)), zero) for s in range(streams)]
-  red = UOp.alloc((RES_WAVES, len(vals)), dtypes.float, addrspace=AddrSpace.LOCAL)
+def _res_mix_kernel(y:UOp, wm:UOp, wn:UOp, xs:UOp, tokens:int|UOp, streams:int, dim:int, eps:float, norm_eps:float, count:UOp|None,
+                    start:int|UOp) -> UOp:
+  """y = rmsnorm(sum_s p_s xs_s) * wn, p the softmax over the streams of (rmsnorm(xs_s) * wm).sum(): a workgroup a token, every thread its
+  RES_PER columns of each stream once: their sums of squares and dots with wm (LDS), then their mix and its sum of squares (LDS).
+  count: the streams mixed (the rest zero, left out)"""
+  W = dim // (RES_PER * WARP_SIZE)
+  token, wave, lane = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(W, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  t = wave * WARP_SIZE + lane
+  cols, zero = [t * RES_PER + i for i in range(RES_PER)], UOp.const(0, dtypes.float)
+  x = [[xs.reshape(-1, streams, dim)[start + token, s, d].load().float() for d in cols] for s in range(streams)]
+  w = [wm[d].load().float() for d in cols]
+  vals = [sum((v * v for v in x[s]), zero) for s in range(streams)] + [sum((v * u for v, u in zip(x[s], w)), zero) for s in range(streams)]
+  red = UOp.alloc((W, 2*streams), dtypes.float, addrspace=AddrSpace.LOCAL)
   red = red.after(UOp.group(*[red[wave, j].store(warp_reduce(v, full_wave=True)) for j, v in enumerate(vals)]).barrier())
-  col = tid.minimum(len(vals)-1)
-  store = part[tw, tid.valid(tid < len(vals))].store(sum((red[k, col].load() for k in range(1, RES_WAVES)), red[0, col].load()))
-  return store.end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_partial", opts_to_apply=()))
-
-@functools.cache
-def _res_mix_norm_kernel(y:UOp, part:UOp, wn:UOp, xs:UOp, tokens:int|UOp, streams:int, dim:int, eps:float, norm_eps:float, count:UOp|None,
-                         start:int|UOp) -> UOp:
-  """y = rmsnorm(sum_s p_s xs_s) * wn, p the softmax over the streams of (rmsnorm(xs_s) * wm).sum(): a workgroup sums its token's partials
-  (the norm's sum of squares is p G p of the gram matrix G) and does its slice. count: the streams mixed (the rest zero, left out)"""
-  G, tw, lane, wave, tid, idx = _res_slice(tokens, dim)
-  t, NP, zero = tw//G, streams*(streams+1)//2, UOp.const(0, dtypes.float)
-  tot = UOp.alloc((NP + streams,), dtypes.float, addrspace=AddrSpace.LOCAL)
-  col = tid.minimum(NP + streams - 1)
-  tot = tot.after(tot[tid.valid(tid < NP + streams)].store(sum((part[t*G + g, col].load() for g in range(1, G)), part[t*G, col].load())).barrier())
-  pair = {sr: j for j, sr in enumerate((s, r) for s in range(streams) for r in range(s, streams))}
-  def gram(s:int, r:int) -> UOp: return tot[pair[min(s, r), max(s, r)]].load()
-  score = [tot[NP + s].load() / (gram(s, s) * (1/dim) + eps).sqrt() for s in range(streams)]
+  tot = UOp.alloc((2*streams,), dtypes.float, addrspace=AddrSpace.LOCAL)
+  col = t.valid(t < 2*streams)
+  tot = tot.after(tot[col].store(sum((red[k, col].load() for k in range(1, W)), red[0, col].load())).barrier())
+  score = [tot[streams + s].load() * (tot[s].load() * (1/dim) + eps).rsqrt() for s in range(streams)]
   if count is not None: score = [(s < count).where(sc, -math.inf) for s, sc in enumerate(score)]
   m = functools.reduce(UOp.maximum, score)
-  e = [((sc - m) * math.log2(math.e)).exp2() for sc in score]
+  e = [((sc - m) * LOG2E).exp2() for sc in score]
   esum = sum(e[1:], e[0])
-  rn = 1 / (sum((e[s] * e[r] * gram(s, r) for s in range(streams) for r in range(streams)), zero) / (esum * esum) * (1/dim) + norm_eps).sqrt()
-  x = xs.reshape(-1, streams, dim)
-  return UOp.group(*[y.reshape(-1, dim)[t, i].store(sum((e[s] * x[start + t, s, i].load().float() for s in range(streams)), zero)
-                                                         / esum * rn * wn[i].load().float()) for i in idx]) \
-    .end(lane, wave, tw).sink(arg=KernelInfo(name="res_mix_norm", opts_to_apply=()))
+  h = [sum((e[s] * x[s][i] for s in range(streams)), zero) for i in range(RES_PER)]
+  lds_s = UOp.alloc((W,), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds_s = lds_s.after(lds_s[wave.valid(lane.eq(0))].store(warp_reduce(sum((v * v for v in h), zero), full_wave=True)).barrier())
+  ss = warp_reduce(lds_s[lane % W].load() * (lane < W).cast(dtypes.float), full_wave=True)
+  inv = 1 / esum * (ss / (esum * esum) * (1/dim) + norm_eps).rsqrt()
+  return UOp.group(*[y.reshape(-1, dim)[token, d].store(v * inv * wn[d].load().float()) for v, d in zip(h, cols)]) \
+    .end(token, wave, lane).sink(arg=KernelInfo(name="res_mix", opts_to_apply=()))
 
 def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float, count:UOp|None=None, rows:tuple[int|UOp, int]|None=None) -> Tensor:
   """rmsnorm(the mix of the residual streams xs (B, T, streams, dim) by wm) * wn: (B, T, dim), of its first count streams (the others zero).
   rows: (start, n) the mix of xs's rows start.. (B 1, read in place)"""
   B, T, streams, dim = cast(tuple[int, int, int, int], xs.shape)
-  assert 1 <= streams <= RES_MAX_STREAMS and (rows is None or B == 1)
+  assert 1 <= streams <= RES_MAX_STREAMS and dim % (RES_PER * WARP_SIZE) == 0 and dim <= RES_PER * WARP_SIZE**2 and (rows is None or B == 1)
   start, n = rows or (0, T)
   N = n if isinstance(n, int) else n.vmax  # (a symbolic n: the buffers its max's, its rows those there are)
-  part = Tensor.empty(B*N*dim // (RES_WAVES*RES_PER*WARP_SIZE), streams*(streams+1)//2 + streams, dtype=dtypes.float32, device=xs.device)
-  fxn = functools.partial(_res_mix_partial_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, start=_unbind(start))
-  part = Tensor.custom_kernel(part, _carry(xs, start, n), wm, fxn=fxn)[0]
   y = Tensor.empty(B, N, dim, dtype=dtypes.float32, device=xs.device)
-  fxn = functools.partial(_res_mix_norm_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
+  fxn = functools.partial(_res_mix_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
                           count=None if count is None else _unbind(count), start=_unbind(start))
-  y = Tensor.custom_kernel(y, part, wn, _carry(xs, start, n, *([] if count is None else [count])), fxn=fxn)[0]
+  y = Tensor.custom_kernel(y, wm, wn, _carry(xs, start, n, *([] if count is None else [count])), fxn=fxn)[0]
   return y if isinstance(n, int) else y[:, :n]

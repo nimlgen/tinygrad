@@ -832,6 +832,23 @@ class TestResidualMix(unittest.TestCase):
         mix.weight, norm.weight = wm, wn
         np.testing.assert_allclose(mix.mix(xs, norm).numpy(), expected.numpy(), rtol=1e-4, atol=1e-4)
 
+  def test_one_pass(self): # a token's streams' sums of squares and dots with the mix weight, then their mix and its sum of squares
+    rng = np.random.default_rng(4)
+    for streams, dim, count, rows in ((9, 7168, 9, None), (9, 7168, 6, (2, 3)), (14, 256, 1, (0, 5)), (3, 512, 2, None)):
+      with self.subTest(shape=(streams, dim, count, rows)):
+        xs, wm, wn = (rng.standard_normal(shape).astype(np.float32) for shape in ((1, 5, streams, dim), (dim,), (dim,)))
+        x = xs[0].astype(np.float64)[slice(None) if rows is None else slice(rows[0], rows[0] + rows[1])]
+        score = (x @ wm) / np.sqrt((x * x).sum(-1) / dim + 1e-5)
+        e = np.exp(np.where(np.arange(streams) < count, score, -np.inf) - score[:, :count].max(-1, keepdims=True))
+        h = (e[..., None] * x).sum(1) / e.sum(-1, keepdims=True)
+        expected = h / np.sqrt((h * h).sum(-1, keepdims=True) / dim + 1e-6) * wn
+        cfg = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=dim, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=dim,
+                                rope_theta=1e4, rope_dim=dim, v_head_dim=dim)
+        mix, norm = AttentionResidual(cfg), nn.RMSNorm(dim, 1e-6)
+        mix.weight, norm.weight = Tensor(wm), Tensor(wn)
+        y = mix.mix(Tensor(xs).realize(), norm, UOp.variable("count", 1, streams).bind(count), rows)
+        np.testing.assert_allclose(y[0].numpy(), expected, rtol=1e-4, atol=1e-4)
+
 
 class TestPartialSum(unittest.TestCase):
   def test_chained_in_a_jit(self): # every gpu's sums in gpu order, bitwise, over replays: one shot and two shot

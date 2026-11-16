@@ -204,7 +204,7 @@ class AttentionResidual:
   def mix(self, xs:Tensor, norm:Callable[[Tensor], Tensor]|None=None, count:UOp|None=None, rows:tuple[int|UOp, int]|None=None) -> Tensor:
     # xs: (B, T, N, D) streams: (B, T, D), then the norm. count: the streams mixed, the rest (zero) left out. rows: (start, n) xs's rows mixed
     if isinstance(norm, nn.RMSNorm) and isinstance(xs.shape[1], int) and xs.shape[2] <= RES_MAX_STREAMS and \
-       xs.shape[-1] % 256 == 0 and amd_custom_kernels_supported(xs.device):
+       xs.shape[-1] % 256 == 0 and xs.shape[-1] <= 8192 and amd_custom_kernels_supported(xs.device):
       return res_mix_norm(xs, self.weight, unwrap(norm.weight), self.norm_eps, norm.eps, count, rows)
     xs = (xs if rows is None else xs[:, rows[0]:rows[0] + rows[1]]).float()
     scores = (xs.rmsnorm(eps=self.norm_eps) * self.weight).sum(-1, keepdim=True)
