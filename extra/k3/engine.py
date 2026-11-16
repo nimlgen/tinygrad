@@ -133,12 +133,6 @@ class Engine:
                     for a in [next(j for j, d in enumerate(shape) if d >= model.max_context)] for row in [prod(shape[a + 1:]) * dt.itemsize]]
     for i, (o, k) in enumerate(self.caches): setattr(o, k, caches[str(i)] if axes[i] is None else Tensor(caches[str(i)].uop.unshard(axes[i])))
     self.grown = 0
-    if window:
-      self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
-                 f"the window's {(slots - self.tail) * self.part / 1e9:.2f} GB)")
-      f0 = free()
-      self.window_lend()
-      self.stage(f"window graphs (their scratch {(f0 - free()) / 1e9:.2f} GB of SPARE's {SPARE / 1e9:.2f})")
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
@@ -148,6 +142,11 @@ class Engine:
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
                   fill=FILL, decay=0.5 ** (1 / 8))
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
+    if window:
+      self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
+                 f"the window's {(slots - self.tail) * self.part / 1e9:.2f} GB)")
+      self.window_lend()
+      self.stage(f"window graphs (their scratch {(self.arena[1] - self.arena[0]) * self.part / 1e9:.2f} GB, the pool's)")
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
@@ -266,10 +265,25 @@ class Engine:
                        TinyJit(functools.partial(self.window_experts, t), arenas=self.arenas)) for t in TILES}
     self.start_jit = TinyJit(self.start, arenas=self.arenas)
 
-  def window_lend(self):  # (the window's state lent from the pool's last slots, its graphs captured on it)
+  def window_lend(self):
+    """the window's state lent from the pool's last slots, its graphs captured on it, their scratch (one arena) lent from the pool's first slots
+    past the caches' (what of them it takes kept from the experts: pinned)"""
     self.tail = self.lent_from = self.slots - self.slots_of(self.window_bytes) - self.slots_of(self.piece_bytes)
     self.win = {**self.window_state(self.tail), **self.piece(self.slots - self.slots_of(self.piece_bytes))}
-    self.window_capture()
+    first, key = self.slots_of(self.cache_bytes), (self.devs, 0)
+    room = self.lend({"arena": (((self.tail - first) * self.part,), dtypes.int8)}, first)[0]["arena"].uop.base
+    self.arenas.clear()
+    self.arenas[key] = room
+    try: self.window_capture()
+    except MemoryError as e: raise MemoryError(f"the window's graphs' scratch past the pool's {room.max_numel() / 1e9:.2f} GB for it") from e
+    if (need:=self.arenas[key].max_numel()) > room.max_numel():
+      raise MemoryError(f"the window's graphs' scratch {need / 1e6:.1f} MB past the pool's {room.max_numel() / 1e6:.1f} MB for it")
+    jits = [j for _, j, _ in self.kinds.values()] + [j for r in self.routes.values() for j in r] + \
+           [self.start_jit, self.tap_jit, self.mix_jit, self.fill_jit]
+    used = max((sum(u.marg[0]) for j in jits if j is not None and j.captured is not None for u in j.captured._linear.toposort()
+                if u.op is Ops.SHRINK and u.src[0] is room), default=0)  # (a planned buffer: the arena's (start, bytes))
+    self.arena, st, sl = (first, first + self.slots_of(used)), self.state, slice(first, first + self.slots_of(used))
+    st["slot_of"][(c:=st["expert_in"][sl])[c >= 0]], st["expert_in"][sl], st["mask"][sl] = -1, -1, 1
 
   def window_capture(self):
     """the window's graphs captured on its lent state: every kind's on its first block (its buffers the args) on dry chunks at position 0 (the

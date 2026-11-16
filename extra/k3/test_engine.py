@@ -82,14 +82,15 @@ class TestEngine(unittest.TestCase):
 
   def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=()) \
       -> Engine:
-    # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches (the pool's first slots, of caches' bytes))
+    # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
+    # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
-    eng = Engine(model, m, slots=slots + 2, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths)  # (2: the caches')
-    at = eng.slots_of(eng.cache_bytes)
-    assert at <= 2
+    eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
+                 widths=widths)  # (96: the caches', the scratch's)
+    at = eng.arena[1]
+    assert at <= 96
     pools = [(caches * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part,
                                                                                                                        b'\0') for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
@@ -161,11 +162,11 @@ class TestEngine(unittest.TestCase):
   def test_grow(self):  # the caches' slots of a context's positions (in steps of a piece) pinned as it grows, their experts dropped
     eng, st = self.eng, self.eng.state
     st["expert_in"][0], st["slot_of"][len(st["slot_of"]) - 1] = len(st["slot_of"]) - 1, 0  # (an expert in the caches' first slot)
-    self.assertEqual(st["mask"].sum(), 0)
+    self.assertEqual(st["mask"].sum(), eng.arena[1] - eng.arena[0])  # (the window's scratch's)
     eng.grow(1)
     self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.W, 1, -1, -1))
     eng.grow(eng.W + 1)
-    self.assertEqual((eng.grown, st["mask"].sum()), (2 * eng.W, eng.slots_of(eng.cache_bytes)))
+    self.assertEqual((eng.grown, st["mask"].sum()), (2 * eng.W, eng.slots_of(eng.cache_bytes) + eng.arena[1] - eng.arena[0]))
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     ids, eng, tol = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4), 3e-3
@@ -255,6 +256,7 @@ class TestEngine(unittest.TestCase):
     calls:list = []
     self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
     self.eng.step_s[1].append(10.0)  # (steps slow: windows)
+    self.eng.pieces = lambda: 1  # type: ignore[method-assign]  # (a read window of a piece)
     self.assertEqual(self.eng.prefill(list(range(10)), 2), 9)
     self.assertEqual(calls, [(2, [2, 3, 4, 5, 6, 7, 8], [3, 4, 5, 6, 7, 8, 9])])
     self.eng.W = 4
