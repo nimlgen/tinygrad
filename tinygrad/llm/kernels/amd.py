@@ -1070,12 +1070,14 @@ def _res_mix_kernel(y:UOp, wm:UOp, wn:UOp, xs:UOp, tokens:int|UOp, streams:int, 
 
 def res_mix_norm(xs:Tensor, wm:Tensor, wn:Tensor, eps:float, norm_eps:float, count:UOp|None=None, rows:tuple[int|UOp, int]|None=None) -> Tensor:
   """rmsnorm(the mix of the residual streams xs (B, T, streams, dim) by wm) * wn: (B, T, dim), of its first count streams (the others zero).
-  rows: (start, n) the mix of xs's rows start.. (B 1, read in place)"""
+  rows: (start, n) the mix of xs's rows start.. (B 1, read in place; xs split on its rows over the devices: each device's own rows start..)"""
   B, T, streams, dim = cast(tuple[int, int, int, int], xs.shape)
   assert 1 <= streams <= RES_MAX_STREAMS and dim % (RES_PER * WARP_SIZE) == 0 and dim <= RES_PER * WARP_SIZE**2 and (rows is None or B == 1)
-  start, n = rows or (0, T)
+  split = len(xs.device) if xs.uop.axis == 1 and isinstance(xs.device, tuple) else 1
+  start, n = rows or (0, T // split)
+  assert split == 1 or isinstance(n, int)
   N = n if isinstance(n, int) else n.vmax  # (a symbolic n: the buffers its max's, its rows those there are)
-  y = Tensor.empty(B, N, dim, dtype=dtypes.float32, device=xs.device)
+  y = Tensor.empty(B, N * split, dim, dtype=dtypes.float32, device=xs.device, axis=1 if split > 1 else None)
   fxn = functools.partial(_res_mix_kernel, tokens=_unbind(B*n), streams=streams, dim=dim, eps=eps, norm_eps=norm_eps,
                           count=None if count is None else _unbind(count), start=_unbind(start))
   y = Tensor.custom_kernel(y, wm, wn, _carry(xs, start, n, *([] if count is None else [count])), fxn=fxn)[0]

@@ -12,7 +12,7 @@ from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.engine.jit import _TinyJit
-from tinygrad.uop.ops import Ops
+from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last
@@ -270,7 +270,7 @@ class Engine:
     self.v_p0 = UOp.variable("p0", 0, self.max_context - 1)  # (a piece's first token in the read window)
     self.v_c0, self.v_wlive = UOp.variable("c0", 0, W - self.chunk), UOp.variable("wlive", 1, W)
     self.v_n, self.v_s = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1)
-    self.v_tap = UOp.variable("tap", 0, self.piece_shapes()["taps"][0][2] - 1)
+    self.v_tap = UOp.variable("tap", 0, self.piece_shapes()["taps"][0][3] - 1)
     self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
     self.wjit = functools.partial(TinyJit, arenas=self.arenas, capture_first=True)
     self.tap_jit, self.mix_jit = self.wjit(self.tap), self.wjit(self.tap_mix)
@@ -338,11 +338,26 @@ class Engine:
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
     return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down") else t for k, t in self.lend(self.window_shapes(), at)[0].items()}
 
-  def piece_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:  # (a piece's: the bank of its W tokens' residual streams, the draft's inputs)
-    c, S = self.model.config, 1 + sum(b.attn_res_score.new_block for b in self.model.blk)
-    return {"bank": ((1, self.W, S, c.dim), self.bank), "taps": ((1, self.W, max(len(self.taps), 1), c.dim), dtypes.float)}
+  def piece_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:
+    """a piece's: the bank of its W tokens' residual streams, the draft's inputs. a gpu's rows: its part of every chunk (1, 1, W/gpus, ...)"""
+    c, S, W = self.model.config, 1 + sum(b.attn_res_score.new_block for b in self.model.blk), self.W // len(self.devs)
+    return {"bank": ((1, 1, W, S, c.dim), self.bank), "taps": ((1, 1, W, max(len(self.taps), 1), c.dim), dtypes.float)}
 
-  def piece(self, at:int) -> dict[str, Tensor]: return self.lend(self.piece_shapes(), at)[0]  # (lent from the pool's slots from at on)
+  def piece(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on: (1, gpus, W/gpus, ...) split on the gpus)
+    return {k: Tensor(t.uop.unshard(1)) for k, t in self.lend(self.piece_shapes(), at)[0].items()}
+
+  def own(self, t:Tensor, c0:UOp) -> Tensor:  # (the rows of the chunk at c0 of a piece's (1, gpus, W/gpus, ...): each gpu's own)
+    n = self.chunk // len(self.devs)
+    return t[:, :, c0 // len(self.devs):c0 // len(self.devs) + n]
+
+  def whole(self, t:Tensor) -> Tensor:  # (t (1, R, ...) split on its rows, on every gpu: each gpu's rows copied to the others once)
+    n = t.shape[1] // len(self.devs)
+    return Tensor.cat(*(t[:, i * n:(i + 1) * n] for i in range(len(self.devs))), dim=1)
+
+  def in_order(self, t:Tensor) -> Tensor:  # (a piece's (1, gpus, W/gpus, ...) on every gpu in its tokens' order (1, W, ...))
+    G, rest = len(self.devs), t.shape[3:]
+    w = self.whole(t.flatten(1, 2)).reshape(1, G, self.W // self.chunk, self.chunk // G, *rest)
+    return w.permute(0, 2, 1, 3, *range(4, 4 + len(rest))).reshape(1, self.W, *rest)
 
   def lend(self, shapes:dict[str, tuple[tuple[int, ...], DType]], at:int) -> tuple[dict[str, Tensor], int]:
     """buffers of shapes on every gpu lent from the pool's slots from at on, and their bytes"""
@@ -377,11 +392,12 @@ class Engine:
     """a chunk's live rows' attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a
     moe's parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s. the rows symbolic: a
     kernel's work the live rows'"""
+    rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
-    h = b.attn_res_score.mix(bank, b.attn_norm, n, (c0, live))
+    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows))[:, :live]
     a = b._attention(h, (pos,), b._indexer_mask(h, (pos,), None), live)
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
-    x = b.ffn_res_score.mix(bank, b.ffn_norm, s + 1, (c0, live))
+    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, b._feed_forward(x)).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
@@ -390,9 +406,9 @@ class Engine:
     return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1]))) for t, v in outs])[0]
 
   def add(self, s:UOp, c0:UOp, y:Tensor) -> Tensor:  # (y (1, live, dim) added to stream s of the bank's chunk at c0, its rows past live 0)
-    # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows)
-    bank, C = Tensor(self.win["bank"].uop), self.chunk
-    return bank[:, c0:c0 + C, s].assign((bank[:, c0:c0 + C, s] + y.pad_to((1, C, y.shape[2]))).cast(bank.dtype))
+    # (a slice of a symbolic offset, a symbolic length and a symbolic index isn't written: the chunk's whole rows. each gpu its own)
+    bank, G, C = self.own(Tensor(self.win["bank"].uop), c0)[:, :, :, s], len(self.devs), self.chunk
+    return bank.assign((bank + y.pad_to((1, C, y.shape[2])).reshape(1, G, C // G, -1)).cast(bank.dtype))
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
@@ -444,23 +460,25 @@ class Engine:
     return self.add(s, c0, y).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
-    return Tensor(self.win["taps"].uop)[:, :, j].assign(Tensor(self.win["bank"].uop)[:, :, s].float()).realize()
+    return Tensor(self.win["taps"].uop)[:, :, :, j].assign(Tensor(self.win["bank"].uop)[:, :, :, s].float()).realize()
 
   def tap_mix(self, s:UOp, j:UOp, w:Tensor, *_) -> Tensor:  # (tap j: the streams up to s mixed by an attention residual's weight w)
     bank = Tensor(self.win["bank"].uop).float()
     scores = (bank.rmsnorm(eps=self.model.config.norm_eps) * w).sum(-1, keepdim=True)
-    scores = (Tensor.arange(bank.shape[2]).to(bank.device).reshape(-1, 1) <= Tensor(s)).where(scores, -math.inf)
-    return Tensor(self.win["taps"].uop)[:, :, j].assign((scores.softmax(2) * bank).sum(2)).realize()
+    scores = (Tensor.arange(bank.shape[3]).to(bank.device).reshape(-1, 1) <= Tensor(s)).where(scores, -math.inf)
+    return Tensor(self.win["taps"].uop)[:, :, :, j].assign((scores.softmax(3) * bank).sum(3)).realize()
 
   def fill(self, pos:UOp, p0:UOp, c0:UOp, *_) -> Tensor:  # (the draft's cache of a chunk of the piece at p0 of the read window)
     C = self.chunk
     given = self.given[p0 + c0:p0 + c0 + C].reshape(1, C).to(self.devs)
-    return self.draft.fill(given, Tensor(self.win["taps"].uop)[:, c0:c0 + C].float(), pos).realize()
+    return self.draft.fill(given, self.whole(self.own(Tensor(self.win["taps"].uop), c0).flatten(1, 2)), pos).realize()
 
-  def start(self, p0:UOp, *_) -> Tensor:  # (a piece's bank of streams: its tokens' embeddings, the rest zero)
-    emb = self.model.token_embd(self.tok[p0:p0 + self.W].reshape(1, self.W).to(self.devs)).unsqueeze(2)
-    bank = Tensor(self.win["bank"].uop)
-    return bank.assign(emb.pad(((0, 0), (0, 0), (0, bank.shape[2] - 1), (0, 0))).cast(bank.dtype)).realize()
+  def start(self, p0:UOp, *_) -> Tensor:  # (a piece's bank of streams: its tokens' embeddings, the rest zero. each gpu its rows of the chunks)
+    G, C, bank = len(self.devs), self.chunk, Tensor(self.win["bank"].uop)
+    emb = self.model.token_embd(self.tok[p0:p0 + self.W].reshape(1, self.W).to(self.devs))
+    emb = emb.reshape(1, self.W // C, G, C // G, -1).permute(0, 2, 1, 3, 4).reshape(1, G, self.W // G, 1, -1)
+    emb = Tensor(emb.uop._shard(1, UOp.range(G, 0, AxisType.DEVICE)).unshard(1))  # (each gpu its own rows, nothing copied)
+    return bank.assign(emb.pad(((0, 0), (0, 0), (0, 0), (0, bank.shape[3] - 1), (0, 0))).cast(bank.dtype)).realize()
 
   def stage(self, name:str):  # (a start's stage: its seconds since the stage before)
     print(f"start: {name} {time.perf_counter() - self.t_stage:.1f} s", flush=True)
