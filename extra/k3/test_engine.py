@@ -220,13 +220,39 @@ class TestEngine(unittest.TestCase):
     steps, seen = iter([([5], [6, 7], None), ([6, 9], [8, 3], None), ([8, 3], [1, 2], None)]), []
     model = SimpleNamespace(fork=lambda *a: 0, save=lambda t: None, rollback=lambda n: None)
     eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
-                          draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0)
+                          draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0,
+                          resume=lambda t: None)
     self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
     self.assertEqual(seen, [[6, 7], [8, 3]])
+
+  def test_steps_faster(self):  # steps or a window of n tokens: a window a fixed part and a token's (measured: their median), a step measured
+    eng = SimpleNamespace(step_s={1: []}, window_s=[])
+    self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 526)], [True, False])  # type: ignore[arg-type]  # (before any measured)
+    eng.window_s = [(9182, 60.0), (9595, 17.0), (9182, 16.5)]  # (a cold first one, sizes alike: a line through them would be anything)
+    eng.step_s[1] = [0.035, 0.04]
+    self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 120, 526, 9000)], [True, True, False, False])  # type: ignore[arg-type]
+    eng.step_s[1] = [0.008]
+    self.assertTrue(Engine.steps_faster(eng, 526))  # type: ignore[arg-type]
+
+  def test_session(self):  # a long session a short request diverges from early kept: its caches and states back when a request extends it
+    self.stub()
+    eng, m = self.eng, self.eng.model
+    def state() -> list[np.ndarray]: return [getattr(o, k).numpy() for o, k in eng.caches] + [s.numpy() for s in m._states()]
+    A, S = [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7], [3, 5, 1, 1, 6]
+    for pos, t in enumerate(A): eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].realize()
+    m._cached_tokens, want = A[:], state()
+    eng.resume(S)
+    self.assertEqual(eng.session, (A, 2))
+    for pos, t in enumerate(S[2:], 2): eng.forward(Tensor([[t]], dtype=dtypes.int32), pos)[0].realize()  # (the short request's)
+    m._cached_tokens = S[:]
+    eng.resume(A + [6])
+    self.assertEqual((eng.session, m._cached_tokens, eng.get_start_pos(A + [6])), (None, A, len(A)))
+    for got, w in zip(state(), want): np.testing.assert_equal(got, w)
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
     self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
+    self.eng.step_s[1].append(10.0)  # (steps slow: windows)
     self.assertEqual(self.eng.prefill(list(range(10)), 2), 9)
     self.assertEqual(calls, [(2, [2, 3, 4, 5, 6, 7, 8], [3, 4, 5, 6, 7, 8, 9])])
     self.eng.W = 4

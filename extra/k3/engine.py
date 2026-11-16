@@ -6,7 +6,7 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import collections, ctypes, functools, itertools, math, os, signal, sys, time
 import numpy as np
-from typing import Callable
+from typing import Callable, cast
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
@@ -24,6 +24,9 @@ from extra.k3.draft import Eagle3, DSpark, load
 # (default: what's free but SPARE bytes)
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
+# (a window's seconds: a fixed part and a token's, a step's (of a token) before any are measured: tinys3's, 4.8 s and 1.26 ms, 50 ms)
+WINDOW_S, WINDOW_TOKEN_S, STEP_S = 5.0, 1.3e-3, 0.05
+SESSION = 4096  # (a kept session's rows a short request that diverges from it early may write)
 TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
 class Engine:
@@ -84,6 +87,7 @@ class Engine:
     # ([done | tokens | guesses | their scores (a scored draft's, f32)])
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + n * (1 + 2 * max(self.width, 1)), dtypes.int32)
     self.jits = {T: TinyJit(functools.partial(self.run, T)) for T in sorted({1, tokens, *widths})}
+    self.keep_jits = (TinyJit(self.keep), TinyJit(self.unkeep))
     self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
     self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}  # (measured: a step's seconds)
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
@@ -91,7 +95,7 @@ class Engine:
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
     self.chain_jit = TinyJit(self.run_chain) if draft is not None and draft.width < tokens - 1 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
-    self.costs = {k: collections.deque(maxlen=64) for k in ("step", "window")}  # (measured: a step's seconds a token, a window's tokens, seconds)
+    self.window_s:collections.deque = collections.deque(maxlen=64)  # (measured: a window's tokens, seconds)
     # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states and the window's
     # graphs (captured on a pool of a slot), then the slots a window's state is lent (its own while it runs): slots of decode's otherwise
     self.word = dtypes.uint16 if self.qtype in HALFWORD_QUANTS else dtypes.uint32
@@ -104,6 +108,13 @@ class Engine:
     self.caches = owners + ([(draft, "cache")] if draft is not None else [])
     shapes = {str(i): (getattr(o, k).uop.shard_shape, getattr(o, k).dtype) for i, (o, k) in enumerate(self.caches)}
     axes = [getattr(o, k).uop.axis for o, k in self.caches]
+    # a kept session (a long one a short request diverges from early): copies of the caches' rows that request may write, its recurrent states
+    self.B, self.session = min(SESSION, model.max_context // 2), cast(tuple[list[int], int]|None, None)
+    self.v_at = UOp.variable("at", 0, model.max_context - self.B)
+    def rows0(t:Tensor) -> Tensor:
+      return t.shrink(tuple((0, self.B) if j == next(j for j, d in enumerate(t.shape) if d >= model.max_context) else None for j in range(t.ndim)))
+    self.stash = [rows0(getattr(o, k)).contiguous().realize() for o, k in self.caches]
+    self.stash_states = [s.clone().realize() for s in model._states()]
     for o, k in self.caches: setattr(o, k, None)  # (freed, with the window's graphs on them: the pool's memory)
     self.kinds = {}
     if window and self.fill_jit: self.fill_jit.reset()
@@ -459,15 +470,14 @@ class Engine:
     for li in ahead: self.counted(li)
     self.win.update(banks[0])
     self.lent_from = self.tail
-    self.costs["window"].append((T, time.perf_counter() - t0))
+    self.window_s.append((T, time.perf_counter() - t0))
 
   def steps_faster(self, n:int) -> bool:
-    """n tokens a step each faster than a window of them, by the times measured (a window's a line through its sizes'; none yet: under a
-    quarter of a chunk)"""
-    steps, windows = self.costs["step"], self.costs["window"]
-    if not steps or len({n for n, _ in windows}) < 2: return n < self.chunk // 4
-    b, a = np.polyfit(*zip(*windows), 1)
-    return n * float(np.mean(steps)) < a + b * n
+    """n tokens a step each faster than a window of them: a step's measured seconds, a window's a fixed part and its tokens' (a token's the
+    measured windows' median past the fixed part: a cold one doesn't move it). before any are measured, tinys3's"""
+    step = float(np.median(self.step_s[1])) if self.step_s[1] else STEP_S
+    token = float(np.median([max(t - WINDOW_S, 0) / m for m, t in self.window_s])) if self.window_s else WINDOW_TOKEN_S
+    return n * step < WINDOW_S + n * token
 
   def layers(self, pieces:list[tuple[int, int, dict[str, Tensor]]], pos:int) -> list[int]:
     """a read window's blocks, a layer at a time over its pieces. a moe layer's experts a piece's tokens route to read in (the host waits for
@@ -559,6 +569,7 @@ class Engine:
     for n, _ in itertools.product(range(1, self.tokens), range(3)): self.model.rollback(n)  # (their jits captured too, after a verify step)
     for (i, save), _ in itertools.product(itertools.product(range(2), (True, False)), range(3)): self.model._copy(i, save)  # (and save's)
     for _ in range(3 if self.chain_jit else 0): self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
+    for jit, _ in itertools.product(self.keep_jits, range(3)): jit(self.v_at.bind(0))  # (a kept session's copies)
 
   def step(self, toks:list[int], pos:int, given:list[int]|None=None) -> tuple[list[int], list[int], np.ndarray|None]:
     """a step of the tokens at positions pos..: the gpus run its graph, the host every layer's routing and reads. the greedy token after each,
@@ -581,7 +592,6 @@ class Engine:
     if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left", -4: "NaN scores"}[err])
     ret, G = self.res_np[1:1 + T + 2 * self.width], self.width
     self.times += (t1 - t0, time.perf_counter() - t2)
-    self.costs["step"].append((time.perf_counter() - t0) / T)
     self.step_s[T].append(time.perf_counter() - t0)
     scores = ret[T + G:].view(np.float32).copy() if self.draft is not None and self.draft.scored else None
     return ret[:T].tolist(), ret[T:T + G].tolist(), scores
@@ -612,6 +622,33 @@ class Engine:
   def max_context(self) -> int: return self.model.max_context
   def get_start_pos(self, tokens:list[int]) -> int: return self.model.get_start_pos(tokens)
 
+  def session_rows(self, i:int, at:UOp) -> Tensor:  # (cache i's rows of a kept session's at..)
+    o, k = self.caches[i]
+    return getattr(o, k).shrink(tuple((at, at + self.B) if j == self.stripes[i][0] else None for j in range(getattr(o, k).ndim)))
+
+  def keep(self, at:UOp):  # (a session's rows at.. and recurrent states into the copies)
+    states = zip(self.stash_states, self.model._states())
+    Tensor.realize(*[c.assign(self.session_rows(i, at)) for i, c in enumerate(self.stash)], *[c.assign(s) for c, s in states])
+
+  def unkeep(self, at:UOp):  # (and back)
+    states = zip(self.stash_states, self.model._states())
+    Tensor.realize(*[self.session_rows(i, at).assign(c) for i, c in enumerate(self.stash)], *[s.assign(c) for c, s in states])
+
+  def resume(self, tokens:list[int]):
+    """the kept session back when tokens share more with it than with the tokens fed (if the request since wrote only its copied rows), else
+    the tokens fed kept when tokens diverge from them early and are fewer (a short request: a title, a summary) and longer than one kept"""
+    m = self.model
+    def shared(a:list[int]) -> int: return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, a)))
+    if self.session is not None and shared(kept:=self.session[0]) > shared(m._cached_tokens):
+      if round_up(len(m._cached_tokens) + self.tokens, max(self.chunk, 1)) <= (at:=self.session[1]) + self.B:
+        self.keep_jits[1](self.v_at.bind(at))
+        m._cached_tokens, m._saved = kept[:], []
+      self.session = None
+    elif len(tokens) < len(m._cached_tokens) and (at:=shared(m._cached_tokens)) + self.B <= self.max_context and len(tokens) - at < self.B // 2 \
+         and len(m._cached_tokens) > (len(self.session[0]) if self.session else 0):
+      self.keep_jits[0](self.v_at.bind(at))
+      self.session = (m._cached_tokens[:], at)
+
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
     partial (its rows padded), unless steps of them are faster (steps_faster), the position after them"""
@@ -629,6 +666,7 @@ class Engine:
     """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
     a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
+    self.resume(tokens)
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
     if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
@@ -649,11 +687,11 @@ class Engine:
       toks, g, score = self.step([t, *gs], len(tokens) - 1)
       row = next((j for j, g in enumerate(gs) if toks[j] != g), len(gs))
       self.verified += (1, len(gs), row)
+      if row < len(gs): self.model.rollback(row + 1)  # (before the kept ones are yielded: a request may stop at any)
       for kept in gs[:row]:
         tokens.append(kept)
         self.model._cached_tokens = tokens[:]
         yield kept
-      if row < len(gs): self.model.rollback(row + 1)
       t = toks[row]
 
   def counters(self) -> np.ndarray:
