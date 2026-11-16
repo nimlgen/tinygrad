@@ -58,13 +58,13 @@ class Engine:
     self.scores = [b[1][0].uop.reshape(n, 2, E // G).unshard(2) for b in bufs]
     # the scorers: a layer's router and the guess of the next layer's experts on its input (GUESS=dir: guess-<block>.npy maps fitted on traces,
     # else the next layer's router), a gpu its experts' rows of each (in q8_0 where there's a kernel). the routers' memory freed: the scorers route
-    routers = [b.ffn_gate_inp.weight.float().numpy() for b in blocks]
+    routers = list(Tensor.stack(*[b.ffn_gate_inp.weight.float() for b in blocks]).numpy())
     def guessed(li:int) -> np.ndarray: return np.load(f) if os.path.exists(f:=f"{guess}/guess-{m['layers'][li]}.npy") else routers[li]
     def scorer(w:np.ndarray) -> Tensor|Linear:  # (rows a gpu's: its experts' of the router, then of the guess)
       w = Tensor(w.reshape(2, G, E // G, -1).transpose(1, 0, 2, 3).reshape(2 * E, -1).astype(np.float16))
       return q8_0_linear(w.to(self.devs[0]), self.devs, 0) if amd_custom_kernels_supported(self.devs) else w.shard(self.devs, 0).realize()
     self.scorers = [scorer(np.stack([r, guessed(min(li + 1, L - 1))])) for li, r in enumerate(routers)]
-    self.bias = [b.exp_probs_b["bias"].float().numpy() for b in blocks]
+    self.bias = list(Tensor.stack(*[b.exp_probs_b["bias"].float() for b in blocks]).numpy())
     for b in model.blk:  # (a verify step's recurrent states after its first token kept: a rollback)
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
     for li, b in enumerate(blocks):
