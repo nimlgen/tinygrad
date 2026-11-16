@@ -12,7 +12,7 @@ def weight(t:Tensor, devs:tuple[str, ...], axis:int|None=None, q8:bool=True) -> 
   """a checkpoint's weight (read once) split over devs on axis (None: a copy on each): a matrix in q8_0 where there's a kernel, else f16"""
   if not q8 or len(t.shape) == 1 or t.shape[1] % (32 * len(devs)) or not amd_custom_kernels_supported(devs):  # (vectors, rows not of blocks)
     return t.to(devs[0]).half().shard(devs, axis).realize()
-  return q8_0_linear(t.to(devs[0]), devs, axis)
+  return q8_0_linear(t.to(devs[0]), devs, axis if len(devs) > 1 else None)  # (one gpu: whole)
 
 class Eagle3:
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int):
