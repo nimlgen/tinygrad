@@ -548,34 +548,39 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
   grid = grid.after(grid[tid].store(grid_src[tid]))
   signs = signs.after(*(signs[tid*2 + i].store(sign_src[tid*2 + i]) for i in range(2)))
   slot = tiles[token_block].cast(dtypes.int32)
-  g = UOp.range((slot >= 0).where(in_features//Q8_GROUP_SIZE, 0), 4, AxisType.LOOP)
-  block, sub, par = g // 8, g % 8, g % 2
+  # a step: steps groups (their rows' words staged, their weights decoded together: more in flight between two barriers)
+  steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
+  step = UOp.range((slot >= 0).where(in_features//Q8_GROUP_SIZE//steps, 0), 4, AxisType.LOOP)
+  par = step % 2
   def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.int32).maximum(0).cast(dtypes.weakint)
   # a row's 16 words of the group, rows 18 words apart (the 16 rows of a fragment on different banks)
-  lds = UOp.alloc((2*tile*18,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  staged = [lds[(par*tile + r//16)*18 + r%16].store(x[xr(token_block*tile + r//16), g*16 + r%16].load())
-            for r in (tid + k*waves*32 for k in range(tile*16 // (waves*32)))]
+  lds = UOp.alloc((2*steps*tile*18,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  staged = [lds[((par*steps + k)*tile + r//16)*18 + r%16].store(x[xr(token_block*tile + r//16), (step*steps + k)*16 + r%16].load())
+            for k in range(steps) for r in (tid + i*waves*32 for i in range(tile*16 // (waves*32)))]
   lds = lds.after(UOp.group(*staged).barrier())
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
   # a lane's inputs of a 16 step h: words 2ph, 2ph+1 and 4+2ph, 5+2ph of the row's 8
-  afrags = [[UOp.stack(*(v for w in (2*ph, 2*ph+1, 4+2*ph, 5+2*ph) for v in halves(lds[(par*tile + t*16 + col)*18 + h*8 + w].load())))
+  def afrags(k:int) -> list[list[UOp]]:
+    return [[UOp.stack(*(v for w in (2*ph, 2*ph+1, 4+2*ph, 5+2*ph) for v in halves(lds[((par*steps + k)*tile + t*16 + col)*18 + h*8 + w].load())))
              for h in range(2)] for t in range(tile//16)]
-  accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in afrags] for _ in outputs]
+  accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(tile//16)] for _ in outputs]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
-  vals = [[acc.after(g) for acc in row] for row in accs]
-  for o, output in enumerate(outputs):
-    base = slot.maximum(0).cast(dtypes.int64)*stride + offset + output*output_words + block*type_words
-    sign_word = _load_u32(raw, base, 66+sub*4)
-    scale = (_half(raw[base]) * ((sign_word >> 28).float()+0.5)*0.5).cast(dtypes.half)
-    scale2, bias2 = ((v.bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001) for v in (scale, scale*-1024))
-    def word(i:int) -> list[UOp]:  # (the lane's word i of the group: its four weights)
-      gw, bits = grid[_load_byte(raw, base, 2+sub*8+i)].load(), ((sign_word >> (7*(i//2))) & 127)*4 + ph*2
-      return [v for p, sel in enumerate((0x04010400, 0x04030402))
-              for v in halves(_IQ3_HALVES.call(gw, scale2, bias2, signs[bits + p].load(), UOp.const(sel, dtypes.uint32)))]
-    bfrags = [UOp.stack(*(v for k in (0, 2) for v in word(h*4 + k + ph))) for h in range(2)]
-    for t, tile_afrags in enumerate(afrags):
-      for afrag, bfrag in zip(tile_afrags, bfrags): vals[o][t] = UOp.wmma(afrag, bfrag, vals[o][t], WMMA_ARG[0], 32)
-  update = UOp.group(*(acc.store(v) for row, vrow in zip(accs, vals) for acc, v in zip(row, vrow))).end(g)
+  vals = [[acc.after(step) for acc in row] for row in accs]
+  for k in range(steps):
+    block, sub, frags = (step*steps + k) // 8, (step*steps + k) % 8, afrags(k)
+    for o, output in enumerate(outputs):
+      base = slot.maximum(0).cast(dtypes.int64)*stride + offset + output*output_words + block*type_words
+      sign_word = _load_u32(raw, base, 66+sub*4)
+      scale = (_half(raw[base]) * ((sign_word >> 28).float()+0.5)*0.5).cast(dtypes.half)
+      scale2, bias2 = ((v.bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001) for v in (scale, scale*-1024))
+      def word(i:int) -> list[UOp]:  # (the lane's word i of the group: its four weights)
+        gw, bits = grid[_load_byte(raw, base, 2+sub*8+i)].load(), ((sign_word >> (7*(i//2))) & 127)*4 + ph*2
+        return [v for p, sel in enumerate((0x04010400, 0x04030402))
+                for v in halves(_IQ3_HALVES.call(gw, scale2, bias2, signs[bits + p].load(), UOp.const(sel, dtypes.uint32)))]
+      bfrags = [UOp.stack(*(v for j in (0, 2) for v in word(h*4 + j + ph))) for h in range(2)]
+      for t, tile_afrags in enumerate(frags):
+        for afrag, bfrag in zip(tile_afrags, bfrags): vals[o][t] = UOp.wmma(afrag, bfrag, vals[o][t], WMMA_ARG[0], 32)
+  update = UOp.group(*(acc.store(v) for row, vrow in zip(accs, vals) for acc, v in zip(row, vrow))).end(step)
   def value(o:int, t:int, j:int) -> UOp: return accs[o][t].after(update)[j].load()
   rows = [[token_block*tile + t*16 + ph*8 + j for j in range(8)] for t in range(tile//16)]
   if act is not None: stores = [out[r, outputs[0]].store(act(value(0, t, j), value(1, t, j)).cast(out.dtype)) for t, rs in enumerate(rows)
