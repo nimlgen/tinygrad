@@ -70,5 +70,21 @@ class TestPersist(unittest.TestCase):
     self.assertEqual(eng2.saved, {})
     for a, b in zip(steps(eng2), want): np.testing.assert_equal(a, b)
 
+  def test_window_mismatch(self):  # the window's route not as saved: the file's dropped, every graph captured again (the window's on its state lent
+    # again), the steps as the first engine's, a file saved again
+    eng = engine(self.t)
+    eng.warm()
+    want = steps(eng)
+    eng2 = engine(self.t)
+    fingerprints, calls = eng2.fingerprints, []
+    def other() -> dict[str, str]:
+      calls.append(fps:=fingerprints())
+      return {**fps, "route": "another start's"} if len(calls) == 1 else fps
+    eng2.fingerprints = other  # type: ignore[method-assign]
+    eng2.warm()
+    self.assertEqual((eng2.saved, len(calls)), ({}, 2))
+    self.assertTrue(persist.path(eng2).exists())
+    for a, b in zip(steps(eng2), want): np.testing.assert_equal(a, b)
+
 if __name__ == "__main__":
   unittest.main()
