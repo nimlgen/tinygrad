@@ -25,6 +25,9 @@ class HCQInfo:
 
   skip_wait:bool = False # TODO: remove. an rdma copy between nodes is two batches, so waiting on the first alone deadlocks
 
+@dataclass(frozen=True)
+class DevInfo: peer_group:str; is_usb:bool # noqa: E702
+
 def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for x in to_tuple(d)} <= c
 
 def get_enqueue_devs(call:UOp) -> tuple[str, ...]:
@@ -237,6 +240,7 @@ class DepsTracker:
 class BatchCtx:
   batch:list[tuple[UOp, str, str]] # (call, device, queue) per enqueued call
   profile:bool
+  machine:dict[str, DevInfo]
   queues:dict[str, list[str]] = field(init=False) # per device, its queues in first-use order: none for a peer without calls of its own
   calls:dict[tuple[str, str], list[int]] = field(init=False) # per queue, the tags of its calls in order
   peers:dict[tuple[str, str], set[str]] = field(init=False) # the other devices whose memory a queue touches
@@ -244,7 +248,7 @@ class BatchCtx:
 
   def __post_init__(self):
     # the other devices whose memory a call touches: a usb gpu can't reach host memory
-    reach = [HCQ_DEVS if getattr(Device[d], "is_usb", False) else HCQ_DEVS | HOST_DEVS for _, d, _ in self.batch]
+    reach = [HCQ_DEVS if self.machine[d].is_usb else HCQ_DEVS | HOST_DEVS for _, d, _ in self.batch]
     arg_devs = [{Device.canonicalize(x) for b in get_call_arg_uops(c) for x in to_tuple(b.device)} for c, _, _ in self.batch]
     touched = [{x for x in xs if all_devices_in(x, r)} - {d} for xs, r, (_, d, _) in zip(arg_devs, reach, self.batch)]
 
@@ -347,7 +351,8 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   return sink.call(*slots.values(), hcq=info)
 
 @rewrite_group(new_ctx=False)
-def sched_batches(l:UOp, profile:bool) -> UOp:
+@Context(ALLOW_DEVICE_USAGE=0)
+def sched_batches(l:UOp, profile:bool, machine:dict[str, DevInfo]) -> UOp:
   copies = [c for c in l.src if c.op is Ops.CALL and c.body.op is Ops.STORE]
   ring = sorted({Device.canonicalize(d) for c in copies for b in get_call_arg_uops(c) for d in to_tuple(b.device) if all_devices_in(d, HCQ_DEVS)})
   # TODO: handle max queue amt better
@@ -363,9 +368,9 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs), key=lambda e: bool(e[1])):
     run = list(grp)
-    peer_groups = dedup([Device[d[0]].peer_group for _, d in run if d])
-    batches = [[(c, d[0], queue_for(c)) for c, d in run if Device[d[0]].peer_group == pg] for pg in peer_groups]
-    if hcq: srcs += [_finalize_batch(BatchCtx(batch, profile), batch is not batches[-1]) for batch in batches]
+    peer_groups = dedup([machine[d[0]].peer_group for _, d in run if d])
+    batches = [[(c, d[0], queue_for(c)) for c, d in run if machine[d[0]].peer_group == pg] for pg in peer_groups]
+    if hcq: srcs += [_finalize_batch(BatchCtx(batch, profile, machine), batch is not batches[-1]) for batch in batches]
     else: srcs += [c for c, _ in run]
   return l.replace(src=tuple(srcs))
 
@@ -579,7 +584,8 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache:bool=
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
   linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
-  lin = graph_rewrite(sched_batches(linear, profile), pm_lower_call, walk=True, name="lower call")
+  machine = {d: DevInfo(Device[d].peer_group, getattr(Device[d], "is_usb", False)) for c in linear.src for d in get_enqueue_devs(c)[:1]}
+  lin = graph_rewrite(sched_batches(linear, profile, machine), pm_lower_call, walk=True, name="lower call")
   with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
   if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
   return final_linear

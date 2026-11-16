@@ -38,8 +38,8 @@ def compiled_chain(n:int, jit=False, device="NULL") -> tuple[Tensor, UOp, list[U
 
 def scheduled(*ts:Tensor, **kwargs) -> list[UOp]:
   batches, orig = list[UOp](), hcq2.sched_batches
-  def track(l, profile):
-    lin = orig(l, profile)
+  def track(l, *args):
+    lin = orig(l, *args)
     batches.extend(c for c in lin.src if c.op is Ops.CALL and c.arg.hcq is not None)
     return lin
   with patch.object(hcq2, "sched_batches", track): compile_linear(ts[0].linear_with_vars(*ts[1:])[0], **kwargs)
