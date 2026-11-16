@@ -118,7 +118,7 @@ class Engine:
     def rows0(t:Tensor) -> tuple[int, ...]: return tuple(self.B if j == next(j for j, d in enumerate(t.shape) if d >= model.max_context) else d
                                                          for j, d in enumerate(t.shape))
     self.stash = [Tensor.empty(*rows0(t:=getattr(o, k)), dtype=t.dtype, device=self.devs, axis=t.uop.axis) for o, k in self.caches]
-    self.stash_states = [s.clone() for s in model._states()]
+    self.stash_states = [s.empty_like() for s in model._states()]
     Tensor.realize(*self.stash, *self.stash_states)
     for o, k in self.caches: setattr(o, k, None)
     free = (lambda: min(free_bytes(d) for d in self.devs)) if not slots else (lambda: 0)  # (what's free on the gpus: sizing the pool by it)
