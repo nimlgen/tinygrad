@@ -547,12 +547,12 @@ _IQ3_HALVES = UOp.custom_function("({{ typedef _Float16 h2 __attribute__((ext_ve
 
 @functools.cache
 def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_features:int, in_features:int, stride:int, offset:int,
-                       act:Callable|None, tile:int) -> UOp:
+                       act:Callable|None, tile:int, gather:bool, skip:bool) -> UOp:
   # a workgroup: a tile's rows (16, 32 or 64) and 256 outputs (act: 128, a wave's gate tile and its up tile), 8 waves of 2 output tiles. a group
   # of 32 inputs at a time the tile's rows go through LDS (two buffers by its parity) and a wave decodes its outputs' weights to halves, the
-  # scales in them
+  # scales in them. skip: a tile's 16 rows whose first is padding (live -1) left out
   *rows_src, grid_src, sign_src = extra
-  xrow = rows_src[0] if rows_src else None
+  xrow, live = rows_src[0] if gather else None, rows_src[-1] if skip else None
   waves, type_words = 8, QUANT_SIZES[IQ3_XXS]//2
   output_words = in_features * type_words // GGML_BLOCK_SIZE
   token_block, output_block = UOp.range(out.shape[0]//tile, 0), UOp.range(out_features//(32*waves), 1)
@@ -576,14 +576,15 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
   lds = lds.after(UOp.group(*staged).barrier())
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
   # a lane's inputs of a 16 step h: words 2ph, 2ph+1 and 4+2ph, 5+2ph of the row's 8
-  def afrags(k:int) -> list[list[UOp]]:
-    return [[UOp.stack(*(v for w in (2*ph, 2*ph+1, 4+2*ph, 5+2*ph) for v in halves(lds[((par*steps + k)*tile + t*16 + col)*18 + h*8 + w].load())))
-             for h in range(2)] for t in range(tile//16)]
+  def afrags(buf:UOp, k:int, t:int) -> list[UOp]:
+    return [UOp.stack(*(v for w in (2*ph, 2*ph+1, 4+2*ph, 5+2*ph) for v in halves(buf[((par*steps + k)*tile + t*16 + col)*18 + h*8 + w].load())))
+            for h in range(2)]
   accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(tile//16)] for _ in outputs]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
-  vals = [[acc.after(step) for acc in row] for row in accs]
+  bfrags:list[list[list[UOp]]] = []
   for k in range(steps):
-    block, sub, frags = (step*steps + k) // 8, (step*steps + k) % 8, afrags(k)
+    block, sub = (step*steps + k) // 8, (step*steps + k) % 8
+    bfrags.append([])
     for o, output in enumerate(outputs):
       base = slot.maximum(0).cast(dtypes.int64)*stride + offset + output*output_words + block*type_words
       sign_word = _load_u32(raw, base, 66+sub*4)
@@ -593,10 +594,18 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
         gw, bits = grid[_load_byte(raw, base, 2+sub*8+i)].load(), ((sign_word >> (7*(i//2))) & 127)*4 + ph*2
         return [v for p, sel in enumerate((0x04010400, 0x04030402))
                 for v in halves(_IQ3_HALVES.call(gw, scale2, bias2, signs[bits + p].load(), UOp.const(sel, dtypes.uint32)))]
-      bfrags = [UOp.stack(*(v for j in (0, 2) for v in word(h*4 + j + ph))) for h in range(2)]
-      for t, tile_afrags in enumerate(frags):
-        for afrag, bfrag in zip(tile_afrags, bfrags): vals[o][t] = UOp.wmma(afrag, bfrag, vals[o][t], WMMA_ARG[0], 32)
-  update = UOp.group(*(acc.store(v) for row, vrow in zip(accs, vals) for acc, v in zip(row, vrow))).end(step)
+      bfrags[k].append([UOp.stack(*(v for j in (0, 2) for v in word(h*4 + j + ph))) for h in range(2)])
+  updates = []
+  for t in range(tile//16):
+    on = step if live is None else UOp.range((live[token_block*tile + t*16] >= 0).where(1, 0).after(lds), 5 + t, AxisType.LOOP)
+    vals = [accs[o][t].after(on) for o in range(len(outputs))]
+    for k in range(steps):
+      for o in range(len(outputs)):
+        for afrag, bfrag in zip(afrags(lds if live is None else lds.after(on), k, t), bfrags[k][o]):
+          vals[o] = UOp.wmma(afrag, bfrag, vals[o], WMMA_ARG[0], 32)
+    stored = UOp.group(*(accs[o][t].store(v) for o, v in enumerate(vals)))
+    updates.append(stored if live is None else stored.end(on))
+  update = UOp.group(*updates).end(step)
   def value(o:int, t:int, j:int) -> UOp: return accs[o][t].after(update)[j].load()
   rows = [[token_block*tile + t*16 + ph*8 + j for j in range(8)] for t in range(tile//16)]
   if act is not None: stores = [out[r, outputs[0]].store(act(value(0, t, j), value(1, t, j)).cast(out.dtype)) for t, rs in enumerate(rows)
@@ -609,16 +618,17 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     arg=KernelInfo(name="expert_iq3_xxs_f16_wmma", opts_to_apply=(), estimates=estimates))
 
 def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, stride:int, offset:int=0,
-                 xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64) -> Tensor:
+                 xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64, live:Tensor|None=None) -> Tensor:
   """out[r] = W[tiles[r // tile]] @ x[xrow[r]] (or x[r]) in half: an IQ3_XXS expert's tile of rows (16, 32 or 64) on the f16 tensor cores (RDNA4),
-  x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output"""
+  x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output.
+  live: the rows' padding (-1), a tile's 16 rows whose first is padding skipped (their outputs 0)"""
   ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), tile * tiles.shape[0]
   if out is None:
     out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act,
-                          tile=tile)
+                          tile=tile, gather=xrow is not None, skip=live is not None)
   srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous().bitcast(dtypes.uint32), tiles.cast(dtypes.int32),
-          *([] if xrow is None else [xrow.cast(dtypes.int32)]), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
+          *(t.cast(dtypes.int32) for t in (xrow, live) if t is not None), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   return ret.reshape(ndev, n, -1) if ndev > 1 else ret
 

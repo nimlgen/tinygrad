@@ -584,6 +584,14 @@ class TestExpertLinear(unittest.TestCase):
         down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off, tile=tile).float().numpy()
         def act(g, u): return g * (u / 25).tanh()
         gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), act=act, tile=tile).float().numpy()
+        live = np.where(np.arange(n) % 32 < 12, 0, -1).astype(np.int32)  # (rows 16..31 of every 32 padding: their 16 left out, 0)
+        kept = np.repeat(live[::16] >= 0, 16)
+        for got, want in ((expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), tile=tile,
+                                        live=Tensor(live)), out),
+                          (expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off, tile=tile, live=Tensor(live)), down)):
+          got = got.float().numpy()
+          np.testing.assert_array_equal(got[kept], want[kept])
+          np.testing.assert_array_equal(got[~kept], 0)
         for t, s in enumerate(self.sel[:2]):
           rows = slice(tile * t, tile * t + tile)
           ref = x[np.maximum(xr[rows], 0)].astype(np.float16).astype(np.float32) @ self.weight(s, 0, 2 * self.UNITS, self.LAT).T
