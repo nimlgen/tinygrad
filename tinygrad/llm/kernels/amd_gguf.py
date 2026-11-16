@@ -571,7 +571,8 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
   def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.int32).maximum(0).cast(dtypes.weakint)
   # a row's 16 words of the group, rows 18 words apart (the 16 rows of a fragment on different banks)
   lds = UOp.alloc((2*steps*tile*18,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  staged = [lds[((par*steps + k)*tile + r//16)*18 + r%16].store(x[xr(token_block*tile + r//16), (step*steps + k)*16 + r%16].load())
+  staged = [lds[((par*steps + k)*tile + r//16)*18 + r%16].store(_amd_load(x[xr(token_block*tile + r//16), ((step*steps + k)*16 + r%16)*2], 2)
+                                                              .bitcast(dtypes.uint32))
             for k in range(steps) for r in (tid + i*waves*32 for i in range(tile*16 // (waves*32)))]
   lds = lds.after(UOp.group(*staged).barrier())
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
@@ -627,7 +628,7 @@ def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_featu
     out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
   fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act,
                           tile=tile, gather=xrow is not None, skip=live is not None)
-  srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous().bitcast(dtypes.uint32), tiles.cast(dtypes.int32),
+  srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous(), tiles.cast(dtypes.int32),
           *(t.cast(dtypes.int32) for t in (xrow, live) if t is not None), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   return ret.reshape(ndev, n, -1) if ndev > 1 else ret
