@@ -4,6 +4,7 @@
 import json, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
+from tinygrad.uop.ops import smax
 from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
@@ -37,8 +38,13 @@ class Eagle3:
     self.cache = Tensor.empty(1, 1, max_context, self.lora + self.rope, dtype=dtypes.half, device=devs).realize()
     self.positions = Tensor.arange(max_context).to(devs).realize()  # (the causal mask's, on the gpus: a symbolic arange isn't)
 
+  width = 1  # (a row's guesses: the next ones a chain's)
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, Tensor|None]:
+    """a step's guesses (T, 1) after each of its rows' next tokens (1, T) on the target's taps, the feedback states (a chain's)"""
+    logits, x, _ = self(tokens, hidden, pos)
+    return logits[0].argmax(-1).reshape(-1, 1).cast(dtypes.int32), x
   def fc(self, hidden:Tensor) -> Tensor:  # (the target's hidden states (1, T, 3, dim) to the layer's)
     return self.lin(Tensor.cat(*[self.norm(hidden[:, :, i], f"fc_norm.{i}") for i in range(hidden.shape[2])], dim=-1), "fc")
 
@@ -85,11 +91,12 @@ class Eagle3:
 # shares the target's embedding and head. its context's keys and values in a cache of every position (layer, k/v, 1, kv heads, position, dim)
 class DSpark:
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
-               q8:bool=True):
+               width:int=1, q8:bool=True):
     cfg = json.load(open(f"{path}/config.json"))
     tl = cfg["transformer_layer_config"]
     self.H, self.KV, self.hd, self.L = tl["num_attention_heads"], tl["num_key_value_heads"], tl["head_dim"], tl["num_hidden_layers"]
     self.eps, self.window, self.mask_id, self.embed, self.head = tl["rms_norm_eps"], tl["sliding_window"], cfg["mask_token_id"], embed, head
+    self.width, self.max_context = width, max_context  # (a step's block of guesses after each row)
     assert cfg["sample_from_anchor"] and cfg["markov_head_type"] == "vanilla" and tl["rope_parameters"]["rope_type"] == "default"
     self.taps = [(i - 1, False) for i in cfg["aux_hidden_state_layer_ids"]]  # (the ids count the blocks done)
     self.freqs_cis = precompute_freqs_cis(self.hd, max_context, tl["rope_parameters"]["rope_theta"]).to(devs).realize()
@@ -117,16 +124,26 @@ class DSpark:
         stores.append(self.cache[l, i, :, :, pos:pos + T].uop.store(x.cast(dtypes.half).uop))
     return Tensor(self.cache.uop.after(*stores))
 
-  def __call__(self, anchors:Tensor, apos:Tensor, k:int, keys:tuple[int|UOp, int], prev:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> tuple[Tensor, None]:
+    """a step's blocks of guesses (T, width) after each of its rows' next tokens (1, T) (the anchors, at positions pos+1..), the cache after
+    the rows' keys on the target's taps hidden (1, T, taps, dim) first: a row's block sees the rows up to it"""
+    T = tokens.shape[1]
+    n = min(self.window + T, self.max_context)  # (the keys any block sees: from pos-window on)
+    cache = self.fill(tokens, hidden, pos)
+    apos = (Tensor.arange(T) + (pos + 1)).to(hidden.device)
+    return self(tokens[0], apos, self.width, (smax(pos + T - n, 0), n), cache=cache)[0], None
+
+  def __call__(self, anchors:Tensor, apos:Tensor, k:int, keys:tuple[int|UOp, int], prev:Tensor|None=None,
+               cache:Tensor|None=None) -> tuple[Tensor, Tensor, Tensor]:
     """A blocks of k guesses after anchors (A,) at positions apos (A,) on the cache's positions keys (start, n): their tokens (A, k), the
     confidence each is right (A, k), its logits (A, k, vocab). prev (A, k): the tokens before the guesses taken as given (an evaluation's)"""
-    A, (k0, n) = anchors.shape[0], keys
-    qpos = apos.reshape(A, 1) + Tensor.arange(k).to(apos.device).reshape(1, k)  # (A, k)
+    A, (k0, n), cache = anchors.shape[0], keys, self.cache if cache is None else cache
+    qpos = apos.reshape(A, 1) + Tensor.arange(k).to(anchors.device).reshape(1, k)  # (A, k)
     freqs = self.freqs_cis[qpos.flatten()].reshape(A, k, -1)
     # a query sees the context before its anchor in the window, its block causally
-    kp = (Tensor.arange(n).to(apos.device) + k0).reshape(1, 1, 1, n)
+    kp = (Tensor.arange(n).to(anchors.device) + k0).reshape(1, 1, 1, n)
     ctx = (kp < apos.reshape(A, 1, 1, 1)) & (kp > qpos.reshape(A, 1, k, 1) - self.window)
-    blk = Tensor.ones(k, k, dtype=dtypes.bool, device=apos.device).tril().reshape(1, 1, k, k)
+    blk = Tensor.ones(k, k, dtype=dtypes.bool, device=anchors.device).tril().reshape(1, 1, k, k)
     mask = ctx.expand(A, 1, k, n).cat(blk.expand(A, 1, k, k), dim=-1).where(0.0, -math.inf)
     x = self.embed(anchors.reshape(A, 1).pad(((0, 0), (0, k - 1)), value=self.mask_id)).float()  # (A, k, dim)
     G = self.H // self.KV
@@ -135,7 +152,7 @@ class DSpark:
       h = self.norm(x, f"layers.{l}.input_layernorm")
       q = apply_rope(self.norm(self.lin(h, a + "q_proj").reshape(A, k, self.H, self.hd), a + "q_norm").transpose(1, 2), freqs)
       kb, vb = self.kv(h, a, freqs)
-      kc, vc = (self.cache[l, i, :, :, k0:k0 + n].float().expand(A, self.KV, n, self.hd) for i in range(2))
+      kc, vc = (cache[l, i, :, :, k0:k0 + n].float().expand(A, self.KV, n, self.hd) for i in range(2))
       keys_, vals = kc.cat(kb, dim=2), vc.cat(vb, dim=2)  # (A, kv, n + k, hd)
       q = q.reshape(A, self.KV, G * k, self.hd)
       att = ((q @ keys_.transpose(-1, -2)).reshape(A, self.H, k, n + k) / math.sqrt(self.hd) + mask).softmax(-1)
@@ -159,3 +176,9 @@ class DSpark:
       out = logits.argmax(-1)
     conf = (h.cat(e, dim=-1) @ self.w["confidence_head.proj"].float().T + self.conf_b).sigmoid()[..., 0]
     return out.cast(dtypes.int32), conf, logits
+
+def load(path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
+         width:int) -> Eagle3|DSpark:
+  """the draft at path (its config's kind), its blocks of width guesses (a block draft's)"""
+  if json.load(open(f"{path}/config.json")).get("speculators_model_type") == "dspark": return DSpark(path, embed, head, devs, max_context, width)
+  return Eagle3(path, embed, devs, max_context)

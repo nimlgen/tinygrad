@@ -11,7 +11,7 @@ from tinygrad import Tensor, Device, UOp, nn, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
-from extra.k3.draft import Eagle3
+from extra.k3.draft import Eagle3, DSpark
 from extra.k3.eval import window_evaluate, window_dump
 
 DIM, LAT, FF, E, K, G, VOCAB = 64, 32, 64, 8, 4, 2, 32
@@ -235,6 +235,25 @@ class TestEngine(unittest.TestCase):
     want = eng.res_np.copy()
     for _ in range(3): eng.jits[2](eng.v_pos.bind(0))
     np.testing.assert_equal(eng.res_np, want)
+
+  def test_dspark_step(self):  # a step's blocks (a row's after its next token, on the rows up to it, the keys of the draft's window of
+    # positions) as the draft's own on all its cache's positions: jitted steps of a token (a symbolic window), then a verify step
+    from extra.k3.test_draft import dspark
+    self.stub()
+    eng, toks = self.eng, [3, 5, 7, 1, 2, 9, 4, 6, 8, 2]
+    eng.draft = d = DSpark(dspark(tempfile.mkdtemp(), np.random.default_rng(5), window=6), lambda t: eng.model.token_embd(t).float(),
+                           eng.model.output, eng.devs, eng.model.max_context, width=2)
+    def want(anchors:list[int], pos:int) -> np.ndarray:
+      g, _, _ = d(Tensor(anchors, dtype=dtypes.int32).shard(eng.devs), Tensor(list(range(pos + 1, pos + 1 + len(anchors))), dtype=dtypes.int32)
+                  .shard(eng.devs), 2, (0, eng.model.max_context))
+      return g.numpy().flatten()
+    for pos, t in enumerate(toks[:8]):
+      eng.tok_np[:1], eng.given_np[:1] = [t], [toks[pos + 1]]
+      eng.jits[1](eng.v_pos.bind(pos))
+      np.testing.assert_equal(eng.res_np[2:4], want([toks[pos + 1]], pos), err_msg=f"position {pos}")
+    eng.tok_np[:2], eng.given_np[:2] = toks[8:], [-1, -1]
+    eng.run(2, eng.v_pos.bind(8))
+    np.testing.assert_equal(eng.res_np[3:7], want(eng.res_np[1:3].tolist(), 8))
 
   @unittest.skipUnless(amd_custom_kernels_supported(Device.DEFAULT), "the graph's host syncs and the expert kernel: AMD")
   def test_generate(self):  # the jitted steps with the host's step_io (every expert cached: no reads), captured on dry steps
