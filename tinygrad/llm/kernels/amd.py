@@ -786,6 +786,82 @@ def _mla_topk_partial(out:UOp, stats:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|
                                                                                                zero)))]
   return UOp.group(*final).end(lane, wave, part, hg, row).sink(arg=KernelInfo(name="mla_topk_partial", opts_to_apply=()))
 
+def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
+  return UOp.custom_function("__builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute({1}, __builtin_bit_cast(int, {0})))", shape=x.shape,
+                             dtype=dtypes.float, fmt=True).call(x, (src*4).cast(dtypes.int32))
+
+@functools.cache
+def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float) -> UOp:
+  """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its slots of
+  idx[b, t] (or every position) of the first start + T at or before it, on the f16 tensor cores (RDNA4). a workgroup a row: its heads in two
+  tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (two buffers by its parity). a tile's 4 waves each the scores of
+  a quarter of D (summed through LDS), then each its online softmax of the block's scores and the values of a quarter of V"""
+  start = _unbind(start)
+  B, H, T, D = cast(tuple[int, int, int, int], q.shape)
+  N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
+  K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
+  assert H <= 32 and D == 2*DW and D % 64 == 0 and V % 64 == 0
+  row, lane, wave = UOp.range(B*T, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(8, 1, AxisType.LOCAL)
+  b, t, tid, tile, part, ph, col = row // T, row % T, wave*WARP_SIZE + lane, wave // 4, wave % 4, lane // 16, lane % 16
+  ks = [4*ph + i for i in range(4)] + [8 + 4*ph + i for i in range(4)]  # (a lane's 8 of a fragment's 16 inputs)
+  def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
+  head = tile*16 + col
+  qfrags = [UOp.stack(*((head < H).where(q[b, head.minimum(H - 1), t, part*(D//4) + i*16 + k].load(), 0.0).cast(dtypes.half) for k in ks))
+            for i in range(D//64)]
+  keys = smin(start + T, K)
+  kb = UOp.range((keys + 15) // 16, 2, AxisType.LOOP)
+  par = kb % 2
+  # the block's keys into LDS: 16 threads a row, a contiguous run of its words each; a slot not a key's reads row 0
+  lds_k = UOp.alloc((2*16*RW,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  lds_ok = UOp.alloc((2*16,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  r, wi, per = tid // 16, tid % 16, DW // 16
+  slot = kb*16 + r
+  pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
+  ok = (slot < keys) & (pos <= start + t) & (pos >= 0)
+  at = ok.where(pos, 0).minimum(N - 1)
+  staged = [lds_k[(par*16 + r)*RW + wi*per + i].store(cache[b, 0, at, wi*per + i].load()) for i in range(per)]
+  staged.append(lds_ok[(par*16 + r).valid(wi.eq(0))].store(ok.cast(dtypes.int32)))
+  barrier = UOp.group(*staged).barrier()
+  lds_k, lds_ok = lds_k.after(barrier), lds_ok.after(barrier)
+  def kword(key:UOp, w:UOp) -> UOp: return lds_k[(par*16 + key)*RW + w].load()
+  # the wave's scores of its quarter of D: (its tile's heads, the block's keys), summed over the quarters through LDS
+  S = UOp.stack(*[UOp.const(0.0, dtypes.float)]*8)
+  for i, qf in enumerate(qfrags):
+    w0 = (part*(D//4) + i*16) // 2
+    S = UOp.wmma(qf, UOp.stack(*(h for w in (2*ph, 2*ph + 1, 4 + 2*ph, 5 + 2*ph) for h in halves(kword(col, w0 + w)))), S, WMMA_ARG[0], WARP_SIZE)
+  lds_s = UOp.alloc((2, 2, 4, 16, 16), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds_s = lds_s.after(UOp.group(*(lds_s[par, tile, part, ph*8 + j, col].store(S[j]) for j in range(8))).barrier())
+  # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V
+  m_reg, l_reg, acc_reg = _reg((1,), -1e30), _reg((1,), 0), _reg((V//64, 8), 0)
+  m, l = m_reg.after(kb)[0].load(), l_reg.after(kb)[0].load()
+  s = [lds_ok[par*16 + k].load().ne(0).where(sum((lds_s[par, tile, p, col, k].load() for p in range(4)), UOp.const(0.0, dtypes.float))*scale,
+                                             -math.inf) for k in ks]
+  mn = m.maximum(functools.reduce(UOp.maximum, s).maximum(_xor16(functools.reduce(UOp.maximum, s))))
+  alpha, p = ((m - mn)*LOG2E).exp2(), [((x - mn)*LOG2E).exp2() for x in s]
+  psum = functools.reduce(UOp.__add__, p)
+  ln = l*alpha + psum + _xor16(psum)
+  pfrag = UOp.stack(*(x.cast(dtypes.half) for x in p))
+  arow = [_lane_of(alpha, ph*8 + j) for j in range(8)]
+  acc = []
+  for o in range(V//64):
+    v = part*(V//4) + o*16 + col
+    vfrag = UOp.stack(*((kword(k, v // 2) >> ((v % 2)*16).cast(dtypes.uint32)).cast(dtypes.uint16).bitcast(dtypes.half) for k in ks))
+    acc.append(UOp.wmma(pfrag, vfrag, UOp.stack(*(acc_reg.after(kb)[o, j].load()*arow[j] for j in range(8))), WMMA_ARG[0], WARP_SIZE))
+  update = UOp.group(m_reg[0].store(mn), l_reg[0].store(ln), *(acc_reg[o, j].store(a[j]) for o, a in enumerate(acc) for j in range(8))).end(kb)
+  l_end = l_reg.after(update)[0].load()
+  lrow = [_lane_of(l_end, ph*8 + j) for j in range(8)]
+  stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), part*(V//4) + o*16 + col].store(acc_reg.after(update)[o, j].load() / lrow[j])
+            for o in range(V//64) for j in range(8)]
+  return UOp.group(*stores).end(lane, wave, row).sink(arg=KernelInfo(name="mla_wmma", opts_to_apply=()))
+
+def mla_wmma_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
+  """mla_topk_attention on the f16 tensor cores (RDNA4, up to 32 heads a device): the queries and probabilities in half, sums in float"""
+  B, H, T, _ = q.shape
+  out = Tensor.empty(B*T, H, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
+  if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
+  out = Tensor.custom_kernel(out, q.contiguous(), cache.bitcast(dtypes.uint32), *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
+                             fxn=functools.partial(_mla_wmma_kernel, start=start, scale=scale))[0]
+  return out.reshape(B, T, H, values).transpose(1, 2)
 def mla_topk_supported(device:str|tuple[str, ...]|None, values:int) -> bool:
   """mla_topk_attention's gpus and shapes: a value a lane's dims of a wave"""
   return amd_custom_kernels_supported(device) and values % WARP_SIZE == 0
@@ -793,7 +869,10 @@ def mla_topk_supported(device:str|tuple[str, ...]|None, values:int) -> bool:
 def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
   idx (B, T, K) (of the first start + T slots, at or before the query; None: every position, causal), a row's value its first values dims"""
-  B, H, T, _ = q.shape
+  B, H, T, D = q.shape
+  local = q.uop.shard_shape[1] if q.uop.axis == 1 else H
+  if _is_rdna4(q.device) and isinstance(T, int) and T >= 16 and local <= 32 and D % 64 == 0 and values % 64 == 0:
+    return mla_wmma_attention(q, cache, idx, start, values, scale)  # (a chunk's rows: the tensor cores)
   parts = 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   stats = Tensor.empty(B*T, H, parts, 2, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)

@@ -716,6 +716,23 @@ class TestTopk(unittest.TestCase):
       p = np.exp(s - s.max(-1, keepdims=True))
       np.testing.assert_allclose(got[0], (p / p.sum(-1, keepdims=True)) @ k[:, :V], rtol=1e-4, atol=1e-4)
 
+  def test_mla_wmma(self): # a chunk's rows on the tensor cores (RDNA4): as the attention over their positions' keys (queries, probabilities: half)
+    if not _is_rdna4(Tensor.empty(1).device): self.skipTest("RDNA4 required")
+    rng, H, D, V, N, K, T = np.random.default_rng(2), 24, 576, 512, 256, 64, 32
+    cache = (rng.standard_normal((1, 1, N, D)) * 0.5).astype(np.float16)
+    for start, positions in ((0, True), (100, True), (100, False), (200, True)):
+      q = (rng.standard_normal((1, H, T, D)) * 0.5).astype(np.float32)
+      idx = np.stack([np.concatenate([p:=np.sort(rng.choice(min(start + t + 1, N), min(K, start + t + 1), replace=False)), np.full(K - len(p), -1)])
+                      for t in range(T)]).astype(np.int32)
+      v = UOp.variable("start_pos", 0, N - T).bind(start)
+      got = mla_topk_attention(Tensor(q), Tensor(cache).realize(), Tensor(idx[None]) if positions else None, v, V, 0.05).numpy()[0]
+      k = cache[0, 0].astype(np.float32)
+      for t in range(T):
+        keys = idx[t][(idx[t] >= 0) & (idx[t] <= start + t)] if positions else np.arange(start + t + 1)
+        s = q[0, :, t] @ k[keys].T * 0.05
+        p = np.exp(s - s.max(-1, keepdims=True))
+        np.testing.assert_allclose(got[:, t], (p / p.sum(-1, keepdims=True)) @ k[keys, :V], rtol=2e-3, atol=2e-3, err_msg=f"{start=} {t=}")
+
   def test_mla_every_key(self): # no indexer: the indexed kernel over every position, as the dense attention masked causal
     cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=64, n_heads=4, n_kv_heads=1, norm_eps=1e-5, vocab_size=16, head_dim=80, rope_theta=1e4,
                             rope_dim=16, v_head_dim=16, max_context=64, q_lora_rank=32, kv_lora_rank=64, mla_nope=True)
