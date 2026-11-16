@@ -506,6 +506,7 @@ class Engine:
     keep |= (old >= 0) & (st["flying"][np.maximum(old, 0)] > 0)
     victims = np.ascontiguousarray(np.argsort(np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0)),
                                               kind="stable")[:len(miss)], np.int64)
+    if keep[victims].any(): raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
     st["slot_of"][old[victims][old[victims] >= 0]] = -1
     st["slot_of"][miss], st["expert_in"][victims] = victims, miss
     io.misses += len(miss)
