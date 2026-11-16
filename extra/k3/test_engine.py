@@ -187,6 +187,7 @@ class TestEngine(unittest.TestCase):
     eng, taps, seq = self.eng, [(0, False), (1, True), (2, True), (1, False)], [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7]
     eng.dump_taps = taps
     eng.window_init(8)
+    eng.window_lend()
     eng.draft = SimpleNamespace(taps=taps)  # (forward's taps)
     want = []
     for pos, t in enumerate(seq):
@@ -278,6 +279,7 @@ class TestEngine(unittest.TestCase):
         for p in nn.state.get_parameters(b.indexer): p.replace(Tensor(rng.normal(0, 0.3, p.shape).astype(np.float32)).shard(eng.devs, p.uop.axis))
         b._init_state(Tensor.empty(1, 1, DIM, device=eng.devs))
     eng.window_init(8)  # (the window's graphs on the draft and the indexers)
+    eng.window_lend()
     ids = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7, 2, 5, 9, 4]
     def run(t:int, pos:int) -> np.ndarray:
       eng.tok_np[:1], eng.given_np[:1] = [t], ids[pos + 1:pos + 2] or [-1]
