@@ -3,6 +3,7 @@
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
 import json, pathlib, tempfile, unittest
+from typing import Callable
 from dataclasses import replace
 from types import SimpleNamespace
 import numpy as np
@@ -79,14 +80,16 @@ class TestEngine(unittest.TestCase):
     self.ref, self.trunk, self.weights = Transformer.from_gguf(full)[0], trunk, weights
     self.eng = self.engine(2 * E)
 
-  def engine(self, slots:int) -> Engine:  # (the engine on the trunk, every expert in its slot: a code (layer * E + expert) a slot, of slots)
+  def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0') -> Engine:
+    # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches (the pool's first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
-    eng = Engine(Transformer.from_gguf(self.trunk, shard=G)[0], m, slots=slots + 2, tokens=2, chunk=4, window=8)  # (2: the caches')
-    # (the experts past the context's caches, the pool's first slots)
+    model = Transformer.from_gguf(self.trunk, shard=G)[0]
+    eng = Engine(model, m, slots=slots + 2, tokens=2, chunk=4, window=8, draft=draft(model) if draft else None)  # (2: the caches')
     at = eng.slots_of(eng.cache_bytes)
-    pools = [(b'\0' * at * part + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part, b'\0')
-             for g in range(G)]
+    assert at <= 2
+    pools = [(caches * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part,
+                                                                                                                       b'\0') for g in range(G)]
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
     eng.state["slot_of"][:] = at + np.arange(len(layers) * E)
     eng.state["expert_in"][at:at + len(layers) * E] = np.arange(len(layers) * E)
@@ -280,11 +283,15 @@ class TestEngine(unittest.TestCase):
 
   def test_dspark_step(self):  # a step's block (after the token after its kept rows, on the rows up to it, the keys of the draft's window of
     # positions) as the draft's own on all its cache's positions: jitted steps of a token (a symbolic window), then verify steps
+    # (its cache the pool's, sharded by heads, the pool's bytes there NaNs till the context grows: its keys past the context masked, zero)
     from extra.k3.test_draft import dspark
+    path, toks = dspark(tempfile.mkdtemp(), np.random.default_rng(5), window=6), [3, 5, 7, 1, 2, 9, 4, 6, 8, 2]
+    self.eng = eng = self.engine(2 * E, lambda m: DSpark(path, lambda t: m.token_embd(t).float(), m.output, m.token_embd.weight.device,
+                                                         m.max_context, width=2), caches=b'\xff')
     self.stub()
-    eng, toks = self.eng, [3, 5, 7, 1, 2, 9, 4, 6, 8, 2]
-    eng.draft = d = DSpark(dspark(tempfile.mkdtemp(), np.random.default_rng(5), window=6), lambda t: eng.model.token_embd(t).float(),
-                           eng.model.output, eng.devs, eng.model.max_context, width=2)
+    d = eng.draft
+    assert isinstance(d, DSpark) and d.cache.uop.axis == 3
+    eng.grow(len(toks))
     def want(anchors:list[int], pos:int) -> np.ndarray:
       g, _, _ = d(Tensor(anchors, dtype=dtypes.int32).shard(eng.devs), Tensor(list(range(pos + 1, pos + 1 + len(anchors))), dtype=dtypes.int32)
                   .shard(eng.devs), 2, (0, eng.model.max_context))

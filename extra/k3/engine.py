@@ -428,7 +428,7 @@ class Engine:
       if len(c) and (err:=host_c().read_wait(ctypes.byref(self.io), len(c), c.ctypes.data)): raise RuntimeError(f"reads failed {err}")
       st["slot_of"][c], st["expert_in"][sl], st["mask"][sl] = -1, -1, 1
       rows = getattr(o, k).shrink(tuple((self.grown, new) if j == a else None for j in range(getattr(o, k).ndim)))
-      rows.assign(rows.zeros_like(buffer=False)).realize()
+      rows.assign(rows.zeros_like()).realize()
     self.grown = new
 
   def pieces(self) -> int:  # (a read window's pieces: the pool past two layers' experts (the one routed, the one read ahead) lent)
