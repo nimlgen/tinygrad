@@ -101,7 +101,8 @@ class DSpark:
     self.taps = [(i - 1, False) for i in cfg["aux_hidden_state_layer_ids"]]  # (the ids count the blocks done)
     self.freqs_cis = precompute_freqs_cis(self.hd, max_context, tl["rope_parameters"]["rope_theta"]).to(devs).realize()
     st = nn.state.safe_load(f"{path}/model.safetensors")
-    split = {"q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1}  # (by heads, by the mlp's rows)
+    # split by heads, by the mlp's rows, the markov term by the vocabulary (a guess at a time reads all of it)
+    split = {"q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1, "markov_w2": 0}
     self.w = {k[:-len(".weight")]: weight(v, devs, split.get(k.split(".")[-2]), q8 and k.startswith(("layers.", "fc."))) for k, v in st.items()
               if k.endswith(".weight")}
     self.conf_b = st["confidence_head.proj.bias"].to(devs[0]).float().to(devs).realize()
