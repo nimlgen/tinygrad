@@ -113,14 +113,14 @@ def disk_read(file:UOp, srcs:UOp, counts:UOp, rings:UOp, sqes:UOp) -> UOp: # src
 # *****************
 # 2. rewriter
 
-def is_disk_read(c:UOp) -> bool:
+def is_disk_read(c:UOp, machine) -> bool:
   dev, src = [to_tuple(b.device)[0] for b in c.src[1:3]] if c.op is Ops.CALL and c.body.op is Ops.STORE else ("", "")
-  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and Device[dev].has_copy_queue and not dev.startswith("NULL") and bool(uring()) \
-    and not getattr(Device[dev], "is_usb", False)
+  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and machine[dev].has_copy_queue and not dev.startswith("NULL") \
+    and bool(uring()) and not getattr(machine[dev], "is_usb", False)
 
 def disk_copy_rewriter(s:UOp) -> UOp|None:
   lin = s.without_after.body
-  if not (copies:=[c for c in lin.src if is_disk_read(c)]): return None
+  if not (copies:=[c for c in lin.src if is_disk_read(c, Device)]): return None
   rings = UOp.alloc((unwrap(uring())[2].nbytes // 4,), dtypes.uint32, 0, device=HCQ_RUNTIME_DEV.device, name="uring_rings")
   sqes = UOp.alloc((8 * RING_ENTRIES,), dtypes.uint64, 0, device=HCQ_RUNTIME_DEV.device, name="uring_sqes")
 

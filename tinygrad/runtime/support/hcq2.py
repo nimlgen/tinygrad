@@ -26,7 +26,17 @@ class HCQInfo:
   skip_wait:bool = False # TODO: remove. an rdma copy between nodes is two batches, so waiting on the first alone deadlocks
 
 @dataclass(frozen=True)
-class DevInfo: peer_group:str; is_usb:bool # noqa: E702
+class DevInfo: peer_group:str; host:str; is_usb:bool; has_copy_queue:bool; has_iface:bool # noqa: E702
+
+def dev_info(d:str) -> DevInfo:
+  dev = Device[d]
+  return DevInfo(dev.peer_group, dev.host, getattr(dev, "is_usb", False), dev.has_copy_queue, hasattr(dev, "iface"))
+
+def get_machine(linear:UOp) -> dict[str, DevInfo]:
+  devs = [k for c in linear.src if c.op is Ops.CALL for b in get_call_arg_uops(c) for d in to_tuple(b.device) if d is not None
+          for k in (d, Device.canonicalize(d))]
+  machine = {d: dev_info(d) for d in dedup(devs)}
+  return machine | {m.host: dev_info(m.host) for m in machine.values()}
 
 def all_devices_in(d:Any, c:frozenset[str]) -> bool: return {x.split(":")[0] for x in to_tuple(d)} <= c
 
@@ -178,35 +188,37 @@ def unwrap_call(call:UOp) -> UOp|None:
                                                                    else a for a in call.src[1:]], dnum.bind(i))) for i in range(n)))
 pm_unwrap_multi = PatternMatcher([(UPat(Ops.CALL, name="call"), unwrap_call)])
 
-def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
+def split_rdma(ctx:dict[str, DevInfo], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   devs = [to_tuple(b.device)[0] for b in (dst, src)]
-  if not all(hasattr(Device[d], "iface") for d in devs) or Device[devs[0]].peer_group == Device[devs[1]].peer_group: return None # not 2 nodes
+  if not all(ctx[d].has_iface for d in devs) or ctx[devs[0]].peer_group == ctx[devs[1]].peer_group: return None # not 2 nodes
 
   from tinygrad.runtime.ops_rdma import rdma_nic_for
-  if None in (nics:=[rdma_nic_for(Device[d], Device[min(devs)]) for d in devs]): return None
+  with Context(ALLOW_DEVICE_USAGE=1):
+    if None in (nics:=[rdma_nic_for(Device[d], Device[min(devs)]) for d in devs]): return None
+    ctx.update({unwrap(nic).device: dev_info(unwrap(nic).device) for nic in nics})
 
   # wires: a placeholder per nic in place of the far gpu, named by it
   wires = [UOp.alloc(src.max_shape, src.dtype, 0, device=unwrap(nic).device, name=peer) for nic, peer in zip(nics, devs[::-1])]
   send = call.replace(src=wires[1].store_call(src).src)
   return UOp(Ops.LINEAR, src=(send, call.replace(src=dst.store_call(wires[0]).src)))
 
-def stage_copy(call:UOp, dst:UOp, src:UOp) -> UOp|None:
+def stage_copy(ctx:dict[str, DevInfo], call:UOp, dst:UOp, src:UOp) -> UOp|None:
   devs = [to_tuple(b.device)[0] for b in (dst, src)]
   if any(d.startswith("RDMA") for d in devs): return None # over the nic
   if not (enqueued:=get_enqueue_devs(call)): return None
   device = enqueued[0]
 
   from tinygrad.runtime.ops_disk import is_disk_read
-  dev, host, usb_memcpys = Device[device], Device[device].host, getattr(Device[device], "is_usb", False)
-  mappable = {"CPU", "PYTHON"} | ({"NPY", "DISK"} if usb_memcpys else {"DISK"} if is_disk_read(call) else set()) # ops_disk stages it in the batch
-  if device != host and not all(Device[d].peer_group == dev.peer_group or (d.split(":")[0] in mappable and Device[d].host == host) for d in devs):
+  dev, host = ctx[device], ctx[device].host
+  mappable = {"CPU", "PYTHON"} | ({"NPY", "DISK"} if dev.is_usb else {"DISK"} if is_disk_read(call, ctx) else set()) # ops_disk stages it in the batch
+  if device != host and not all(ctx[d].peer_group == dev.peer_group or (d.split(":")[0] in mappable and ctx[d].host == host) for d in devs):
     stage = UOp.alloc(src.max_shape, src.dtype, int.from_bytes(call.key[:8], "little"), device=host)
     return UOp(Ops.LINEAR, src=(stage.store_call(src), dst.store_call(stage)))
 
-  if Device[device].has_copy_queue: return None
+  if dev.has_copy_queue: return None
   out, inp = (UOp.param(i, dtypes.u8, b.nbytes(), device=device) for i, b in enumerate((dst, src)))
   ast = out.index(r:=UOp.range(src.nbytes(), 0)).store(inp.index(r).load()).end(r).sink(arg=KernelInfo())
-  return lower_and_compile(call.replace(src=(ast, *call.src[1:])))
+  return call.replace(src=(ast, *call.src[1:]))
 
 pm_insert_copy_staging = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), split_rdma),
@@ -351,7 +363,6 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   return sink.call(*slots.values(), hcq=info)
 
 @rewrite_group(new_ctx=False)
-@Context(ALLOW_DEVICE_USAGE=0)
 def sched_batches(l:UOp, profile:bool, machine:dict[str, DevInfo]) -> UOp:
   copies = [c for c in l.src if c.op is Ops.CALL and c.body.op is Ops.STORE]
   ring = sorted({Device.canonicalize(d) for c in copies for b in get_call_arg_uops(c) for d in to_tuple(b.device) if all_devices_in(d, HCQ_DEVS)})
@@ -575,18 +586,21 @@ pm_resolve_link = PatternMatcher([
 
 hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a buffer-free linear (uops are hash-consed) to its compiled form
 
-@rewrite_group(lambda linear,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
-def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache:bool=False) -> UOp:
+@rewrite_group(lambda linear,machine,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
+@Context(ALLOW_DEVICE_USAGE=0)
+def hcq_compile(linear:UOp, machine:dict[str, DevInfo], input_uops:list[UOp]|None, profile:bool, cache:bool=False) -> UOp:
   if any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src): return linear # compiled already
 
   if cache and input_uops is not None:
     slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
-  linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
+  linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, ctx=machine, name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
-  machine = {d: DevInfo(Device[d].peer_group, getattr(Device[d], "is_usb", False)) for c in linear.src for d in get_enqueue_devs(c)[:1]}
-  lin = graph_rewrite(sched_batches(linear, profile, machine), pm_lower_call, walk=True, name="lower call")
-  with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
+  with Context(ALLOW_DEVICE_USAGE=1): kernels = lower_and_compile(linear)
+  batched = sched_batches(kernels, profile, machine)
+  with Context(ALLOW_DEVICE_USAGE=1):
+    lin = graph_rewrite(batched, pm_lower_call, walk=True, name="lower call")
+    with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
   if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
   return final_linear
 

@@ -254,7 +254,7 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
                            name="precompile kernels")
 
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, get_machine # noqa: E402 # down here, hcq2 imports realize
 
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
@@ -267,7 +267,7 @@ def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:li
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=BEAM.value if beam is None else beam) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
   linear = lower_and_compile(linear)
-  linear = hcq_compile(linear, input_uops, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache)
+  linear = hcq_compile(linear, get_machine(linear), input_uops, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache)
   return linear
 
 def link_linear(linear:UOp, input_uops:list[UOp]|None=None) -> UOp: return hcq_link(linear, input_uops=input_uops)
