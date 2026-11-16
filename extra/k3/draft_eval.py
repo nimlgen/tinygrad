@@ -10,6 +10,7 @@ import numpy as np
 from tinygrad import Tensor, Device, TinyJit
 from tinygrad.helpers import getenv
 from tinygrad.llm.gguf import gguf_parse, ggml_data_to_tensor
+from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 from extra.k3.draft import DSpark, Eagle3
 
 CLOSE, THINK = 163588, 39964  # (K3.1's "<|close|>think": the end of the thinking)
@@ -17,13 +18,13 @@ K, STRIDE, BATCH, T2, DT = getenv("K", 7), getenv("STRIDE", 1), getenv("BATCH", 
 DEADLINE = getenv("DEADLINE", 50.0)  # (seconds: the anchors guessed by then reported)
 
 def shared(path:str, dev:str) -> tuple:
-  """the target's embedding and head, decoded on dev from the trunk gguf"""
+  """the target's embedding and head (in q8_0: the kernel's fast), decoded on dev from the trunk gguf"""
   _, entries = gguf_parse(path)
   def dec(name:str) -> Tensor:
     data, shape, typ = entries[name]
     return ggml_data_to_tensor(data.to(dev), int(np.prod(shape)), typ).reshape(shape).half().realize()
-  emb, out = dec("token_embd.weight"), dec("output.weight")
-  return (lambda t: emb[t]), (lambda x: x.half() @ out.T)
+  emb, out = dec("token_embd.weight"), q8_0_linear(dec("output.weight"), dev)
+  return (lambda t: emb[t]), (lambda x: out(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1))
 
 def kinds(meta:dict, toks:np.ndarray) -> np.ndarray:
   """each position's kind of text: 0 prompt, 1 thinking, 2 answer, 3 an edit's completion"""
@@ -45,7 +46,7 @@ def run(draft_kind:str, path:str, dump:str, gguf:str) -> dict:
   L = max(s["len"] for s in meta["seqs"])
   t0 = time.perf_counter()
   if draft_kind == "dspark":
-    d = DSpark(path, lambda t: embed(t).float(), head, (dev,), L + K, q8=bool(getenv("Q8", 0)))
+    d = DSpark(path, lambda t: embed(t).float(), head, (dev,), L + K, q8=bool(getenv("Q8", 1)))
     names = [f"{b}{'m' if getenv('MIXED', 0) else ''}" for b, _ in d.taps]
   else:
     d = Eagle3(path, lambda t: embed(t).float(), (dev,), L)
