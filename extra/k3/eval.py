@@ -1,6 +1,6 @@
 # EVAL=corpus.jsonl:nseq:ntok:first (engine.py): production completions teacher forced through an engine, each from position 0. per output
 # token the top-1 agreement with production and KL(production's top 5 and the rest || ours), per sequence and so far
-import json, os, sys, time
+import itertools, json, os, sys, time
 from typing import Callable
 import numpy as np
 from tinygrad import Tensor
@@ -85,12 +85,10 @@ def window_dump(eng, spec:str, late:Callable[[], bool], out:str, rows:int=128):
 def bench(eng, specs:str, late:Callable[[], bool], depth:str=""):
   """BENCH=corpus.jsonl:nseq:ntok:first[+corpus..]: verify steps of [the next, the draft's guesses] over production completions teacher forced
   (the text fixed: the steps' time and the guesses right don't move with what the engine would have written), each corpus's so far.
-  depth (DEPTH=corpus.jsonl:n): n tokens of that corpus's texts (its last rows first) before each prompt"""
-  prefix:list[int] = []
-  if depth:
-    dpath, dn = depth.split(":")
-    prefix = [t for line in open(dpath).readlines()[::-1] for r in [json.loads(line)] for t in r["prompt_ids"] + r["output_ids"]][:int(dn)]
-  for spec in specs.split("+"):
+  depth (DEPTH=corpus.jsonl:n[,n..]): n tokens of that corpus's texts (its last rows first) before each prompt, every corpus at each n"""
+  dpath, dns = depth.split(":") if depth else ("", "0")
+  text = [t for line in open(dpath).readlines()[::-1] for r in [json.loads(line)] for t in r["prompt_ids"] + r["output_ids"]] if depth else []
+  for prefix, spec in itertools.product([text[:int(dn)] for dn in dns.split(",")], specs.split("+")):
     path, *nums = spec.split(":")
     nseq, ntok, first = [int(x) for x in nums] + [16, 256, 0][len(nums):]
     steps, right, firsts, tokens, t_steps, T = 0, 0, 0, 0, 0.0, eng.tokens
