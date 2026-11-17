@@ -476,8 +476,14 @@ class Engine:
     tiles = Tensor(self.win["tiles"].uop)[:self.state_rows(tile)[1]]
     slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
     tslot, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
-    a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
-    y = self.tiles(tile, pool, tslot, a, self.lat, u, types[1], off, h2, live=xrow)
+    if amd_custom_kernels_supported(pool.device) and types != (IQ3_XXS, IQ3_XXS):
+      slots16, live = tslot.maximum(0).reshape(-1, 1).expand(-1, tile // 16).flatten(), (xrow >= 0).cast(dtypes.int32)
+      gu = expert_linear(self.pools[types[0]], slots16, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], self.part, split=True, per=16,
+                         live=live, xrow=xrow)
+      y = expert_linear(self.pools[types[1]], slots16, gu, self.lat, u, types[1], self.part, off, act=self.act, per=16, live=live)
+    else:
+      a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
+      y = self.tiles(tile, pool, tslot, a, self.lat, u, types[1], off, h2, live=xrow)
     out = (y.reshape(len(self.devs), -1, self.lat)[:, pos.maximum(0)].float() * w.reshape(1, -1, 1)).reshape(len(self.devs), -1, K, self.lat).sum(2)
     return Tensor(self.win["out"].uop).assign(partial_sum(out) * self.model.config.routed_scaling_factor).realize()
 
