@@ -182,14 +182,16 @@ class Engine:
   def forward(self, tokens:Tensor, pos:UOp) -> tuple[Tensor, Tensor|None]:
     """the logits (T, vocab) after each of the tokens (1, T) at positions pos.., the draft's taps (1, T, taps, dim): after a block its last
     stream (the block's sum so far) or (mixed) the streams as the next block's attention residual mixes them"""
-    m, hidden, taps = self.model, {}, self.draft.taps if self.draft is not None else []
-    x = m.token_embd(tokens.to(m.token_embd.weight.device)).float().unsqueeze(2)  # (the attention residuals' streams: (1, T, 1, dim))
+    m, hidden, taps, streams = self.model, {}, self.draft.taps if self.draft is not None else [], self.model.config.attn_res_block_size
+    x = m.token_embd(tokens.to(m.token_embd.weight.device)).float()
+    if streams: x = x.unsqueeze(2)  # (the attention residuals' streams: (1, T, 1, dim))
     mask = None
     for i, b in enumerate(m.blk):
       x, mask = b(x, (pos,), mask)
       for t in taps:
-        if t[0] == i: hidden[t] = self.mixer(i).mix(x) if t[1] else x[:, :, -1]
-    return m.output(m.output_norm(m.output_res_score.mix(x)))[0].float(), Tensor.stack(*(hidden[t] for t in taps), dim=2) if taps else None
+        if t[0] == i: hidden[t] = (self.mixer(i).mix(x) if t[1] else x[:, :, -1]) if streams else x
+    x = m.output_res_score.mix(x) if streams else x
+    return m.output(m.output_norm(x))[0].float(), Tensor.stack(*(hidden[t] for t in taps), dim=2) if taps else None
 
   def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
     """the greedy token after each of the step's tokens and (a draft) its guesses of the tokens after that (after the given one where there's
@@ -674,7 +676,7 @@ class Engine:
       jit(self.v_pos.bind(0))[0].tolist()
       self.stage(f"step graph of {T}")
     for n in range(1, self.tokens): self.model.rollback(n)  # (their jits captured too, after a verify step)
-    for i, save in itertools.product(range(2), (True, False)): self.model._copy(i, save)  # (and save's)
+    for i, save in itertools.product(range(len(self.model._sets)), (True, False)): self.model._copy(i, save)  # (and save's)
     if self.chain_jit: self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
     for jit in self.keep_jits: jit(self.v_at.bind(0))  # (a kept session's copies)
     self.zero_jit(self.v_grown.bind(0))  # (and the caches' growth: its rows zeroed, there's no context yet)
@@ -709,7 +711,7 @@ class Engine:
     """the graphs' outputs on defined inputs, run after every graph's first (the gpus' first uses of the host's buffers done): a step of each
     count of tokens of token 0 at position 0 on zeroed recurrent states (and the draft's chain), the window's route of zero logits (its
     selections' rows sorted: within an expert their order is the atomics'). only what's exact: tokens, guesses, the routes' weights"""
-    Tensor.realize(*[s.assign(s.zeros_like()) for s in self.model._states()])
+    if (states:=self.model._states()): Tensor.realize(*[s.assign(s.zeros_like()) for s in states])
     self.tok_np[:], self.given_np[:] = 0, -1
     fps = {}
     for T, jit in self.jits.items():
