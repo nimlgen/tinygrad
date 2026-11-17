@@ -269,10 +269,12 @@ class TestEngine(unittest.TestCase):
     self.assertEqual((eng.session, m._cached_tokens, eng.get_start_pos(A + [6])), (None, A, len(A)))
     for got, w in zip(state(), want): np.testing.assert_equal(got, w)
 
-  def test_session_fork(self):  # a server's requests: a conversation's turns (its replies rendered again: the prompt's states), short requests
-    # between them (two in a row): each turn fed from where it would have been without them, its states, caches, logits as without them
-    P, G = [3, 5, 7, 1, 2, 9, 4, 6], [8, 2]
-    turns, sides = [(P, G), (P + [7, 1, 5], [3]), (P + [7, 1, 5, 3, 6], [])], [[3, 5, 1, 1, 6], [3, 5, 2, 6]]
+  def test_session_fork(self):  # a server's requests: an earlier one, a conversation's turns (its replies rendered again: the prompt's states),
+    # short requests between them (one past the states saved before, two in a row): each turn fed from where it would have been without them,
+    # its states, caches, logits as without them
+    P, G, S = [3, 5, 7, 1, 2, 9, 4, 6], [8, 2], [[3, 5, 1, 1, 6], [3, 5, 2, 6]]
+    turns = [(P[:4] + [6], []), (P, G), (P + [7, 1, 5], [3]), (P + [7, 1, 5, 3, 6], [])]
+    sides = [[], [], [P[:5] + [1]], S]
     def serve(tokens:list[int], gen:list[int]) -> tuple[int, list[np.ndarray]]:  # (LLMServer's get_start_pos, then generate's, its steps)
       eng, m = self.eng, self.eng.model
       eng.get_start_pos(tokens)
@@ -288,13 +290,13 @@ class TestEngine(unittest.TestCase):
     self.eng = self.engine(2 * E)
     self.stub()
     for i, turn in enumerate(turns):
-      for side in sides[:i]: serve(side, [4])
+      for side in sides[i]: serve(side, [4])
       start, got = serve(*turn)
       self.assertEqual(start, want[i][0])
       for g, w in zip(got, want[i][1]): np.testing.assert_equal(g, w)
-    serve(sides[0], [4] * 6)  # (a reply past the kept rows: the session gone, the next short request's kept)
-    serve(sides[1], [4])
-    self.assertEqual(self.eng.session[:2] if self.eng.session else None, (sides[0] + [4] * 6, 2))
+    serve(S[0], [4] * 6)  # (a reply past the kept rows: the session gone, the next short request's kept)
+    serve(S[1], [4])
+    self.assertEqual(self.eng.session[:2] if self.eng.session else None, (S[0] + [4] * 6, 2))
 
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
