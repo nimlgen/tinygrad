@@ -798,15 +798,16 @@ def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
 @functools.cache
 def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, rows:int|UOp) -> UOp:
   """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its slots of
-  idx[b, t] (or every position) of the first start + T at or before it, on the f16 tensor cores (RDNA4). a workgroup a row: its heads in two
-  tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (two buffers by its parity). a tile's 4 waves each the scores of
-  a quarter of D (summed through LDS), then each its online softmax of the block's scores and the values of a quarter of V"""
+  idx[b, t] (or every position) of the first start + T at or before it, on the f16 tensor cores (RDNA4). a workgroup a row: its heads in
+  tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (loaded into registers the block before). a tile's 4 waves each
+  the scores of a quarter of D (summed through LDS), then each its online softmax of the block's scores and the values of a quarter of V"""
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
   N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
   K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
-  assert H <= 32 and D == 2*DW and D % 64 == 0 and V % 64 == 0
-  row, lane, wave = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(8, 1, AxisType.LOCAL)
+  tiles = -(-H // 16)
+  assert tiles <= 2 and D == 2*DW and D % 64 == 0 and V % 64 == 0 and DW % (8*tiles) == 0
+  row, lane, wave = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(4*tiles, 1, AxisType.LOCAL)
   b, t, tid, tile, part, ph, col = row // T, row % T, wave*WARP_SIZE + lane, wave // 4, wave % 4, lane // 16, lane % 16
   ks = [4*ph + i for i in range(4)] + [8 + 4*ph + i for i in range(4)]  # (a lane's 8 of a fragment's 16 inputs)
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
@@ -814,33 +815,40 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   qfrags = [UOp.stack(*((head < H).where(q[b, head.minimum(H - 1), t, part*(D//4) + i*16 + k].load(), 0.0).cast(dtypes.half) for k in ks))
             for i in range(D//64)]
   keys = smin(start + T, K)
-  kb = UOp.range((keys + 15) // 16, 2, AxisType.LOOP)
-  par = kb % 2
-  # the block's keys into LDS: 16 threads a row, a contiguous run of its words each; a slot not a key's reads row 0
-  lds_k = UOp.alloc((2*16*RW,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  lds_ok = UOp.alloc((2*16,), dtypes.int32, addrspace=AddrSpace.LOCAL)
-  r, wi, per = tid // 16, tid % 16, DW // 16
-  slot = kb*16 + r
-  pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
-  ok = (slot < keys) & (pos <= start + t) & (pos >= 0)
-  at = ok.where(pos, 0).minimum(N - 1)
-  staged = [lds_k[(par*16 + r)*RW + wi*per + i].store(cache[b, 0, at, wi*per + i].load()) for i in range(per)]
-  staged.append(lds_ok[(par*16 + r).valid(wi.eq(0))].store(ok.cast(dtypes.int32)))
+  blocks = (keys + 15) // 16
+  kb = UOp.range(blocks, 2, AxisType.LOOP)
+  # the block's keys into LDS: 8*tiles threads a row, a contiguous run of its words each (vector loads of vec), loaded into registers the block
+  # before; a slot not a key's reads row 0
+  lds_k = UOp.alloc((16*RW,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  lds_ok = UOp.alloc((16,), dtypes.int32, addrspace=AddrSpace.LOCAL)
+  r, wi, per = tid // (8*tiles), tid % (8*tiles), DW // (8*tiles)
+  vec = math.gcd(per, 4)
+  def block_words(blk:UOp) -> list[UOp]:
+    slot = blk*16 + r
+    pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
+    ok = (slot < keys) & (pos <= start + t) & (pos >= 0)
+    at = ok.where(pos, 0).minimum(N - 1)
+    return [ok.cast(dtypes.uint32)] + [v[j] for i in range(0, per, vec) for v in [_amd_load(cache[b, 0, at, wi*per + i], vec)] for j in range(vec)]
+  ahead = UOp.alloc((per + 1,), dtypes.uint32, addrspace=AddrSpace.REG)
+  ahead = ahead.after(UOp.group(*(ahead[i].store(w) for i, w in enumerate(block_words(kb.const_like(0))))))
+  cur = [ahead.after(kb)[i].load() for i in range(per + 1)]
+  staged = [lds_k[r*RW + wi*per + i].store(cur[1 + i]) for i in range(per)]
+  staged.append(lds_ok[r.valid(wi.eq(0))].store(cur[0].cast(dtypes.int32)))
   barrier = UOp.group(*staged).barrier()
   lds_k, lds_ok = lds_k.after(barrier), lds_ok.after(barrier)
-  def kword(key:UOp, w:UOp) -> UOp: return lds_k[(par*16 + key)*RW + w].load()
+  def kword(key:UOp, w:UOp) -> UOp: return lds_k[key*RW + w].load()
   # the wave's scores of its quarter of D: (its tile's heads, the block's keys), summed over the quarters through LDS
   S = UOp.stack(*[UOp.const(0.0, dtypes.float)]*8)
   for i, qf in enumerate(qfrags):
     w0 = (part*(D//4) + i*16) // 2
     S = UOp.wmma(qf, UOp.stack(*(h for w in (2*ph, 2*ph + 1, 4 + 2*ph, 5 + 2*ph) for h in halves(kword(col, w0 + w)))), S, WMMA_ARG[0], WARP_SIZE)
-  lds_s = UOp.alloc((2, 2, 4, 16, 16), dtypes.float, addrspace=AddrSpace.LOCAL)
-  lds_s = lds_s.after(UOp.group(*(lds_s[par, tile, part, ph*8 + j, col].store(S[j]) for j in range(8))).barrier())
+  lds_s = UOp.alloc((tiles, 4, 16, 16), dtypes.float, addrspace=AddrSpace.LOCAL)
+  lds_s = lds_s.after(UOp.group(*(lds_s[tile, part, ph*8 + j, col].store(S[j]) for j in range(8))).barrier())
   # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V
   m_reg, l_reg, acc_reg = _reg((1,), -1e30), _reg((1,), 0), _reg((V//64, 8), 0)
   m, l = m_reg.after(kb)[0].load(), l_reg.after(kb)[0].load()
-  s = [lds_ok[par*16 + k].load().ne(0).where(sum((lds_s[par, tile, p, col, k].load() for p in range(4)), UOp.const(0.0, dtypes.float))*scale,
-                                             -math.inf) for k in ks]
+  s = [lds_ok[k].load().ne(0).where(sum((lds_s[tile, p, col, k].load() for p in range(4)), UOp.const(0.0, dtypes.float))*scale, -math.inf)
+       for k in ks]
   mn = m.maximum(functools.reduce(UOp.maximum, s).maximum(_xor16(functools.reduce(UOp.maximum, s))))
   alpha, p = ((m - mn)*LOG2E).exp2(), [((x - mn)*LOG2E).exp2() for x in s]
   psum = functools.reduce(UOp.__add__, p)
@@ -852,7 +860,9 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
     v = part*(V//4) + o*16 + col
     vfrag = UOp.stack(*((kword(k, v // 2) >> ((v % 2)*16).cast(dtypes.uint32)).cast(dtypes.uint16).bitcast(dtypes.half) for k in ks))
     acc.append(UOp.wmma(pfrag, vfrag, UOp.stack(*(acc_reg.after(kb)[o, j].load()*arow[j] for j in range(8))), WMMA_ARG[0], WARP_SIZE))
-  update = UOp.group(m_reg[0].store(mn), l_reg[0].store(ln), *(acc_reg[o, j].store(a[j]) for o, a in enumerate(acc) for j in range(8))).end(kb)
+  fetch = [ahead.after(*cur)[i].store(w) for i, w in enumerate(block_words((kb + 1).minimum(blocks - 1)))]
+  update = UOp.group(m_reg[0].store(mn), l_reg[0].store(ln), *(acc_reg[o, j].store(a[j]) for o, a in enumerate(acc) for j in range(8)),
+                     *fetch).end(kb)
   l_end = l_reg.after(update)[0].load()
   lrow = [_lane_of(l_end, ph*8 + j) for j in range(8)]
   stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), part*(V//4) + o*16 + col].store(acc_reg.after(update)[o, j].load() / lrow[j])
