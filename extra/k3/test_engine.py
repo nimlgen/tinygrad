@@ -241,18 +241,22 @@ class TestEngine(unittest.TestCase):
     model = SimpleNamespace(fork=lambda *a: 0, save=lambda t: None, rollback=lambda n: None)
     eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
                           draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0,
-                          counters=lambda: np.zeros(15))
+                          counters=lambda: np.zeros(15), jits={1: None, 2: None})
+    eng.steps = lambda *a: Engine.steps(eng, *a)  # type: ignore[arg-type]
     self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
     self.assertEqual(seen, [[6, 7], [8, 3]])
 
-  def test_steps_faster(self):  # steps or a window of n tokens: a window a fixed part and a token's (measured: their median), a step measured
-    eng = SimpleNamespace(step_s={1: []}, window_s=[])
+  def test_steps_faster(self):  # steps or a window of n tokens: a window the store's experts not cached read (5 s here) and a token's (measured:
+    # their median), a step measured (of the most tokens there's a graph of)
+    eng = SimpleNamespace(step_s={1: [], 2: []}, window_s=[], jits={1: None}, bias=[0], m={"n_experts": 1000}, slots=25, part=10**9, devs=("A",))
     self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 526)], [True, False])  # type: ignore[arg-type]  # (before any measured)
     eng.window_s = [(9182, 60.0), (9595, 17.0), (9182, 16.5)]  # (a cold first one, sizes alike: a line through them would be anything)
     eng.step_s[1] = [0.035, 0.04]
     self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 120, 526, 9000)], [True, True, False, False])  # type: ignore[arg-type]
     eng.step_s[1] = [0.008]
     self.assertTrue(Engine.steps_faster(eng, 526))  # type: ignore[arg-type]
+    eng.step_s[1], eng.step_s[2], eng.jits[2] = [0.06], [0.06], None
+    self.assertTrue(Engine.steps_faster(eng, 150))  # type: ignore[arg-type]
 
   def test_session(self):  # a long session a short request diverges from early kept: its caches and states back when a request extends it
     self.stub()
@@ -303,7 +307,7 @@ class TestEngine(unittest.TestCase):
   def test_prefill(self):  # windows of a prompt but its last token (each with the tokens after it given) of up to W, split evenly, none without
     calls:list = []
     self.eng.window = lambda toks, pos, given: calls.append((pos, toks, given))  # type: ignore[method-assign,assignment,misc]
-    self.eng.step_s[1].append(10.0)  # (steps slow: windows)
+    self.eng.step_s[max(self.eng.jits)].append(10.0)  # (steps slow: windows)
     self.eng.pieces = lambda: 1  # type: ignore[method-assign]  # (a read window of a piece)
     self.assertEqual(self.eng.prefill(list(range(10)), 2), 9)
     self.assertEqual(calls, [(2, [2, 3, 4, 5, 6, 7, 8], [3, 4, 5, 6, 7, 8, 9])])
@@ -579,6 +583,22 @@ class TestMTP(unittest.TestCase):
     self.assertEqual(self.eng.spans, [2, 1])
     same(got:=run([(16384, self.weights, [1, 2]), (8192, other, [1])]), run([(8192, self.weights, [1, 2]), (8192, other, [1])], own=False))
     self.assertFalse(np.allclose(got[0], want[0], rtol=1e-2))
+
+  def test_window_copies(self):  # a window's experts not cached in the first copy (half of block 1's) read in the second where it holds their
+    # layer: its streams as an engine's of a copy of the second's weights for them
+    toks, rng = [3, 5, 7, 1, 2, 9, 4], np.random.default_rng(3)
+    other = {n: rng.normal(0, 0.3, w.shape).astype(np.float32) if n.startswith('blk.1.') and '_exps.' in n else w for n, w in self.weights.items()}
+    mixed = {n: np.concatenate([other[n][:E // 2], w[E // 2:]]) if n.startswith('blk.1.') and '_exps.' in n else w for n, w in self.weights.items()}
+    def bank(copies:list) -> np.ndarray:
+      eng = self.engine(2, copies)
+      if len(copies) > 1:
+        eng.drop(eng.state["slot_of"][:E // 2].copy())
+        np.testing.assert_array_equal(eng.window_codes(0, np.arange(E)), np.arange(E))
+        eng.window_copies = True
+      eng.window(toks, 0, toks[1:] + [-1])
+      return eng.in_order(Tensor(eng.win["bank"].uop), 0, len(toks)).numpy()
+    want = bank([(8192, mixed, [1, 2])])
+    np.testing.assert_allclose(bank([(16384, self.weights, [1, 2]), (8192, other, [1])]), want, rtol=1e-3, atol=1e-3 * np.abs(want).max())
 
   def test_chain(self):
     eng, (toks, _) = self.engine(4), self.greedy(4)

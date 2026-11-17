@@ -27,8 +27,9 @@ from extra.k3 import persist
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 BIG = getenv("BIG", 2)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
-# (a window's seconds: a fixed part and a token's, a step's (of a token) before any are measured: tinys3's, 4.8 s and 1.26 ms, 50 ms)
-WINDOW_S, WINDOW_TOKEN_S, STEP_S = 5.0, 1.3e-3, 0.05
+# (the drives' bytes a second, a window's seconds a token, a step's before any are measured: tinys3's, 195 GB/s (k3's store not cached in 4.8 s),
+# 1.26 ms, 50 ms)
+READ_BW, WINDOW_TOKEN_S, STEP_S = 195e9, 1.3e-3, 0.05
 SESSION = 4096  # (a kept session's rows a short request that diverges from it early may write)
 TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
@@ -37,7 +38,7 @@ class Engine:
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=()):
+               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -50,6 +51,7 @@ class Engine:
     self.dump_taps = taps or []
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
+    self.window_copies = window_copies
     self.ms = [m, *copies]
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
@@ -62,7 +64,7 @@ class Engine:
     qtype, layers = {n.upper(): t for t, n in QUANT_NAMES.items()}, [b for b in m["layers"] if b < len(stack)]
     self.copies = [[(qtype[t[0]], qtype[t[2]]) if t else None for t in (c["types"].get(str(b)) if "types" in c else [c["expert_type"]] * 3
                                                                       if b in c["layers"] else None for b in layers)] for c in self.ms]
-    self.types = self.copies[0]
+    self.types, self.layer_copies = self.copies[0], [tuple(c[li] for c in self.copies) for li in range(len(layers))]
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: entry j*T+t is token t's j-th expert and its weight (a
     # window's: [ready | an expert's slot], [ready | an expert's count])
@@ -327,7 +329,7 @@ class Engine:
     self.fill_jit = self.wjit(self.fill) if self.draft else None
     # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
     self.routes = {t: (self.wjit(functools.partial(self.window_route, t)),
-                       {ty: self.wjit(functools.partial(self.window_experts, t, ty)) for ty in dict.fromkeys(self.types)}) for t in TILES}
+                       {ty: self.wjit(functools.partial(self.window_experts, t, ty)) for ty in dict.fromkeys(self.layer_copies)}) for t in TILES}
     self.start_jit = self.wjit(self.start)
 
   def window_lend(self):
@@ -376,15 +378,15 @@ class Engine:
     li = self.m["layers"].index(self.model.blk.index(b))
     for route, experts in self.routes.values():
       self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-      self.graph(experts[self.types[li]], self.pool, self.parts[0][li])
+      self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
 
   def window_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:
-    """the window's compute state (a piece of W tokens'): the moe's inputs and outputs (the routed experts' inputs and outputs, the shared
-    experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
+    """the window's compute state (a piece of W tokens'): the moe's inputs (the routed experts' inputs, the shared experts' outputs, the
+    router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32),
-            "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
+    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "w": ((W, K), f32),
+            "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
             "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half)}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
@@ -509,38 +511,47 @@ class Engine:
     tag = Tensor(tag.uop.after(counted.uop, kept.uop))
     return tag.assign(tag * 0 + 1).realize()
 
-  def window_experts(self, tile:int, types:tuple[int, int], pool:Tensor, part1:Tensor, *_) -> Tensor:
-    """the window's routed experts (of gate/up and down quant types) once the host gave their slots (part 1): each gpu its units of the experts
-    in tiles of an expert's rows, summed over the gpus"""
-    K, E, u, off = self.model.config.num_experts_per_tok, self.m["n_experts"], self.units, self.nbytes(types[0], 2 * self.units * self.lat)
-    w, pos, entries, h1, h2 = (Tensor(self.win[k].uop) for k in ("w", "pos", "entries", "act", "down"))
+  def window_experts(self, tile:int, types:tuple[tuple[int, int]|None, ...], pool:Tensor, part1:Tensor, *_) -> Tensor:
+    """the window's routed experts once the host gave their slots (part 1: an expert's slot * copies + its copy): each gpu its units of the
+    experts in tiles of an expert's rows, a copy's tiles at a time (of its gate/up and down quant types, none: a layer it doesn't hold) (their
+    rows of down)"""
+    K, E, C, u = self.model.config.num_experts_per_tok, self.m["n_experts"], len(self.ms), self.units
+    entries, h1, h2 = (Tensor(self.win[k].uop) for k in ("entries", "act", "down"))
     tiles = Tensor(self.win["tiles"].uop)[:self.state_rows(tile)[1]]
     slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
-    tslot, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
-    a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
-    y = self.tiles(tile, pool, tslot, a, self.lat, u, types[1], off, h2, live=xrow)
-    out = (y.reshape(len(self.devs), -1, self.lat)[:, pos.maximum(0)].float() * w.reshape(1, -1, 1)).reshape(len(self.devs), -1, K, self.lat).sum(2)
-    return Tensor(self.win["out"].uop).assign(partial_sum(out) * self.model.config.routed_scaling_factor).realize()
+    at, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
+    h = Tensor(self.win["h"].uop).cast(dtypes.half).contiguous()
+    for c, ty in enumerate(types):
+      if ty is None: continue
+      tslot = ((at >= 0) & (at % C == c)).where(at // C, -1)
+      h1 = self.tiles(tile, pool, tslot, h, 2 * u, self.lat, ty[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
+      h2 = self.tiles(tile, pool, tslot, h1, self.lat, u, ty[1], self.nbytes(ty[0], 2 * u * self.lat), h2, live=xrow)
+    return h2.realize()
 
   def tiles(self, tile:int, pool:Tensor, tslot:Tensor, x:Tensor, out_f:int, in_f:int, qtype:int, off:int, out:Tensor, xrow:Tensor|None=None,
             act:Callable|None=None, live:Tensor|None=None) -> Tensor:
-    """(gpus, tile * tiles, out_f) into out: each gpu's units of the experts (of quant type qtype) at off bytes in the slots of tiles of tile
-    rows, on their rows of x (xrow: its rows, -1 its first), act(gate, up) of the outputs' halves: the AMD tensor cores' expert tiles for
-    TILE_QUANTS (live: the rows' padding -1, left out), else decoded"""
+    """(gpus, tile * tiles, out_f) into out (the rows of tiles -1 kept): each gpu's units of the experts (of quant type qtype) at off bytes in
+    the pool's slots of tiles of tile rows, on their rows of x (xrow: its rows, -1 its first), act(gate, up) of the outputs' halves: the AMD
+    tensor cores' expert tiles for TILE_QUANTS (live: the rows' padding -1, left out), else decoded"""
+    out = out.reshape(-1, out.shape[-1])
     if amd_custom_kernels_supported(x.device) and qtype in TILE_QUANTS:
-      return expert_tiles(self.pools[qtype], tslot, x, out_f, in_f, qtype, self.spans[0] * self.part, off, xrow=xrow, act=act, out=out, tile=tile,
-                          live=live)
+      return expert_tiles(self.pools[qtype], tslot, x, out_f, in_f, qtype, self.part, off, xrow=xrow, act=act, out=out, tile=tile, live=live)
     NT, size, isz = tslot.shape[0], self.nbytes(qtype, out_f * in_f), self.word.itemsize
-    w = pool.reshape(len(self.devs), -1, self.spans[0] * self.part // isz)[:, tslot.maximum(0)][..., off // isz:(off + size) // isz]
+    w = pool.reshape(len(self.devs), -1, self.part // isz)[:, tslot.maximum(0)][..., off // isz:(off + size) // isz]
     w = w.bitcast(dtypes.uint8)
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // size * out_f * in_f, qtype).reshape(-1, NT, out_f, in_f)
     y = (x if xrow is None else x[xrow.maximum(0)]).reshape(-1, NT, tile, in_f) @ w.transpose(-1, -2)
     y = (y if act is None else act(*y.split(out_f // 2, -1))).cast(out.dtype)
+    y = (tslot >= 0).reshape(1, NT, 1, 1).where(y, Tensor(out.uop).reshape(y.shape))
     return Tensor(out.uop).assign(y.reshape(out.shape)).reshape(len(self.devs), NT * tile, -1)
 
   def post(self, b:FFNBlock, live:UOp, c0:UOp, s:UOp, *_) -> Tensor:
-    """a chunk's live rows' routed and shared experts' outputs into the block's, added to stream s"""
-    y = b._expert_output(Tensor(self.win["out"].uop)[c0:c0 + live].unsqueeze(0), None)
+    """a chunk's live rows' routed experts' outputs (their rows of down weighted, summed over the gpus) and shared experts' outputs into the
+    block's, added to stream s"""
+    G, K = len(self.devs), self.model.config.num_experts_per_tok
+    pos, w = Tensor(self.win["pos"].uop).reshape(-1, K)[c0:c0 + live], Tensor(self.win["w"].uop)[c0:c0 + live]
+    out = (Tensor(self.win["down"].uop).reshape(G, -1, self.lat)[:, pos.maximum(0)].float() * w.unsqueeze(-1)).sum(2)
+    y = b._expert_output((partial_sum(out) * self.model.config.routed_scaling_factor).unsqueeze(0), None)
     return self.add(s, c0, y, self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
@@ -569,10 +580,14 @@ class Engine:
 
   def slots_of(self, n:int) -> int: return -(-n // self.part)  # (the pool's slots n bytes take)
 
-  def drop(self, units:slice|np.ndarray):  # (the experts in the pool's slots units dropped: all of their slots)
+  def drop(self, units:slice|np.ndarray, wait:bool=False):  # (the experts in the pool's slots units dropped: all of their slots)
     st, n = self.state, len(self.types) * self.m["n_experts"]
-    for c in np.unique(st["expert_in"][units]):
-      if c >= 0: st["expert_in"][st["slot_of"][c]:st["slot_of"][c] + self.spans[c // n]], st["slot_of"][c] = -1, -1
+    codes = np.unique(st["expert_in"][units])
+    codes = codes[codes >= 0]
+    if wait:
+      flying = np.ascontiguousarray(codes[st["flying"][codes] > 0], np.int64)
+      if len(flying) and (err:=host_c().read_wait(ctypes.byref(self.io), len(flying), flying.ctypes.data)): raise RuntimeError(f"reads failed {err}")
+    for c in codes: st["expert_in"][st["slot_of"][c]:st["slot_of"][c] + self.spans[c // n]], st["slot_of"][c] = -1, -1
   @staticmethod
   def nbytes(qtype:int, n:int) -> int: return n // _GGML_QUANT[qtype][0] * _GGML_QUANT[qtype][1]
 
@@ -584,9 +599,7 @@ class Engine:
     for (a, first, row, blocks, size), (o, k) in zip(self.stripes, self.caches):
       starts = first + np.arange(blocks) * size
       sl = np.unique(np.concatenate([np.arange((s + self.grown * row) // self.part, (s + new * row - 1) // self.part + 1) for s in starts]))
-      c = np.ascontiguousarray((c:=st["expert_in"][sl])[c >= 0], np.int64)
-      if len(c) and (err:=host_c().read_wait(ctypes.byref(self.io), len(c), c.ctypes.data)): raise RuntimeError(f"reads failed {err}")
-      self.drop(sl)
+      self.drop(sl, wait=True)
       st["mask"][sl] = 1
     for g in range(self.grown, new, self.grow_step): self.zero_jit(self.v_grown.bind(min(g, self.max_context - self.grow_step)))
     self.grown = new
@@ -614,35 +627,38 @@ class Engine:
     banks = [{k: self.win[k] for k in ("bank", "taps")}] + [self.piece(self.tail - i * ps) for i in range(1, -(-T // W))]
     self.lent_from = self.tail - (len(banks) - 1) * ps
     assert self.lent_from >= self.arena[1] and not st["mask"][self.lent_from:self.tail].any(), "a piece over the caches or the scratch"
-    self.drop(slice(self.lent_from, None))
+    self.drop(slice(self.lent_from, None), wait=True)
     pieces = [(p0, min(W, T - p0), bank) for p0, bank in zip(range(0, T, W), banks)]
     for p0, _, bank in pieces:
       self.win.update(bank)
       self.graph(self.start_jit, self.v_p0.bind(p0))
     host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
-    ahead = self.layers(pieces, pos)
+    self.layers(pieces, pos)
     for p0, n, bank in pieces if self.fill_jit else []:
       self.win.update(bank)
       for c0 in range(0, n, C): self.graph(self.fill_jit, self.v_pos.bind(pos + p0 + c0), self.v_p0.bind(p0), self.v_c0.bind(c0))
     for d in self.devs: Device[d].synchronize()
-    for li in ahead: self.counted(li)
     self.win.update(banks[0])
     self.lent_from = self.tail
     self.window_s.append((T, time.perf_counter() - t0))
 
   def steps_faster(self, n:int) -> bool:
-    """n tokens a step each faster than a window of them: a step's measured seconds, a window's a fixed part and its tokens' (a token's the
-    measured windows' median past the fixed part: a cold one doesn't move it). before any are measured, tinys3's"""
-    step = float(np.median(self.step_s[1])) if self.step_s[1] else STEP_S
-    token = float(np.median([max(t - WINDOW_S, 0) / m for m, t in self.window_s])) if self.window_s else WINDOW_TOKEN_S
-    return n * step < WINDOW_S + n * token
+    """n tokens in steps (of the most tokens there's a graph of) faster than a window of them: a step's measured seconds, a window's a fixed
+    part (the store's experts not cached read) and its tokens' (a token's the measured windows' median past the fixed part: a cold one doesn't
+    move it). before any are measured, tinys3's"""
+    T = max(self.jits)
+    step = float(np.median(self.step_s[T])) if self.step_s[T] else STEP_S
+    fixed = (len(self.bias) * self.m["n_experts"] - self.slots) * self.part * len(self.devs) / READ_BW
+    token = float(np.median([max(t - fixed, 0) / m for m, t in self.window_s])) if self.window_s else WINDOW_TOKEN_S
+    return -(-n // T) * step < fixed + n * token
 
-  def layers(self, pieces:list[tuple[int, int, dict[str, Tensor]]], pos:int) -> list[int]:
+  def layers(self, pieces:list[tuple[int, int, dict[str, Tensor]]], pos:int):
     """a read window's blocks, a layer at a time over its pieces. a moe layer's experts a piece's tokens route to read in (the host waits for
-    the gpus' counts), their slots given to the gpus, kept till the layer's done. when a piece's tokens route to nearly all of a layer's
-    experts, every next layer's are read ahead while the gpus work (and not waited for: those layers' counted after the window). returns
-    those"""
-    n, E, K, ahead = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, []
+    the gpus' counts: the layers before are done with their slots), their slots given to the gpus, kept till the layer's done. when a
+    piece's tokens route to half of a layer's experts or more, every next layer's are read ahead (queued behind the layer's own) while the
+    gpus work"""
+    n, E, K, L = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, len(self.types)
+    ahead:dict[int, np.ndarray] = {}
     moe = sum(hasattr(b, "ffn_gate_inp") for b in self.model.blk)
     def chunks(T:int) -> list[tuple[int, int]]: return [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)]
     for i, b in enumerate(self.model.blk):
@@ -658,15 +674,23 @@ class Engine:
           route, experts = self.routes[next(t for t in TILES if T * K <= t * E or t == TILES[-1])]
           for t in self.bufs[li][0][1]: t[0] = 0  # (the tag: this piece's counts)
           self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-          codes = li * E + (np.arange(E) if li in ahead else np.nonzero(self.counted(li))[0])
+          counts = self.counted(li)
+          used = np.flatnonzero(counts)
+          codes = self.window_codes(li, np.union1d(used, ahead[li]) if li in ahead else used)
+          if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(used) >= E // 2):
+            guesses = np.arange(E)
+            if T * K < E * TILES[0]:
+              freq = self.state["freq"][(li + 1) * E:(li + 2) * E]
+              guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
+              self.read(codes, codes, wait=False)
+            self.read(self.window_codes(li + 1, guesses), codes, wait=False)
+            ahead[li + 1] = guesses
           t0 = time.perf_counter()
           self.read(codes, codes, wait=True)
           self.io.t_reads += time.perf_counter() - t0
-          for p in self.bufs[li][2][1]: p[1:1 + E] = (self.state["slot_of"][li * E:(li + 1) * E] // self.spans[0]).view(np.uint32)
-          self.graph(experts[self.types[li]], self.pool, self.parts[0][li])
-          if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(codes) >= 0.9 * E):
-            self.read((li + 1) * E + np.arange(E), codes, wait=False)
-            ahead.append(li + 1)
+          table = np.maximum(self.state["slot_of"][every:=self.window_codes(li, np.arange(E))], 0) * len(self.ms) + every // (L * E)
+          for p in self.bufs[li][2][1]: p[1:1 + E] = table.astype(np.int32).view(np.uint32)
+          self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
           jit, args, _ = self.kind("post", b, self.post)
           for c0, live in chunks(T):
             self.graph(jit, self.v_live.bind(live), self.v_c0.bind(c0), self.v_s.bind(s), *args)
@@ -676,7 +700,15 @@ class Engine:
           if mixed: self.graph(self.mix_jit, self.v_s.bind(s), self.v_tap.bind(j), self.mixer(i).weight)
           else: self.graph(self.tap_jit, self.v_s.bind(s), self.v_tap.bind(j))
       n = s + 1
-    return ahead
+
+  def window_codes(self, li:int, experts:np.ndarray) -> np.ndarray:
+    """the codes of layer li's experts a window reads: the first copy's if cached there (a step's rule past its big ranks: host.py's
+    code_of), else of the first other copy that holds the layer"""
+    code = li * self.m["n_experts"] + experts
+    if not self.window_copies: return code
+    other = next((c for c, ty in enumerate(self.layer_copies[li]) if c and ty is not None), 0)
+    big = ((self.state["slot_of"][code] >= 0) & (self.io.big >= 0)) | (other == 0)
+    return np.where(big, code, code + other * len(self.types) * self.m["n_experts"])
 
   def graph(self, jit:Callable, *args) -> Tensor:  # (a window graph on the window's state)
     return jit(*args, *self.win.values())
@@ -690,6 +722,7 @@ class Engine:
     tags = self.bufs[li][0][1]
     while not all(t[0] == 1 for t in tags):
       if any(t[0] == 2 for t in tags) or time.perf_counter() - t0 > 60: raise RuntimeError(f"window layer {li}: no counts from the gpus")
+      self.pump()
     counts = self.bufs[li][3][1][0][1:1 + E].copy()
     f = self.state["freq"][li * E:(li + 1) * E]
     f[:] = f * io.decay + counts
@@ -704,15 +737,17 @@ class Engine:
     if wait and len(reads[0]) and (err:=host_c().read_wait(ctypes.byref(io), len(reads[0]), reads[0].ctypes.data)):
       raise RuntimeError(f"window reads failed {err}")
     if not len(miss:=reads[1]): return
-    old, E, w = st["expert_in"], self.m["n_experts"], self.spans[0]
-    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= self.layer * E) & (old < (self.layer + 2) * E)) | (st["mask"] > 0)
-    keep[st["slot_of"][busy][st["slot_of"][busy] >= 0]] = True
-    keep |= (old >= 0) & (st["flying"][np.maximum(old, 0)] > 0)
-    key = np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0))[:self.slots // w * w].reshape(-1, w).sum(1)
-    victims = np.ascontiguousarray(np.argsort(key, kind="stable")[:len(miss)] * w, np.int64)
-    if np.isinf(key[victims // w]).any(): raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
-    self.drop(units:=(victims[:, None] + np.arange(w)).flatten())
-    st["slot_of"][miss], st["expert_in"][units] = victims, np.repeat(miss, w)
+    old, E, LE = st["expert_in"], self.m["n_experts"], len(self.types) * self.m["n_experts"]
+    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= 0) & (old % LE >= self.layer * E) & (old % LE < (self.layer + 2) * E))
+    keep |= (st["mask"] > 0) | np.isin(old, busy) | ((old >= 0) & (st["flying"][np.maximum(old, 0)] > 0))
+    victims = np.zeros(len(miss), np.int64)
+    for c in np.unique(miss // LE):
+      at, w = np.nonzero(miss // LE == c)[0], self.spans[c]
+      key = np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0))[:self.slots // w * w].reshape(-1, w).sum(1)
+      victims[at] = np.argsort(key, kind="stable")[:len(at)] * w
+      if np.isinf(key[victims[at] // w]).any(): raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
+      self.drop(units:=(victims[at][:, None] + np.arange(w)).flatten())
+      st["slot_of"][miss[at]], st["expert_in"][units], keep[units] = victims[at], np.repeat(miss[at], w), True
     io.misses += len(miss)
     if not wait: return host_c().read_ahead(ctypes.byref(io), len(miss), miss.ctypes.data)
     if (err:=host_c().read_codes(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)):
@@ -753,7 +788,8 @@ class Engine:
             **{f"copy{i}{save}": j for (i, save), j in m._copies.items()},
             **({"start": self.start_jit, "tap": self.tap_jit, "mix": self.mix_jit, **({"fill": self.fill_jit} if self.fill_jit else {}),
                 **{f"route{t}": r for t, (r, _) in self.routes.items()},
-                **{f"experts{t}_{gu}_{d}": j for t, (_, e) in self.routes.items() for (gu, d), j in e.items()},
+                **{f"experts{t}_" + "_".join(f"{ty[0]}_{ty[1]}" if ty else "x" for ty in tys): j for t, (_, e) in self.routes.items()
+                   for tys, j in e.items()},
                 **{f"kind{i}": j for i, (_, j, _) in enumerate(v for k, v in self.kinds.items() if len(k) == 3)}} if self.W else {})}
 
   def saved_graph(self, name:str, jit:TinyJit) -> TinyJit:  # (jit, the start's file's graph of the name if there's one)
@@ -910,17 +946,24 @@ class Engine:
       pos += n
     return pos
 
+  def steps(self, tokens:list[int], pos:int, end:int) -> tuple[list[int], list[int], np.ndarray|None]:
+    """the tokens from pos to end in steps of the most of them there's a graph of (each given the token after it), the last step's outputs"""
+    out:tuple[list[int], list[int], np.ndarray|None] = ([], [], None)
+    while pos < end:
+      out = self.step(tokens[pos:pos + (T:=max(t for t in self.jits if t <= end - pos))], pos, tokens[pos + 1:pos + 1 + T])
+      pos += T
+    return out
+
   def generate(self, tokens:list[int], temperature:float=0.0):
-    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest a token
-    a step, then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
+    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest in steps
+    (steps), then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
     if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
-      for pos in range(self.prefill(tokens[:fork + 1], start), fork): self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+      self.steps(tokens, self.prefill(tokens[:fork + 1], start), fork)
       self.model.save(tokens[:fork])
-    for pos in range(self.prefill(tokens, fork), len(tokens)):
-      (t,), g, score = self.step(tokens[pos:pos + 1], pos, tokens[pos + 1:pos + 2])
+    (*_, t), g, score = self.steps(tokens, self.prefill(tokens, fork), len(tokens))
     self.model.save(tokens)
     row, c0, v0, widths = 0, self.counters(), self.verified.copy(), collections.Counter()
     try:

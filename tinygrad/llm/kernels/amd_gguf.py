@@ -628,7 +628,7 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     updates.append(stored if live is None else stored.end(on))
   update = UOp.group(*updates).end(step)
   def value(o:int, t:int, j:int) -> UOp: return accs[o][t].after(update)[j].load()
-  rows = [[token_block*tile + t*16 + ph*8 + j for j in range(8)] for t in range(tile//16)]
+  rows = [[(token_block*tile + t*16 + ph*8 + j).valid(slot >= 0) for j in range(8)] for t in range(tile//16)]
   if act is not None: stores = [out[r, outputs[0]].store(act(value(0, t, j), value(1, t, j)).cast(out.dtype)) for t, rs in enumerate(rows)
                                 for j, r in enumerate(rs)]
   else: stores = [out[r, output].store(value(o, t, j).cast(out.dtype)) for o, output in enumerate(outputs) for t, rs in enumerate(rows)
@@ -641,7 +641,8 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
 def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
                  xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64, live:Tensor|None=None) -> Tensor:
   """out[r] = W[tiles[r // tile]] @ x[xrow[r]] (or x[r]) in half: an expert's tile of rows (16, 32 or 64) of a quant type of TILE_QUANTS on the
-  f16 tensor cores (RDNA4), x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the
+  f16 tensor cores (RDNA4), x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped (its rows not written), a row -1 of
+  xrow reads x[0]. out: the
   buffer of the output. live: the rows' padding (-1), a tile's 16 rows whose first is padding skipped (their outputs 0)"""
   ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), tile * tiles.shape[0]
   if out is None:

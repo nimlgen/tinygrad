@@ -221,8 +221,8 @@ static void slots_past_big(const io_t *s, int64_t li, int32_t *slot) {
   for (int64_t e = 0; e < s->E; e++) slot[e] = s->slot_of[code_of(s, li, e, s->k)];
 }
 
-// the codes of the reads ahead not on a queue yet: a ring of at most two layers'
-#define NPEND 4096
+// the codes of the reads ahead not on a queue yet (each in flight till it is): a ring of at most two layers'
+#define NPEND (2 * 4096)
 static int64_t pend[NPEND], npend, pend_at;
 
 // the completions reaped, the pending reads queued on the demand queues while every drive of the next has room, the queues that moved
@@ -234,8 +234,21 @@ static int64_t poll_io(io_t *s) {
     while (r < s->ptr[c + 1] && s->inflight[s->drive[r]] < s->entries - 8) r++;
     if (r < s->ptr[c + 1]) break;
     submit(s, 1, &c, &sl, 0, 1);
+    s->flying[c]--;
   }
   ring(s);
+  return 0;
+}
+
+// till the n codes' reads are in, the reads ahead queued as the drives have room. 0, -1 a read failed, -2 a timeout
+int64_t read_wait(io_t *s, int64_t n, const int64_t *codes) {
+  double t0 = now();
+  for (int64_t busy = 1; busy;) {
+    if (poll_io(s) < 0) return -1;
+    busy = 0;
+    for (int64_t i = 0; i < n && !busy; i++) busy = s->flying[codes[i]] > 0;
+    if (now() - t0 > 60) return stuck(s, "reads", 0, t0);
+  }
   return 0;
 }
 
@@ -400,40 +413,20 @@ int64_t layer(io_t *s, int64_t li) {
   return 0;
 }
 
-// n codes read into slots on the demand queues, waited for. 0, -1 a read failed, -2 a timeout
+// n codes read into slots on the demand queues, waited for (the reads ahead go on). 0, -1 a read failed, -2 a timeout
 int64_t read_codes(io_t *s, int64_t n, const int64_t *codes, const int64_t *slots) {
-  double t0 = now();
-  submit(s, n, codes, slots, 0, 0);
-  for (int64_t busy = 1; busy;) {
-    if (reap(s) < 0) return -1;
-    ring(s);
-    busy = 0;
-    for (int64_t q = 0; q < s->nd; q++) busy |= s->inflight[q] != 0;
-    if (now() - t0 > 60) return stuck(s, "reads", 0, t0);
-  }
-  return 0;
+  submit(s, n, codes, slots, 0, 1);
+  return read_wait(s, n, codes);
 }
 
 // n codes read ahead into their slots (slot_of): pending on the demand queues, queued as they have room (pump), not waited for
 void read_ahead(io_t *s, int64_t n, const int64_t *codes) {
-  for (int64_t i = 0; i < n; i++) pend[npend++ % NPEND] = codes[i];
+  for (int64_t i = 0; i < n; i++) pend[npend++ % NPEND] = codes[i], s->flying[codes[i]]++;
   poll_io(s);
 }
 
 // the reads ahead queued as the drives have room, the completions reaped. 0, -1 a read failed
 int64_t pump(io_t *s) { return poll_io(s); }
-
-// till every read ahead is queued and the n codes' reads are in. 0, -1 a read failed, -2 a timeout
-int64_t read_wait(io_t *s, int64_t n, const int64_t *codes) {
-  double t0 = now();
-  for (int64_t busy = 1; busy;) {
-    if (poll_io(s) < 0) return -1;
-    busy = pend_at < npend;
-    for (int64_t i = 0; i < n && !busy; i++) busy = s->flying[codes[i]] > 0;
-    if (now() - t0 > 60) return stuck(s, "reads", 0, t0);
-  }
-  return 0;
-}
 
 // every layer's ready words set to value, with 0 the tags cleared too (before a step's graph runs)
 void flags(io_t *s, uint32_t value) {
