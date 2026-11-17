@@ -2,7 +2,7 @@
 # stores its router scores and its tag (store), the host routes on them, reads the missing experts straight from the drives into the
 # gpus' slot pools and gives the gpus the slots and weights in two parts (a wait on each): the first those cached, the gpus work on it
 # while the rest are read. the reads go on two host-owned queues of each drive (demand, guesses) the c fills, rings and reaps itself
-import ctypes, functools, hashlib, os, subprocess
+import ctypes, functools, hashlib, itertools, os, subprocess
 from typing import cast
 import numpy as np
 from tinygrad import Device, Tensor
@@ -38,12 +38,14 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 
 # io_t: the host's state, the drives' queues and command tables, the counts (IO: name, c type, a pointer is an address). bufs: every layer's
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each
-# [ready | slots | weights], k1*T then (k-k1)*T entries: entry j*T+t token t's j-th expert and its weight, padded with slot 0, weight 0 (the
-# union of the tokens' experts read once). tokens: a step's
-IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n nvict pf fill".split()),
+# [ready | a copy's slots | its weights | the next copy's ..], k1*T then (k-k1)*T entries a copy: entry j*T+t token t's j-th expert and its
+# weight in the copy it's read from, padded with slot 0, weight 0 (the union of the tokens' experts read once). tokens: a step's. the copies of
+# the experts: code c * layers * E + layer * E + expert, its slot width[c] slots of the pool (slot_of: its first), big: a token's experts of a
+# rank under it in copy 0, the rest too if cached there (big >= 0), else in the first copy that holds them
+IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n pf fill copies big".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),
-      ("mask", "uint8_t *"), ("victims", "int64_t *"), ("owner", "int64_t *"),
+      ("mask", "uint8_t *"), ("victims", "int64_t *"), ("nvict", "int64_t *"), ("width", "const int64_t *"), ("owner", "int64_t *"),
       ("ptr", "const int64_t *"), ("drive", "const int32_t *"), ("gpu", "const int32_t *"),
       *((n, "const int64_t *") for n in "lba nbytes inpart part_pages".split()),
       *((n, "const uint64_t *") for n in "prp sq db cq cq_db".split()),
@@ -54,7 +56,8 @@ BUFS = ["tag", "scores", "part1", "part2"]
 CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float": ctypes.c_float, "double": ctypes.c_double}
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
 
-HOST_C = "#include <stdint.h>\ntypedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
+VICTIMS = 1024
+HOST_C = f"#include <stdint.h>\n#define VICTIMS {VICTIMS}\n" + "typedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
   ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\n" + r"""
 #include <stdio.h>
 #include <time.h>
@@ -156,37 +159,63 @@ static int64_t route(const io_t *s, const float *logits, const float *bias, cons
   return c;
 }
 
-// a slot a victim can be: not masked (pinned), not of an expert in flight or guessed
+// a slot a victim can be: not masked (pinned), not of an expert in flight, guessed or pinned
 static int64_t free_slot(const io_t *s, int64_t sl) {
   int64_t c = s->expert_in[sl];
-  return !s->mask[sl] && !(c >= 0 && (s->flying[c] || s->guess[c]));
+  return !s->mask[sl] && !(c >= 0 && (s->flying[c] || s->guess[c] || s->mask[s->slot_of[c]]));
 }
 
-// the victims of the next misses and guesses: the n least used free slots (an empty one first), least used first
+static int64_t copy_of(const io_t *s, int64_t code) { return code / (s->layers * s->E); }
+
+static int64_t slots_free(const io_t *s, int64_t sl, int64_t w) {
+  for (int64_t u = sl; u < sl + w; u++) if (!free_slot(s, u)) return 0;
+  return 1;
+}
+
+// the victims of the next misses and guesses of every copy: its n least used free slots of its width (empty ones first), least used first
 static void pick(io_t *s, int64_t n) {
-  float key[1024]; int64_t m = 0;
+  float key[4][VICTIMS], sum[4]; int64_t ok[4];
+  for (int64_t c = 0; c < s->copies; c++) s->nvict[c] = 0;
   for (int64_t sl = 0; sl < s->slots; sl++) {
-    int64_t c = s->expert_in[sl];
-    if (!free_slot(s, sl)) continue;
-    float f = c >= 0 ? s->freq[c] : -1;
-    if (m == n && f >= key[m - 1]) continue;
-    int64_t j = m < n ? m++ : m - 1;
-    for (; j > 0 && key[j - 1] > f; j--) key[j] = key[j - 1], s->victims[j] = s->victims[j - 1];
-    key[j] = f, s->victims[j] = sl;
+    int64_t code = s->expert_in[sl], fr = free_slot(s, sl);
+    float f = code >= 0 ? s->freq[code] : -1;
+    for (int64_t c = 0; c < s->copies; c++) {
+      int64_t w = s->width[c], first = sl - sl % w, m = s->nvict[c], *v = s->victims + c * VICTIMS;
+      if (sl == first) sum[c] = 0, ok[c] = 1;
+      sum[c] += f, ok[c] &= fr;
+      if (sl != first + w - 1 || !ok[c] || (m == n && sum[c] >= key[c][m - 1])) continue;
+      int64_t j = m < n ? s->nvict[c]++ : m - 1;
+      for (; j > 0 && key[c][j - 1] > sum[c]; j--) key[c][j] = key[c][j - 1], v[j] = v[j - 1];
+      key[c][j] = sum[c], v[j] = first;
+    }
   }
-  s->nvict = m;
 }
 
-// the first victim still free, taken out of the list, into code's slot (-1: none left)
+static void drop(io_t *s, int64_t code) {
+  for (int64_t u = s->slot_of[code]; u < s->slot_of[code] + s->width[copy_of(s, code)]; u++) s->expert_in[u] = -1;
+  s->slot_of[code] = -1;
+}
+
+// the first victim of code's copy still free, taken out of the list, into code's slots, pinned (-1: none left)
 static int64_t take(io_t *s, int64_t code) {
-  for (int64_t i = 0; i < s->nvict; i++) if (free_slot(s, s->victims[i])) {
-    int64_t sl = s->victims[i];
-    for (s->nvict--; i < s->nvict; i++) s->victims[i] = s->victims[i + 1];
-    if (s->expert_in[sl] >= 0) s->slot_of[s->expert_in[sl]] = -1;
-    s->expert_in[sl] = code, s->slot_of[code] = (int32_t)sl;
+  int64_t c = copy_of(s, code), w = s->width[c], *v = s->victims + c * VICTIMS;
+  for (int64_t i = 0; i < s->nvict[c]; i++) if (slots_free(s, v[i], w)) {
+    int64_t sl = v[i];
+    for (s->nvict[c]--; i < s->nvict[c]; i++) v[i] = v[i + 1];
+    for (int64_t u = sl; u < sl + w; u++) if (s->expert_in[u] >= 0) drop(s, s->expert_in[u]);
+    for (int64_t u = sl; u < sl + w; u++) s->expert_in[u] = code;
+    s->slot_of[code] = (int32_t)sl, s->mask[sl] = 1;
     return sl;
   }
   return -1;
+}
+
+static int64_t code_of(const io_t *s, int64_t li, int64_t e, int64_t r) {
+  int64_t code = li * s->E + e;
+  if (r < s->big || (s->big >= 0 && s->slot_of[code] >= 0)) return code;
+  for (int64_t c = 1; c < s->copies; c++) if (s->ptr[code + c * s->layers * s->E + 1] > s->ptr[code + c * s->layers * s->E])
+    return code + c * s->layers * s->E;
+  return code;
 }
 
 // the codes of the reads ahead not on a queue yet: a ring of at most two layers'
@@ -228,27 +257,29 @@ static void prefetch(io_t *s, const uint64_t *b, int64_t lj, int64_t row, int64_
   float logits[4096], sig[4096], w[64]; int64_t sel[64], codes[64], ms[64], m = 0;
   logits_of(s, b, row, logits);
   const float *bias = s->bias[lj];
-  int32_t *so = s->slot_of + lj * s->E;
-  int64_t c = route(s, logits, bias, so, 0, sel, w, sig, 0, 0);
+  int64_t c = route(s, logits, bias, s->slot_of + lj * s->E, 0, sel, w, sig, 0, 0);
   #define KEY(e) (sig[e] + bias[e])
   for (int64_t a = 1; a < c; a++) for (int64_t j = a; j > 0 && KEY(sel[j - 1]) < KEY(sel[j]); j--) {
     int64_t u = sel[j]; sel[j] = sel[j - 1], sel[j - 1] = u;
   }
   for (int64_t j = 0; j < c && m < n; j++) {
-    if (so[sel[j]] >= 0) continue;
-    if ((ms[m] = take(s, codes[m] = lj * s->E + sel[j])) < 0) break;
+    int64_t code = code_of(s, lj, sel[j], j);
+    if (s->slot_of[code] >= 0) continue;
+    if ((ms[m] = take(s, codes[m] = code)) < 0) break;
     s->guess[codes[m++]] = 1;
   }
   submit(s, m, codes, ms, 1, 1);
+  for (int64_t i = 0; i < m; i++) s->mask[ms[i]] = 0;
   s->guesses += m;
 }
 
 // layer li of a step of tokens (each its rows of the gpus' scores): waits for the gpus' tags, routes every token on its row 0 (the union
-// of their experts read once), reads the misses into victims, queues the guesses of the next layer (row 1, only while every guess queue is
-// under half full: they can't wrap one, the demand's are drained every layer), gives the gpus every token's slots and weights in the two
-// parts, each in the order they're ready (cached, cached and in flight, read now): the first k1 a token, those in (one in flight or read
-// only when the second can't hold the rest), released while the rest are read; padded with slot 0, weight 0 (the gemvs skip it). then the
-// counts, li's guesses settled (used when routed), the decayed use counts and the next layer's victims (but this layer's slots).
+// of their experts read once, each of a copy: code_of its best rank), reads the misses into victims, queues the guesses of the next layer
+// (row 1, only while every guess queue is under half full: they can't wrap one, the demand's are drained every layer), gives the gpus every
+// token's slots and weights in the two parts, each in the order they're ready (cached, cached and in flight, read now): the first k1 a
+// token, those in (one in flight or read only when the second can't hold the rest), released while the rest are read; padded with slot 0,
+// weight 0 (the gemvs skip it). then the counts, li's guesses settled (used when routed), the decayed use counts and the next layer's
+// victims (but this layer's slots).
 // 0, -1 a read failed, -2 a timeout, -3 no victims
 int64_t layer(io_t *s, int64_t li) {
   int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1, K2 = s->k - K1;
@@ -258,30 +289,35 @@ int64_t layer(io_t *s, int64_t li) {
   if (r) return r;
   double t1 = now();
   float logits[4096], sig[4096], tw[512];
-  int64_t sel[64], pos[4096], usel[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0, late = 0, ns = 0, nf = 0;
+  int64_t sel[64], pos[4096], usel[512], urank[512], ucode[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0,
+          late = 0, ns = 0, nf = 0;
   uint8_t hit[512];
-  int32_t *so = s->slot_of + li * E;
   for (int64_t e = 0; e < E; e++) pos[e] = -1;
   for (int64_t t = 0; t < T; t++) {
     logits_of(s, b, t * s->rows, logits);
-    int64_t c = tc[t] = route(s, logits, s->bias[li], so, 1, sel, tw + t * 64, sig, skip, &ns);
+    int64_t c = tc[t] = route(s, logits, s->bias[li], s->slot_of + li * E, 1, sel, tw + t * 64, sig, skip, &ns);
     for (int64_t j = 0; j < c; j++) {
-      if (pos[sel[j]] < 0) pos[sel[j]] = nu, usel[nu++] = sel[j];
+      if (pos[sel[j]] < 0) pos[sel[j]] = nu, usel[nu] = sel[j], urank[nu++] = j;
+      if (j < urank[pos[sel[j]]]) urank[pos[sel[j]]] = j;
       tj[t * 64 + j] = pos[sel[j]];
     }
   }
   for (int64_t j = 0; j < nu; j++) {
-    if ((hit[j] = so[usel[j]] >= 0)) nh++, late += s->flying[li * E + usel[j]] > 0, s->mask[so[usel[j]]] = 1;
-    else codes[nm++] = li * E + usel[j];
+    int64_t sl = s->slot_of[ucode[j] = code_of(s, li, usel[j], urank[j])];
+    if ((hit[j] = sl >= 0)) nh++, late += s->flying[ucode[j]] > 0, s->mask[sl] = 1;
+    else codes[nm++] = ucode[j];
   }
-  int64_t free = 0;
-  for (int64_t i = 0; i < s->nvict; i++) free += free_slot(s, s->victims[i]);
-  if (free < nm) pick(s, s->victims_n);  // too few: new ones, but this layer's cached
-  for (int64_t i = 0; i < nm; i++) if ((ms[i] = take(s, codes[i])) < 0) return -3;
+  for (int64_t c = 0; c < s->copies; c++) {
+    int64_t need = 0, free = 0;
+    for (int64_t i = 0; i < nm; i++) need += copy_of(s, codes[i]) == c;
+    for (int64_t i = 0; i < s->nvict[c]; i++) free += slots_free(s, s->victims[c * VICTIMS + i], s->width[c]);
+    if (free < need) pick(s, s->victims_n);  // too few: new ones, but this layer's cached
+    for (int64_t i = 0; i < nm; i++) if (copy_of(s, codes[i]) == c && (ms[i] = take(s, codes[i])) < 0) return -3;
+  }
   submit(s, nm, codes, ms, 0, 0);
   ring(s);
   double t2 = now();
-  #define FLYING(u) (hit[u] && s->flying[li * E + usel[u]] > 0)
+  #define FLYING(u) (hit[u] && s->flying[ucode[u]] > 0)
   #define RANK(u) (!hit[u] ? 2 : FLYING(u) ? 1 : 0)
   #define BUSY(u) (hit[u] ? FLYING(u) : reads)
   // each token's experts by readiness (stable), its part 1 those in
@@ -298,13 +334,13 @@ int64_t layer(io_t *s, int64_t li) {
   for (int64_t g = 0; g < ng; g++) for (int64_t second = 0; second < 2; second++) {
     int64_t cap = (second ? K2 : K1) * T;
     uint32_t *part = BUF(second ? B_PART2 : B_PART1, g, uint32_t);
-    for (int64_t i = 0; i < 2 * cap; i++) part[1 + i] = 0;
+    for (int64_t i = 0; i < 2 * cap * s->copies; i++) part[1 + i] = 0;
     for (int64_t t = 0; t < T; t++) {
       int64_t begin = second ? p1[t] : 0, end = second ? tc[t] : p1[t];
       for (int64_t j = begin; j < end; j++) {
-        int64_t at = (j - begin) * T + t;
-        ((int32_t *)part)[1 + at] = so[usel[tj[t * 64 + j]]];
-        ((float *)part)[1 + cap + at] = tw[t * 64 + j];
+        int64_t code = ucode[tj[t * 64 + j]], c = copy_of(s, code), at = 1 + 2 * cap * c + (j - begin) * T + t;
+        ((int32_t *)part)[at] = s->slot_of[code] / (int32_t)s->width[c];
+        ((float *)part)[at + cap] = tw[t * 64 + j];
       }
     }
   }
@@ -324,13 +360,16 @@ int64_t layer(io_t *s, int64_t li) {
       for (int64_t q = nd; q < 2 * nd; q++) room &= s->inflight[q] < s->entries / 2;
       if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, s->pf);
       for (int64_t i = 0; room && i < ns && nf < s->fill; i++) if (pos[skip[i]] == -1) {  // (each once, none another token kept)
+        int64_t code = code_of(s, li, skip[i], s->k);
         pos[skip[i]] = -2;
-        if ((ms[nm + nf] = take(s, codes[nm + nf] = li * E + skip[i])) < 0) break;
+        if (s->slot_of[code] >= 0) continue;
+        if ((ms[nm + nf] = take(s, codes[nm + nf] = code)) < 0) break;
         nf++;
       }
       submit(s, nf, codes + nm, ms + nm, 1, 1);
       ring(s);
-      for (int64_t j = 0; j < nu; j++) if (hit[j]) s->mask[so[usel[j]]] = 0;
+      for (int64_t i = 0; i < nf; i++) s->mask[ms[nm + i]] = 0;
+      for (int64_t j = 0; j < nu; j++) if (hit[j]) s->mask[s->slot_of[ucode[j]]] = 0;
     }
     if (!busy) break;
     if (now() - t0 > 60) return stuck(s, "reads", li, t0);
@@ -339,17 +378,18 @@ int64_t layer(io_t *s, int64_t li) {
   for (int64_t g = 0; g < ng; g++) *BUF(B_PART1, g, volatile uint32_t) = 1, *BUF(B_PART2, g, volatile uint32_t) = 1;
   double t3 = now();
   s->refs += nu, s->hits += nh - late, s->late += late, s->misses += nm, s->fills += nf;
-  for (int64_t e = 0; e < E; e++) if (s->guess[li * E + e]) {
-    s->guess[li * E + e] = 0;
-    if (pos[e] >= 0) s->used++; else s->wasted++;
+  for (int64_t c = li * E; c < s->copies * s->layers * E; c += s->layers * E) {
+    for (int64_t e = 0; e < E; e++) if (s->guess[c + e]) {
+      s->guess[c + e] = 0;
+      if (pos[e] >= 0) s->used++; else s->wasted++;
+    }
+    for (int64_t e = 0; e < E; e++) s->freq[c + e] *= s->decay;
   }
-  float *f = s->freq + li * E;
-  for (int64_t e = 0; e < E; e++) f[e] *= s->decay;
-  for (int64_t j = 0; j < nu; j++) f[usel[j]] += 1;
-  for (int64_t i = 0; i < nf; i++) f[codes[nm + i] - li * E] += 1;  // (a fill counts as routed: it was)
-  for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 1;
+  for (int64_t j = 0; j < nu; j++) s->freq[ucode[j]] += 1;
+  for (int64_t i = 0; i < nf; i++) s->freq[codes[nm + i]] += 1;  // (a fill counts as routed: it was)
+  for (int64_t j = 0; j < nu; j++) s->mask[s->slot_of[ucode[j]]] = 1;
   pick(s, s->victims_n);
-  for (int64_t j = 0; j < nu; j++) s->mask[so[usel[j]]] = 0;
+  for (int64_t j = 0; j < nu; j++) s->mask[s->slot_of[ucode[j]]] = 0;
   s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += t3 - t2, s->t_after += now() - t3;
   return 0;
 }
@@ -431,28 +471,33 @@ def host_c() -> ctypes.CDLL:
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib
 
-def reads(m:dict, disks:list[list[str]], pools:list[Buffer], sizes:list[int]) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-  """step_io's reads of every expert code (layer * E + expert) into the gpus' pools (a part a slot): two new host-owned queues on every
-  drive of the disks (queue j of drive k at j * nd + k: the demand's, then the guesses'), the drive commands of each code (the first
-  sizes[layer] bytes of its part, a piece of a stripe each, in code order) and the prp table of each pool, the one master maps it with on its
-  disk's first drive (the drives share an address space). the tables and the io_t scalars"""
-  nvs = [cast(NVMEDevice, Device[d]) for disk in disks for d in disk]
+def reads(copies:list[tuple[dict, list[list[str]], list[tuple[int, int]|None]]], pools:list[Buffer], slot:int) \
+    -> tuple[dict[str, np.ndarray], dict[str, int]]:
+  """step_io's reads of every expert code (copy * layers * E + layer * E + expert) into the gpus' pools of slots of slot bytes: two new
+  host-owned queues on every drive of the first copy's disks (queue j of drive k at j * nd + k: the demand's, then the guesses'), the drive
+  commands of each code (a copy (manifest, disks, each layer's (layer in its store, bytes) or None) reads the first bytes of its part, a piece
+  of a stripe each, in code order) and the prp table of each pool, the one master maps it with on its disk's first drive (the drives share an
+  address space). the tables and the io_t scalars"""
+  disks = copies[0][1]
+  names = {d: i for i, d in enumerate(d for disk in disks for d in disk)}
+  nvs = [cast(NVMEDevice, Device[d]) for d in names]
   qs, (nd, shift) = [nv.nvme.new_queue() for _ in range(2) for nv in nvs], (len(nvs), nvs[0].nvme.lba_shift)
   assert all(nv.nvme.lba_shift == shift and nv.nvme.max_xfer >= STRIPE for nv in nvs), "the drives read a stripe a command, of one block size"
   rows, ptr = [], [0]
-  for code in range(len(sizes) * m["n_experts"]):
-    for g, disk in enumerate(disks):
-      done = 0
-      for d, o, n in pieces(part_off(m, g, code), sizes[code // m["n_experts"]], len(disk)):
-        rows.append((g * len(disk) + d, g, o >> shift, n, done >> 12))
-        done += n
-    ptr.append(len(rows))
+  for m, dks, layers in copies:
+    for at, e in itertools.product(layers, range(m["n_experts"])):
+      for g, disk in enumerate(dks if at is not None else []):
+        done = 0
+        for d, o, n in pieces(part_off(m, g, at[0] * m["n_experts"] + e), at[1], len(disk)):
+          rows.append((names[disk[d]], g, o >> shift, n, done >> 12))
+          done += n
+      ptr.append(len(rows))
   drive, gpu, lba, nbytes, inpart = (np.array(c, np.int64) for c in zip(*rows))
   prps = [cast(NVMEAllocator, Device[disk[0]].allocator).prp_tables[pool.get_buf(disk[0])].get_storage().host for disk, pool in zip(disks, pools)]
   def addrs(xs) -> np.ndarray: return np.array([x.addr for x in xs], np.uint64)
   tables:dict[str, np.ndarray] = {
     "ptr": np.array(ptr, np.int64), "drive": drive.astype(np.int32), "gpu": gpu.astype(np.int32), "lba": lba, "nbytes": nbytes, "inpart": inpart,
-    "part_pages": np.array(m["part_bytes"], np.int64) >> 12, "prp": addrs(prps), "sq": addrs(q.sq for q in qs), "cq": addrs(q.cq for q in qs),
+    "part_pages": np.full(len(disks), slot >> 12, np.int64), "prp": addrs(prps), "sq": addrs(q.sq for q in qs), "cq": addrs(q.cq for q in qs),
     "db": np.array([q.dev.regs.addr + q.sq_db for q in qs], np.uint64), "cq_db": np.array([q.dev.regs.addr + q.cq_db for q in qs], np.uint64),
     **{k: np.zeros(2 * nd, np.int64) for k in ("tails", "db_tails", "heads", "inflight", "cids")}, "phases": np.ones(2 * nd, np.int64),
     "owner": np.full(2 * nd * 65536, -2, np.int64)}

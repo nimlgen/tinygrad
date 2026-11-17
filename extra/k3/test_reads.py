@@ -18,7 +18,8 @@ class TestReads(unittest.TestCase):
     cls.ncodes, cls.parts = len(cls.m["layers"]) * cls.m["n_experts"], cls.m["part_bytes"]
     cls.pools = [Tensor.zeros(SLOTS * p, dtype=dtypes.uint8, device=g).contiguous().realize() for g, p in zip(GPUS, cls.parts)]
     st = time.perf_counter()
-    cls.tables, scalars = reads(cls.m, cls.disks, [p.uop.buffer for p in cls.pools], [cls.parts[0]] * len(cls.m["layers"]))
+    cls.tables, scalars = reads([(cls.m, cls.disks, [(li, cls.parts[0]) for li in range(len(cls.m["layers"]))])],
+                                [p.uop.buffer for p in cls.pools], cls.parts[0])
     print(f"{cls.ncodes} codes: {len(cls.tables['lba'])} commands, tables in {time.perf_counter() - st:.2f} s")
     cls.io = IoT(**scalars)
     for name, a in cls.tables.items(): setattr(cls.io, name, a.ctypes.data)

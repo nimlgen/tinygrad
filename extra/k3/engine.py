@@ -17,7 +17,7 @@ from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, Attent
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
-from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
+from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
 from extra.k3 import persist
 
@@ -158,10 +158,11 @@ class Engine:
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
     self.state = {"slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(L * E, np.float32),
                   "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(slots, np.uint8),
-                  "victims": np.zeros(max(32 * tokens, E), np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
+                  "victims": np.zeros(VICTIMS, np.int64), "nvict": np.zeros(1, np.int64), "width": np.ones(1, np.int64),
+                  "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
                   "bufs": np.array([[[v.ctypes.data for v in views] for _, views in b] for b in bufs], np.uint64)}
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
-                  fill=FILL, decay=0.5 ** (1 / 8))
+                  fill=FILL, decay=0.5 ** (1 / 8), copies=1)
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     if window:
       self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
@@ -172,8 +173,9 @@ class Engine:
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
-    sizes = [round_up(self.nbytes(gu, 2 * self.units * self.lat) + self.nbytes(d, self.units * self.lat), 4096) for gu, d in self.types]
-    self.tables, scalars = reads(self.m, disks, self.pool.uop.buffer.bufs, sizes)
+    sizes = [(li, round_up(self.nbytes(gu, 2 * self.units * self.lat) + self.nbytes(d, self.units * self.lat), 4096))
+             for li, (gu, d) in enumerate(self.types)]
+    self.tables, scalars = reads([(self.m, disks, sizes)], self.pool.uop.buffer.bufs, self.part)
     for name, v in {**scalars, **{k: a.ctypes.data for k, a in self.tables.items()}}.items(): setattr(self.io, name, v)
 
   # *** the step's graph

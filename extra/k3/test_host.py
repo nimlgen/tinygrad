@@ -3,9 +3,9 @@
 # order, as drives do), the gpus' tags are set up front. checks the slots and weights the gpus get, where each read lands (its prp), the
 # cache tables, the guesses and the counts.
 # PYTHONPATH=. python3 extra/k3/test_host.py
-import ctypes, threading, time, unittest
+import ctypes, itertools, threading, time, unittest
 import numpy as np
-from extra.k3.host import IoT, host_c, BUFS
+from extra.k3.host import IoT, host_c, BUFS, VICTIMS
 
 E, L, NGPU, K, KMIN, ND, ENTRIES, ROWS = 64, 6, 2, 8, 2, 4, 64, 2
 
@@ -42,24 +42,27 @@ class FakeDrives(threading.Thread):
         self.tail[q] = t
 
 class TestStepIO(unittest.TestCase):
-  def setUp(self, slots=200, T=1, slow=False, parts=1):
-    """gpu g reads its part of a code (parts pages on each of its ND // NGPU drives, a command each) into its pool, a prp table each"""
-    SLOTS, rng, self.keep = slots, np.random.default_rng(0), []
+  def setUp(self, slots=200, T=1, slow=False, parts=1, widths=(1,), held=()):
+    """gpu g reads its part of a code (parts pages a slot it takes on each of its ND // NGPU drives, a command each) into its pool, a prp
+    table each. widths: the copies' slots a code, held: the layers of the copies after the first"""
+    SLOTS, rng, self.keep, C = slots, np.random.default_rng(0), [], len(widths)
     def arr(a) -> np.ndarray:
       self.keep.append(a := np.ascontiguousarray(a))
       return a
-    nq, dpg, ncodes = 2 * ND, ND // NGPU, L * E
+    nq, dpg, ncodes = 2 * ND, ND // NGPU, C * L * E
     self.sq, self.cq = [arr(np.zeros(ENTRIES * 16, np.uint32)) for _ in range(nq)], [arr(np.zeros(ENTRIES * 4, np.uint32)) for _ in range(nq)]
     self.db, self.cq_db = [arr(np.zeros(1, np.uint32)) for _ in range(nq)], [arr(np.zeros(1, np.uint32)) for _ in range(nq)]
-    # the commands of a code: gpu, drive, page in the part
-    gpu, drive, inpart = (np.tile(np.array(c), ncodes) for c in zip(*[(g, g * dpg + d, d * parts + p) for g in range(NGPU) for d in range(dpg)
-                                                                       for p in range(parts)]))
-    n = NGPU * dpg * parts
+    # the commands of a code: gpu, drive, page in the part (none of a layer its copy doesn't hold)
+    def commands(w:int) -> list[tuple[int, int, int]]:
+      return [(g, g * dpg + d, d * parts * w + p) for g in range(NGPU) for d in range(dpg) for p in range(parts * w)]
+    cmds = [commands(widths[c]) if c == 0 or li in held[c - 1] else [] for c in range(C) for li in range(L) for _ in range(E)]
+    gpu, drive, inpart = (np.array(c, np.int64) for c in zip(*itertools.chain(*cmds)))
+    ptr = np.cumsum([0] + [len(c) for c in cmds])
     # the pages of gpu g's pool: g << 32 | page << 12 (and lists after each)
     self.prp = [arr(np.array([(g << 32 | p << 12, 1) for p in range(SLOTS * dpg * parts + 1)], np.uint64).reshape(-1)) for g in range(NGPU)]
     self.tables:dict[str, np.ndarray] = {
-      "ptr": np.arange(0, n * ncodes + 1, n, dtype=np.int64), "drive": drive.astype(np.int32), "gpu": gpu.astype(np.int32),
-      "lba": np.arange(n * ncodes, dtype=np.int64), "nbytes": np.full(n * ncodes, 4096, np.int64), "inpart": inpart.astype(np.int64),
+      "ptr": ptr.astype(np.int64), "drive": drive.astype(np.int32), "gpu": gpu.astype(np.int32),
+      "lba": np.arange(len(gpu), dtype=np.int64), "nbytes": np.full(len(gpu), 4096, np.int64), "inpart": inpart,
       "part_pages": np.full(NGPU, dpg * parts, np.int64), "prp": np.array([p.ctypes.data for p in self.prp], np.uint64),
       "sq": np.array([a.ctypes.data for a in self.sq], np.uint64), "db": np.array([a.ctypes.data for a in self.db], np.uint64),
       "cq": np.array([a.ctypes.data for a in self.cq], np.uint64), "cq_db": np.array([a.ctypes.data for a in self.cq_db], np.uint64),
@@ -67,20 +70,21 @@ class TestStepIO(unittest.TestCase):
       "owner": np.full(nq * 65536, -2, np.int64)}
     self.bias = [arr(rng.normal(0, 0.1, E).astype(np.float32)) for _ in range(L)]
     self.state:dict[str, np.ndarray] = {
-      "slot_of": np.full(L * E, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(L * E, np.float32),
-      "flying": np.zeros(L * E, np.int32), "guess": np.zeros(L * E, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
-      "victims": np.zeros(32 * T, np.int64), "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
+      "slot_of": np.full(ncodes, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(ncodes, np.float32),
+      "flying": np.zeros(ncodes, np.int32), "guess": np.zeros(ncodes, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
+      "victims": np.zeros(C * VICTIMS, np.int64), "nvict": np.zeros(C, np.int64), "width": np.array(widths, np.int64),
+      "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.keep += [*self.tables.values(), *self.state.values()]
     # the gpus' buffers of every layer: tag, scores (ROWS of E / NGPU a token), the two parts' tables [ready | slots | weights]
     nr, self.k1 = E // NGPU, K // 2
     def gpu_bufs():
       return {"tag": arr(np.ones(1, np.uint32)), "scores": arr(rng.normal(0, 2, (T * ROWS, nr)).astype(np.float32)),
-              "part1": arr(np.zeros(1 + 2 * self.k1 * T, np.uint32)),
-              "part2": arr(np.zeros(1 + 2 * (K - self.k1) * T, np.uint32))}
+              "part1": arr(np.zeros(1 + 2 * C * self.k1 * T, np.uint32)),
+              "part2": arr(np.zeros(1 + 2 * C * (K - self.k1) * T, np.uint32))}
     self.gbuf = [[gpu_bufs() for _ in range(NGPU)] for _ in range(L)]
     self.bufs = arr(np.array([[[g[b].ctypes.data for g in self.gbuf[li]] for b in BUFS] for li in range(L)], np.uint64))
     self.io = io = IoT(layers=L, E=E, ngpu=NGPU, k=K, kmin=KMIN, k1=self.k1, rows=ROWS, tokens=T,
-                       nd=ND, entries=ENTRIES, shift=9, slots=SLOTS,
+                       nd=ND, entries=ENTRIES, shift=9, slots=SLOTS, copies=C, big=0,
                        victims_n=32 * T, pf=3, tau=0.03, decay=0.5 ** (1 / 8), bufs=self.bufs.ctypes.data)
     for name, a in {**self.tables, **self.state}.items(): setattr(io, name, a.ctypes.data)
     self.drives = FakeDrives(self.sq, self.db, self.cq, slow)
@@ -95,15 +99,18 @@ class TestStepIO(unittest.TestCase):
       for g in self.gbuf[li]: g["tag"][0] = 1
     self.assertEqual(host_c().step_io(ctypes.byref(self.io)), 0)
 
-  def parts(self, li:int, g:int) -> tuple[np.ndarray, np.ndarray]: # a gpu's slots and weights of a layer, both parts
-    p = [(t, (len(t) - 1) // 2) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
-    return np.concatenate([t[1:1 + n].view(np.int32) for t, n in p]), np.concatenate([t[1 + n:].view(np.float32) for t, n in p])
+  def parts(self, li:int, g:int, c:int=0) -> tuple[np.ndarray, np.ndarray]: # a gpu's slots and weights of a layer in copy c, both parts
+    p = [(t, (len(t) - 1) // 2 // len(self.state["width"])) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
+    return (np.concatenate([t[1 + 2 * c * n:1 + (2 * c + 1) * n].view(np.int32) for t, n in p]),
+            np.concatenate([t[1 + (2 * c + 1) * n:1 + (2 * c + 2) * n].view(np.float32) for t, n in p]))
 
   def check_tables(self):
-    slot_of, expert_in, t = self.state["slot_of"], self.state["expert_in"], self.tables
+    slot_of, expert_in, t, width = self.state["slot_of"], self.state["expert_in"], self.tables, self.state["width"]
     for sl, c in enumerate(expert_in):
-      if c >= 0: self.assertEqual(slot_of[c], sl)
-    for c in np.nonzero(slot_of >= 0)[0]: self.assertEqual(expert_in[slot_of[c]], c)
+      if c >= 0: self.assertTrue(slot_of[c] <= sl < slot_of[c] + width[c // (L * E)])
+    for c in np.nonzero(slot_of >= 0)[0]:
+      w = width[c // (L * E)]
+      self.assertEqual((slot_of[c] % w, expert_in[slot_of[c]:slot_of[c] + w].tolist()), (0, [c] * w))
     # every cached expert's commands read into the pages of its slot
     for c in np.nonzero((slot_of >= 0) & (self.state["flying"] == 0))[0]:
       for r in range(t["ptr"][c], t["ptr"][c + 1]):
@@ -209,6 +216,36 @@ class TestStepIO(unittest.TestCase):
             np.testing.assert_allclose(weights[t, order], expected[t, want_order], rtol=1e-6)
       self.assertEqual((self.io.refs, self.io.misses), (refs, refs))
       for guard in guards: np.testing.assert_array_equal(guard, 0xa5a5a5a5)
+
+  def test_copies(self): # two copies (copy 0's slots two of the pool's, copy 1 holding layers 1..): a token's experts of a rank under big in
+    # copy 0, the others in copy 0 if cached there (big >= 0), else in copy 1 where it holds their layer
+    for big in (-1, 0, 2, K):
+      self.tearDown()
+      self.setUp(slots=3 * L * E, T=2, widths=(2, 1), held=(range(1, L),))
+      self.io.big = big
+      for _ in range(4):
+        before = self.state["slot_of"][:L * E] >= 0
+        self.step()
+        self.check_tables()
+        for li in range(L):
+          (s0, w0), (s1, w1) = self.parts(li, 0), self.parts(li, 0, 1)
+          self.assertTrue(all((self.parts(li, 1, c)[0] == s).all() for c, s in ((0, s0), (1, s1))))
+          self.assertAlmostEqual(float(w0.sum() + w1.sum()), 2.0, places=5)
+          codes = [self.state["expert_in"][s[w > 0] * width] - c * L * E for c, (s, w, width) in enumerate(((s0, w0, 2), (s1, w1, 1)))]
+          self.assertTrue(all((cs // E == li).all() for cs in codes))
+          if li == 0 or big == K: self.assertEqual(len(codes[1]), 0)
+          if li and big < 0: self.assertEqual(len(codes[0]), 0)
+          if big >= 0: self.assertFalse(before[li * E + codes[1] % E].any())
+          for t in range(2):
+            ws = np.concatenate([w0.reshape(-1, 2)[:, t], w1.reshape(-1, 2)[:, t]])
+            top = set(np.argsort(-ws)[:max(big, 0)].tolist())
+            self.assertFalse(top & {len(w0) // 2 + j for j, w in enumerate(w1.reshape(-1, 2)[:, t]) if w > 0})
+    self.tearDown()
+    self.setUp(slots=80, T=2, widths=(2, 1), held=(range(1, L),))
+    self.io.big = 2
+    for _ in range(5):
+      self.step()
+      self.check_tables()
 
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
     self.io.tau, self.io.pf, self.io.fill = 0.2, 0, 4
