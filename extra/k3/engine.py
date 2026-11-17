@@ -254,8 +254,10 @@ class Engine:
     T, s = x.shape[1], w(x[0]) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
     scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
-    out = self.experts(li, h[0], self.host(li, 0, scores), self.ks[0] * T).contiguous()  # (a buffer: part 2 waited for after it)
-    return (partial_sum(out + self.experts(li, h[0], self.host(li, 1, out), self.ks[1] * T)) * self.model.config.routed_scaling_factor).unsqueeze(0)
+    y1, w1 = self.experts(li, h[0], self.host(li, 0, scores), self.ks[0] * T)
+    y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
+    y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
+    return (partial_sum(self.heaviest_first([y1, y2], [w1, w2], T)) * self.model.config.routed_scaling_factor).unsqueeze(0)
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
@@ -263,11 +265,11 @@ class Engine:
     if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).where(1, 2).cast(dtypes.uint32))
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
-  def experts(self, li:int, h:Tensor, table:Tensor, n:int) -> Tensor:
+  def experts(self, li:int, h:Tensor, table:Tensor, n:int) -> tuple[Tensor, Tensor]:
     """each gpu's units of layer li's n experts of a table (a copy's n slots, padded with slot 0, their weights a token's: j*T + t, then the next
-    copy's) on h (T, lat): (gpus, T, lat). entry j*T+t is token t's j-th expert, the act in the q8 of the down gemv's input, the down gemv a
-    token's sum"""
-    T, u, outs = h.shape[0], self.units, []
+    copy's) on h (T, lat): (gpus, n a copy in turn, lat) and their weights. entry j*T+t is token t's j-th expert (weight 0 in the copies it
+    isn't read from), the act in the q8 of the down gemv's input"""
+    u, ys, ws = self.units, [], []
     for c, types in enumerate(self.copies):
       if types[li] is None: continue
       (gu_type, down_type), stride, at = types[li], self.spans[c] * self.part, 1 + 2 * c * n
@@ -275,12 +277,19 @@ class Engine:
       slots, w = table[at:at + n].bitcast(dtypes.int32), table[at + n:at + 2 * n].bitcast(dtypes.float32)
       if amd_custom_kernels_supported(h.device):
         gu = expert_linear(self.pools[gu_type], slots, h, 2 * u, self.lat, gu_type, stride, split=True, live=w)
-        outs.append(expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, stride, off, act=self.act, w=w, rows=T))
-      else:
-        down = self.gemv(c, slots, self.act(*self.gemv(c, slots, h, 2 * u, self.lat, gu_type, 0).split(u, -1)), self.lat, u, down_type, off)
-        outs.append(down * w.reshape(n, 1))
-    out = functools.reduce(Tensor.add, outs)
-    return out if amd_custom_kernels_supported(h.device) else out.reshape(-1, n // T, T, self.lat).sum(1)
+        ys.append(expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, stride, off, act=self.act, live=w))
+      else: ys.append(self.gemv(c, slots, self.act(*self.gemv(c, slots, h, 2 * u, self.lat, gu_type, 0).split(u, -1)), self.lat, u, down_type, off))
+      ws.append(w)
+    return Tensor.cat(*ys, dim=1), Tensor.cat(*ws)
+
+  @staticmethod
+  def heaviest_first(ys:list[Tensor], ws:list[Tensor], T:int) -> Tensor:
+    """(gpus, T, lat): each token's expert outputs of the parts ys (gpus, n, lat), entry j*T+t token t's, weighted by ws (n,) and summed
+    heaviest first (a tie: the earlier entry first), the same sum whichever part an expert came in"""
+    rows = [(y[:, j * T:(j + 1) * T], w[j * T:(j + 1) * T].reshape(1, T, 1)) for y, w in zip(ys, ws) for j in range(w.shape[0] // T)]
+    rank = [sum(((v >= w) if i < j else (v > w)).cast(dtypes.int32) for i, (_, v) in enumerate(rows) if i != j) for j, (_, w) in enumerate(rows)]
+    return functools.reduce(Tensor.add, [functools.reduce(Tensor.add, [(rank[j] == r).where(y * w, 0) for j, (y, w) in enumerate(rows)])
+                                         for r in range(len(rows))])
 
   def gemv(self, c:int, slots:Tensor, x:Tensor, out_f:int, in_f:int, qtype:int, off:int) -> Tensor:
     """(gpus, n, out_f): W @ x[k % rows] (or a gpu's x[k]) of the W of quant type qtype at off bytes in copy c's slots[k] of each gpu's pool,
