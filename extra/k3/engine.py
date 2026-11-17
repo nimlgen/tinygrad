@@ -797,19 +797,21 @@ class Engine:
     Tensor.realize(*[self.session_rows(i, at).assign(c) for i, c in enumerate(self.stash)], *[s.assign(c) for c, s in states])
 
   def resume(self, tokens:list[int]):
-    """the kept session back when tokens share more with it than with the tokens fed (if the request since wrote only its copied rows), else
-    the tokens fed kept when tokens diverge from them early and are fewer (a short request: a title, a summary) and longer than one kept"""
+    """the kept session back when tokens share more with it than the tokens fed are (if the request since wrote only its copied rows), else
+    the tokens fed kept when tokens diverge from them early and are fewer (a short request: a title, a summary), unless they're a short
+    request's too and one longer is kept"""
     m = self.model
     def shared(a:list[int]) -> int: return sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, a)))
     if self.session is not None and m._cached_tokens != self.session[0] and \
        round_up(len(m._cached_tokens) + self.tokens, max(self.chunk, 1)) > self.session[1] + self.B: self.session = None
-    if self.session is not None and shared(kept:=self.session[0]) > shared(m._cached_tokens):
+    if self.session is not None and shared(kept:=self.session[0]) > max(shared(m._cached_tokens), len(m._cached_tokens)):
       self.keep_jits[1](self.v_at.bind(self.session[1]))
       m._cached_tokens, m._saved, self.session = kept[:], self.session[2], None
     elif len(tokens) < len(m._cached_tokens) and (at:=shared(m._cached_tokens)) + self.B <= self.max_context and len(tokens) - at < self.B // 2 \
-         and len(m._cached_tokens) > (len(self.session[0]) if self.session else 0):
+         and (self.session is None or len(m._cached_tokens) - at >= self.B or len(m._cached_tokens) > len(self.session[0])):
       self.keep_jits[0](self.v_at.bind(at))
       self.session = (m._cached_tokens[:], at, m._saved[:])
+    print(f"session: {len(tokens)} tokens, {len(m._cached_tokens)} fed, kept {self.session and (len(self.session[0]), self.session[1])}", flush=True)
 
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
