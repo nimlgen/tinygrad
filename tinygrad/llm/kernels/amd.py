@@ -815,7 +815,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   head = tile*16 + col
   qfrags = [UOp.stack(*((head < H).where(q[b, head.minimum(H - 1), t, part*(D//4) + i*16 + k].load(), 0.0).cast(dtypes.half) for k in ks))
             for i in range(D//64)]
-  keys = smin(start + t + 1, K)
+  keys = (t + start + 1).minimum(K)
   blocks = (keys + 15) // 16
   kb = UOp.range(blocks, 2, AxisType.LOOP)
   # the block's keys into LDS: 8*tiles threads a row, a contiguous run of its words each (vector loads of vec), loaded into registers the block
