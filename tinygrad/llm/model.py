@@ -196,6 +196,7 @@ class TransformerConfig:
   attn_head_gate: bool = False
   mla_nope: bool = False  # NoPE (No Positional Embeddings)
   streamed_experts: bool = False  # no routed expert weights: _routed is zero unless replaced (by an engine that streams the experts in)
+  mtp: bool = False
 
 class AttentionResidual:
   def __init__(self, config:TransformerConfig, new_block:bool=False):
@@ -626,6 +627,14 @@ class MLATransformerBlock(FFNBlock):
                                           device=x.device, yarn=self.config.yarn) if needs_rope else None
     if self.indexer: self.indexer._init_state(x)
 
+class MTPBlock(MLATransformerBlock):
+  def __init__(self, config:TransformerConfig):
+    super().__init__(config)
+    self.eh_proj = Linear(2 * config.dim, config.dim, bias=False)
+    self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
+
+  def project(self, emb:Tensor, hidden:Tensor) -> Tensor: return self.eh_proj(self.enorm(emb).cat(self.hnorm(hidden), dim=-1))
+
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
@@ -783,6 +792,7 @@ class Transformer:
     if config.hc and config.hc.low_rank: self.output_hc, self.output_norm = GatedResidual(config, inject=False), lambda x: x
     if config.attn_res_block_size: self.output_res_score = AttentionResidual(config)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
+    if config.mtp: self.mtp = MTPBlock(config)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -930,6 +940,8 @@ class Transformer:
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
+    if (mtp:=kv_lora_rank > 0 and f'blk.{num_blocks}.nextn.eh_proj.weight' in state_dict):
+      state_dict = {re.sub(rf'^blk\.{num_blocks}\.(nextn\.)?', 'mtp.', k):v for k,v in state_dict.items()}
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim, log_mul = kv.get(f'{arch}.rope.dimension_count', head_dim), kv.get(f'{arch}.rope.scaling.yarn_log_multiplier', 0.0)
     mscale = log_mul * math.log(kv.get(f'{arch}.rope.scaling.factor', 1.0)) + 1.0 if kv_lora_rank or arch.startswith('deepseek') else None
@@ -986,7 +998,7 @@ class Transformer:
                     tuple(kv[f'{arch}.ple.head_vocab_sizes']), kv[f'{arch}.ple.eos_token_id'], kv[f'{arch}.ple.conv_kernel']) if ple_entry else None,
       expert_latent_dim=kv.get(f'{arch}.expert_latent_length', 0), attn_res_block_size=kv.get(f'{arch}.attn_res.block_size', 0),
       situ=(kv[f'{arch}.activation.situ_beta'], kv[f'{arch}.activation.situ_linear_beta']) if f'{arch}.activation.situ_beta' in kv else None,
-      streamed_experts=bool(kv.get(f'{arch}.expert_count')) and not any(k.endswith('.ffn_gate_exps.weight') for k in state_dict))
+      streamed_experts=bool(kv.get(f'{arch}.expert_count')) and not any(k.endswith('.ffn_gate_exps.weight') for k in state_dict), mtp=mtp)
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
