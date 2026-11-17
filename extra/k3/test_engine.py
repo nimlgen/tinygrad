@@ -294,6 +294,8 @@ class TestEngine(unittest.TestCase):
       start, got = serve(*turn)
       self.assertEqual(start, want[i][0])
       for g, w in zip(got, want[i][1]): np.testing.assert_equal(g, w)
+    for side in (P[:5] + [1], S[0]): serve(side, [4])
+    for g, w in zip(serve(*turns[3])[1], want[3][1]): np.testing.assert_equal(g, w)
     serve(S[0], [4] * 6)  # (a reply past the kept rows: the session gone, the next short request's kept)
     serve(S[1], [4])
     self.assertEqual(self.eng.session[:2] if self.eng.session else None, (S[0] + [4] * 6, 2))
