@@ -117,7 +117,9 @@ class Engine:
     self.jits = {T: TinyJit(functools.partial(self.run, T), capture_first=True) for T in sorted({1, tokens, *widths})}
     self.keep_jits = (TinyJit(self.keep, capture_first=True), TinyJit(self.unkeep, capture_first=True))
     self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
-    self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}  # (measured: a step's seconds)
+    # (measured: a step's seconds, the chain's that guessed for it too)
+    self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}
+    self.chain_s = 0.0
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
     # ([done | a chain step's guesses | their probabilities (f32)])
     self.links = 1 if draft is not None and draft.blk else max(tokens - 2, 0)
@@ -819,7 +821,8 @@ class Engine:
     if err: raise RuntimeError({-1: "a read failed", -2: "timeout", -3: "no victims left", -4: "NaN scores"}[err])
     ret, G = self.res_np[1:1 + T + 2 * self.width], self.width
     self.times += (t1 - t0, time.perf_counter() - t2)
-    self.step_s[T].append(time.perf_counter() - t0)
+    self.step_s[T].append(time.perf_counter() - t0 + self.chain_s)
+    self.chain_s = 0.0
     scores = ret[T + G:].view(np.float32).copy() if self.draft is not None and self.draft.scored else None
     return ret[:T].tolist(), ret[T:T + G].tolist(), scores
 
@@ -841,6 +844,7 @@ class Engine:
   def chain(self, g:int, pos:int, row:int) -> Iterator[tuple[int, float]]:
     """the draft's guesses after g (at pos+1, guessed at the step's row) for a verify step and their probabilities, a chain step's at a time"""
     while self.chain_jit is not None:
+      t0 = time.perf_counter()
       self.given_np[0], self.cres_np[0], self.io.tokens, self.io.victims_n = g, 0, 1, 32
       host_c().flags(ctypes.byref(self.io), 0)
       self.chain_jit(self.v_pos.bind(pos), self.v_row.bind(row))
@@ -849,6 +853,7 @@ class Engine:
       while self.cres_np[0] != 1:
         if time.perf_counter() - st > 60: raise RuntimeError("the draft's chain didn't finish")
       if err: raise RuntimeError(f"the draft's layer: {err}")
+      self.chain_s += time.perf_counter() - t0
       guesses, pos = self.cres_np[1:1 + self.links].tolist(), pos + self.links
       yield from zip(guesses, self.cres_np[1 + self.links:].view(np.float32).tolist())
       g = guesses[-1]
