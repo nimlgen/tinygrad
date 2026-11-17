@@ -42,10 +42,10 @@ class FakeDrives(threading.Thread):
         self.tail[q] = t
 
 class TestStepIO(unittest.TestCase):
-  def setUp(self, slots=200, T=1, slow=False, parts=1, widths=(1,), held=()):
+  def setUp(self, slots=200, T=1, slow=False, parts=1, spans=(1,), held=()):
     """gpu g reads its part of a code (parts pages a slot it takes on each of its ND // NGPU drives, a command each) into its pool, a prp
-    table each. widths: the copies' slots a code, held: the layers of the copies after the first"""
-    SLOTS, rng, self.keep, C = slots, np.random.default_rng(0), [], len(widths)
+    table each. spans: the copies' slots a code, held: the layers of the copies after the first"""
+    SLOTS, rng, self.keep, C = slots, np.random.default_rng(0), [], len(spans)
     def arr(a) -> np.ndarray:
       self.keep.append(a := np.ascontiguousarray(a))
       return a
@@ -55,7 +55,7 @@ class TestStepIO(unittest.TestCase):
     # the commands of a code: gpu, drive, page in the part (none of a layer its copy doesn't hold)
     def commands(w:int) -> list[tuple[int, int, int]]:
       return [(g, g * dpg + d, d * parts * w + p) for g in range(NGPU) for d in range(dpg) for p in range(parts * w)]
-    cmds = [commands(widths[c]) if c == 0 or li in held[c - 1] else [] for c in range(C) for li in range(L) for _ in range(E)]
+    cmds = [commands(spans[c]) if c == 0 or li in held[c - 1] else [] for c in range(C) for li in range(L) for _ in range(E)]
     gpu, drive, inpart = (np.array(c, np.int64) for c in zip(*itertools.chain(*cmds)))
     ptr = np.cumsum([0] + [len(c) for c in cmds])
     # the pages of gpu g's pool: g << 32 | page << 12 (and lists after each)
@@ -72,7 +72,7 @@ class TestStepIO(unittest.TestCase):
     self.state:dict[str, np.ndarray] = {
       "slot_of": np.full(ncodes, -1, np.int32), "expert_in": np.full(SLOTS, -1, np.int64), "freq": np.zeros(ncodes, np.float32),
       "flying": np.zeros(ncodes, np.int32), "guess": np.zeros(ncodes, np.uint8), "mask": np.zeros(SLOTS, np.uint8),
-      "victims": np.zeros(C * VICTIMS, np.int64), "nvict": np.zeros(C, np.int64), "width": np.array(widths, np.int64),
+      "victims": np.zeros(C * VICTIMS, np.int64), "nvict": np.zeros(C, np.int64), "span": np.array(spans, np.int64),
       "bias": np.array([b.ctypes.data for b in self.bias], np.uint64)}
     self.keep += [*self.tables.values(), *self.state.values()]
     # the gpus' buffers of every layer: tag, scores (ROWS of E / NGPU a token), the two parts' tables [ready | slots | weights]
@@ -100,16 +100,16 @@ class TestStepIO(unittest.TestCase):
     self.assertEqual(host_c().step_io(ctypes.byref(self.io)), 0)
 
   def parts(self, li:int, g:int, c:int=0) -> tuple[np.ndarray, np.ndarray]: # a gpu's slots and weights of a layer in copy c, both parts
-    p = [(t, (len(t) - 1) // 2 // len(self.state["width"])) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
+    p = [(t, (len(t) - 1) // 2 // len(self.state["span"])) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
     return (np.concatenate([t[1 + 2 * c * n:1 + (2 * c + 1) * n].view(np.int32) for t, n in p]),
             np.concatenate([t[1 + (2 * c + 1) * n:1 + (2 * c + 2) * n].view(np.float32) for t, n in p]))
 
   def check_tables(self):
-    slot_of, expert_in, t, width = self.state["slot_of"], self.state["expert_in"], self.tables, self.state["width"]
+    slot_of, expert_in, t, span = self.state["slot_of"], self.state["expert_in"], self.tables, self.state["span"]
     for sl, c in enumerate(expert_in):
-      if c >= 0: self.assertTrue(slot_of[c] <= sl < slot_of[c] + width[c // (L * E)])
+      if c >= 0: self.assertTrue(slot_of[c] <= sl < slot_of[c] + span[c // (L * E)])
     for c in np.nonzero(slot_of >= 0)[0]:
-      w = width[c // (L * E)]
+      w = span[c // (L * E)]
       self.assertEqual((slot_of[c] % w, expert_in[slot_of[c]:slot_of[c] + w].tolist()), (0, [c] * w))
     # every cached expert's commands read into the pages of its slot
     for c in np.nonzero((slot_of >= 0) & (self.state["flying"] == 0))[0]:
@@ -221,7 +221,7 @@ class TestStepIO(unittest.TestCase):
     # copy 0, the others in copy 0 if cached there (big >= 0), else in copy 1 where it holds their layer
     for big in (-1, 0, 2, K):
       self.tearDown()
-      self.setUp(slots=3 * L * E, T=2, widths=(2, 1), held=(range(1, L),))
+      self.setUp(slots=3 * L * E, T=2, spans=(2, 1), held=(range(1, L),))
       self.io.big = big
       for _ in range(4):
         before = self.state["slot_of"][:L * E] >= 0
@@ -231,7 +231,7 @@ class TestStepIO(unittest.TestCase):
           (s0, w0), (s1, w1) = self.parts(li, 0), self.parts(li, 0, 1)
           self.assertTrue(all((self.parts(li, 1, c)[0] == s).all() for c, s in ((0, s0), (1, s1))))
           self.assertAlmostEqual(float(w0.sum() + w1.sum()), 2.0, places=5)
-          codes = [self.state["expert_in"][s[w > 0] * width] - c * L * E for c, (s, w, width) in enumerate(((s0, w0, 2), (s1, w1, 1)))]
+          codes = [self.state["expert_in"][s[w > 0] * n] - c * L * E for c, (s, w, n) in enumerate(((s0, w0, 2), (s1, w1, 1)))]
           self.assertTrue(all((cs // E == li).all() for cs in codes))
           if li == 0 or big == K: self.assertEqual(len(codes[1]), 0)
           if li and big < 0: self.assertEqual(len(codes[0]), 0)
@@ -241,7 +241,7 @@ class TestStepIO(unittest.TestCase):
             top = set(np.argsort(-ws)[:max(big, 0)].tolist())
             self.assertFalse(top & {len(w0) // 2 + j for j, w in enumerate(w1.reshape(-1, 2)[:, t]) if w > 0})
     self.tearDown()
-    self.setUp(slots=80, T=2, widths=(2, 1), held=(range(1, L),))
+    self.setUp(slots=80, T=2, spans=(2, 1), held=(range(1, L),))
     self.io.big = 2
     for _ in range(5):
       self.step()

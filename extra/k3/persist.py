@@ -55,7 +55,7 @@ def key(eng) -> str:
   draft = [(type(eng.draft).__name__, eng.width, eng.taps), *((k, t.shape, t.dtype) for k, t in nn.state.get_state_dict(eng.draft).items())]
   h.update(repr(draft).encode())
   h.update(json.dumps({k: str(v.value) for k, v in sorted(ContextVar._cache.items())}).encode())
-  h.update(repr((eng.model.config, eng.m, eng.devs, eng.tokens, sorted(eng.jits), eng.chunk, eng.W, eng.slots, eng.tail, eng.dump_taps,
+  h.update(repr((eng.model.config, eng.ms, eng.devs, eng.tokens, sorted(eng.jits), eng.chunk, eng.W, eng.slots, eng.tail, eng.dump_taps,
                    eng.keep_logits)).encode())
   return h.hexdigest()[:32]
 

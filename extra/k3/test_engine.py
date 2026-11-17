@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 from gguf import GGUFWriter, GGMLQuantizationType, quants
 from tinygrad import Tensor, Device, UOp, nn, dtypes
+from tinygrad.helpers import round_up
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
@@ -102,19 +103,28 @@ class TestEngine(unittest.TestCase):
   def want(self, tok:int, pos:int) -> np.ndarray:  # master's model's logits (the engine's forward of it, with the routed experts)
     return Engine.forward(SimpleNamespace(model=self.ref, draft=None), Tensor([[tok]], dtype=dtypes.int32), pos)[0].numpy()[0]
 
-  def stub(self):  # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an
-    # entry j*T+t is token t's j-th expert and its weight)
+  def stub(self, copy:Callable[[int, int], int]=lambda li, j: 0, slot_of:list[np.ndarray]|None=None):
+    # the host's part stubbed: a token's top k by sigmoid + bias, the weights the sigmoids normalized, in the two parts (an entry j*T+t is token
+    # t's j-th expert and its weight, in copy(li, j) of layer li's: its slot in slot_of (default: the engine's), in that copy's section of an
+    # engine of copies)
     eng = self.eng
     tables:dict[int, list[Tensor]] = {}
+    n = len(eng.types) * E
+    slots_of = slot_of or [eng.state["slot_of"][c * n:(c + 1) * n] // w for c, w in enumerate(eng.spans)]
     def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
       if i == 0:
         sig = dep[:, 0].to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
         def table(ks:slice) -> Tensor:  # (an entry a token's expert's slot and weight, j*T+t)
-          slots = Tensor(eng.state["slot_of"], device="CPU")[sel[:, ks].T.flatten() + li * E]
-          return Tensor([1], dtype=dtypes.uint32, device="CPU").cat(slots.bitcast(dtypes.uint32),
-                                                          w[:, ks].T.flatten().cast(dtypes.float32).bitcast(dtypes.uint32)).shard(eng.devs)
+          js = range(K)[ks]
+          slots = Tensor.stack(*[Tensor(slots_of[copy(li, j)], device="CPU")[sel[:, j] + li * E] for j in js])
+          out = [Tensor([1], dtype=dtypes.uint32, device="CPU")]
+          for c in range(len(eng.ms)):
+            on = Tensor([[len(eng.ms) == 1 or copy(li, j) == c] for j in js], device="CPU")
+            out += [on.where(slots, 0).flatten().bitcast(dtypes.uint32),
+                    on.where(w[:, ks].T, 0).flatten().cast(dtypes.float32).bitcast(dtypes.uint32)]
+          return out[0].cat(*out[1:]).shard(eng.devs)
         tables[li] = [table(slice(0, eng.ks[0])), table(slice(eng.ks[0], K))]
       return tables[li][i]
     eng.host = host  # type: ignore[method-assign]
@@ -471,17 +481,26 @@ class TestMTP(unittest.TestCase):
     write_glm(trunk:=pathlib.Path(folder)/'trunk.gguf', self.weights, False)
     self.ref, self.trunk = Transformer.from_gguf(full)[0], trunk
 
-  def engine(self, tokens:int) -> Engine:
-    part, layers, slots = 8192, [1, 2], 2 * E + 96
-    m = {"n_experts": E, "lat": DIM, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
+  def engine(self, tokens:int, copies:list[tuple[int, dict[str, np.ndarray], list[int]]]|None=None, own:bool=True) -> Engine:
+    """an engine of the store's copies (part, weights, layers) of the experts, every expert in its slots past the caches' and the scratch (own:
+    the copies after the first the engine's, else only in the pool: self.slot_of the slots of each)"""
+    copies = copies or [(8192, self.weights, [1, 2])]
+    ms = [{"n_experts": E, "lat": DIM, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
+          for part, _, layers in copies]
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
-    self.eng = eng = Engine(model, m, slots=slots, tokens=tokens, chunk=4, window=8, draft=MTP(model))
-    at = eng.arena[1]
-    pools = [(b'\0' * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part, b'\0')
-             for g in range(G)]
+    self.eng = eng = Engine(model, ms[0], slots=sum(-(-p // 8192) * len(ls) for p, _, ls in copies) * E + 160, tokens=tokens, chunk=4, window=8,
+                            draft=MTP(model), copies=tuple(ms[1:]) if own else ())
+    pools, at, self.slot_of = [bytearray(eng.slots * eng.part) for _ in range(G)], round_up(eng.arena[1], 2), []
+    for c, (part, weights, layers) in enumerate(copies):
+      w, self.slot_of = -(-part // eng.part), [*self.slot_of, np.zeros(2 * E, np.int32)]
+      for li, e in itertools.product(range(2), range(E)):
+        if ms[0]["layers"][li] not in layers: continue
+        for g, b in enumerate(parts(weights, ms[0]["layers"][li], e, part)): pools[g][at * eng.part:at * eng.part + part] = b
+        self.slot_of[c][li * E + e], code = at // w, (c * 2 + li) * E + e
+        if own or c == 0: eng.state["slot_of"][code], eng.state["expert_in"][at:at + w] = at, code
+        at += w
+    assert at <= eng.tail
     eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
-    eng.state["slot_of"][:] = at + np.arange(len(layers) * E)
-    eng.state["expert_in"][at:at + len(layers) * E] = np.arange(len(layers) * E)
     self.stub()
     return eng
 
@@ -532,6 +551,30 @@ class TestMTP(unittest.TestCase):
     eng.window(toks[:8], 0, toks[1:9])
     for got, w in zip(caches(), want): np.testing.assert_allclose(got, w, rtol=1e-2, atol=1e-2 * np.abs(w).max())
     self.assertEqual(self.step([toks[8]], 8), ([toks[9]], guesses[8]))
+
+  def test_copies(self):  # a second copy of block 1's experts (its part half the first's): the same weights in it, a step's experts in either
+    # copy: the first copy's logits; others in it: where they're in it, the weights of an engine of a copy holding both copies' (its slots)
+    toks, rng = [3, 5, 7, 1, 2, 9, 4, 6, 8], np.random.default_rng(3)
+    other = {n: rng.normal(0, 0.3, w.shape).astype(np.float32) if '_exps.' in n else w for n, w in self.weights.items()}
+    def copy(li:int, j:int) -> int: return int(li == 0 and j >= 2)
+    def run(copies:list|None, own:bool=True, policy:Callable[[int, int], int]=copy) -> list[np.ndarray]:
+      eng, out = self.engine(2, copies, own), []
+      eng.keep_logits = True
+      self.stub(policy, self.slot_of)
+      for pos, t in enumerate(toks[:4]):
+        eng.tok_np[:1], eng.given_np[:1] = [t], [-1]
+        out += [eng.run(1, eng.v_pos.bind(pos))[1].numpy(), eng.res_np[1:3].copy()]
+      eng.window(toks[:8], 0, toks[1:9])
+      eng.tok_np[:1], eng.given_np[:1] = [toks[8]], [-1]
+      return out + [eng.run(1, eng.v_pos.bind(8))[1].numpy(), eng.res_np[1:3].copy()]
+    def same(a:list[np.ndarray], b:list[np.ndarray]):  # (the tokens, the logits to a sum's rounding: the copies' outputs added)
+      for x, y in zip(a, b): np.testing.assert_allclose(x, y, rtol=1e-6, atol=1e-6 * np.abs(y).max()) if x.dtype == np.float32 else \
+        np.testing.assert_equal(x, y)
+    want = run(None, policy=lambda li, j: 0)
+    same(run([(16384, self.weights, [1, 2]), (8192, self.weights, [1])]), want)
+    self.assertEqual(self.eng.spans, [2, 1])
+    same(got:=run([(16384, self.weights, [1, 2]), (8192, other, [1])]), run([(8192, self.weights, [1, 2]), (8192, other, [1])], own=False))
+    self.assertFalse(np.allclose(got[0], want[0], rtol=1e-2))
 
   def test_chain(self):
     eng, (toks, _) = self.engine(4), self.greedy(4)

@@ -40,12 +40,12 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 # buffers (BUFS) of each gpu: its tag, router scores (rows a token: the router's, the next layer's guess) and the two parts' tables, each
 # [ready | a copy's slots | its weights | the next copy's ..], k1*T then (k-k1)*T entries a copy: entry j*T+t token t's j-th expert and its
 # weight in the copy it's read from, padded with slot 0, weight 0 (the union of the tokens' experts read once). tokens: a step's. the copies of
-# the experts: code c * layers * E + layer * E + expert, its slot width[c] slots of the pool (slot_of: its first), big: a token's experts of a
+# the experts: code c * layers * E + layer * E + expert, its slot span[c] slots of the pool (slot_of: its first), big: a token's experts of a
 # rank under it in copy 0, the rest too if cached there (big >= 0), else in the first copy that holds them
 IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n pf fill copies big".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),
-      ("mask", "uint8_t *"), ("victims", "int64_t *"), ("nvict", "int64_t *"), ("width", "const int64_t *"), ("owner", "int64_t *"),
+      ("mask", "uint8_t *"), ("victims", "int64_t *"), ("nvict", "int64_t *"), ("span", "const int64_t *"), ("owner", "int64_t *"),
       ("ptr", "const int64_t *"), ("drive", "const int32_t *"), ("gpu", "const int32_t *"),
       *((n, "const int64_t *") for n in "lba nbytes inpart part_pages".split()),
       *((n, "const uint64_t *") for n in "prp sq db cq cq_db".split()),
@@ -172,7 +172,7 @@ static int64_t slots_free(const io_t *s, int64_t sl, int64_t w) {
   return 1;
 }
 
-// the victims of the next misses and guesses of every copy: its n least used free slots of its width (empty ones first), least used first
+// the victims of the next misses and guesses of every copy: its n least used free slots of its span (empty ones first), least used first
 static void pick(io_t *s, int64_t n) {
   float key[4][VICTIMS], sum[4]; int64_t ok[4];
   for (int64_t c = 0; c < s->copies; c++) s->nvict[c] = 0;
@@ -180,7 +180,7 @@ static void pick(io_t *s, int64_t n) {
     int64_t code = s->expert_in[sl], fr = free_slot(s, sl);
     float f = code >= 0 ? s->freq[code] : -1;
     for (int64_t c = 0; c < s->copies; c++) {
-      int64_t w = s->width[c], first = sl - sl % w, m = s->nvict[c], *v = s->victims + c * VICTIMS;
+      int64_t w = s->span[c], first = sl - sl % w, m = s->nvict[c], *v = s->victims + c * VICTIMS;
       if (sl == first) sum[c] = 0, ok[c] = 1;
       sum[c] += f, ok[c] &= fr;
       if (sl != first + w - 1 || !ok[c] || (m == n && sum[c] >= key[c][m - 1])) continue;
@@ -192,13 +192,13 @@ static void pick(io_t *s, int64_t n) {
 }
 
 static void drop(io_t *s, int64_t code) {
-  for (int64_t u = s->slot_of[code]; u < s->slot_of[code] + s->width[copy_of(s, code)]; u++) s->expert_in[u] = -1;
+  for (int64_t u = s->slot_of[code]; u < s->slot_of[code] + s->span[copy_of(s, code)]; u++) s->expert_in[u] = -1;
   s->slot_of[code] = -1;
 }
 
 // the first victim of code's copy still free, taken out of the list, into code's slots, pinned (-1: none left)
 static int64_t take(io_t *s, int64_t code) {
-  int64_t c = copy_of(s, code), w = s->width[c], *v = s->victims + c * VICTIMS;
+  int64_t c = copy_of(s, code), w = s->span[c], *v = s->victims + c * VICTIMS;
   for (int64_t i = 0; i < s->nvict[c]; i++) if (slots_free(s, v[i], w)) {
     int64_t sl = v[i];
     for (s->nvict[c]--; i < s->nvict[c]; i++) v[i] = v[i + 1];
@@ -310,7 +310,7 @@ int64_t layer(io_t *s, int64_t li) {
   for (int64_t c = 0; c < s->copies; c++) {
     int64_t need = 0, free = 0;
     for (int64_t i = 0; i < nm; i++) need += copy_of(s, codes[i]) == c;
-    for (int64_t i = 0; i < s->nvict[c]; i++) free += slots_free(s, s->victims[c * VICTIMS + i], s->width[c]);
+    for (int64_t i = 0; i < s->nvict[c]; i++) free += slots_free(s, s->victims[c * VICTIMS + i], s->span[c]);
     if (free < need) pick(s, s->victims_n);  // too few: new ones, but this layer's cached
     for (int64_t i = 0; i < nm; i++) if (copy_of(s, codes[i]) == c && (ms[i] = take(s, codes[i])) < 0) return -3;
   }
@@ -339,7 +339,7 @@ int64_t layer(io_t *s, int64_t li) {
       int64_t begin = second ? p1[t] : 0, end = second ? tc[t] : p1[t];
       for (int64_t j = begin; j < end; j++) {
         int64_t code = ucode[tj[t * 64 + j]], c = copy_of(s, code), at = 1 + 2 * cap * c + (j - begin) * T + t;
-        ((int32_t *)part)[at] = s->slot_of[code] / (int32_t)s->width[c];
+        ((int32_t *)part)[at] = s->slot_of[code] / (int32_t)s->span[c];
         ((float *)part)[at + cap] = tw[t * 64 + j];
       }
     }
