@@ -144,30 +144,31 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
     .sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 @functools.cache
-def _q8_rms_norm_kernel(q:UOp, scale:UOp, xsum:UOp, h:UOp, w:UOp, tokens:int, in_features:int, eps:float) -> UOp:
-  """the q8 of rmsnorm(h) * w: a workgroup's waves a group each of a token, the workgroup the token's sum of squares first"""
+def _q8_rms_norm_kernel(q:UOp, scale:UOp, xsum:UOp, w:UOp, *hs:UOp, tokens:int, in_features:int, eps:float) -> UOp:
+  """the q8 of rmsnorm(h) * w of h the sum of the rows hs: a workgroup's waves a group each of a token, the workgroup the token's sum of
+  squares first"""
   groups = in_features//Q8_GROUP_SIZE
   waves = math.gcd(groups, 8)
   chunk, wave, lane = UOp.range(tokens*groups//waves, 0, AxisType.GLOBAL), UOp.range(waves, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
   token, group = chunk//(groups//waves), chunk%(groups//waves)*waves + wave
-  h = h.reshape(tokens, in_features)
-  squares = [h[token, c].load().float() for i in range(in_features//(waves*32)) for c in [wave*32 + lane + i*waves*32]]
+  def h(c:UOp) -> UOp: return functools.reduce(lambda a, b: a + b, [x.reshape(tokens, in_features)[token, c].load().float() for x in hs])
+  squares = [h(wave*32 + lane + i*waves*32) for i in range(in_features//(waves*32))]
   red = UOp.alloc((waves,), dtypes.float, addrspace=AddrSpace.LOCAL)
   red = red.after(red[wave.valid(lane.eq(0))].store(warp_reduce(sum((v*v for v in squares[1:]), squares[0]*squares[0]), full_wave=True)).barrier())
   total = sum((red[k].load() for k in range(1, waves)), red[0].load())
-  value = h[token, group*32 + lane].load().float() * (total * (1/in_features) + eps).sqrt().reciprocal() * w[group*32 + lane].load().float()
+  value = h(group*32 + lane) * (total * (1/in_features) + eps).sqrt().reciprocal() * w[group*32 + lane].load().float()
   return UOp.group(*_q8_stores(q, scale, xsum, value, token, group, lane)).end(chunk, wave, lane) \
     .sink(arg=KernelInfo(name="q8_rms_norm", opts_to_apply=()))
 
-def _rms_norm_of(x:Tensor) -> tuple[Tensor, Tensor, float]|None:
-  """(h, w, eps) if x is exactly nn.RMSNorm's of the float rows h: rmsnorm(h, eps) * w, its last axis whole"""
+def _rms_norm_of(x:Tensor) -> tuple[list[Tensor], Tensor, float]|None:
+  """(hs, w, eps) if x is exactly nn.RMSNorm's of the float rows h: rmsnorm(h, eps) * w, its last axis whole. hs: h's terms if h is a sum"""
   u = x.uop
   while u.op is Ops.RESHAPE: u = u.src[0]
   if u.op is not Ops.MUL or (y:=u.src[0]).op is not Ops.MUL or (r:=y.src[1]).op is not Ops.RECIP or r.src[0].op is not Ops.SQRT: return None
   if (a:=r.src[0].src[0]).op is not Ops.ADD or a.src[1].op is not Ops.CONST: return None
   h, w, eps = Tensor(y.src[0]), Tensor(u.src[1]), float(a.src[1].arg)
   if h.dtype != dtypes.float or h.uop.axis == h.ndim-1 or (h.rmsnorm(eps=eps) * w).uop is not u: return None
-  return h, _view_back(w), eps
+  return [Tensor(t) for t in h.uop.src] if h.uop.op is Ops.ADD and all(t.shape == h.shape for t in h.uop.src) else [h], _view_back(w), eps
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -> tuple[Tensor, Tensor, Tensor]:
   """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits). its
@@ -178,9 +179,9 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -
                     for i, (shape, dt) in enumerate((((tokens, groups, 8), dtypes.uint32), ((tokens, groups), dtypes.float32),
                                                      ((tokens, groups, 2), dtypes.float32))))
   if act is None and (norm:=_rms_norm_of(x)) is not None:
-    h, w, eps = norm
+    hs, w, eps = norm
     fxn = functools.partial(_q8_rms_norm_kernel, tokens=tokens, in_features=in_features, eps=eps)
-    return cast(tuple[Tensor, Tensor, Tensor], tuple(Tensor.custom_kernel(q, scale, xsum, h.reshape(-1, in_features), w, fxn=fxn)[:3]))
+    return cast(tuple[Tensor, Tensor, Tensor], tuple(Tensor.custom_kernel(q, scale, xsum, w, *(h.reshape(-1, in_features) for h in hs), fxn=fxn)[:3]))
   fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, act=act)
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
