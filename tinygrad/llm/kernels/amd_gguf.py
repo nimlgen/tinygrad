@@ -17,7 +17,7 @@ QUANT_SIZES = {Q5_0: 176, Q8_0: 272, Q2_K: 84, Q3_K: 110, Q4_K: 144, Q5_K: 176, 
                IQ3_XXS: 98, IQ4_NL: 144, IQ3_S: 110, IQ2_S: 82, IQ4_XS: 136}  # bytes per 256 weights
 HALFWORD_QUANTS = (Q5_0, Q8_0, Q6_K, Q2_K, Q3_K, IQ2_XS, IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
 SMALL_BLOCK_QUANTS = {Q5_0: 11, Q8_0: 17, IQ4_NL: 9}
-QUANT_NAMES = {Q5_0: "q5_0", Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6", IQ4_XS: "iq4_xs",
+QUANT_NAMES = {Q5_0: "q5_0", Q8_0: "q8_0", Q2_K: "q2_k", Q3_K: "q3_k", Q4_K: "q4_k", Q5_K: "q5_k", Q6_K: "q6_k", IQ4_XS: "iq4_xs",
                IQ2_XS: "iq2_xs", IQ3_XXS: "iq3_xxs", IQ4_NL: "iq4_nl", IQ3_S: "iq3_s", IQ2_S: "iq2_s"}
 
 def q8_0_linear(w:Tensor, devices:tuple[str, ...]|str, axis:int|None=None) -> Linear:
