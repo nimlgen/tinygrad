@@ -811,7 +811,6 @@ class Engine:
          and (self.session is None or len(fed:=m._cached_tokens) > len(self.session[0]) or len(fed) - at >= self.B and fed != self.session[0]):
       self.keep_jits[0](self.v_at.bind(at))
       self.session = (m._cached_tokens[:], at, m._saved[:])
-    print(f"session: {len(tokens)} tokens, {len(m._cached_tokens)} fed, kept {self.session and (len(self.session[0]), self.session[1])}", flush=True)
 
   def prefill(self, tokens:list[int], pos:int) -> int:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
