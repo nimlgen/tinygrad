@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys, \
-  keyed_empty, _carry, _unbind, amd_custom_kernels_supported, PARTIALS
+  _view_back, keyed_empty, _carry, _unbind, amd_custom_kernels_supported, PARTIALS
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -114,6 +114,21 @@ def iq4_half_lut(device:str|tuple[str, ...]|None) -> Tensor:
   return Tensor.const(tuple(x for j in range(16) for i in range(16) for x in (kvalues_iq4nl[i], kvalues_iq4nl[j])),
                       dtypes.float16).to(device, force=True).bitcast(dtypes.uint32)
 
+def _q8_stores(q:UOp, scale:UOp, xsum:UOp, value:UOp, token:UOp, group:UOp, lane:UOp) -> tuple[UOp, ...]:
+  # Quantize each input once, then pack four neighboring lanes into one word.
+  # Keep divisions intact: reciprocal multiplication can move half-precision inputs across rounding ties.
+  warp_max = warp_reduce(value.abs(), maximum=True, full_wave=True)
+  d = UOp.custom_function("({0}/127.0f)", shape=warp_max.shape, dtype=dtypes.float, fmt=True).call(warp_max).maximum(1e-8)
+  rounded = UOp.custom_function("__builtin_nearbyintf({0}/{1})", shape=value.shape, dtype=dtypes.float, fmt=True).call(value, d)
+  quant = rounded.clip(-127, 127).cast(dtypes.int8)
+  word = quant.cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
+  for offset in (1, 2):
+    word |= UOp.custom_function(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f|offset<<10})", shape=word.shape, dtype=dtypes.uint32,
+                                fmt=True).call(word)
+  return (q[token, group, (lane//4).valid((lane%4).eq(0))].store(word),
+          scale[token, group.valid(lane.eq(0))].store(d),
+          xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
+
 @functools.cache
 def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int, act:Callable|None=None) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
@@ -125,29 +140,47 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
     gate, up = (sum((x[token, h*in_features + group*32 + lane, s].load() for s in range(1, x.shape[-1])),
                     x[token, h*in_features + group*32 + lane, 0].load()) for h in range(2))
     value = act(gate, up).float()
-  # Quantize each input once, then pack four neighboring lanes into one word.
-  # Keep divisions intact: reciprocal multiplication can move half-precision inputs across rounding ties.
-  warp_max = warp_reduce(value.abs(), maximum=True, full_wave=True)
-  d = UOp.custom_function("({0}/127.0f)", shape=warp_max.shape, dtype=dtypes.float, fmt=True).call(warp_max).maximum(1e-8)
-  rounded = UOp.custom_function("__builtin_nearbyintf({0}/{1})", shape=value.shape, dtype=dtypes.float, fmt=True).call(value, d)
-  quant = rounded.clip(-127, 127).cast(dtypes.int8)
-  word = quant.cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
-  for offset in (1, 2):
-    word |= UOp.custom_function(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f|offset<<10})", shape=word.shape, dtype=dtypes.uint32,
-                                fmt=True).call(word)
-  stores = (q[token, group, (lane//4).valid((lane%4).eq(0))].store(word),
-            scale[token, group.valid(lane.eq(0))].store(d),
-            xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
-  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
+  return UOp.group(*_q8_stores(q, scale, xsum, value, token, group, lane)).end(token_group, lane) \
+    .sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
+
+@functools.cache
+def _q8_rms_norm_kernel(q:UOp, scale:UOp, xsum:UOp, h:UOp, w:UOp, tokens:int, in_features:int, eps:float) -> UOp:
+  """the q8 of rmsnorm(h) * w: a workgroup's waves a group each of a token, the workgroup the token's sum of squares first"""
+  groups = in_features//Q8_GROUP_SIZE
+  waves = math.gcd(groups, 8)
+  chunk, wave, lane = UOp.range(tokens*groups//waves, 0, AxisType.GLOBAL), UOp.range(waves, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  token, group = chunk//(groups//waves), chunk%(groups//waves)*waves + wave
+  h = h.reshape(tokens, in_features)
+  squares = [h[token, c].load().float() for i in range(in_features//(waves*32)) for c in [wave*32 + lane + i*waves*32]]
+  red = UOp.alloc((waves,), dtypes.float, addrspace=AddrSpace.LOCAL)
+  red = red.after(red[wave.valid(lane.eq(0))].store(warp_reduce(sum((v*v for v in squares[1:]), squares[0]*squares[0]), full_wave=True)).barrier())
+  total = sum((red[k].load() for k in range(1, waves)), red[0].load())
+  value = h[token, group*32 + lane].load().float() * (total * (1/in_features) + eps).sqrt().reciprocal() * w[group*32 + lane].load().float()
+  return UOp.group(*_q8_stores(q, scale, xsum, value, token, group, lane)).end(chunk, wave, lane) \
+    .sink(arg=KernelInfo(name="q8_rms_norm", opts_to_apply=()))
+
+def _rms_norm_of(x:Tensor) -> tuple[Tensor, Tensor, float]|None:
+  """(h, w, eps) if x is exactly nn.RMSNorm's of the float rows h: rmsnorm(h, eps) * w, its last axis whole"""
+  u = x.uop
+  while u.op is Ops.RESHAPE: u = u.src[0]
+  if u.op is not Ops.MUL or (y:=u.src[0]).op is not Ops.MUL or (r:=y.src[1]).op is not Ops.RECIP or r.src[0].op is not Ops.SQRT: return None
+  if (a:=r.src[0].src[0]).op is not Ops.ADD or a.src[1].op is not Ops.CONST: return None
+  h, w, eps = Tensor(y.src[0]), Tensor(u.src[1]), float(a.src[1].arg)
+  if h.dtype != dtypes.float or h.uop.axis == h.ndim-1 or (h.rmsnorm(eps=eps) * w).uop is not u: return None
+  return h, _view_back(w), eps
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -> tuple[Tensor, Tensor, Tensor]:
   """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits). its
-  buffers' slots are x's and the kernel's: the linears that read the same x share one q8"""
+  buffers' slots are x's and the kernel's: the linears that read the same x share one q8. an rmsnorm's x: in the norm's kernel"""
   if act is None: x = x.reshape(-1, x.shape[-1])
   groups, slot = in_features//Q8_GROUP_SIZE, hash((x.uop.key, tokens, in_features, act)) % (1 << 62)
   q, scale, xsum = (Tensor(UOp.alloc(shape, dt, slot+i, device=x.device, bind_on_realize=True))
                     for i, (shape, dt) in enumerate((((tokens, groups, 8), dtypes.uint32), ((tokens, groups), dtypes.float32),
                                                      ((tokens, groups, 2), dtypes.float32))))
+  if act is None and (norm:=_rms_norm_of(x)) is not None:
+    h, w, eps = norm
+    fxn = functools.partial(_q8_rms_norm_kernel, tokens=tokens, in_features=in_features, eps=eps)
+    return cast(tuple[Tensor, Tensor, Tensor], tuple(Tensor.custom_kernel(q, scale, xsum, h.reshape(-1, in_features), w, fxn=fxn)[:3]))
   fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, act=act)
   q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=fxn)[:3]
   return q, scale, xsum
