@@ -597,6 +597,7 @@ class Engine:
     experts, every next layer's are read ahead while the gpus work (and not waited for: those layers' counted after the window). returns
     those"""
     n, E, K, ahead = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, []
+    moe = sum(hasattr(b, "ffn_gate_inp") for b in self.model.blk)
     def chunks(T:int) -> list[tuple[int, int]]: return [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)]
     for i, b in enumerate(self.model.blk):
       s = n - 1 + int(self.new_stream(b))
@@ -617,7 +618,7 @@ class Engine:
           self.io.t_reads += time.perf_counter() - t0
           for p in self.bufs[li][2][1]: p[1:1 + E] = self.state["slot_of"][li * E:(li + 1) * E].view(np.uint32)
           self.graph(experts[self.types[li]], self.pool, self.parts[0][li])
-          if li + 1 < len(self.parts[0]) and li + 1 not in ahead and (li in ahead or len(codes) >= 0.9 * E):
+          if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(codes) >= 0.9 * E):
             self.read((li + 1) * E + np.arange(E), codes, wait=False)
             ahead.append(li + 1)
           jit, args, _ = self.kind("post", b, self.post)
