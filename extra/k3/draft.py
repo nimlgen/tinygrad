@@ -206,16 +206,16 @@ class DSpark:
     return out.cast(dtypes.int32), conf, logits
 
 class MTP:
-  width, scored = 1, False
+  width, scored = 1, True
   def __init__(self, model:Transformer):
     self.blk, self.taps = [model.mtp], [(len(model.blk) - 1, False)]
     self.embed:Callable[[Tensor], Tensor] = lambda t: model.token_embd(t).float()
     self.output_norm:Callable[[Tensor], Tensor] = lambda x: model.output_norm(x)
     self.head:Callable[[Tensor], Tensor] = lambda x: model.output(x)
 
-  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, None, Tensor]:
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, Tensor, Tensor]:
     logits, x, _ = self(tokens, hidden, pos)
-    return pick(logits[0].argmax(-1), row).reshape(1).cast(dtypes.int32), None, x
+    return pick(logits[0].argmax(-1), row).reshape(1).cast(dtypes.int32), pick(logits[0].softmax(-1).max(-1), row).reshape(1), x
 
   def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
     b = self.blk[0]
