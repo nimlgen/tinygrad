@@ -807,7 +807,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
   K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
   tiles = -(-H // 16)
-  assert tiles <= 2 and D == 2*DW and D % 64 == 0 and V % 64 == 0 and DW % (8*tiles) == 0
+  assert tiles <= 2 and D == 2*DW and D % 64 == 0 and V % 128 == 0 and DW % (8*tiles) == 0
   row, lane, wave = UOp.range(rows, 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(4*tiles, 1, AxisType.LOCAL)
   b, t, tid, tile, part, ph, col = row // T, row % T, wave*WARP_SIZE + lane, wave // 4, wave % 4, lane // 16, lane % 16
   ks = [4*ph + i for i in range(4)] + [8 + 4*ph + i for i in range(4)]  # (a lane's 8 of a fragment's 16 inputs)
@@ -845,7 +845,8 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
     S = UOp.wmma(qf, UOp.stack(*(h for w in (2*ph, 2*ph + 1, 4 + 2*ph, 5 + 2*ph) for h in halves(kword(col, w0 + w)))), S, WMMA_ARG[0], WARP_SIZE)
   lds_s = UOp.alloc((tiles, 4, 16, 16), dtypes.float, addrspace=AddrSpace.LOCAL)
   lds_s = lds_s.after(UOp.group(*(lds_s[tile, part, ph*8 + j, col].store(S[j]) for j in range(8))).barrier())
-  # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V
+  # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V (a lane the two
+  # dims of a word, the halves of it in two fragments)
   m_reg, l_reg, acc_reg = _reg((1,), -1e30), _reg((1,), 0), _reg((V//64, 8), 0)
   m, l = m_reg.after(kb)[0].load(), l_reg.after(kb)[0].load()
   s = [lds_ok[k].load().ne(0).where(sum((lds_s[tile, p, col, k].load() for p in range(4)), UOp.const(0.0, dtypes.float))*scale, -math.inf)
@@ -856,17 +857,17 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   ln = l*alpha + psum + _xor16(psum)
   pfrag = UOp.stack(*(x.cast(dtypes.half) for x in p))
   arow = [_lane_of(alpha, ph*8 + j) for j in range(8)]
+  def vdim(o:int) -> UOp: return part*(V//4) + (o//2)*32 + 2*col + o % 2
   acc = []
   for o in range(V//64):
-    v = part*(V//4) + o*16 + col
-    vfrag = UOp.stack(*((kword(k, v // 2) >> ((v % 2)*16).cast(dtypes.uint32)).cast(dtypes.uint16).bitcast(dtypes.half) for k in ks))
+    vfrag = UOp.stack(*(halves(kword(k, vdim(o) // 2))[o % 2] for k in ks))
     acc.append(UOp.wmma(pfrag, vfrag, UOp.stack(*(acc_reg.after(kb)[o, j].load()*arow[j] for j in range(8))), WMMA_ARG[0], WARP_SIZE))
   fetch = [ahead.after(*cur)[i].store(w) for i, w in enumerate(block_words((kb + 1).minimum(blocks - 1)))]
   update = UOp.group(m_reg[0].store(mn), l_reg[0].store(ln), *(acc_reg[o, j].store(a[j]) for o, a in enumerate(acc) for j in range(8)),
                      *fetch).end(kb)
   l_end = l_reg.after(update)[0].load()
   lrow = [_lane_of(l_end, ph*8 + j) for j in range(8)]
-  stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), part*(V//4) + o*16 + col].store(acc_reg.after(update)[o, j].load() / lrow[j])
+  stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), vdim(o)].store(acc_reg.after(update)[o, j].load() / lrow[j])
             for o in range(V//64) for j in range(8)]
   return UOp.group(*stores).end(lane, wave, row).sink(arg=KernelInfo(name="mla_wmma", opts_to_apply=()))
 
@@ -892,7 +893,7 @@ def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
   values dims"""
   B, H, T, D = q.shape
   local = q.uop.shard_shape[1] if q.uop.axis == 1 else H
-  if _is_rdna4(q.device) and q.max_shape[2] >= 16 and local <= 32 and D % 64 == 0 and values % 64 == 0:
+  if _is_rdna4(q.device) and q.max_shape[2] >= 16 and local <= 32 and D % 64 == 0 and values % 128 == 0:
     return mla_wmma_attention(q, cache, idx, start, values, scale)  # (a chunk's rows: the tensor cores)
   parts = 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
