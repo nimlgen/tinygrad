@@ -274,7 +274,7 @@ class Engine:
   def window_init(self, W:int):
     """the window's variables and graphs (captured once its state is lent from the pool: window_capture), its state's bytes"""
     m = self.model
-    self.W, S = W, 1 + sum(b.attn_res_score.new_block for b in m.blk)
+    self.W, S = W, 1 + sum(map(self.new_stream, m.blk))
     self.window_bytes, self.piece_bytes = (sum(round_up(prod(sh) * dt.itemsize, 256) for sh, dt in f().values())
                                            for f in (self.window_shapes, self.piece_shapes))
     self.v_p0 = UOp.variable("p0", 0, self.max_context - 1)  # (a piece's first token in the read window)
@@ -352,7 +352,7 @@ class Engine:
   def piece_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:
     """a piece's: the bank of its W tokens' residual streams, the draft's inputs. a gpu's rows: its part of every chunk (1, 1, W/gpus, ...)"""
     c, W = self.model.config, self.W // len(self.devs)
-    S = self.bank_streams or 1 + sum(b.attn_res_score.new_block for b in self.model.blk)
+    S = self.bank_streams or 1 + sum(map(self.new_stream, self.model.blk))
     return {"bank": ((1, 1, W, S, c.dim), self.bank), "taps": ((1, 1, W, max(len(self.taps), 1), c.dim), dtypes.float)}
 
   def piece(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on: (1, gpus, W/gpus, ...) split on the gpus)
@@ -408,11 +408,11 @@ class Engine:
     kernel's work the live rows'"""
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
-    h = self.whole(b.attn_res_score.mix(bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live]
+    h = self.whole(self.mix(getattr(b, "attn_res_score", None), bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live]
     mask = b._indexer_mask(h, (pos,), None)
     a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
-    x = self.whole(b.ffn_res_score.mix(bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
+    x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
     logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
@@ -421,6 +421,14 @@ class Engine:
     shared = self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)
     return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs],
                           shared.assign(self.split(self.partials(lambda: b._shared(x))).cast(shared.dtype)))[0]
+
+  @staticmethod
+  def new_stream(b:FFNBlock) -> bool: return hasattr(b, "attn_res_score") and b.attn_res_score.new_block
+
+  def mix(self, res:AttentionResidual|None, xs:Tensor, norm:Callable[[Tensor], Tensor], n:UOp, rows:tuple[UOp, int]) -> Tensor:
+    """the bank's streams xs (1, W, S, dim) of each gpu's rows at rows mixed by an attention residual (none: the one stream) and normed"""
+    if res is not None: return res.mix(xs, norm, n, rows)
+    return norm(xs.reshape(1, len(self.devs), -1, *xs.shape[2:])[:, :, rows[0]:rows[0] + rows[1]].flatten(1, 2)[:, :, 0].float())
 
   def partials(self, f:Callable[[], Tensor]) -> Tensor:  # (f's output, its row parallel linears' partials (gpus, ...) as they are, if any)
     PARTIALS[0] = True
@@ -588,7 +596,7 @@ class Engine:
     n, E, K, ahead = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, []
     def chunks(T:int) -> list[tuple[int, int]]: return [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)]
     for i, b in enumerate(self.model.blk):
-      s = n - 1 + int(b.attn_res_score.new_block)
+      s = n - 1 + int(self.new_stream(b))
       for p0, T, bank in pieces:
         self.win.update(bank)
         jit, args, _ = self.kind("attend", b, self.attend)
