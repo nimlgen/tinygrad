@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, WMMA_ARG, _is_cdna, _is_rdna4, warp_reduce, _amd_load, partial_sum, _reg, _sys, \
-  _carry, _unbind, amd_custom_kernels_supported, PARTIALS
+  keyed_empty, _carry, _unbind, amd_custom_kernels_supported, PARTIALS
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, unwrap, round_up
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -709,7 +709,8 @@ def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=(), rows:int|UOp|Non
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cdna=cdna)
     srcs = (*(xq or q8_quantize(x, tokens, in_features)), *extra)
     out_shape += ((in_features+1023)//1024,)
-  out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
+  out = keyed_empty((layer.weight.uop.key, *(s.uop.key for s in srcs)), out_shape, dtypes.float32, x.device,
+                    None if layer.shard_axis is None else 1-layer.shard_axis)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
   if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce (PARTIALS: its caller's)

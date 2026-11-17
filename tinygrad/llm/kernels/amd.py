@@ -1108,6 +1108,12 @@ def partial_sum(x:Tensor) -> Tensor:
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
 
+def keyed_empty(key:tuple, shape:tuple[sint, ...], dtype, device:str|tuple[str, ...]|None, axis:int|None=None) -> Tensor:
+  """an empty tensor (sharded on axis) whose buffer is key's: the kernels that write it from the same inputs are one"""
+  local = tuple(s // len(device) if i == axis and isinstance(device, tuple) else s for i, s in enumerate(shape))
+  return Tensor(UOp.alloc(local, dtype, hash((key, shape, dtype, device, axis)) % (1 << 62), device=device, bind_on_realize=True,
+                          axis=axis if isinstance(device, tuple) else None))
+
 def _gather_offset(el:UOp, peer:int, peers:int, widths:tuple[int, ...], rows:int) -> UOp:
   width = sum(widths)
   row, col = el // width, el % width
@@ -1181,7 +1187,7 @@ def allgather_lasts(*xs:Tensor, exact:bool=False) -> list[Tensor]:
     return [whole(x, w) for x, w in zip(xs, widths)]
   fxn = functools.partial(_allgather_kernel, n=n, widths=widths, T=shape[0], EP=shape[1])
   counter, *mbs = _mailboxes(devs)
-  out = Tensor.empty((*xs[0].shape[:-1], len(devs) * sum(widths)), dtype=dtypes.float32, device=devs)
+  out = keyed_empty(("allgather", *(x.uop.key for x in xs)), (*xs[0].shape[:-1], len(devs) * sum(widths)), dtypes.float32, devs)
   out = Tensor.custom_kernel(out, counter, *(x.contiguous() for x in xs), *mbs, fxn=fxn)[0]
   if len(xs) == 1: return [out]
   rows = int(prod(out.shape[:-1]))
