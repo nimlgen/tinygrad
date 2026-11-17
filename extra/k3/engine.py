@@ -674,7 +674,7 @@ class Engine:
           route, experts = self.routes[next(t for t in TILES if T * K <= t * E or t == TILES[-1])]
           for t in self.bufs[li][0][1]: t[0] = 0  # (the tag: this piece's counts)
           self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
-          counts = self.counted(li)
+          counts = self.counted(li, T)
           used = np.flatnonzero(counts)
           codes = self.window_codes(li, np.union1d(used, ahead[li]) if li in ahead else used)
           if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(used) >= E // 2):
@@ -716,14 +716,19 @@ class Engine:
   def pump(self):  # (the reads ahead queued as the drives have room)
     if host_c().pump(ctypes.byref(self.io)): raise RuntimeError("window reads failed")
 
-  def counted(self, li:int) -> np.ndarray:
+  def counted(self, li:int, live:int) -> np.ndarray:
     """layer li's expert counts of a window's tokens once the gpus give them, added to its decayed use counts"""
     E, io, t0 = self.m["n_experts"], self.io, time.perf_counter()
     tags = self.bufs[li][0][1]
     while not all(t[0] == 1 for t in tags):
       if any(t[0] == 2 for t in tags) or time.perf_counter() - t0 > 60: raise RuntimeError(f"window layer {li}: no counts from the gpus")
       self.pump()
-    counts = self.bufs[li][3][1][0][1:1 + E].copy()
+    replicas = [p[1:1 + E] for p in self.bufs[li][3][1]]
+    counts = replicas[0].copy()
+    expected = live * self.model.config.num_experts_per_tok
+    if counts.sum() != expected or counts.max() > live:
+      raise RuntimeError(f"window layer {li}: invalid expert counts for {live} tokens (sum {counts.sum()}, expected {expected}, max {counts.max()})")
+    if any(not np.array_equal(counts, r) for r in replicas[1:]): raise RuntimeError(f"window layer {li}: expert counts differ across GPUs")
     f = self.state["freq"][li * E:(li + 1) * E]
     f[:] = f * io.decay + counts
     io.t_gpu += time.perf_counter() - t0

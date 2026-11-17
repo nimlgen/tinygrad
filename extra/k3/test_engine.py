@@ -71,6 +71,14 @@ def eagle(folder:str, rng:np.random.Generator, lora:int=16) -> str:
   return folder
 
 class TestEngine(unittest.TestCase):
+  def test_invalid_window_counts(self):
+    live, ok = 2, np.ones(4, dtype=np.uint32)
+    tags = [np.array([1], np.uint32) for _ in range(2)]
+    for a, b in [(ok, ok[:]*0), (ok[:]*0, ok[:]*0), (np.array([4, 0, 0, 0]), np.array([4, 0, 0, 0]))]:
+      buf = [(None, tags), None, None, (None, [np.r_[0, a], np.r_[0, b]])]
+      e = SimpleNamespace(m={"n_experts":4}, io=None, bufs=[buf], model=SimpleNamespace(config=SimpleNamespace(num_experts_per_tok=2)))
+      with self.assertRaisesRegex(RuntimeError, "expert counts"): Engine.counted(e, 0, live)
+
   def setUp(self):
     Engine.bank = dtypes.float  # (a window's streams in float: as steps' to their rounding; the half bank: test_window_pieces)
     rng = np.random.default_rng(0)

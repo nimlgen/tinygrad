@@ -652,6 +652,17 @@ class TestExpertLinear(unittest.TestCase):
     np.testing.assert_allclose(out[0], ref, rtol=0.05, atol=0.05 * np.abs(ref).max())
 
 class TestMoeRoute(unittest.TestCase):
+  def test_invalid_route(self):
+    T, E, K = 5, 256, 8
+    logits = np.zeros((T, E), np.float32)
+    logits[1, 119], logits[2], logits[3] = np.nan, np.nan, -np.inf
+    weights, pos, entries, _, counts = (t.numpy() for t in moe_route(Tensor(logits), Tensor.zeros(E), K, 16))
+    self.assertEqual(int(counts.sum()), 2*K)
+    np.testing.assert_equal(pos.reshape(T, K)[1:4], -1)
+    np.testing.assert_equal(weights[1:4], 0)
+    np.testing.assert_equal(np.sort(entries[entries >= 0]), np.r_[0:K, 4*K:5*K])
+    np.testing.assert_allclose(weights[[0, 4]].sum(-1), 1)
+
   def test_route(self): # the host's route(): top k of sigmoid + bias (ties: the lower expert), weights over the k's sum; rows sorted into tiles
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
     T, E, K, tile = 300, 896, 16, 64

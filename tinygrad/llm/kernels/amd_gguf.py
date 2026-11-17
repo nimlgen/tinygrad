@@ -729,14 +729,17 @@ def _route_topk_kernel(sel:UOp, w:UOp, logits:UOp, bias:UOp, k:int, live:UOp|int
   def sigmoid(e:UOp) -> UOp: return _sys("(1.0f / (1.0f + __builtin_expf(-{0})))", dtypes.float, logits[token, e].load())
   experts = [lane + 32*i for i in range(E // 32)]
   keys, picks, total = [sigmoid(e) + bias[e].load() for e in experts], [], UOp.const(0.0, dtypes.float)
+  bad = functools.reduce(UOp.__or__, [_sys("__builtin_isnan({0})", dtypes.bool, key) for key in keys])
+  valid = warp_reduce(bad.cast(dtypes.float), maximum=True, full_wave=True).eq(0)
   for _ in range(k):
     top = warp_reduce(functools.reduce(UOp.maximum, keys), maximum=True, full_wave=True)
     lowest = functools.reduce(UOp.minimum, [key.eq(top).where(e, E) for key, e in zip(keys, experts)]).cast(dtypes.float)
     e = (-warp_reduce(-lowest, maximum=True, full_wave=True)).cast(dtypes.int32).cast(dtypes.weakint)
     keys = [x.eq(e).where(-math.inf, key) for key, x in zip(keys, experts)]
-    picks.append((e, sigmoid(e)))
+    valid = valid & (e < E)
+    picks.append((e, sigmoid(e.minimum(E - 1))))
     total = total + picks[-1][1]
-  ok, stores = token < live, []
+  ok, stores = (token < live) & valid & (total > 0), []
   for r, (e, sg) in enumerate(picks):
     at = UOp.const(r, dtypes.weakint).valid(lane.eq(0))
     stores += [sel[token, at].store(ok.where(e.cast(dtypes.int32), -1)), w[token, at].store(ok.where(sg / total, 0.0))]
@@ -810,9 +813,13 @@ def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|Non
   T, E = cast(tuple[int, int], logits.shape)
   N, R = T*k, round_up(T*k + (tile-1)*E, tile)
   sig = logits.float().sigmoid()
-  sel = (sig + bias.float()).topk(k)[1]
-  w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
-  ok = (Tensor.arange(T).reshape(T, 1) < (T if live is None else Tensor(live))).expand(T, k).reshape(N)
+  keys = sig + bias.float()
+  sel = keys.topk(k)[1]
+  weights = sig.gather(-1, sel)
+  total = weights.sum(-1, keepdim=True)
+  w = weights / total
+  valid = (total > 0) & ~keys.isnan().any(-1, keepdim=True)
+  ok = ((Tensor.arange(T).reshape(T, 1) < (T if live is None else Tensor(live))) & valid).expand(T, k).reshape(N)
   onehot = ok.unsqueeze(-1) & (sel.reshape(N, 1) == Tensor.arange(E).reshape(1, E))
   counts = onehot.sum(0, dtype=dtypes.int32)
   padded = (counts + tile - 1) // tile * tile
