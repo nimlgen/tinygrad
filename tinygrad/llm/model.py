@@ -221,7 +221,7 @@ class AttentionResidual:
                norm:Callable[[Tensor], Tensor]|None=None) -> tuple[Tensor, Tensor|None]:
     out, aux = sublayer(self.mix(xs, norm))
     # (B, T, N+1, D) if new_block else (B, T, N, D)
-    return (xs.cat(out.unsqueeze(2), dim=2) if self.new_block else xs[:, :, :-1].cat(xs[:, :, -1:] + out.unsqueeze(2), dim=2)), aux
+    return (xs.cat(out.unsqueeze(2), dim=2) if self.new_block else xs + out.unsqueeze(2).pad((None, None, (xs.shape[2] - 1, 0), None))), aux
 
 class HyperConnection:
   def __init__(self, config:TransformerConfig):
