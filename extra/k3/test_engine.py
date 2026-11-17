@@ -521,7 +521,7 @@ class TestMTP(unittest.TestCase):
   def chain(self, g:int, pos:int, row:int) -> list[int]:
     self.eng.given_np[0], self.eng.cres_np[0] = g, 0
     self.eng.run_chain(self.eng.v_pos.bind(pos), self.eng.v_row.bind(row))
-    return self.eng.cres_np[1:].tolist()
+    return self.eng.cres_np[1:1 + self.eng.links].tolist()
 
   def test_verify(self):
     for tokens in (2, 3):

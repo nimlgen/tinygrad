@@ -6,7 +6,7 @@
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
 import collections, ctypes, functools, itertools, math, os, signal, sys, time
 import numpy as np
-from typing import Callable, cast
+from typing import Callable, Iterator, cast
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
 from tinygrad.dtype import DType
 from tinygrad.helpers import DEBUG, getenv, prod, round_up
@@ -119,7 +119,9 @@ class Engine:
     self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
     self.step_s:dict[int, collections.deque] = {T: collections.deque(maxlen=64) for T in self.jits}  # (measured: a step's seconds)
     # a draft's chain of guesses after its first (a verify step's other tokens): its steps on its own hidden states (dx: a step's), from a row
-    self.cres, (self.cres_np,) = host_tensor(self.devs[0], 2 if draft is not None and draft.blk else max(tokens - 1, 1), dtypes.int32)
+    # ([done | a chain step's guesses | their probabilities (f32)])
+    self.links = 1 if draft is not None and draft.blk else max(tokens - 2, 0)
+    self.cres, (self.cres_np,) = host_tensor(self.devs[0], 1 + 2 * self.links, dtypes.int32)
     self.dx, self.v_row = Tensor.empty(n, model.config.dim, device=self.devs).realize(), UOp.variable("row", 0, tokens - 1)
     self.chain_jit = TinyJit(self.run_chain, capture_first=True) if draft is not None and draft.width < tokens - 1 else None
     self.times, self.verified = np.zeros(2), np.zeros(3)  # (launching the graphs, after the last layer), (verify steps, guesses, right ones)
@@ -239,12 +241,13 @@ class Engine:
 
   def run_chain(self, pos:UOp, row:UOp) -> Tensor:
     """the draft's next guesses after the given one (a token at pos+1), a step each on its own hidden state of the step before (from its
-    row of the verify step's) into host memory, then the done word"""
-    tok, hid, cache, out = self.given[:1].to(self.devs), Tensor(self.dx.uop)[row:row + 1], None, []
-    for k in range(self.cres_np.size - 1):
+    row of the verify step's) into host memory and their probabilities, then the done word"""
+    tok, hid, cache, out, probs = self.given[:1].to(self.devs), Tensor(self.dx.uop)[row:row + 1], None, [], []
+    for k in range(self.links):
       logits, hid, cache = self.draft(tok.reshape(1, 1), None, pos + k, hid=hid.reshape(1, 1, -1), cache=cache)
       out.append(tok:=logits[0].argmax(-1))
-    outs = [Tensor(self.cres.uop)[1:].assign(Tensor.cat(*[t.to(self.devs[0]) for t in out]).cast(dtypes.int32)).uop]
+      probs.append(logits[0].softmax(-1).max(-1).float().bitcast(dtypes.int32))
+    outs = [Tensor(self.cres.uop)[1:].assign(Tensor.cat(*[t.to(self.devs[0]).cast(dtypes.int32) for t in out + probs])).uop]
     if self.draft.blk: outs.append(Tensor(self.dx.uop)[row:row + 1].assign(hid.reshape(1, -1).float()).uop)
     return Tensor(self.cres.uop.after(*outs))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0])).realize()
 
@@ -775,7 +778,7 @@ class Engine:
       fps[f"step{T}"] = persist.fingerprint(self.res_np[:1 + T + self.width])  # (the tokens and guesses, not the scores' floats)
     if self.chain_jit:
       self.chain_jit(self.v_pos.bind(0), self.v_row.bind(0)).tolist()
-      fps["chain"] = persist.fingerprint(self.cres_np)
+      fps["chain"] = persist.fingerprint(self.cres_np[:1 + self.links])
     if self.W:
       Tensor(self.win["logits"].uop).assign(Tensor(self.win["logits"].uop).zeros_like()).realize()
       b = next(b for b in self.model.blk if hasattr(b, "ffn_gate_inp"))
@@ -822,28 +825,33 @@ class Engine:
 
   def proposal(self, g:list[int], score:np.ndarray|None, pos:int, row:int) -> list[int]:
     """a verify step's guesses after the token at pos: the row's of the step before (guessed at its row), the draft's chain after them. scored:
-    as many as the step of the widths that expects most tokens a second (by the scores, the steps' measured seconds: one not measured first)"""
-    n = self.tokens - 1
-    if score is not None and len(self.widths) > 1:
-      def rate(T:int) -> float: return (1 + np.cumprod(score[:T - 1]).sum()) / np.mean(s) if (s:=self.step_s[T]) else math.inf
-      n = max(self.widths, key=rate) - 1
-    return g[:n] if len(g) >= n else [*g, *self.chain(g[-1], pos, row)]
+    as many as the step of the widths that expects most tokens a second (by the scores, a guess the chain hasn't made yet scored as the last,
+    the steps' measured seconds: one not measured first), the chain run a guess further while a wider step's expected"""
+    chain = None
+    while True:
+      n = self.tokens - 1
+      if score is not None and len(self.widths) > 1:
+        s = np.concatenate([score, np.full(n, score[-1])])
+        def rate(T:int) -> float: return (1 + np.cumprod(s[:T - 1]).sum()) / np.mean(t) if (t:=self.step_s[T]) else math.inf
+        n = max(self.widths, key=rate) - 1
+      if len(g) >= n: return g[:n]
+      guess, prob = next(chain:=chain or self.chain(g[-1], pos, row))
+      g, score = [*g, guess], None if score is None else np.append(score, prob)
 
-  def chain(self, g:int, pos:int, row:int) -> list[int]:
-    """the draft's guesses after g (at pos+1, guessed at the step's row) for a verify step"""
-    out:list[int] = []
-    while self.chain_jit is not None and len(out) < self.tokens - 2:
+  def chain(self, g:int, pos:int, row:int) -> Iterator[tuple[int, float]]:
+    """the draft's guesses after g (at pos+1, guessed at the step's row) for a verify step and their probabilities, a chain step's at a time"""
+    while self.chain_jit is not None:
       self.given_np[0], self.cres_np[0], self.io.tokens, self.io.victims_n = g, 0, 1, 32
       host_c().flags(ctypes.byref(self.io), 0)
-      self.chain_jit(self.v_pos.bind(pos + len(out)), self.v_row.bind(row))
+      self.chain_jit(self.v_pos.bind(pos), self.v_row.bind(row))
       if (err:=host_c().layer(ctypes.byref(self.io), len(self.bias) - 1) if self.draft.blk else 0): host_c().flags(ctypes.byref(self.io), 1)
       st = time.perf_counter()
       while self.cres_np[0] != 1:
         if time.perf_counter() - st > 60: raise RuntimeError("the draft's chain didn't finish")
       if err: raise RuntimeError(f"the draft's layer: {err}")
-      out += self.cres_np[1:].tolist()
-      g = out[-1]
-    return out
+      guesses, pos = self.cres_np[1:1 + self.links].tolist(), pos + self.links
+      yield from zip(guesses, self.cres_np[1 + self.links:].view(np.float32).tolist())
+      g = guesses[-1]
 
   # *** master's model's generate (LLMServer's): the caches only go forward, a prompt that extends the tokens fed (or the last prompt) feeds
   # the rest
