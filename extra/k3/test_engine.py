@@ -592,6 +592,20 @@ class TestMTP(unittest.TestCase):
     same(got:=run([(16384, self.weights, [1, 2]), (8192, other, [1])]), run([(8192, self.weights, [1, 2]), (8192, other, [1])], own=False))
     self.assertFalse(np.allclose(got[0], want[0], rtol=1e-2))
 
+  def test_window_hot(self):
+    eng = self.engine(2, [(16384, self.weights, [1, 2]), (8192, self.weights, [1])])
+    eng.window_big = 2
+    toks = [3, 5, 7]
+    eng.state["freq"].fill(0)
+    eng.window(toks, 0, toks[1:] + [-1])
+    self.assertTrue(eng.window_hot.all())
+    eng.state["freq"].fill(0)
+    eng.state["freq"][:E] = np.arange(E)
+    eng.window(toks, 0, toks[1:] + [-1])
+    np.testing.assert_array_equal(np.flatnonzero(eng.window_hot[0]), [E-2, E-1])
+    eng.drop(eng.state["slot_of"][:E].copy())
+    np.testing.assert_array_equal(eng.window_codes(0, np.arange(E)), np.r_[np.arange(E-2) + len(eng.types)*E, E-2, E-1])
+
   def test_window_copies(self):  # a window's experts not cached in the first copy (half of block 1's) read in the second where it holds their
     # layer: its streams as an engine's of a copy of the second's weights for them
     toks, rng = [3, 5, 7, 1, 2, 9, 4], np.random.default_rng(3)

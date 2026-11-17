@@ -38,7 +38,7 @@ class Engine:
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0))):
+               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0)):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -51,7 +51,9 @@ class Engine:
     self.dump_taps = taps or []
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
-    self.window_copies = window_copies
+    self.window_copies, self.window_big = window_copies, window_big
+    self.window_hot:np.ndarray|None = None
+    if not 0 <= window_big <= m["n_experts"]: raise ValueError("WINDOW_BIG exceeds the expert count or is negative")
     self.ms = [m, *copies]
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
@@ -619,6 +621,13 @@ class Engine:
     """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
     a layer's experts read once a read window. the caches and states as after steps of them, the draft's cache"""
     T, C, W, t0 = len(toks), self.chunk, self.W, time.perf_counter()
+    E, L = self.m["n_experts"], len(self.types)
+    self.window_hot = None
+    if self.window_big and len(self.ms) > 1 and T * self.model.config.num_experts_per_tok < E * TILES[0]:
+      freq = self.state["freq"][:L*E].reshape(L, E)
+      hot = np.zeros((L, E), dtype=bool)
+      np.put_along_axis(hot, np.argsort(-freq, axis=1, kind="stable")[:, :self.window_big], True, axis=1)
+      self.window_hot = (hot & (freq > 0)) | (freq.max(axis=1, keepdims=True) == 0)
     self.grow(pos + round_up(T, C))
     assert T <= W * self.pieces() and pos + round_up(T, C) <= self.max_context
     self.tok_np[:T], self.given_np[:T] = toks, given
@@ -705,9 +714,10 @@ class Engine:
     """the codes of layer li's experts a window reads: the first copy's if cached there (a step's rule past its big ranks: host.py's
     code_of), else of the first other copy that holds the layer"""
     code = li * self.m["n_experts"] + experts
-    if not self.window_copies: return code
+    if not self.window_copies and self.window_hot is None: return code
     other = next((c for c, ty in enumerate(self.layer_copies[li]) if c and ty is not None), 0)
     big = ((self.state["slot_of"][code] >= 0) & (self.io.big >= 0)) | (other == 0)
+    if self.window_hot is not None: big |= self.window_hot[li, experts]
     return np.where(big, code, code + other * len(self.types) * self.m["n_experts"])
 
   def graph(self, jit:Callable, *args) -> Tensor:  # (a window graph on the window's state)
