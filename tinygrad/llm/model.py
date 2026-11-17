@@ -821,7 +821,7 @@ class Transformer:
 
   def rollback(self, n:int):
     """after a short step, the recurrent states go back to after its first n tokens (attention caches are rewritten from start_pos)"""
-    blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+    if not (blocks:=[b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]): return
     assert all(1 <= n <= len(b.kept) for b in blocks), f"rollback({n}) after a step that kept {[len(b.kept) for b in blocks]}"
     def copy(): Tensor.realize(*[s.assign(k) for b in blocks for s, k in zip(b._states(), b.kept[n-1])])
     if n not in self._rollbacks: self._rollbacks[n] = TinyJit(copy, capture_first=True)  # (a copy a state, scheduled once)
