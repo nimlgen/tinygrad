@@ -143,6 +143,7 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_featur
 def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -> tuple[Tensor, Tensor, Tensor]:
   """the q8 of x (tokens, in_features), or of act(gate, up) of a gate and up gemv's partial sums x (tokens, 2*in_features, splits). its
   buffers' slots are x's and the kernel's: the linears that read the same x share one q8"""
+  if act is None: x = x.reshape(-1, x.shape[-1])
   groups, slot = in_features//Q8_GROUP_SIZE, hash((x.uop.key, tokens, in_features, act)) % (1 << 62)
   q, scale, xsum = (Tensor(UOp.alloc(shape, dt, slot+i, device=x.device, bind_on_realize=True))
                     for i, (shape, dt) in enumerate((((tokens, groups, 8), dtypes.uint32), ((tokens, groups), dtypes.float32),
@@ -366,7 +367,7 @@ def expert_linear(pool:Tensor, slots:Tensor, x:Tensor, out_features:int, in_feat
                           stride=stride//word.itemsize, offset=offset//word.itemsize, cdna=_is_cdna(x.device), weighted=w is not None, per=per,
                           live=live is not None)
   extra = (_iq_grid(x.device, ggml_type),) if ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
-  srcs = (pool.bitcast(word), *q8_quantize(x.contiguous(), xrows, in_features, act), slots.cast(dtypes.int32),
+  srcs = (pool.bitcast(word), *q8_quantize(x, xrows, in_features, act), slots.cast(dtypes.int32),
           *([w] if w is not None else [live] if live is not None else []), *extra)
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   ret = ret if split else ret[..., 0] if ret.shape[-1] == 1 else ret.sum(-1)  # (a sum of one is a copy)
