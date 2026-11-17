@@ -332,8 +332,8 @@ class Engine:
     experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32), "w": ((W, K), f32),
-            "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32), "act": ((R, self.units), dtypes.half),
+    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32),
+            "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32), "act": ((R, self.units), dtypes.half),
             "down": ((R, self.lat), dtypes.half)}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
@@ -808,7 +808,7 @@ class Engine:
       self.keep_jits[1](self.v_at.bind(self.session[1]))
       m._cached_tokens, m._saved, self.session = kept[:], self.session[2], None
     elif len(tokens) < len(m._cached_tokens) and (at:=shared(m._cached_tokens)) + self.B <= self.max_context and len(tokens) - at < self.B // 2 \
-         and (self.session is None or len(m._cached_tokens) - at >= self.B or len(m._cached_tokens) > len(self.session[0])):
+         and (self.session is None or len(fed:=m._cached_tokens) > len(self.session[0]) or len(fed) - at >= self.B and fed != self.session[0]):
       self.keep_jits[0](self.v_at.bind(at))
       self.session = (m._cached_tokens[:], at, m._saved[:])
     print(f"session: {len(tokens)} tokens, {len(m._cached_tokens)} fed, kept {self.session and (len(self.session[0]), self.session[1])}", flush=True)

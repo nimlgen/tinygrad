@@ -72,7 +72,8 @@ def window_dump(eng, spec:str, late:Callable[[], bool], out:str, rows:int=128):
       eng.window(toks_w, at, (seq[at + 1:at + 1 + len(toks_w)] + [-1])[:len(toks_w)])
       for j, t in enumerate(taps): t[at0 + at:at0 + at + len(toks_w)] = eng.in_order(Tensor(eng.win["taps"].uop), 0, len(toks_w))[0, :, j].numpy()
       for r0 in range(0, len(toks_w), rows):
-        lg = m.output(m.output_norm(m.output_res_score.mix(eng.in_order(Tensor(eng.win["bank"].uop), r0, min(rows, eng.W - r0)))))[0].float()[:len(toks_w) - r0]
+        bank = eng.in_order(Tensor(eng.win["bank"].uop), r0, min(rows, eng.W - r0))
+        lg = m.output(m.output_norm(m.output_res_score.mix(bank)))[0].float()[:len(toks_w) - r0]
         o = at0 + at + r0
         nxt[o:o + lg.shape[0]], p1[o:o + lg.shape[0]] = lg.argmax(-1).numpy(), lg.softmax(-1).max(-1).numpy()
     toks[at0:at0 + len(seq)] = seq
