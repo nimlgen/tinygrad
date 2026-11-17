@@ -370,11 +370,11 @@ class FFNBlock:
         h = attn_norm(h)
         mask = self._indexer_mask(h, start_pos, idx_mask)
         return self._attention(h, start_pos, mask, live), mask
-      x, idx_mask = res_attn(x, attend)
+      x, mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(ffn_norm(h)), None))[0].contiguous()
-      return (out, idx_mask) if idx_mask is not None else out
+      return (out, mask) if mask is not None and mask is not idx_mask else out
     out = _run(x, start_pos, idx_mask, live)
-    return out if isinstance(out, tuple) else (out, None)
+    return out if isinstance(out, tuple) else (out, idx_mask)
 
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
