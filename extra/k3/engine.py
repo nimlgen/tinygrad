@@ -15,8 +15,10 @@ from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, MLATransformerBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, ordered_expert_sum, ordered_expert_sum_supported
-from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, \
+  ordered_expert_sum, ordered_expert_sum_supported
+from tinygrad.llm.kernels.amd_gguf import find_packed, expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, \
+  TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
 from extra.k3 import persist
@@ -145,7 +147,9 @@ class Engine:
     for li, b in enumerate(blocks):
       b._feed_forward = functools.partial(self.feed_forward, li, b)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
-    weights = {id(t) for t in nn.state.get_parameters(stack)}  # (not realized here: some are decoded in the step's graph)
+    # (the weights a quantized kernel reads packed: not realized here, the step's graph decodes them for its kernels. the others decoded once)
+    Tensor.realize(*[t.replace(t.contiguous()) for t in nn.state.get_parameters([model, draft]) if t.numel() and find_packed(t, t.shape[-1]) is None])
+    weights = {id(t) for t in nn.state.get_parameters(stack)}
     # (a draft holding the trunk's weights would realize them as its state: decoded, their quantized kernels lost)
     assert not {id(t) for t in nn.state.get_parameters(draft)} - weights & {id(t) for t in nn.state.get_parameters(model)}, \
       "a draft with the trunk's weights"
