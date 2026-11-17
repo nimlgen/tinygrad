@@ -845,8 +845,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
     S = UOp.wmma(qf, UOp.stack(*(h for w in (2*ph, 2*ph + 1, 4 + 2*ph, 5 + 2*ph) for h in halves(kword(col, w0 + w)))), S, WMMA_ARG[0], WARP_SIZE)
   lds_s = UOp.alloc((tiles, 4, 16, 16), dtypes.float, addrspace=AddrSpace.LOCAL)
   lds_s = lds_s.after(UOp.group(*(lds_s[tile, part, ph*8 + j, col].store(S[j]) for j in range(8))).barrier())
-  # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V (a lane the two
-  # dims of a word, the halves of it in two fragments)
+  # the online softmax of a lane's head row col over its 8 keys and its partner's (lane ^ 16), the values of a quarter of V
   m_reg, l_reg, acc_reg = _reg((1,), -1e30), _reg((1,), 0), _reg((V//64, 8), 0)
   m, l = m_reg.after(kb)[0].load(), l_reg.after(kb)[0].load()
   s = [lds_ok[k].load().ne(0).where(sum((lds_s[tile, p, col, k].load() for p in range(4)), UOp.const(0.0, dtypes.float))*scale, -math.inf)
