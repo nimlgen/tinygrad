@@ -6,7 +6,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.uop.ops import smax
 from tinygrad.helpers import prod, round_up
-from tinygrad.llm.model import precompute_freqs_cis, apply_rope, YaRNConfig
+from tinygrad.llm.model import Transformer, FFNBlock, precompute_freqs_cis, apply_rope, YaRNConfig
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
@@ -41,6 +41,7 @@ class Eagle3:
     self.positions = Tensor.arange(max_context).to(devs).realize()  # (the causal mask's, on the gpus: a symbolic arange isn't)
 
   width, scored = 1, False  # (a row's guesses: the next ones a chain's; no scores of them)
+  blk:list[FFNBlock] = []
   def norm(self, x:Tensor, name:str) -> Tensor: return x.float().rmsnorm(eps=self.eps) * self.w[name]
   def lin(self, x:Tensor, name:str) -> Tensor: return w(x) if isinstance(w:=self.w[name], Linear) else x.half() @ w.T
   def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, None, Tensor]:
@@ -100,6 +101,7 @@ def rows16(f:Callable[[Tensor], Tensor], x:Tensor) -> Tensor:
   return f(x.reshape(n, x.shape[-1]).pad(((0, round_up(n, 16) - n), (0, 0))))[:n].reshape(*x.shape[:-1], -1)
 
 class DSpark:
+  blk:list[FFNBlock] = []
   def __init__(self, path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
                width:int=1, q8:bool=True):
     cfg = json.load(open(f"{path}/config.json"))
@@ -202,6 +204,29 @@ class DSpark:
       out = logits.argmax(-1)
     conf = (h.cat(e, dim=-1) @ self.w["confidence_head.proj"].float().T + self.conf_b).sigmoid()[..., 0]
     return out.cast(dtypes.int32), conf, logits
+
+class MTP:
+  width, scored = 1, False
+  def __init__(self, model:Transformer):
+    self.blk, self.taps = [model.mtp], [(len(model.blk) - 1, False)]
+    self.embed:Callable[[Tensor], Tensor] = lambda t: model.token_embd(t).float()
+    self.output_norm:Callable[[Tensor], Tensor] = lambda x: model.output_norm(x)
+    self.head:Callable[[Tensor], Tensor] = lambda x: model.output(x)
+
+  def guess(self, tokens:Tensor, hidden:Tensor, pos:int|UOp, row:Tensor|int) -> tuple[Tensor, None, Tensor]:
+    logits, x, _ = self(tokens, hidden, pos)
+    return pick(logits[0].argmax(-1), row).reshape(1).cast(dtypes.int32), None, x
+
+  def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
+    b = self.blk[0]
+    h = b.attn_norm(b.project(self.embed(tokens), self.output_norm(hidden[:, :, 0])))
+    return b._attention(h, (pos,), b._indexer_mask(h, (pos,), None))
+
+  def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:None=None) -> tuple[Tensor, Tensor, None]:
+    b = self.blk[0]
+    x, _ = b(b.project(self.embed(tokens), self.output_norm(cast(Tensor, hidden)[:, :, 0]) if hid is None else hid), (pos,))
+    h = b.shared_head_norm(x)
+    return self.head(h).float(), h, None
 
 def load(path:str, embed:Callable[[Tensor], Tensor], head:Callable[[Tensor], Tensor], devs:tuple[str, ...], max_context:int,
          width:int) -> Eagle3|DSpark:

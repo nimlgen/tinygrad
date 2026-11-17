@@ -2,7 +2,7 @@
 # the engine's forward against master's model with the routed experts on a tiny random kimi-k3 on two CPU "gpus": every expert in the pools
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
-import json, pathlib, tempfile, unittest
+import itertools, json, pathlib, re, tempfile, unittest
 from typing import Callable
 from dataclasses import replace
 from types import SimpleNamespace
@@ -12,7 +12,7 @@ from tinygrad import Tensor, Device, UOp, nn, dtypes
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
-from extra.k3.draft import Eagle3, DSpark
+from extra.k3.draft import Eagle3, DSpark, MTP
 from extra.k3.eval import window_evaluate, window_dump
 
 DIM, LAT, FF, E, K, G, VOCAB = 64, 32, 64, 8, 4, 2, 32
@@ -432,6 +432,118 @@ class TestEngine(unittest.TestCase):
     take(X + [6, 8])
     self.assertEqual(self.eng.get_start_pos(X + [2, 4]), len(X))
     self.assertEqual(take(X + [2, 4]), want)
+
+GLM = TransformerConfig(num_blocks=2, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
+  rope_theta=10000.0, rope_dim=8, v_head_dim=16, max_context=16, num_experts=E, num_experts_per_tok=K, expert_gating_func=ExpertGating.SIGMOID,
+  norm_topk_prob=True, q_lora_rank=16, kv_lora_rank=16, shared_expert_dim=FF, leading_dense_blocks=1, dense_hidden_dim=64, expert_bias=True,
+  shared_expert_gate=False, routed_scaling_factor=2.5, rope_interleave=True, indexer=IndexerConfig(2, 16, 4, rope_dim=8), mtp=True)
+
+def write_glm(path:pathlib.Path, weights:dict[str, np.ndarray], experts:bool):
+  w = GGUFWriter(path, "glm-dsa")
+  for key, value in {'context_length': 16, 'embedding_length': DIM, 'feed_forward_length': 64, 'expert_feed_forward_length': FF, 'block_count': 3,
+                     'nextn_predict_layers': 1, 'attention.head_count': 2, 'attention.head_count_kv': 1, 'attention.q_lora_rank': 16,
+                     'attention.kv_lora_rank': 16, 'rope.dimension_count': 8, 'attention.key_length_mla': 24, 'attention.value_length_mla': 16,
+                     'expert_count': E, 'expert_used_count': K, 'expert_shared_count': 1, 'leading_dense_block_count': 1, 'expert_gating_func': 2,
+                     'attention.indexer.head_count': 2, 'attention.indexer.key_length': 16, 'attention.indexer.top_k': 4}.items():
+    w.add_uint32(f'glm-dsa.{key}', value)
+  w.add_float32('glm-dsa.attention.layer_norm_rms_epsilon', 1e-5)
+  w.add_float32('glm-dsa.expert_weights_scale', 2.5)
+  w.add_bool('glm-dsa.expert_weights_norm', True)
+  w.add_array('tokenizer.ggml.tokens', [str(i) for i in range(VOCAB)])
+  for name, x in weights.items():
+    if '_exps.' not in name: w.add_tensor(name, x)
+    elif experts: w.add_tensor(name, quants.quantize(x, GGMLQuantizationType.Q8_0), raw_dtype=GGMLQuantizationType.Q8_0)
+  w.write_header_to_file()
+  w.write_kv_data_to_file()
+  w.write_tensors_to_file()
+  w.close()
+
+class TestMTP(unittest.TestCase):
+  stub = TestEngine.stub
+  def setUp(self):
+    Engine.bank = dtypes.half
+    rng = np.random.default_rng(0)
+    def gguf_name(n:str) -> str: return re.sub(r'^mtp\.', 'blk.2.', re.sub(r'^mtp\.(eh_proj|enorm|hnorm|shared_head_norm)', r'blk.2.nextn.\1', n))
+    self.weights = {gguf_name(n): (1 + rng.normal(0, 0.1, t.shape) if 'norm' in n else rng.normal(0, 0.3, t.shape)).astype(np.float32)
+                    for n, t in nn.state.get_state_dict(Transformer(GLM)).items()}
+    folder = tempfile.mkdtemp()
+    write_glm(full:=pathlib.Path(folder)/'full.gguf', self.weights, True)
+    write_glm(trunk:=pathlib.Path(folder)/'trunk.gguf', self.weights, False)
+    self.ref, self.trunk = Transformer.from_gguf(full)[0], trunk
+
+  def engine(self, tokens:int) -> Engine:
+    part, layers, slots = 8192, [1, 2], 2 * E + 96
+    m = {"n_experts": E, "lat": DIM, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
+    model = Transformer.from_gguf(self.trunk, shard=G)[0]
+    self.eng = eng = Engine(model, m, slots=slots, tokens=tokens, chunk=4, window=8, draft=MTP(model))
+    at = eng.arena[1]
+    pools = [(b'\0' * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part, b'\0')
+             for g in range(G)]
+    eng.pool.assign(Tensor(np.frombuffer(b''.join(pools), np.dtype(eng.word.fmt))).shard(eng.devs, 0)).realize()
+    eng.state["slot_of"][:] = at + np.arange(len(layers) * E)
+    eng.state["expert_in"][at:at + len(layers) * E] = np.arange(len(layers) * E)
+    self.stub()
+    return eng
+
+  def greedy(self, n:int) -> tuple[list[int], list[int]]:
+    ref, draft, toks, guesses = self.ref, MTP(self.ref), [3], []
+    for pos in range(n):
+      logits, hidden = Engine.forward(SimpleNamespace(model=ref, draft=draft), Tensor([[toks[-1]]], dtype=dtypes.int32), pos)
+      toks.append(int(logits.numpy()[0].argmax()))
+      guesses.append(int(draft.guess(Tensor([[toks[-1]]], dtype=dtypes.int32), hidden, pos, 0)[0].numpy()[0]))
+    return toks, guesses
+
+  def step(self, toks:list[int], pos:int) -> tuple[list[int], int]:
+    eng, T = self.eng, len(toks)
+    eng.tok_np[:T], eng.given_np[:T] = toks, [-1] * T
+    eng.run(T, eng.v_pos.bind(pos))
+    return eng.res_np[1:1 + T].tolist(), int(eng.res_np[1 + T])
+
+  def chain(self, g:int, pos:int, row:int) -> list[int]:
+    self.eng.given_np[0], self.eng.cres_np[0] = g, 0
+    self.eng.run_chain(self.eng.v_pos.bind(pos), self.eng.v_row.bind(row))
+    return self.eng.cres_np[1:].tolist()
+
+  def test_verify(self):
+    for tokens in (2, 3):
+      with self.subTest(tokens=tokens):
+        self.engine(tokens)
+        toks, guesses = self.greedy(13)
+        (t,), g = self.step([3], 0)
+        self.assertEqual((t, g), (toks[1], guesses[0]))
+        out, pos, row = [3, t], 1, 0
+        for i in itertools.takewhile(lambda _: pos + tokens <= len(guesses), itertools.count()):
+          gs = toks[pos + 1:pos + tokens] if i % 2 else [g, *(self.chain(g, pos, row) if tokens > 2 else [])]
+          targets, g = self.step([out[-1], *gs], pos)
+          row = next((j for j, x in enumerate(gs) if targets[j] != x), len(gs))
+          self.assertEqual(g, guesses[pos + row])
+          out += gs[:row] + [targets[row]]
+          pos += row + 1
+        self.assertEqual(out, toks[:len(out)])
+
+  def test_window(self):
+    eng, (toks, guesses) = self.engine(2), self.greedy(9)
+    b = eng.draft.blk[0]
+    def caches() -> list[np.ndarray]: return [b.cache_k.numpy()[..., :8, :], b.indexer.cache_kg.numpy()[:, :8]]
+    for pos in range(8):
+      eng.tok_np[:1], eng.given_np[:1] = [toks[pos]], [toks[pos + 1]]
+      eng.run(1, eng.v_pos.bind(pos))
+    want = caches()
+    eng.window(toks[:8], 0, toks[1:9])
+    for got, w in zip(caches(), want): np.testing.assert_allclose(got, w, rtol=1e-2, atol=1e-2 * np.abs(w).max())
+    self.assertEqual(self.step([toks[8]], 8), ([toks[9]], guesses[8]))
+
+  def test_chain(self):
+    eng, (toks, _) = self.engine(4), self.greedy(4)
+    for pos in range(3): self.step(toks[pos:pos + 1], pos)
+    _, g = self.step([toks[3]], 3)
+    hid, out = Tensor(eng.dx.numpy()[:1].reshape(1, 1, -1)).to(eng.devs), []
+    for k in range(2): out += self.chain(out[-1] if out else g, 4 + k, 0)
+    want, tok = [], g
+    for k in range(2):
+      logits, hid, _ = eng.draft(Tensor([[tok]], dtype=dtypes.int32).to(eng.devs), None, 4 + k, hid=hid)
+      want.append(tok:=int(logits.numpy()[0, 0].argmax()))
+    self.assertEqual(out, want)
 
 if __name__ == "__main__":
   unittest.main()

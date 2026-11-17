@@ -105,7 +105,7 @@ def discard(eng):
 
 def scorers_path(eng, guess:str) -> pathlib.Path:
   guesses = sorted(str(p) for p in pathlib.Path(guess).glob("guess-*.npy")) if guess else []
-  h = hashlib.sha256(code() + files(eng.source, *guesses) + repr((eng.model.config, eng.m, eng.devs)).encode())
+  h = hashlib.sha256(code() + files(eng.source, *guesses) + repr((eng.model.config, eng.m, eng.devs, len(eng.types))).encode())
   return pathlib.Path(cache_dir) / "k3" / f"scorers-{h.hexdigest()[:32]}.pkl"
 
 def lanes(t:Tensor) -> list[Buffer]: return b.bufs if isinstance(b:=t.uop.base.buffer, MultiBuffer) else [b]

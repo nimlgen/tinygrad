@@ -250,7 +250,7 @@ static void prefetch(io_t *s, const uint64_t *b, int64_t lj, int64_t row, int64_
 // only when the second can't hold the rest), released while the rest are read; padded with slot 0, weight 0 (the gemvs skip it). then the
 // counts, li's guesses settled (used when routed), the decayed use counts and the next layer's victims (but this layer's slots).
 // 0, -1 a read failed, -2 a timeout, -3 no victims
-static int64_t layer(io_t *s, int64_t li) {
+int64_t layer(io_t *s, int64_t li) {
   int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1, K2 = s->k - K1;
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
@@ -423,6 +423,7 @@ def host_c() -> ctypes.CDLL:
     os.replace(tmp, so)
   lib = ctypes.CDLL(so)
   lib.step_io.restype, lib.step_io.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
+  lib.layer.restype, lib.layer.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64]
   lib.read_codes.restype, lib.read_codes.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p]
   lib.read_ahead.argtypes = [ctypes.POINTER(IoT), ctypes.c_int64, ctypes.c_void_p]
   lib.pump.restype, lib.pump.argtypes = ctypes.c_int64, [ctypes.POINTER(IoT)]
