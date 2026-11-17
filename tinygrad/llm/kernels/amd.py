@@ -797,10 +797,11 @@ def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
 
 @functools.cache
 def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, rows:int|UOp) -> UOp:
-  """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its slots of
-  idx[b, t] (or every position) of the first start + T at or before it, on the f16 tensor cores (RDNA4). a workgroup a row: its heads in
-  tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (loaded into registers the block before). a tile's 4 waves each
-  the scores of a quarter of D (summed through LDS), then each its online softmax of the block's scores and the values of a quarter of V"""
+  """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its first
+  start + t + 1 slots of idx[b, t] (or every position) at or before it (its keys first, as topk_indices has them), on the f16 tensor cores
+  (RDNA4). a workgroup a row: its heads in tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (loaded into registers
+  the block before). a tile's 4 waves each the scores of a quarter of D (summed through LDS), then each its online softmax of the block's
+  scores and the values of a quarter of V"""
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
   N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
@@ -814,7 +815,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   head = tile*16 + col
   qfrags = [UOp.stack(*((head < H).where(q[b, head.minimum(H - 1), t, part*(D//4) + i*16 + k].load(), 0.0).cast(dtypes.half) for k in ks))
             for i in range(D//64)]
-  keys = smin(start + T, K)
+  keys = smin(start + t + 1, K)
   blocks = (keys + 15) // 16
   kb = UOp.range(blocks, 2, AxisType.LOOP)
   # the block's keys into LDS: 8*tiles threads a row, a contiguous run of its words each (vector loads of vec), loaded into registers the block
@@ -887,7 +888,8 @@ def mla_topk_supported(device:str|tuple[str, ...]|None, values:int) -> bool:
 
 def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """(B, H, T, values): the queries q (B, H, T, D) at positions start.. attending to the cache's rows (B, 1, N, D) at their indexer's positions
-  idx (B, T, K) (of the first start + T slots, at or before the query; None: every position, causal), a row's value its first values dims"""
+  idx (B, T, K) (of the first start + T slots, at or before the query, those first; None: every position, causal), a row's value its first
+  values dims"""
   B, H, T, D = q.shape
   local = q.uop.shard_shape[1] if q.uop.axis == 1 else H
   if _is_rdna4(q.device) and q.max_shape[2] >= 16 and local <= 32 and D % 64 == 0 and values % 64 == 0:
