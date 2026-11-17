@@ -172,7 +172,8 @@ class Engine:
 
   def drives(self, disks:list[list[str]]):
     """step_io's reads from the store's drives (each gpu's disk) into the pools"""
-    self.tables, scalars = reads(self.m, disks, self.pool.uop.buffer.bufs, len(self.bias) * self.m["n_experts"])
+    sizes = [round_up(self.nbytes(gu, 2 * self.units * self.lat) + self.nbytes(d, self.units * self.lat), 4096) for gu, d in self.types]
+    self.tables, scalars = reads(self.m, disks, self.pool.uop.buffer.bufs, sizes)
     for name, v in {**scalars, **{k: a.ctypes.data for k, a in self.tables.items()}}.items(): setattr(self.io, name, v)
 
   # *** the step's graph
@@ -898,13 +899,13 @@ class Engine:
 
   def counters(self) -> np.ndarray:
     io = self.io
-    return np.array([time.perf_counter(), io.misses + io.guesses + io.fills, io.refs, io.hits, io.late, io.misses, io.guesses, io.used, io.fills,
+    return np.array([time.perf_counter(), io.bytes, io.refs, io.hits, io.late, io.misses, io.guesses, io.used, io.fills,
                      io.t_gpu, io.t_route, io.t_reads, io.t_after, *self.times])
 
   def report(self, c0:np.ndarray, n:int):
     """a step's time, reads and their split over the n steps since the counters c0"""
     dt, reads, refs, hits, late, misses, guesses, used, fills, *ms = (self.counters() - c0) / n
-    print(f"{dt * 1e3:.1f} ms/token = {1 / dt:.2f} tok/s, {reads * sum(self.m['part_bytes']) / 1e9:.2f} GB/token read: {misses:.0f} misses, "
+    print(f"{dt * 1e3:.1f} ms/token = {1 / dt:.2f} tok/s, {reads / 1e9:.2f} GB/token read: {misses:.0f} misses, "
           f"{guesses:.0f} guesses ({used:.0f} used), {fills:.0f} fills; of {refs:.0f} experts {hits / refs:.1%} cached, {late / refs:.1%} in flight")
     print("  ms/token: " + ", ".join(f"{t * 1e3:.1f} {k}" for k, t in zip(("waiting on the gpus", "routing", "waiting on reads",
                                                                            "after the reads", "launching", "after the last layer"), ms)), flush=True)

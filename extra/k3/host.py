@@ -48,7 +48,7 @@ IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries 
       *((n, "const int64_t *") for n in "lba nbytes inpart part_pages".split()),
       *((n, "const uint64_t *") for n in "prp sq db cq cq_db".split()),
       *((n, "int64_t *") for n in "tails db_tails heads phases inflight cids".split()),
-      *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills".split()),
+      *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills bytes".split()),
       *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split())]
 BUFS = ["tag", "scores", "part1", "part2"]
 CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float": ctypes.c_float, "double": ctypes.c_double}
@@ -95,7 +95,7 @@ static void submit(io_t *s, int64_t n, const int64_t *codes, const int64_t *slot
     e->prp1 = prp[2 * page], e->prp2 = pages == 1 ? 0 : pages == 2 ? prp[2 * page + 2] : prp[2 * page + 1];
     e->cdw10 = (uint32_t)s->lba[r], e->cdw11 = (uint32_t)(s->lba[r] >> 32), e->cdw12 = (uint32_t)((s->nbytes[r] >> s->shift) - 1);
     own[cid] = owned ? codes[i] : -1;
-    s->tails[q] = (s->tails[q] + 1) % s->entries, s->inflight[q]++;
+    s->tails[q] = (s->tails[q] + 1) % s->entries, s->inflight[q]++, s->bytes += s->nbytes[r];
     if (owned) s->flying[codes[i]]++;
   }
 }
@@ -431,19 +431,19 @@ def host_c() -> ctypes.CDLL:
   lib.flags.argtypes = [ctypes.POINTER(IoT), ctypes.c_uint32]
   return lib
 
-def reads(m:dict, disks:list[list[str]], pools:list[Buffer], ncodes:int) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+def reads(m:dict, disks:list[list[str]], pools:list[Buffer], sizes:list[int]) -> tuple[dict[str, np.ndarray], dict[str, int]]:
   """step_io's reads of every expert code (layer * E + expert) into the gpus' pools (a part a slot): two new host-owned queues on every
-  drive of the disks (queue j of drive k at j * nd + k: the demand's, then the guesses'), the drive commands of each code (a piece of a
-  stripe each, in code order) and the prp table of each pool, the one master maps it with on its disk's first drive (the drives share an
-  address space). the tables and the io_t scalars"""
+  drive of the disks (queue j of drive k at j * nd + k: the demand's, then the guesses'), the drive commands of each code (the first
+  sizes[layer] bytes of its part, a piece of a stripe each, in code order) and the prp table of each pool, the one master maps it with on its
+  disk's first drive (the drives share an address space). the tables and the io_t scalars"""
   nvs = [cast(NVMEDevice, Device[d]) for disk in disks for d in disk]
   qs, (nd, shift) = [nv.nvme.new_queue() for _ in range(2) for nv in nvs], (len(nvs), nvs[0].nvme.lba_shift)
   assert all(nv.nvme.lba_shift == shift and nv.nvme.max_xfer >= STRIPE for nv in nvs), "the drives read a stripe a command, of one block size"
   rows, ptr = [], [0]
-  for code in range(ncodes):
-    for g, (disk, size) in enumerate(zip(disks, m["part_bytes"])):
+  for code in range(len(sizes) * m["n_experts"]):
+    for g, disk in enumerate(disks):
       done = 0
-      for d, o, n in pieces(part_off(m, g, code), size, len(disk)):
+      for d, o, n in pieces(part_off(m, g, code), sizes[code // m["n_experts"]], len(disk)):
         rows.append((g * len(disk) + d, g, o >> shift, n, done >> 12))
         done += n
     ptr.append(len(rows))
