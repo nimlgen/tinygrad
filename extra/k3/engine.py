@@ -115,7 +115,8 @@ class Engine:
     self.window_s:collections.deque = collections.deque(maxlen=64)  # (measured: a window's tokens, seconds)
     # each gpu's pool in the experts' words (a bitcast of it is a copy), of what's free after the blocks' caches and states and the window's
     # graphs (captured on a pool of a slot), then the slots a window's state is lent (its own while it runs): slots of decode's otherwise
-    self.word = dtypes.uint16 if any(t in HALFWORD_QUANTS for t in itertools.chain(*self.types)) else dtypes.uint32
+    words = {t: dtypes.uint16 if t in HALFWORD_QUANTS else dtypes.uint32 for t in itertools.chain(*self.types)}
+    self.word = min(words.values(), key=lambda dt: dt.itemsize)
     def pool(n:int) -> Tensor: return Tensor.zeros(G * n * self.part // self.word.itemsize, dtype=self.word, device=self.devs, axis=0).realize()
     self.W = 0
     if window: self.window_init(window)
@@ -140,6 +141,9 @@ class Engine:
     self.slots = slots = self.tail + lent
     self.lent_from = self.tail
     self.pool = pool(slots)
+    pools = {dt: self.pool if dt == self.word else Tensor(self.lend({"pool": ((slots * self.part // dt.itemsize,), dt)}, 0)[0]["pool"].uop.unshard(0))
+             for dt in set(words.values())}
+    self.pools = {t: pools[dt] for t, dt in words.items()}
     caches, self.cache_bytes = self.lend(shapes, 0)
     # (a cache's: its positions' axis, its first byte, a position's bytes, its blocks of every position's rows and their bytes)
     self.stripes = [(a, caches[i].uop.base.buffer.bufs[0].offset, row, prod(shape[:a]), shape[a] * row) for i, (shape, dt) in shapes.items()
@@ -249,8 +253,8 @@ class Engine:
     off = self.nbytes(gu_type, 2 * u * self.lat)
     slots, w = table[1:1 + n].bitcast(dtypes.int32), table[1 + n:1 + 2 * n].bitcast(dtypes.float32)
     if amd_custom_kernels_supported(h.device):
-      gu = expert_linear(self.pool, slots, h, 2 * u, self.lat, gu_type, self.part, split=True, live=w)
-      return expert_linear(self.pool, slots, gu, self.lat, u, down_type, self.part, off, act=self.act, w=w, rows=T)
+      gu = expert_linear(self.pools[gu_type], slots, h, 2 * u, self.lat, gu_type, self.part, split=True, live=w)
+      return expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, self.part, off, act=self.act, w=w, rows=T)
     down = self.gemv(slots, self.act(*self.gemv(slots, h, 2 * u, self.lat, gu_type, 0).split(u, -1)), self.lat, u, down_type, off)
     return (down * w.reshape(n, 1)).reshape(-1, n // T, T, self.lat).sum(1)
 
