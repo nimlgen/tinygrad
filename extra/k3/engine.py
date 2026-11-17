@@ -54,7 +54,6 @@ class Engine:
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
       "a part of every expert on each gpu"
-    assert len(self.ms) <= 4, "past the host's fixed arrays"
     # (a pool's slot: the smallest part, a copy's part its span of them)
     self.part = min(c["part_bytes"][0] for c in self.ms)
     self.spans = [-(-c["part_bytes"][0] // self.part) for c in self.ms]

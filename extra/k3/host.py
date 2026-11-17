@@ -174,20 +174,19 @@ static int64_t slots_free(const io_t *s, int64_t sl, int64_t w) {
 
 // the victims of the next misses and guesses of every copy: its n least used free slots of its span (empty ones first), least used first
 static void pick(io_t *s, int64_t n) {
-  float key[4][VICTIMS], sum[4]; int64_t ok[4];
-  for (int64_t c = 0; c < s->copies; c++) s->nvict[c] = 0;
-  for (int64_t sl = 0; sl < s->slots; sl++) {
-    int64_t code = s->expert_in[sl], fr = free_slot(s, sl);
-    float f = code >= 0 ? s->freq[code] : -1;
-    for (int64_t c = 0; c < s->copies; c++) {
-      int64_t w = s->span[c], first = sl - sl % w, m = s->nvict[c], *v = s->victims + c * VICTIMS;
-      if (sl == first) sum[c] = 0, ok[c] = 1;
-      sum[c] += f, ok[c] &= fr;
-      if (sl != first + w - 1 || !ok[c] || (m == n && sum[c] >= key[c][m - 1])) continue;
-      int64_t j = m < n ? s->nvict[c]++ : m - 1;
-      for (; j > 0 && key[c][j - 1] > sum[c]; j--) key[c][j] = key[c][j - 1], v[j] = v[j - 1];
-      key[c][j] = sum[c], v[j] = first;
+  float f[s->slots], key[VICTIMS];
+  for (int64_t sl = 0; sl < s->slots; sl++) f[sl] = !free_slot(s, sl) ? __builtin_inff() : s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : -1;
+  for (int64_t c = 0; c < s->copies; c++) {
+    int64_t w = s->span[c], m = 0, *v = s->victims + c * VICTIMS;
+    for (int64_t sl = 0; sl + w <= s->slots; sl += w) {
+      float sum = f[sl];
+      for (int64_t u = sl + 1; u < sl + w; u++) sum += f[u];
+      if (sum == __builtin_inff() || (m == n && sum >= key[m - 1])) continue;
+      int64_t j = m < n ? m++ : m - 1;
+      for (; j > 0 && key[j - 1] > sum; j--) key[j] = key[j - 1], v[j] = v[j - 1];
+      key[j] = sum, v[j] = sl;
     }
+    s->nvict[c] = m;
   }
 }
 
