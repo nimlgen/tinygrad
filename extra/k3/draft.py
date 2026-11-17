@@ -173,15 +173,14 @@ class DSpark:
       q = q.reshape(A, self.KV, G, k, self.hd)
       def flat(x:Tensor) -> Tensor: return x.permute(1, 0, 2, 3, 4).reshape(self.KV, A * G * k, -1)  # ((A, kv, G, k, d) -> (kv, A*G*k, d))
       def unflat(x:Tensor) -> Tensor: return x.reshape(self.KV, A, G, k, -1).permute(1, 0, 2, 3, 4)
-      # one softmax over the context's keys and the block's: the context's in C chunks (their maxes, sums and values in parallel), then combined
       C, N = 32, round_up(n, 32)
       sc = (unflat(flat(q) @ kc.transpose(-1, -2)) / math.sqrt(self.hd) + mask[..., :n]).pad((None,) * 4 + ((0, N - n),), value=-math.inf)
       sc, sb = sc.reshape(A, self.KV, G, k, C, N // C), q @ kb.unsqueeze(2).transpose(-1, -2) / math.sqrt(self.hd) + mask[..., n:]
-      cm = sc.max(-1).maximum(-1e30).contiguous()  # (a chunk of no keys: a finite max)
+      cm = sc.max(-1).maximum(-1e30).contiguous()
       top = cm.max(-1).maximum(sb.max(-1)).unsqueeze(-1)
       e, w, eb = (sc - cm.unsqueeze(-1)).exp(), (cm - top).exp(), (sb - top).exp()
       ev = e.permute(1, 4, 0, 2, 3, 5).reshape(self.KV, C, A * G * k, N // C) @ vc.pad((None, (0, N - n), None)).reshape(self.KV, C, N // C, -1)
-      ev = ev.contiguous().reshape(self.KV, C, A, G, k, self.hd).permute(2, 0, 3, 4, 1, 5)  # (A, kv, G, k, C, hd)
+      ev = ev.contiguous().reshape(self.KV, C, A, G, k, self.hd).permute(2, 0, 3, 4, 1, 5)
       o = ((ev * w.unsqueeze(-1)).sum(-2) + eb @ vb.unsqueeze(2)) / ((e.sum(-1).contiguous() * w).sum(-1) + eb.sum(-1)).unsqueeze(-1)
       o = o.reshape(A, self.H, k, self.hd).transpose(1, 2).reshape(A, k, -1)
       x = x + self.lin(o, a + "o_proj")

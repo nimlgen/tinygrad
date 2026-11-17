@@ -858,7 +858,7 @@ class Engine:
           yield kept
         t = toks[row]
     finally:
-      if (n:=sum(widths.values())):  # (a request's decode: its verify steps' tokens, widths and split)
+      if (n:=sum(widths.values())):
         dt, _, refs, hits, *_, gpu, _, reads, _, _, after = (self.counters() - c0) / n
         print(f"decode: {n} steps, {1 + (self.verified[2] - v0[2]) / n:.2f} tokens a step (widths {dict(sorted(widths.items()))}), "
               f"{dt * 1e3:.1f} ms a step: {gpu * 1e3:.1f} waiting on the gpus, {reads * 1e3:.1f} on reads, {after * 1e3:.1f} after the last layer; "
