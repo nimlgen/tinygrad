@@ -579,16 +579,18 @@ class TestExpertLinear(unittest.TestCase):
         tiles, off, n = Tensor(np.array(self.sel[:2] + [-1], np.int32)), 2 * self.UNITS * self.ROW_UP, 3 * tile
         x = self.rng.standard_normal((5, self.LAT)).astype(np.float32)
         xr = self.rng.integers(-1, 5, n).astype(np.int32)
-        out = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), tile=tile).float().numpy()
+        out = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=Tensor(xr), tile=tile).float().numpy()
         h = self.rng.standard_normal((n, self.UNITS)).astype(np.float32)
-        down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off, tile=tile).float().numpy()
+        down = expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, tile=tile).float().numpy()
         def act(g, u): return g * (u / 25).tanh()
-        gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), act=act, tile=tile).float().numpy()
+        gu = expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=Tensor(xr), act=act,
+                          tile=tile).float().numpy()
         live = np.where(np.arange(n) % 32 < 12, 0, -1).astype(np.int32)  # (rows 16..31 of every 32 padding: their 16 left out, 0)
         kept = np.repeat(live[::16] >= 0, 16)
-        for got, want in ((expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, self.PART, xrow=Tensor(xr), tile=tile,
+        for got, want in ((expert_tiles(self.pool, tiles, Tensor(x), 2 * self.UNITS, self.LAT, IQ3_XXS, self.PART, xrow=Tensor(xr), tile=tile,
                                         live=Tensor(live)), out),
-                          (expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, self.PART, off, tile=tile, live=Tensor(live)), down)):
+                          (expert_tiles(self.pool, tiles, Tensor(h), self.LAT, self.UNITS, IQ3_XXS, self.PART, off, tile=tile,
+                                        live=Tensor(live)), down)):
           got = got.float().numpy()
           np.testing.assert_array_equal(got[kept], want[kept])
           np.testing.assert_array_equal(got[~kept], 0)

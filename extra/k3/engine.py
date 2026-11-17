@@ -16,7 +16,7 @@ from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS
-from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, IQ3_XXS
+from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor
 from extra.k3.draft import Eagle3, DSpark, load
 from extra.k3 import persist
@@ -476,24 +476,18 @@ class Engine:
     tiles = Tensor(self.win["tiles"].uop)[:self.state_rows(tile)[1]]
     slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
     tslot, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
-    if amd_custom_kernels_supported(pool.device) and types != (IQ3_XXS, IQ3_XXS):
-      slots16, live = tslot.maximum(0).reshape(-1, 1).expand(-1, tile // 16).flatten(), (xrow >= 0).cast(dtypes.int32)
-      gu = expert_linear(self.pools[types[0]], slots16, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], self.part, split=True, per=16,
-                         live=live, xrow=xrow)
-      y = expert_linear(self.pools[types[1]], slots16, gu, self.lat, u, types[1], self.part, off, act=self.act, per=16, live=live)
-    else:
-      a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
-      y = self.tiles(tile, pool, tslot, a, self.lat, u, types[1], off, h2, live=xrow)
+    a = self.tiles(tile, pool, tslot, Tensor(self.win["h"].uop), 2 * u, self.lat, types[0], 0, h1, xrow=xrow, act=self.act, live=xrow)
+    y = self.tiles(tile, pool, tslot, a, self.lat, u, types[1], off, h2, live=xrow)
     out = (y.reshape(len(self.devs), -1, self.lat)[:, pos.maximum(0)].float() * w.reshape(1, -1, 1)).reshape(len(self.devs), -1, K, self.lat).sum(2)
     return Tensor(self.win["out"].uop).assign(partial_sum(out) * self.model.config.routed_scaling_factor).realize()
 
   def tiles(self, tile:int, pool:Tensor, tslot:Tensor, x:Tensor, out_f:int, in_f:int, qtype:int, off:int, out:Tensor, xrow:Tensor|None=None,
             act:Callable|None=None, live:Tensor|None=None) -> Tensor:
     """(gpus, tile * tiles, out_f) into out: each gpu's units of the experts (of quant type qtype) at off bytes in the slots of tiles of tile
-    rows, on their rows of x (xrow: its rows, -1 its first), act(gate, up) of the outputs' halves: the AMD tensor cores' expert tiles for IQ3_XXS
-    (live: the rows' padding -1, left out), else decoded"""
-    if amd_custom_kernels_supported(x.device) and qtype == IQ3_XXS:
-      return expert_tiles(pool, tslot, x, out_f, in_f, self.part, off, xrow=xrow, act=act, out=out, tile=tile, live=live)
+    rows, on their rows of x (xrow: its rows, -1 its first), act(gate, up) of the outputs' halves: the AMD tensor cores' expert tiles for
+    TILE_QUANTS (live: the rows' padding -1, left out), else decoded"""
+    if amd_custom_kernels_supported(x.device) and qtype in TILE_QUANTS:
+      return expert_tiles(self.pools[qtype], tslot, x, out_f, in_f, qtype, self.part, off, xrow=xrow, act=act, out=out, tile=tile, live=live)
     NT, size, isz = tslot.shape[0], self.nbytes(qtype, out_f * in_f), self.word.itemsize
     w = pool.reshape(len(self.devs), -1, self.part // isz)[:, tslot.maximum(0)][..., off // isz:(off + size) // isz].bitcast(dtypes.uint8)
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // size * out_f * in_f, qtype).reshape(-1, NT, out_f, in_f)

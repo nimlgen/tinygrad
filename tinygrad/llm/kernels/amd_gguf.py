@@ -552,29 +552,32 @@ def _iq3_signs(device:str|tuple[str, ...]|None) -> Tensor:
     return sum(0x8000 << (16*b) for b in range(2) if signs >> (4*half + 2*pair + b) & 1)
   return Tensor.const(tuple(mask(i, h, p) for i in range(128) for h in range(2) for p in range(2)), dtypes.uint32).to(device, force=True)
 
-# a pair of a grid word's bytes b as halves 1024+b (a byte_perm under 0x64), times the scale plus the bias -1024*scale, then their signs
-_IQ3_HALVES = UOp.custom_function("({{ typedef _Float16 h2 __attribute__((ext_vector_type(2))); __builtin_bit_cast(unsigned, "
-  "__builtin_bit_cast(h2, __builtin_amdgcn_perm(0x64646464u, {0}, {4})) * __builtin_bit_cast(h2, {1}) + __builtin_bit_cast(h2, {2})) ^ {3}; }})",
-  dtype=dtypes.uint32, fmt=True)
+# a pair of a word's bytes b as halves 1024+b (a byte_perm under 0x64) less the zero, times the scale plus the bias, then their signs
+_F16_PAIR = UOp.custom_function("({{ typedef _Float16 h2 __attribute__((ext_vector_type(2))); __builtin_bit_cast(unsigned, "
+  "(__builtin_bit_cast(h2, __builtin_amdgcn_perm(0x64646464u, {0}, {5})) - __builtin_bit_cast(h2, {1})) * __builtin_bit_cast(h2, {2}) + "
+  "__builtin_bit_cast(h2, {3})) ^ {4}; }})", dtype=dtypes.uint32, fmt=True)
+TILE_QUANTS = (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS)
 
 @functools.cache
-def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_features:int, in_features:int, stride:int, offset:int,
-                       act:Callable|None, tile:int, gather:bool, skip:bool) -> UOp:
+def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int, stride:int,
+                       offset:int, act:Callable|None, tile:int, gather:bool, skip:bool) -> UOp:
   # a workgroup: a tile's rows (16, 32 or 64) and 256 outputs (act: 128, a wave's gate tile and its up tile), 8 waves of 2 output tiles. a group
   # of 32 inputs at a time the tile's rows go through LDS (two buffers by its parity) and a wave decodes its outputs' weights to halves, the
   # scales in them. skip: a tile's 16 rows whose first is padding (live -1) left out
-  *rows_src, grid_src, sign_src = extra
+  rows_src, tables = extra[:gather + skip], extra[gather + skip:]
   xrow, live = rows_src[0] if gather else None, rows_src[-1] if skip else None
-  waves, type_words = 8, QUANT_SIZES[IQ3_XXS]//2
+  waves, type_words = 8, QUANT_SIZES[ggml_type]//raw.dtype.itemsize
   output_words = in_features * type_words // GGML_BLOCK_SIZE
   token_block, output_block = UOp.range(out.shape[0]//tile, 0), UOp.range(out_features//(32*waves), 1)
   lane, wave = UOp.range(32, -1, axis_type=AxisType.WARP), UOp.range(waves, 3, axis_type=AxisType.LOCAL)
   ph, col, tid = lane//16, lane%16, wave*32 + lane
   outputs = tuple((output_block*waves + wave)*16 + col + o*(out_features//2) for o in range(2)) if act is not None else \
     tuple((output_block*waves + wave)*32 + o*16 + col for o in range(2))
-  grid, signs = UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL), UOp.alloc((512,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
-  grid = grid.after(grid[tid].store(grid_src[tid]))
-  signs = signs.after(*(signs[tid*2 + i].store(sign_src[tid*2 + i]) for i in range(2)))
+  if tables:
+    (grid_src, sign_src), grid, signs = tables, UOp.alloc((256,), dtypes.uint32, addrspace=AddrSpace.LOCAL), \
+      UOp.alloc((512,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+    grid = grid.after(grid[tid].store(grid_src[tid]))
+    signs = signs.after(*(signs[tid*2 + i].store(sign_src[tid*2 + i]) for i in range(2)))
   slot = tiles[token_block].cast(dtypes.int32)
   # a step: steps groups (their rows' words staged, their weights decoded together: more in flight between two barriers)
   steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
@@ -588,6 +591,7 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
             for k in range(steps) for r in (tid + i*waves*32 for i in range(tile*16 // (waves*32)))]
   lds = lds.after(UOp.group(*staged).barrier())
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
+  def pair(v:UOp) -> UOp: return v.cast(dtypes.half).bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001
   # a lane's inputs of a 16 step h: words 2ph, 2ph+1 and 4+2ph, 5+2ph of the row's 8
   def afrags(buf:UOp, k:int, t:int) -> list[UOp]:
     return [UOp.stack(*(v for w in (2*ph, 2*ph+1, 4+2*ph, 5+2*ph) for v in halves(buf[((par*steps + k)*tile + t*16 + col)*18 + h*8 + w].load())))
@@ -600,14 +604,20 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     bfrags.append([])
     for o, output in enumerate(outputs):
       base = slot.maximum(0).cast(dtypes.int64)*stride + offset + output*output_words + block*type_words
-      sign_word = _load_u32(raw, base, 66+sub*4)
-      scale = (_half(raw[base]) * ((sign_word >> 28).float()+0.5)*0.5).cast(dtypes.half)
-      scale2, bias2 = ((v.bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001) for v in (scale, scale*-1024))
-      def word(i:int) -> list[UOp]:  # (the lane's word i of the group: its four weights)
-        gw, bits = grid[_load_byte(raw, base, 2+sub*8+i)].load(), ((sign_word >> (7*(i//2))) & 127)*4 + ph*2
-        return [v for p, sel in enumerate((0x04010400, 0x04030402))
-                for v in halves(_IQ3_HALVES.call(gw, scale2, bias2, signs[bits + p].load(), UOp.const(sel, dtypes.uint32)))]
-      bfrags[k].append([UOp.stack(*(v for j in (0, 2) for v in word(h*4 + j + ph))) for h in range(2)])
+      bfrags[k].append([])
+      for h in range(2):
+        scale, zero, minimum = _wmma_scale(raw, base, sub, h, ggml_type)
+        scale = scale.cast(dtypes.half)
+        if tables: zero2, bias2 = UOp.const(0, dtypes.uint32), pair(scale*-1024)
+        else: zero2, bias2 = UOp.const((0x6400 + zero) * 0x10001, dtypes.uint32), pair(-minimum)
+        def word(i:int) -> list[UOp]:  # (the lane's word i of the group: its four weights)
+          if tables:
+            q, bits = grid[_load_byte(raw, base, 2+sub*8+i)].load(), ((_load_u32(raw, base, 66+sub*4) >> (7*(i//2))) & 127)*4 + ph*2
+            signs2 = [signs[bits + p].load() for p in range(2)]
+          else: q, signs2 = _quant_word(raw, base, sub, i, ggml_type, None), [UOp.const(0, dtypes.uint32)]*2
+          return [v for p, sel in enumerate((0x04010400, 0x04030402))
+                  for v in halves(_F16_PAIR.call(q, zero2, pair(scale), bias2, signs2[p], UOp.const(sel, dtypes.uint32)))]
+        bfrags[k][o].append(UOp.stack(*(v for j in (0, 2) for v in word(h*4 + j + ph))))
   updates = []
   for t in range(tile//16):
     on = step if live is None else UOp.range((live[token_block*tile + t*16] >= 0).where(1, 0).after(lds), 5 + t, AxisType.LOOP)
@@ -626,22 +636,26 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
   else: stores = [out[r, output].store(value(o, t, j).cast(out.dtype)) for o, output in enumerate(outputs) for t, rs in enumerate(rows)
                   for j, r in enumerate(rs)]
   weights = cast(int, out.shape[0]) * out_features * in_features
-  estimates = Estimates(2*weights, weights*type_words*2//GGML_BLOCK_SIZE, weights*type_words*2//GGML_BLOCK_SIZE)
+  estimates = Estimates(2*weights, weights*QUANT_SIZES[ggml_type]//GGML_BLOCK_SIZE, weights*QUANT_SIZES[ggml_type]//GGML_BLOCK_SIZE)
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(
-    arg=KernelInfo(name="expert_iq3_xxs_f16_wmma", opts_to_apply=(), estimates=estimates))
+    arg=KernelInfo(name=f"expert_{QUANT_NAMES[ggml_type]}_f16_wmma", opts_to_apply=(), estimates=estimates))
 
-def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, stride:int, offset:int=0,
+def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
                  xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64, live:Tensor|None=None) -> Tensor:
-  """out[r] = W[tiles[r // tile]] @ x[xrow[r]] (or x[r]) in half: an IQ3_XXS expert's tile of rows (16, 32 or 64) on the f16 tensor cores (RDNA4),
-  x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the buffer of the output.
-  live: the rows' padding (-1), a tile's 16 rows whose first is padding skipped (their outputs 0)"""
+  """out[r] = W[tiles[r // tile]] @ x[xrow[r]] (or x[r]) in half: an expert's tile of rows (16, 32 or 64) of a quant type of TILE_QUANTS on the
+  f16 tensor cores (RDNA4), x in half (act: act(gate, up) of the outputs' two halves). a tile -1 is skipped, a row -1 of xrow reads x[0]. out: the
+  buffer of the output. live: the rows' padding (-1), a tile's 16 rows whose first is padding skipped (their outputs 0)"""
   ndev, n = int(pool.shape[0]) // int(pool.uop.shard_shape[0]), tile * tiles.shape[0]
   if out is None:
     out = Tensor.empty(ndev*n, out_features // (1 if act is None else 2), dtype=dtypes.half, device=pool.device, axis=0 if ndev > 1 else None)
-  fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, stride=stride//2, offset=offset//2, act=act,
-                          tile=tile, gather=xrow is not None, skip=live is not None)
-  srcs = (pool.bitcast(dtypes.uint16), x.reshape(-1, in_features).cast(dtypes.half).contiguous(), tiles.cast(dtypes.int32),
-          *(t.cast(dtypes.int32) for t in (xrow, live) if t is not None), _iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device))
+  word = dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
+  assert stride % word.itemsize == 0 and offset % word.itemsize == 0, f"{QUANT_NAMES[ggml_type]} slots must be {word.itemsize} byte aligned"
+  fxn = functools.partial(_expert_f16_kernel, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                          stride=stride//word.itemsize, offset=offset//word.itemsize, act=act, tile=tile, gather=xrow is not None,
+                          skip=live is not None)
+  tables = (_iq_grid(x.device, IQ3_XXS), _iq3_signs(x.device)) if ggml_type == IQ3_XXS else ()
+  srcs = (pool.bitcast(word), x.reshape(-1, in_features).cast(dtypes.half).contiguous(), tiles.cast(dtypes.int32),
+          *(t.cast(dtypes.int32) for t in (xrow, live) if t is not None), *tables)
   ret = Tensor.custom_kernel(out, *srcs, fxn=fxn)[0]
   return ret.reshape(ndev, n, -1) if ndev > 1 else ret
 
