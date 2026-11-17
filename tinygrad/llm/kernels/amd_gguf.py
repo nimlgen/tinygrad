@@ -497,6 +497,31 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
   return _quant_linear_wmma(out, x, out_features, in_features, QUANT_SIZES[IQ4_XS]//4, layout, dequant, "linear_iq4_xs_f16_wmma", kgroups, lanes,
                             heads)
 
+def _wmma_scale(raw:UOp, base:UOp, subgroup:UOp, half:int, ggml_type:int) -> tuple[UOp, int, UOp]:
+  def byte(offset): return _load_byte(raw, base, offset)
+  zero, minimum = 0, UOp.const(0, dtypes.float)
+  if ggml_type in (Q4_K, Q5_K):
+    d, dmin, sc, mn = _q5_scales(raw, base, subgroup)
+    scale, minimum = d*sc, dmin*mn
+  elif ggml_type == Q2_K:
+    sc = byte(subgroup*2+half)
+    scale, minimum = _half(raw[base+40])*(sc & 15).float(), _half(raw[base+41])*(sc >> 4).float()
+  elif ggml_type == Q3_K:
+    j = subgroup*2+half
+    sc = ((byte(96+j%8) >> ((j//8)*4)) & 15) | (((byte(104+j%4) >> ((j//4)*2)) & 3) << 4)
+    scale, zero = _half(raw[base+54])*(sc.cast(dtypes.int32)-32).float(), 4
+  elif ggml_type == Q6_K:
+    scale, zero = _half(raw[base+104])*byte(192+subgroup*2+half).cast(dtypes.uint8).bitcast(dtypes.int8).float(), 32
+  elif ggml_type == Q5_0: scale, zero = _half(raw[base]), 16
+  else:
+    scale = _half(raw[base])
+    if ggml_type in (IQ2_XS, IQ2_S):
+      sc = byte((66 if ggml_type == IQ2_XS else 74)+subgroup)
+      scale *= (((sc >> (half*4)) & 15).float()+0.5)*0.25
+    elif ggml_type == IQ3_S: scale *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
+    elif ggml_type == IQ3_XXS: scale *= ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
+  return scale, zero, minimum
+
 @functools.cache
 def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                                   out_features:int, in_features:int, ggml_type:int, kgroups:int, lanes:int, heads:int=1,
@@ -513,25 +538,7 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
     grid = grid.after(*(grid[tid+i*threads].store(grids[0][tid+i*threads]) for i in range(int(grid.numel())//threads)))
   def dequant(base:UOp, subgroup:UOp, half:int) -> tuple[UOp, ...]:
     if ggml_type in SMALL_BLOCK_QUANTS: base += subgroup*SMALL_BLOCK_QUANTS[ggml_type]  # eight independent blocks per 256 weights
-    def byte(offset): return _load_byte(raw, base, offset)
-    zero, minimum = 0, UOp.const(0, dtypes.float)
-    if ggml_type == Q2_K:
-      sc = byte(subgroup*2+half)
-      scale, minimum = _half(raw[base+40])*(sc & 15).float(), _half(raw[base+41])*(sc >> 4).float()
-    elif ggml_type == Q3_K:
-      j = subgroup*2+half
-      sc = ((byte(96+j%8) >> ((j//8)*4)) & 15) | (((byte(104+j%4) >> ((j//4)*2)) & 3) << 4)
-      scale, zero = _half(raw[base+54])*(sc.cast(dtypes.int32)-32).float(), 4
-    elif ggml_type == Q6_K:
-      scale, zero = _half(raw[base+104])*byte(192+subgroup*2+half).cast(dtypes.uint8).bitcast(dtypes.int8).float(), 32
-    elif ggml_type == Q5_0: scale, zero = _half(raw[base]), 16
-    else:
-      scale = _half(raw[base])
-      if ggml_type in (IQ2_XS, IQ2_S):
-        sc = byte((66 if ggml_type == IQ2_XS else 74)+subgroup)
-        scale *= (((sc >> (half*4)) & 15).float()+0.5)*0.25
-      elif ggml_type == IQ3_S: scale *= (1+2*((byte(106+subgroup//2) >> ((subgroup%2)*4)) & 15)).float()
-      elif ggml_type == IQ3_XXS: scale *= ((_load_u32(raw, base, 66+subgroup*4) >> 28).float()+0.5)*0.5
+    scale, zero, minimum = _wmma_scale(raw, base, subgroup, half, ggml_type)
     words = tuple(_quant_word(raw, base, subgroup, half*4+i, ggml_type, grid) for i in word_indices)
     return tuple((((word >> (b*8)).cast(dtypes.uint8).bitcast(dtypes.int8).float()-zero)*scale-minimum).cast(dtypes.half)
                  for word in words for b in range(4))
