@@ -333,8 +333,8 @@ class Engine:
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
     return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "out": ((W, self.lat), f32),
-            "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32), "act": ((R, self.units), dtypes.half),
-            "down": ((R, self.lat), dtypes.half)}
+            "w": ((W, K), f32), "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
+            "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half)}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
     return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down", "shared") else t for k, t in self.lend(self.window_shapes(), at)[0].items()}
