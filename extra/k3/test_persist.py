@@ -44,6 +44,15 @@ class TestPersist(unittest.TestCase):
     self.assertNotEqual(eng2.saved, {})
     for a, b in zip(steps(eng2), want): np.testing.assert_equal(a, b)
 
+  def test_save_at_lookup_key(self):
+    with patch.object(persist, "key", return_value="before"):
+      eng = engine(self.t)
+    with patch.object(persist, "key", return_value="packed"):
+      eng.warm()
+    with patch.object(persist, "key", return_value="before"):
+      again = engine(self.t)
+    self.assertTrue(again.saved)
+
   def test_other_config(self):  # another engine's key (here its pool's slots): its own file, not the first's
     eng = engine(self.t)
     eng.warm()

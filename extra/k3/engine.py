@@ -801,6 +801,9 @@ class Engine:
     if (captured:=self.saved.get("graphs", {}).get(name)) is not None: jit.captured, jit.cnt = captured, 2
     return jit
 
+  @functools.cached_property
+  def graph_key(self) -> str: return persist.key(self)
+
   def restore(self):
     """the start's file's graphs into theirs (the model's rollbacks' and saves' made), else they're captured"""
     self.names = persist.buffers(self)

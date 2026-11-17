@@ -59,7 +59,7 @@ def key(eng) -> str:
                    eng.keep_logits)).encode())
   return h.hexdigest()[:32]
 
-def path(eng) -> pathlib.Path: return pathlib.Path(cache_dir) / "k3" / f"{key(eng)}.pkl"
+def path(eng) -> pathlib.Path: return pathlib.Path(cache_dir) / "k3" / f"{eng.graph_key}.pkl"
 
 class _Pickler(pickle.Pickler):
   def __init__(self, f:io.BytesIO, names:dict[int, tuple[str, Named]]):
