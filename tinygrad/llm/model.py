@@ -5,7 +5,7 @@ from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
   indexer_scores, topk_indices, mla_topk_attention, mla_topk_supported, res_mix_norm, kda_decode, RES_MAX_STREAMS, allgather_last
-from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT
+from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT, _GGML_NATIVE
 from tinygrad.llm.kernels.amd_gguf import q8_linear, head_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
 from tinygrad.uop.ops import resolve, smax, ssimplify
@@ -896,6 +896,8 @@ class Transformer:
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    for _, names in itertools.groupby(state_dict, lambda k: k.split(".")[1] if k.startswith("blk.") else k):
+      if native:=[state_dict[k] for k in names if entries[k][2] in _GGML_NATIVE]: Tensor.realize(*native)
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
