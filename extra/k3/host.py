@@ -217,6 +217,10 @@ static int64_t code_of(const io_t *s, int64_t li, int64_t e, int64_t r) {
   return code;
 }
 
+static void slots_past_big(const io_t *s, int64_t li, int32_t *slot) {
+  for (int64_t e = 0; e < s->E; e++) slot[e] = s->slot_of[code_of(s, li, e, s->k)];
+}
+
 // the codes of the reads ahead not on a queue yet: a ring of at most two layers'
 #define NPEND 4096
 static int64_t pend[NPEND], npend, pend_at;
@@ -253,10 +257,11 @@ static void logits_of(const io_t *s, const uint64_t *b, int64_t row, float *out)
 // the guesses of layer lj on a row of the scores of the layer of buffers b: the first n its router would keep that aren't cached, in the
 // router's order (sigmoid + bias: a guess high in it is likelier routed), read into victims on the guess queues, held till lj routes
 static void prefetch(io_t *s, const uint64_t *b, int64_t lj, int64_t row, int64_t n) {
-  float logits[4096], sig[4096], w[64]; int64_t sel[64], codes[64], ms[64], m = 0;
+  float logits[4096], sig[4096], w[64]; int64_t sel[64], codes[64], ms[64], m = 0; int32_t slot[4096];
   logits_of(s, b, row, logits);
+  slots_past_big(s, lj, slot);
   const float *bias = s->bias[lj];
-  int64_t c = route(s, logits, bias, s->slot_of + lj * s->E, 0, sel, w, sig, 0, 0);
+  int64_t c = route(s, logits, bias, slot, 0, sel, w, sig, 0, 0);
   #define KEY(e) (sig[e] + bias[e])
   for (int64_t a = 1; a < c; a++) for (int64_t j = a; j > 0 && KEY(sel[j - 1]) < KEY(sel[j]); j--) {
     int64_t u = sel[j]; sel[j] = sel[j - 1], sel[j - 1] = u;
@@ -291,10 +296,12 @@ int64_t layer(io_t *s, int64_t li) {
   int64_t sel[64], pos[4096], usel[512], urank[512], ucode[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0,
           late = 0, ns = 0, nf = 0;
   uint8_t hit[512];
+  int32_t slot[4096];
+  slots_past_big(s, li, slot);
   for (int64_t e = 0; e < E; e++) pos[e] = -1;
   for (int64_t t = 0; t < T; t++) {
     logits_of(s, b, t * s->rows, logits);
-    int64_t c = tc[t] = route(s, logits, s->bias[li], s->slot_of + li * E, 1, sel, tw + t * 64, sig, skip, &ns);
+    int64_t c = tc[t] = route(s, logits, s->bias[li], slot, 1, sel, tw + t * 64, sig, skip, &ns);
     for (int64_t j = 0; j < c; j++) {
       if (pos[sel[j]] < 0) pos[sel[j]] = nu, usel[nu] = sel[j], urank[nu++] = j;
       if (j < urank[pos[sel[j]]]) urank[pos[sel[j]]] = j;
