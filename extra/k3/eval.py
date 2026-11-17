@@ -30,6 +30,9 @@ def evaluate(eng, spec:str, late:Callable[[], bool]):
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}")
     eng.report(c0, len(ids) + len(outs) - 2)
 
+def bank_logits(m, bank:Tensor) -> Tensor:
+  return m.output(m.output_norm(m.output_res_score.mix(bank) if m.config.attn_res_block_size else bank[:, :, 0].float()))[0].float()
+
 def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128, size:int=0) -> list[tuple[float, float]]:
   """WEVAL=corpus.jsonl:nseq:ntok:first: evaluate's completions through windows (of up to size tokens, else the engine's), every position's logits
   from the window's last streams (a pass of the sequence, no steps), rows at a time"""
@@ -44,8 +47,8 @@ def window_evaluate(eng, spec:str, late:Callable[[], bool], rows:int=128, size:i
       toks = seq[at:at + (size or eng.W)]
       eng.window(toks, at, (seq[at + 1:at + 1 + len(toks)] + [-1])[:len(toks)])
       for r0 in range(0, len(toks), rows):
-        x = m.output_res_score.mix(eng.in_order(Tensor(eng.win["bank"].uop), r0, min(rows, eng.W - r0)))
-        for pos, lg in enumerate(m.output(m.output_norm(x))[0].float().numpy()[:len(toks) - r0].astype(np.float64), at + r0):
+        lgs = bank_logits(m, eng.in_order(Tensor(eng.win["bank"].uop), r0, min(rows, eng.W - r0))).numpy()[:len(toks) - r0]
+        for pos, lg in enumerate(lgs.astype(np.float64), at + r0):
           if pos >= len(ids) - 1: stats.append(score(lg, r["output_top"][pos - len(ids) + 1]))
     (a1, k1), (a, k) = np.mean(stats[n0:], 0), np.mean(stats, 0)
     print(f"{r['task_id']}: top-1 agree {a1:.1%}, KL {k1:.4f}; all {len(stats)} tokens: top-1 agree {a:.1%}, KL {k:.4f}", flush=True)
@@ -73,7 +76,7 @@ def window_dump(eng, spec:str, late:Callable[[], bool], out:str, rows:int=128):
       for j, t in enumerate(taps): t[at0 + at:at0 + at + len(toks_w)] = eng.in_order(Tensor(eng.win["taps"].uop), 0, len(toks_w))[0, :, j].numpy()
       for r0 in range(0, len(toks_w), rows):
         bank = eng.in_order(Tensor(eng.win["bank"].uop), r0, min(rows, eng.W - r0))
-        lg = m.output(m.output_norm(m.output_res_score.mix(bank)))[0].float()[:len(toks_w) - r0]
+        lg = bank_logits(m, bank)[:len(toks_w) - r0]
         o = at0 + at + r0
         nxt[o:o + lg.shape[0]], p1[o:o + lg.shape[0]] = lg.argmax(-1).numpy(), lg.softmax(-1).max(-1).numpy()
     toks[at0:at0 + len(seq)] = seq
