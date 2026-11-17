@@ -666,14 +666,20 @@ def _wmma_kernel(ggml_type:int, device) -> tuple[Callable[..., UOp], tuple[Tenso
   return functools.partial(fxn, kgroups=4 if cdna else 2 if _is_rdna4(device) else 1, lanes=64 if cdna else 32), extra
 
 def head_linear(x:Tensor, w:Tensor) -> Tensor|None:
-  """x (1, H, T, in) @ w.T of a head's own weights w (H, out, in) of packed ggml weights, on the f16 tensor cores (T a multiple of 64), else None"""
+  """x (1, H, T, in) @ w.T of a head's own weights w (H, out, in) of packed ggml weights, on the f16 tensor cores (T a multiple of 64), a few
+  tokens on the expert gemv (a head a slot of the weights), else None"""
   B, H, T, I = x.shape
   N = x.max_shape[2]  # (a symbolic T: the kernel's rows those there are a head, its buffers the max's)
-  if B != 1 or not isinstance(I, int) or N % 64 or not amd_custom_kernels_supported(x.device): return None
+  if B != 1 or not isinstance(I, int) or not amd_custom_kernels_supported(x.device): return None
   if (found:=find_packed(w, I)) is None: return None
   ggml_type, raw = found
-  fxn, extra = _wmma_kernel(ggml_type, x.device)
   heads, out_features = (x.uop.shard_shape[1] if x.uop.axis == 1 else H), int(w.shape[1])
+  if N % 64:
+    if not isinstance(T, int) or T > 8: return None
+    slots = Tensor.arange(heads, dtype=dtypes.int32).to(x.device)
+    y = expert_linear(raw, slots, x.reshape(H*T, I), out_features, I, ggml_type, out_features*I*QUANT_SIZES[ggml_type]//256, per=T)
+    return y.reshape(B, H, T, out_features)
+  fxn, extra = _wmma_kernel(ggml_type, x.device)
   out = Tensor.empty(H*N, out_features, dtype=dtypes.float32, device=x.device, axis=None if x.uop.axis is None else 0)
   fxn = functools.partial(fxn, out_features=out_features, in_features=I, heads=heads, **({} if isinstance(T, int) else {"live": _unbind(T)}))
   x = _carry(x.cast(dtypes.float16).pad_to(x.max_shape).reshape(H*N, I).contiguous(), *([] if isinstance(T, int) else [T]))

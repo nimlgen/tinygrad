@@ -75,10 +75,12 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
         w = ggml_data_to_tensor(raw, H*out_features*in_features, ggml_type).reshape(H, out_features, in_features)
         x = rng.standard_normal((1, H, 128, in_features)).astype(np.float16)
         want = x.astype(np.float32) @ w.numpy().astype(np.float16).astype(np.float32).transpose(0, 2, 1)
-        for T, n in ((128, 128), (UOp.variable("rows", 1, 128).bind(77), 77)):  # (a symbolic count of rows: those there are)
+        # (a symbolic count of rows: those there are)
+        q8 = 2e-2 * np.abs(want).max()
+        for T, n, atol in ((128, 128, 2e-2), (UOp.variable("rows", 1, 128).bind(77), 77, 2e-2), (1, 1, q8), (2, 2, q8)):
           got = head_linear(Tensor(x)[:, :, :T], w)
           assert got is not None
-          np.testing.assert_allclose(got.pad_to((1, H, 128, out_features)).numpy()[:, :, :n], want[:, :, :n], rtol=3e-3, atol=2e-2)
+          np.testing.assert_allclose(got.pad_to((1, H, 128, out_features)).numpy()[:, :, :n], want[:, :, :n], rtol=3e-3, atol=atol)
 
   def test_q5_0_linear(self): self._test_quant_linear(6, 176, in_features=288, out_features=16, token_counts=(1, 3, 16))
   def test_q8_0_linear_small_blocks(self): self._test_quant_linear(8, 272, in_features=288, out_features=16, token_counts=(1, 16))
