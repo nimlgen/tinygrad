@@ -272,8 +272,8 @@ class Engine:
 
   def experts(self, li:int, h:Tensor, table:Tensor, n:int) -> tuple[Tensor, Tensor]:
     """each gpu's units of layer li's n experts of a table (a copy's n slots, padded with slot 0, their weights a token's: j*T + t, then the next
-    copy's) on h (T, lat): (gpus, n a copy in turn, lat) and their weights. entry j*T+t is token t's j-th expert (weight 0 in the copies it
-    isn't read from), the act in the q8 of the down gemv's input"""
+    copy's) on h (T, lat): (gpus, n, lat) and the weights (n,). entry j*T+t is token t's j-th expert, from the copy where its weight isn't 0,
+    the act in the q8 of the down gemv's input"""
     u, ys, ws = self.units, [], []
     for c, types in enumerate(self.copies):
       if types[li] is None: continue
@@ -285,14 +285,15 @@ class Engine:
         ys.append(expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, stride, off, act=self.act, live=w))
       else: ys.append(self.gemv(c, slots, self.act(*self.gemv(c, slots, h, 2 * u, self.lat, gu_type, 0).split(u, -1)), self.lat, u, down_type, off))
       ws.append(w)
-    return Tensor.cat(*ys, dim=1), Tensor.cat(*ws)
+    return functools.reduce(Tensor.add, [(w.reshape(1, -1, 1) != 0).where(y, 0) for y, w in zip(ys, ws)]), functools.reduce(Tensor.add, ws)
 
   @staticmethod
   def heaviest_first(ys:list[Tensor], ws:list[Tensor], T:int) -> Tensor:
     """(gpus, T, lat): each token's expert outputs of the parts ys (gpus, n, lat), entry j*T+t token t's, weighted by ws (n,) and summed
     heaviest first (a tie: the earlier entry first), the same sum whichever part an expert came in"""
     rows = [(y[:, j * T:(j + 1) * T], w[j * T:(j + 1) * T].reshape(1, T, 1)) for y, w in zip(ys, ws) for j in range(w.shape[0] // T)]
-    rank = [sum(((v >= w) if i < j else (v > w)).cast(dtypes.int32) for i, (_, v) in enumerate(rows) if i != j) for j, (_, w) in enumerate(rows)]
+    rank = Tensor.stack(*[sum(((v >= w) if i < j else (v > w)).cast(dtypes.int32) for i, (_, v) in enumerate(rows) if i != j)
+                          for j, (_, w) in enumerate(rows)]).contiguous()
     return functools.reduce(Tensor.add, [functools.reduce(Tensor.add, [(rank[j] == r).where(y * w, 0) for j, (y, w) in enumerate(rows)])
                                          for r in range(len(rows))])
 
