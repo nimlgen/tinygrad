@@ -3,6 +3,7 @@
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
 import itertools, json, pathlib, re, tempfile, unittest
+from unittest.mock import patch
 from typing import Callable
 from dataclasses import replace
 from types import SimpleNamespace
@@ -162,6 +163,16 @@ class TestEngine(unittest.TestCase):
     self.eng.window(toks[:8], 0, toks[1:9])
     ours = self.eng.forward(Tensor([toks[8:]], dtype=dtypes.int32), 8)[0].numpy()[0]
     np.testing.assert_allclose(ours, want, rtol=1e-3, atol=1e-3 * np.abs(want).max())
+
+  def test_short_chunk(self):
+    toks = [3, 5, 7, 1, 2, 9, 4]
+    outs = []
+    for cap in (4, 2):
+      with patch("extra.k3.engine.SHORT_CHUNK", cap): self.eng = self.engine(2*E)
+      self.stub()
+      self.eng.window(toks[:-1], 0, toks[1:])
+      outs.append(self.eng.forward(Tensor([[toks[-1]]]), 6)[0].numpy())
+    np.testing.assert_allclose(outs[1], outs[0], rtol=1e-3, atol=1e-3 * np.abs(outs[0]).max())
 
   def test_window_evaluate(self):  # a completion teacher forced through windows (two) scored against its token steps' top 5: as them
     self.stub()

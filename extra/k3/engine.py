@@ -30,6 +30,7 @@ SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
 # (the drives' bytes a second, a window's seconds a token, a step's before any are measured: tinys3's, 195 GB/s (k3's store not cached in 4.8 s),
 # 1.26 ms, 50 ms)
 READ_BW, WINDOW_TOKEN_S, STEP_S = 195e9, 1.3e-3, 0.05
+SHORT_CHUNK = 256
 SESSION = 4096  # (a kept session's rows a short request that diverges from it early may write)
 TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
@@ -318,6 +319,8 @@ class Engine:
   def window_init(self, W:int):
     """the window's variables and graphs (captured once its state is lent from the pool: window_capture), its state's bytes"""
     m = self.model
+    self.chunk_vars = {SHORT_CHUNK: UOp.variable("short_live", 1, SHORT_CHUNK)} if self.chunk > SHORT_CHUNK else {}
+    self.chunk_vars[self.chunk] = self.v_live
     self.W, S = W, 1 + sum(map(self.new_stream, m.blk))
     self.window_bytes, self.piece_bytes = (sum(round_up(prod(sh) * dt.itemsize, 256) for sh, dt in f().values())
                                            for f in (self.window_shapes, self.piece_shapes))
@@ -364,12 +367,12 @@ class Engine:
     host's flags preset: slot 0), the routes and experts, the rest. their scratch: one arena (SPARE's)"""
     m, self.kinds = self.model, {}
     moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
-    for b, (name, fxn) in itertools.product(m.blk, (("attend", self.attend), ("post", self.post))):
+    for b, (name, fxn), cap in itertools.product(m.blk, (("attend", self.attend), ("post", self.post)), self.chunk_vars):
       if name == "post" and b not in moe: continue
-      jit, args, first = self.kind(name, b, fxn)
+      jit, args, first, live = self.chunk_graph(name, b, fxn, cap)
       if first is not b: continue
-      vs = (self.v_pos.bind(0), self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
-        (self.v_live.bind(self.chunk), self.v_c0.bind(0), self.v_s.bind(0))
+      vs = (self.v_pos.bind(0), live, self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
+        (live, self.v_c0.bind(0), self.v_s.bind(0))
       self.graph(jit, *vs, *args)
     self.graph(self.start_jit, self.v_p0.bind(0))
     self.graph(self.tap_jit, self.v_s.bind(0), self.v_tap.bind(0))
@@ -446,6 +449,10 @@ class Engine:
       self.kinds[(name, b)] = (*self.kinds[key][:2], [Tensor(u) for u in seen])
     first, jit, args = self.kinds[(name, b)]
     return jit, args, first
+
+  def chunk_graph(self, name:str, b:FFNBlock, fxn:Callable, n:int) -> tuple[Callable, list[Tensor], FFNBlock, UOp]:
+    cap = next(c for c in self.chunk_vars if n <= c)
+    return (*self.kind(f"{name}{cap}", b, fxn), self.chunk_vars[cap].bind(n))
 
   def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_) -> Tensor:
     """a chunk's live rows' attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a
@@ -674,9 +681,9 @@ class Engine:
       s = n - 1 + int(self.new_stream(b))
       for p0, T, bank in pieces:
         self.win.update(bank)
-        jit, args, _ = self.kind("attend", b, self.attend)
-        for c0, live in chunks(T):
-          self.graph(jit, self.v_pos.bind(pos + p0 + c0), self.v_live.bind(live), self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
+        for c0, nlive in chunks(T):
+          jit, args, _, live = self.chunk_graph("attend", b, self.attend, nlive)
+          self.graph(jit, self.v_pos.bind(pos + p0 + c0), live, self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
           self.pump()
         if hasattr(b, "ffn_gate_inp"):
           self.layer = li = self.m["layers"].index(i)
@@ -700,9 +707,9 @@ class Engine:
           table = np.maximum(self.state["slot_of"][every:=self.window_codes(li, np.arange(E))], 0) * len(self.ms) + every // (L * E)
           for p in self.bufs[li][2][1]: p[1:1 + E] = table.astype(np.int32).view(np.uint32)
           self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
-          jit, args, _ = self.kind("post", b, self.post)
-          for c0, live in chunks(T):
-            self.graph(jit, self.v_live.bind(live), self.v_c0.bind(c0), self.v_s.bind(s), *args)
+          for c0, nlive in chunks(T):
+            jit, args, _, live = self.chunk_graph("post", b, self.post, nlive)
+            self.graph(jit, live, self.v_c0.bind(c0), self.v_s.bind(s), *args)
             self.pump()
         for j, (blk, mixed) in enumerate(self.taps):
           if blk != i: continue
