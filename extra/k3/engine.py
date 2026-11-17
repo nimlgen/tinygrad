@@ -954,7 +954,7 @@ if __name__ == "__main__":
   tok = SimpleTokenizer.from_gguf_kv(kv)
   print(f"model in {time.perf_counter() - st:.0f} s", flush=True)
   # STORE=at,..: the store's copies of the experts (their manifests' offsets on disk 0)
-  stores = [open_store(list(model.token_embd.weight.device), int(at)) for at in str(getenv("STORE", 512 << 30)).split(",")]  # (k3's iq3_xxs store)
+  stores = [open_store(list(model.token_embd.weight.device), int(at)) for at in getenv("STORE", str(512 << 30)).split(",")]  # (k3's iq3_xxs store)
   # DRAFT=dir: the draft (eagle's head, dspark's blocks; mtp: the model's own next token prediction layer), speculative decoding with verify
   # steps of VERIFY tokens (memory: fewer SLOTS)
   # VERIFY=n: a verify step's tokens, the next and the draft's n-1 guesses (eagle's: a chain) (an EVAL: its steps of n tokens)
