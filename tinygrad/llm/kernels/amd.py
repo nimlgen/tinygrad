@@ -866,15 +866,17 @@ def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
                              dtype=dtypes.float, fmt=True).call(x, (src*4).cast(dtypes.int32))
 
 @functools.cache
-def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, rows:int|UOp) -> UOp:
+def _mla_wmma_kernel(out:UOp, *srcs:UOp, start:int|UOp, scale:float, rows:int|UOp, split:int=1) -> UOp:
   """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D halves) at its first
   start + t + 1 slots of idx[b, t] (or every position) at or before it (its keys first, as topk_indices has them), on the f16 tensor cores
   (RDNA4). a workgroup a row: its heads in tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (loaded into registers
   the block before). a tile's 4 waves each the scores of a quarter of D (summed through LDS), then each its online softmax of the block's
-  scores and the values of a quarter of V"""
+  scores and the values of a quarter of V. split: a workgroup a row's every split-th block, out (B*T, H, split, V) and stats (B*T, H, split, 2)
+  (srcs: stats first) its flash-decode partials"""
+  stats, (q, cache, *idx) = (srcs[0], srcs[1:]) if split > 1 else (None, srcs)
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
-  N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]) // 2, cast(int, out.shape[2])
+  N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]) // 2, cast(int, out.shape[-1])
   K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
   tiles = -(-H // 16)
   assert tiles <= 2 and D == 2*DW and D % 64 == 0 and V % 128 == 0 and DW % (8*tiles) == 0
@@ -887,7 +889,8 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
             for i in range(D//64)]
   keys = (t + start + 1).minimum(K)
   blocks = (keys + 15) // 16
-  kb = UOp.range(blocks, 2, AxisType.LOOP)
+  first = UOp.range(split, 3, AxisType.GLOBAL) if split > 1 else UOp.const(0, dtypes.weakint)
+  kb = UOp.range((blocks - first + split - 1) // split, 2, AxisType.LOOP)
   # the block's keys into LDS: 8*tiles threads a row, a contiguous run of its words each (vector loads of vec), loaded into registers the block
   # before; a slot not a key's reads row 0
   lds_k = UOp.alloc((16*RW,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
@@ -903,7 +906,7 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
     words = [_amd_load(cache[b, 0, at, 2*(wi*per + i)], 2*vec).bitcast(dtypes.uint32) for i in range(0, per, vec)]
     return [ok.cast(dtypes.uint32)] + [w[j] for w in words for j in range(vec)]
   ahead = UOp.alloc((per + 1,), dtypes.uint32, addrspace=AddrSpace.REG)
-  ahead = ahead.after(UOp.group(*(ahead[i].store(w) for i, w in enumerate(block_words(kb.const_like(0))))))
+  ahead = ahead.after(UOp.group(*(ahead[i].store(w) for i, w in enumerate(block_words(kb.const_like(0)*split + first)))))
   cur = [ahead.after(kb)[i].load() for i in range(per + 1)]
   staged = [lds_k[r*RW + wi*per + i].store(cur[1 + i]) for i in range(per)]
   staged.append(lds_ok[r.valid(wi.eq(0))].store(cur[0].cast(dtypes.int32)))
@@ -933,14 +936,20 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
   for o in range(V//64):
     vfrag = UOp.stack(*(halves(kword(k, vdim(o) // 2))[o % 2] for k in ks))
     acc.append(UOp.wmma(pfrag, vfrag, UOp.stack(*(acc_reg.after(kb)[o, j].load()*arow[j] for j in range(8))), WMMA_ARG[0], WARP_SIZE))
-  fetch = [ahead.after(*cur)[i].store(w) for i, w in enumerate(block_words((kb + 1).minimum(blocks - 1)))]
+  fetch = [ahead.after(*cur)[i].store(w) for i, w in enumerate(block_words(((kb + 1)*split + first).minimum(blocks - 1)))]
   update = UOp.group(m_reg[0].store(mn), l_reg[0].store(ln), *(acc_reg[o, j].store(a[j]) for o, a in enumerate(acc) for j in range(8)),
                      *fetch).end(kb)
   l_end = l_reg.after(update)[0].load()
-  lrow = [_lane_of(l_end, ph*8 + j) for j in range(8)]
-  stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), vdim(o)].store(acc_reg.after(update)[o, j].load() / lrow[j])
+  if stats is None:
+    lrow = [_lane_of(l_end, ph*8 + j) for j in range(8)]
+    stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), vdim(o)].store(acc_reg.after(update)[o, j].load() / lrow[j])
+              for o in range(V//64) for j in range(8)]
+    return UOp.group(*stores).end(lane, wave, row).sink(arg=KernelInfo(name="mla_wmma", opts_to_apply=()))
+  stores = [out[row, (tile*16 + ph*8 + j).valid(tile*16 + ph*8 + j < H), first, vdim(o)].store(acc_reg.after(update)[o, j].load())
             for o in range(V//64) for j in range(8)]
-  return UOp.group(*stores).end(lane, wave, row).sink(arg=KernelInfo(name="mla_wmma", opts_to_apply=()))
+  stores += [stats[row, head.valid((head < H) & ph.eq(0) & part.eq(0)), first, k].store(x)
+             for k, x in enumerate((m_reg.after(update)[0].load(), l_end))]
+  return UOp.group(*stores).end(lane, wave, first, row).sink(arg=KernelInfo(name="mla_wmma_split", opts_to_apply=()))
 
 def mla_wmma_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, values:int, scale:float) -> Tensor:
   """mla_topk_attention on the f16 tensor cores (RDNA4, up to 32 heads a device): the queries and probabilities in half, sums in float. a symbolic
@@ -964,16 +973,20 @@ def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
   values dims"""
   B, H, T, D = q.shape
   local = q.uop.shard_shape[1] if q.uop.axis == 1 else H
-  if _is_rdna4(q.device) and q.max_shape[2] >= 16 and local <= 32 and D % 64 == 0 and values % 128 == 0:
-    return mla_wmma_attention(q, cache, idx, start, values, scale)  # (a chunk's rows: the tensor cores)
-  parts = 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
+  wmma = _is_rdna4(q.device) and local <= 32 and D % 64 == 0 and values % 128 == 0
+  if wmma and q.max_shape[2] >= 16: return mla_wmma_attention(q, cache, idx, start, values, scale)  # (a chunk's rows: the tensor cores)
+  parts = 16 if wmma else 4 if B*T > 8 else 32  # (a few rows: more blocks a row)
   partial = Tensor.empty(B*T, H, parts, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   stats = Tensor.empty(B*T, H, parts, 2, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
-  # (a key read once for up to 3 heads: their queries and sums in a lane's registers)
-  fxn = functools.partial(_mla_topk_partial, start=start, scale=scale, heads=max(n for n in (1, 2, 3) if H % n == 0))
-  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
-                                        fxn=fxn)[:2]
+  ids = [] if idx is None else [idx.cast(dtypes.int32).contiguous()]
+  if wmma:
+    fxn = functools.partial(_mla_wmma_kernel, start=start, scale=scale, rows=B*T, split=parts)
+    partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, *ids, fxn=fxn)[:2]
+  else:
+    # (a key read once for up to 3 heads: their queries and sums in a lane's registers)
+    fxn = functools.partial(_mla_topk_partial, start=start, scale=scale, heads=max(n for n in (1, 2, 3) if H % n == 0))
+    partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache, *ids, fxn=fxn)[:2]
   out = Tensor.empty(B*T, H, 1, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   out = Tensor.custom_kernel(out, partial, stats, fxn=functools.partial(_amd_flash_decode_combine, live=parts))[0]
   return out.reshape(B, T, H, values).transpose(1, 2)
