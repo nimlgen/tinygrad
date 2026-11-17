@@ -488,11 +488,12 @@ def reads(copies:list[tuple[dict, list[list[str]], list[tuple[int, int]|None]]],
   rows, ptr = [], [0]
   for m, dks, layers in copies:
     for at, e in itertools.product(layers, range(m["n_experts"])):
-      for g, disk in enumerate(dks if at is not None else []):
-        done = 0
-        for d, o, n in pieces(part_off(m, g, at[0] * m["n_experts"] + e), at[1], len(disk)):
-          rows.append((names[disk[d]], g, o >> shift, n, done >> 12))
-          done += n
+      if at is not None:
+        for g, disk in enumerate(dks):
+          done = 0
+          for d, o, n in pieces(part_off(m, g, at[0] * m["n_experts"] + e), at[1], len(disk)):
+            rows.append((names[disk[d]], g, o >> shift, n, done >> 12))
+            done += n
       ptr.append(len(rows))
   drive, gpu, lba, nbytes, inpart = (np.array(c, np.int64) for c in zip(*rows))
   prps = [cast(NVMEAllocator, Device[disk[0]].allocator).prp_tables[pool.get_buf(disk[0])].get_storage().host for disk, pool in zip(disks, pools)]
