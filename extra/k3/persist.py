@@ -56,7 +56,7 @@ def key(eng) -> str:
   h.update(repr(draft).encode())
   h.update(json.dumps({k: str(v.value) for k, v in sorted(ContextVar._cache.items())}).encode())
   h.update(repr((eng.model.config, eng.ms, eng.devs, eng.tokens, sorted(eng.jits), eng.chunk, eng.W, eng.slots, eng.tail, eng.dump_taps,
-                   eng.keep_logits)).encode())
+                   eng.keep_logits, eng.part, eng.layer_spans)).encode())
   return h.hexdigest()[:32]
 
 def path(eng) -> pathlib.Path: return pathlib.Path(cache_dir) / "k3" / f"{eng.graph_key}.pkl"

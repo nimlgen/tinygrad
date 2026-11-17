@@ -100,16 +100,18 @@ class TestStepIO(unittest.TestCase):
     self.assertEqual(host_c().step_io(ctypes.byref(self.io)), 0)
 
   def parts(self, li:int, g:int, c:int=0) -> tuple[np.ndarray, np.ndarray]: # a gpu's slots and weights of a layer in copy c, both parts
-    p = [(t, (len(t) - 1) // 2 // len(self.state["span"])) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
+    p = [(t, (len(t) - 1) // 2 // self.io.copies) for t in (self.gbuf[li][g][b] for b in ("part1", "part2"))]
     return (np.concatenate([t[1 + 2 * c * n:1 + (2 * c + 1) * n].view(np.int32) for t, n in p]),
             np.concatenate([t[1 + (2 * c + 1) * n:1 + (2 * c + 2) * n].view(np.float32) for t, n in p]))
 
   def check_tables(self):
-    slot_of, expert_in, t, span = self.state["slot_of"], self.state["expert_in"], self.tables, self.state["span"]
+    slot_of, expert_in, t = self.state["slot_of"], self.state["expert_in"], self.tables
+    group = self.state.get("span_group", np.repeat(np.arange(self.io.copies), L))
+    span = np.repeat(self.state["span"][group], E)
     for sl, c in enumerate(expert_in):
-      if c >= 0: self.assertTrue(slot_of[c] <= sl < slot_of[c] + span[c // (L * E)])
+      if c >= 0: self.assertTrue(slot_of[c] <= sl < slot_of[c] + span[c])
     for c in np.nonzero(slot_of >= 0)[0]:
-      w = span[c // (L * E)]
+      w = span[c]
       self.assertEqual((slot_of[c] % w, expert_in[slot_of[c]:slot_of[c] + w].tolist()), (0, [c] * w))
     # every cached expert's commands read into the pages of its slot
     for c in np.nonzero((slot_of >= 0) & (self.state["flying"] == 0))[0]:
@@ -125,6 +127,33 @@ class TestStepIO(unittest.TestCase):
     # every guess is of a layer of the step: settled (used or not) by its end
     self.assertEqual(io.used + io.wasted, io.guesses)
     self.assertEqual(int(self.state["guess"].sum()), 0)
+
+  def test_mixed_slot_spans(self):
+    self.tearDown()
+    self.setUp(slots=252, T=4, spans=(2, 1), held=((0, 1, 3, 4),))
+    self.io.big = 2
+    self.state["span_group"] = np.array([1, 1, 0, 1, 1, 0, 2, 2, 0, 2, 2, 0], np.int64)
+    self.state["span"] = np.array([4, 3, 2], np.int64)
+    self.state["victims"] = np.zeros(3 * VICTIMS, np.int64)
+    self.state["nvict"] = np.zeros(3, np.int64)
+    self.io.slot_groups = 3
+    for key in ("span_group", "span", "victims", "nvict"):
+      setattr(self.io, key, self.state[key].ctypes.data)
+    for _ in range(3):
+      self.step()
+      self.check_tables()
+      self.assertEqual(self.io.refs, self.io.hits + self.io.late + self.io.misses)
+      self.assertEqual(self.io.used + self.io.wasted, self.io.guesses)
+      for li in range(L):
+        for c in range(self.io.copies):
+          slots, weights = self.parts(li, 0, c)
+          group = self.state["span_group"][c * L + li]
+          rows = (slots[weights > 0] * self.state["span"][group]).tolist()
+          self.assertTrue(all(0 <= row < self.io.slots for row in rows))
+    # The last layer has no alternative and cannot be evicted later in the step.
+    slots, weights = self.parts(L - 1, 0)
+    np.testing.assert_array_equal(self.state["expert_in"][slots[weights > 0] * 4] // E, L - 1)
+    self.assertFalse(self.parts(L - 1, 0, 1)[1].any())
 
   def test_read_ahead(self): # reads pending, queued as the drives have room (pump), waited for: each into its slot's pages
     codes, slots = np.arange(3 * E, 3 * E + 40, dtype=np.int64), np.arange(100, 140, dtype=np.int64)

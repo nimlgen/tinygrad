@@ -50,7 +50,7 @@ class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
-               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0)):
+               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0)):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -77,14 +77,26 @@ class Engine:
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
       "a part of every expert on each gpu"
     # (a pool's slot: the smallest part, a copy's part its span of them)
-    self.part = min(c["part_bytes"][0] for c in self.ms)
-    self.spans = [-(-c["part_bytes"][0] // self.part) for c in self.ms]
+    if expert_slot_bytes < 0 or expert_slot_bytes % 4096: raise ValueError("EXPERT_SLOT_BYTES must be page aligned")
+    self.store_part = min(c["part_bytes"][0] for c in self.ms)
+    self.part = expert_slot_bytes or self.store_part
     assert E <= 4096 and K <= 64 and tokens <= 8 and tokens * K <= 512 and 32 * tokens <= 1024, "past the host's fixed arrays"
     self.tokens, self.chunk, n = tokens, chunk, max(tokens, chunk, window)  # (n: a step's or a window's most tokens)
     qtype, layers = {n.upper(): t for t, n in QUANT_NAMES.items()}, [b for b in m["layers"] if b < len(stack)]
     self.copies = [[(qtype[t[0]], qtype[t[2]]) if t else None for t in (c["types"].get(str(b)) if "types" in c else [c["expert_type"]] * 3
                                                                       if b in c["layers"] else None for b in layers)] for c in self.ms]
     self.types, self.layer_copies = self.copies[0], [tuple(c[li] for c in self.copies) for li in range(len(layers))]
+    self.expert_sizes = [[0 if ty is None else round_up(self.nbytes(ty[0], 2 * self.units * self.lat) +
+                          self.nbytes(ty[1], self.units * self.lat), 4096) for ty in types] for types in self.copies]
+    if expert_slot_bytes:
+      self.layer_spans = [[self.slots_of(size) if size else 0 for size in sizes] for sizes in self.expert_sizes]
+      self.spans = sorted({w for spans in self.layer_spans for w in spans if w}, reverse=True)
+      self.span_groups = np.array([[self.spans.index(w) if w else 0 for w in spans] for spans in self.layer_spans], np.int64)
+    else:
+      self.spans = [self.slots_of(c["part_bytes"][0]) for c in self.ms]
+      self.layer_spans = [[w] * L for w in self.spans]
+      self.span_groups = np.repeat(np.arange(len(self.ms), dtype=np.int64)[:, None], L, axis=1)
+    self.max_primary_span = max(self.layer_spans[0])
     # each layer's host buffers on every gpu: its tag, router scores (a token's rows: the router's, the next layer's guess; a gpu its experts')
     # and the two parts of a step's slots and weights, [ready | slots | weights]: entry j*T+t is token t's j-th expert and its weight (a
     # window's: [ready | an expert's slot], [ready | an expert's count])
@@ -193,12 +205,13 @@ class Engine:
     codes = len(self.ms) * L * E
     self.state = {"slot_of": np.full(codes, -1, np.int32), "expert_in": np.full(slots, -1, np.int64), "freq": np.zeros(codes, np.float32),
                   "flying": np.zeros(codes, np.int32), "guess": np.zeros(codes, np.uint8), "mask": np.zeros(slots, np.uint8),
-                  "victims": np.zeros(len(self.ms) * VICTIMS, np.int64), "nvict": np.zeros(len(self.ms), np.int64),
+                  "victims": np.zeros(len(self.spans) * VICTIMS, np.int64), "nvict": np.zeros(len(self.spans), np.int64),
                   "span": np.array(self.spans, np.int64),
                   "bias": np.array([b.ctypes.data for b in self.bias], np.uint64),
                   "bufs": np.array([[[v.ctypes.data for v in views] for _, views in b] for b in bufs], np.uint64)}
+    if expert_slot_bytes: self.state["span_group"] = self.span_groups
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
-                  fill=FILL, decay=0.5 ** (1 / 8), copies=len(self.ms), big=BIG)
+                  fill=FILL, decay=0.5 ** (1 / 8), copies=len(self.ms), big=BIG, slot_groups=len(self.spans) if expert_slot_bytes else 0)
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     if window:
       self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
@@ -209,10 +222,10 @@ class Engine:
 
   def drives(self, *disks:list[list[str]]):
     """step_io's reads from the store's drives (each copy's: each gpu's disk) into the pools"""
-    def sizes(c:dict, types:list) -> list[tuple[int, int]|None]:
-      return [None if t is None else (c["layers"].index(b), round_up(self.nbytes(t[0], 2 * self.units * self.lat) + self.nbytes(t[1], self.units *
-              self.lat), 4096)) for b, t in zip(self.m["layers"], types)]
-    self.tables, scalars = reads([(c, d, sizes(c, ts)) for c, d, ts in zip(self.ms, disks, self.copies)], self.pool.uop.buffer.bufs, self.part)
+    def sizes(c:dict, lengths:list[int]) -> list[tuple[int, int]|None]:
+      return [(c["layers"].index(b), n) if n else None for b, n in zip(self.m["layers"], lengths)]
+    self.tables, scalars = reads([(c, d, sizes(c, lengths)) for c, d, lengths in zip(self.ms, disks, self.expert_sizes)],
+                                self.pool.uop.buffer.bufs, self.part)
     for name, v in {**scalars, **{k: a.ctypes.data for k, a in self.tables.items()}}.items(): setattr(self.io, name, v)
 
   # *** the step's graph
@@ -299,13 +312,15 @@ class Engine:
     u, ys, ws = self.units, [], []
     for c, types in enumerate(self.copies):
       if types[li] is None: continue
-      (gu_type, down_type), stride, at = types[li], self.spans[c] * self.part, 1 + 2 * c * n
+      (gu_type, down_type), stride, at = types[li], self.layer_spans[c][li] * self.part, 1 + 2 * c * n
       off = self.nbytes(gu_type, 2 * u * self.lat)
       slots, w = table[at:at + n].bitcast(dtypes.int32), table[at + n:at + 2 * n].bitcast(dtypes.float32)
       if amd_custom_kernels_supported(h.device):
         gu = expert_linear(self.pools[gu_type], slots, h, 2 * u, self.lat, gu_type, stride, split=True, live=w)
         ys.append(expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, stride, off, act=self.act, live=w))
-      else: ys.append(self.gemv(c, slots, self.act(*self.gemv(c, slots, h, 2 * u, self.lat, gu_type, 0).split(u, -1)), self.lat, u, down_type, off))
+      else:
+        gu = self.gemv(stride, slots, h, 2 * u, self.lat, gu_type, 0)
+        ys.append(self.gemv(stride, slots, self.act(*gu.split(u, -1)), self.lat, u, down_type, off))
       ws.append(w)
     return functools.reduce(Tensor.add, [(w.reshape(1, -1, 1) != 0).where(y, 0) for y, w in zip(ys, ws)]), functools.reduce(Tensor.add, ws)
 
@@ -319,11 +334,11 @@ class Engine:
     return functools.reduce(Tensor.add, [functools.reduce(Tensor.add, [(rank[j] == r).where(y * w, 0) for j, (y, w) in enumerate(rows)])
                                          for r in range(len(rows))])
 
-  def gemv(self, c:int, slots:Tensor, x:Tensor, out_f:int, in_f:int, qtype:int, off:int) -> Tensor:
+  def gemv(self, stride:int, slots:Tensor, x:Tensor, out_f:int, in_f:int, qtype:int, off:int) -> Tensor:
     """(gpus, n, out_f): W @ x[k % rows] (or a gpu's x[k]) of the W of quant type qtype at off bytes in copy c's slots[k] of each gpu's pool,
     decoded (no kernel)"""
     n, size, isz = slots.shape[0], self.nbytes(qtype, out_f * in_f), self.word.itemsize
-    w = self.pool.reshape(len(self.devs), -1, self.spans[c] * self.part // isz)[:, slots][..., off // isz:(off + size) // isz]
+    w = self.pool.reshape(len(self.devs), -1, stride // isz)[:, slots][..., off // isz:(off + size) // isz]
     w = w.bitcast(dtypes.uint8)
     w = ggml_data_to_tensor(w.flatten(), prod(w.shape) // size * out_f * in_f, qtype).reshape(-1, n, out_f, in_f)
     return (w * (x if x.ndim == 3 else x[Tensor.arange(n) % x.shape[0]]).unsqueeze(-2)).sum(-1)
@@ -646,7 +661,9 @@ class Engine:
     if wait:
       flying = np.ascontiguousarray(codes[st["flying"][codes] > 0], np.int64)
       if len(flying) and (err:=host_c().read_wait(ctypes.byref(self.io), len(flying), flying.ctypes.data)): raise RuntimeError(f"reads failed {err}")
-    for c in codes: st["expert_in"][st["slot_of"][c]:st["slot_of"][c] + self.spans[c // n]], st["slot_of"][c] = -1, -1
+    for c in codes:
+      w = self.layer_spans[c // n][c % n // self.m["n_experts"]]
+      st["expert_in"][st["slot_of"][c]:st["slot_of"][c] + w], st["slot_of"][c] = -1, -1
   @staticmethod
   def nbytes(qtype:int, n:int) -> int: return n // _GGML_QUANT[qtype][0] * _GGML_QUANT[qtype][1]
 
@@ -671,7 +688,7 @@ class Engine:
   def pieces(self) -> int:
     """a read window's pieces: lent below the window's state, past the caches' stripes and the scratch (their rows pinned as they grow, the
     rest the experts'), the pool past them and two layers' experts (the one routed, the one read ahead)"""
-    free = min(self.tail - self.arena[1], self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"] * self.spans[0])
+    free = min(self.tail - self.arena[1], self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"] * self.max_primary_span)
     return 1 + max(0, free // self.slots_of(self.piece_bytes))
 
   def window(self, toks:list[int], pos:int, given:list[int]):
@@ -714,7 +731,8 @@ class Engine:
     move it). before any are measured, tinys3's"""
     T = max(self.jits)
     step = float(np.median(self.step_s[T])) if self.step_s[T] else STEP_S
-    fixed = (len(self.bias) * self.m["n_experts"] - self.slots) * self.part * len(self.devs) / READ_BW
+    # The minimum stored expert size estimates bytes read independently of the pool's allocation quantum.
+    fixed = (len(self.bias) * self.m["n_experts"] * self.store_part - self.slots * self.part) * len(self.devs) / READ_BW
     token = float(np.median([max(t - fixed, 0) / m for m, t in self.window_s])) if self.window_s else WINDOW_TOKEN_S
     return -(-n // T) * step < fixed + n * token
 
@@ -813,8 +831,9 @@ class Engine:
     keep = (np.arange(self.slots) >= self.lent_from) | ((old >= 0) & (old % LE >= self.layer * E) & (old % LE < (self.layer + 2) * E))
     keep |= (st["mask"] > 0) | np.isin(old, busy) | ((old >= 0) & (st["flying"][np.maximum(old, 0)] > 0))
     victims = np.zeros(len(miss), np.int64)
-    for c in np.unique(miss // LE):
-      at, w = np.nonzero(miss // LE == c)[0], self.spans[c]
+    groups = self.span_groups.reshape(-1)[miss // E]
+    for c in np.unique(groups):
+      at, w = np.nonzero(groups == c)[0], self.spans[c]
       key = np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0))[:self.slots // w * w].reshape(-1, w).sum(1)
       victims[at] = np.argsort(key, kind="stable")[:len(at)] * w
       if np.isinf(key[victims[at] // w]).any(): raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
