@@ -256,7 +256,7 @@ class Engine:
   def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
     of the experts it gives in two parts, summed over the gpus"""
-    T, s = x.shape[1], w(x[0]) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
+    T, s = x.shape[1], w(x) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
     scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
     y1, w1 = self.experts(li, h[0], self.host(li, 0, scores), self.ks[0] * T)
