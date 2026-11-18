@@ -241,7 +241,7 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
                            name="precompile kernels")
 
-from tinygrad.runtime.support.hcq2 import hcq_prep, hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
+from tinygrad.runtime.support.hcq2 import replace_buffers, hcq_prep, hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
 
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
@@ -250,11 +250,11 @@ pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat.custom_function("validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
 
-def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, profile:bool|None=None, cache=False) -> UOp:
+def compile_linear(linear:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=BEAM.value if beam is None else beam) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
-  linear = lower_and_compile(hcq_prep(linear, input_uops if cache else None))
-  return hcq_compile(linear, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache and input_uops is not None)
+  linear = lower_and_compile(hcq_prep(linear))
+  return hcq_compile(linear, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache and not validate)
 
 def link_linear(linear:UOp, input_uops:list[UOp]|None=None) -> UOp: return hcq_link(linear, input_uops=input_uops)
 
@@ -262,7 +262,7 @@ def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequenc
   assert linear.op is Ops.LINEAR, f"run_linear calls on {linear.op}"
   if len(linear.src) == 0: return
   inputs = list(input_uops)
-  if not jit: linear = link_linear(compile_linear(linear, validate=VALIDATE_WITH_CPU, input_uops=inputs, cache=True), input_uops=inputs)
+  if not jit: linear = link_linear(compile_linear(replace_buffers(linear, inputs), validate=VALIDATE_WITH_CPU, cache=True), input_uops=inputs)
   ctx = ExecContext(var_vals or {}, tuple(inputs), update_stats, jit, wait or DEBUG>=2)
   for call in linear.src: track_stats(ctx, call.without_after, perf_counter_us(), pm_exec.rewrite(call.without_after, ctx))
 

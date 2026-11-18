@@ -168,6 +168,10 @@ def replace_buffer(ctx:tuple[list[UOp], dict[UOp, int]], b:UOp) -> UOp:
   return b.replace(op=Ops.EXTERN, arg=replace(b.arg, slot=slots[b], buffer=None))
 pm_replace_buffers = PatternMatcher([(UPat(Ops.BUFFER, name="b"), lambda ctx, b: replace_buffer(ctx, b))])
 
+def replace_buffers(linear:UOp, input_uops:list[UOp]) -> UOp:
+  slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
+  return graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
+
 def unwrap_call(call:UOp) -> UOp|None:
   if (n:=max([len(to_tuple(a.device)) for a in get_call_arg_uops(call)], default=1)) == 1: return None
   dnum = UOp.variable("_device_num", 0, n - 1, dtypes.i32)
@@ -571,18 +575,10 @@ pm_resolve_link = PatternMatcher([
 
 hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a buffer-free linear (uops are hash-consed) to its compiled form
 
-def is_compiled(linear:UOp) -> bool: return any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src)
-
-def hcq_prep(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:
-  if is_compiled(linear): return linear
-  if input_uops is not None:
-    slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
-    linear = graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
-  return graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
+def hcq_prep(linear:UOp) -> UOp: return graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
 
 @rewrite_group(lambda linear,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
 def hcq_compile(linear:UOp, profile:bool, cache:bool=False) -> UOp:
-  if is_compiled(linear): return linear
   if cache and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_lower_call, walk=True, name="lower call")
   with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
