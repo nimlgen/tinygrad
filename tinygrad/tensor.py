@@ -277,7 +277,7 @@ class Tensor(RandMixin):
     """Runs an exported function compiled to a LINEAR, its EXTERNs are the externs from `Tensor.export`."""
     linear, var_vals = map_back(linear, externs)
     # a capturing jit runs its captured linears later
-    if capturing and CAPTURING: capturing[0].add_linear(link_linear(linear, externs), var_vals)
+    if capturing and CAPTURING: capturing[0].add_linear(linear, externs, var_vals)
     else: run_linear(linear, var_vals, externs=externs, update_stats=do_update_stats)
 
   @disable_gc()
