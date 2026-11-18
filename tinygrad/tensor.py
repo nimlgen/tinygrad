@@ -40,13 +40,13 @@ pm_export: PatternMatcher = PatternMatcher([
 ])
 
 # bound Variables map back to the Variable, its value is in var_vals. storage stays EXTERN, it's bound at link
-def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
+def map_back_vars(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
   if e.arg.slot >= len(ctx) or (x:=ctx[e.arg.slot]).as_extern(e.arg.slot) is not e:
     got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
     raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
   return x.unbound() if x.is_variable else None
 
-pm_map_back = PatternMatcher([(UPat(Ops.EXTERN, name="e"), map_back_extern)])
+pm_map_back = PatternMatcher([(UPat(Ops.EXTERN, name="e"), map_back_vars)])
 
 def map_back(linear:UOp, externs:tuple[UOp, ...]) -> tuple[UOp, dict[str, int]]:
   linear = graph_rewrite(linear, pm_map_back, ctx=externs, walk=True, enter_calls=True, name="map back")
