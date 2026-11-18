@@ -505,28 +505,35 @@ class Indexer:
                                   *((2, self.idx.head_dim) if hasattr(self, "compressor_gate") else (self.idx.head_dim,)),
                                   dtype=dtypes.half, device=x.device)
 
+  def store_keys(self, x:Tensor, start_pos:StartPos, rot:Tensor|None) -> Tensor:
+    idx = self.idx
+    k = self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x))
+    if rot is not None and not idx.qsa:
+      k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
+    if hasattr(self, "compressor_gate"): k = k.stack(self.compressor_gate(x), dim=2)
+    return _update_cache(self.cache_kg, k, start_pos, 1)
+
   def __call__(self, x:Tensor, q:Tensor, start_pos:StartPos, freqs:Tensor|None=None) -> Tensor:
     (B, T, _), idx, S = x.shape, self.idx, ssimplify(smax(start_pos) + x.shape[1])
     P = round_up(S, idx.kpool)  # (the pools so far)
-    k, iq = self.attn_k(x) if idx.qsa else self.k_norm(self.attn_k(x)), self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
+    rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos)) if idx.rope_dim else None
+    keys = self.store_keys(x, start_pos, rot)
+    iq = self.attn_q_b(q).reshape(B, T, idx.n_heads, idx.head_dim)
     if idx.msa or idx.qsa: iq = self.q_norm(iq)
-    if idx.rope_dim:
-      rot = Tensor.stack(*(unwrap(freqs)[p:p+T] for p in start_pos))
-      if not idx.qsa: k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
+    if rot is not None:
       iq = apply_rope(iq[..., :idx.rope_dim].transpose(1, 2), rot, idx.rope_interleave).transpose(1, 2).cat(iq[..., idx.rope_dim:], dim=-1)
     if idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and len(start_pos) == 1 and amd_custom_kernels_supported(x.device):
       # (a key each: the positions (B, T, top_k) themselves, the attention gathers their keys)
-      keys, w = _update_cache(self.cache_kg, k, start_pos, 1), self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5
+      w = self.proj(x) * (idx.n_heads * idx.head_dim)**-0.5
       # (a symbolic T: the kernels on its max rows, the rest sliced off)
       iq, w = iq.pad_to(iq.max_shape), w.pad_to(w.max_shape)
       return topk_indices(indexer_scores(iq, keys, w, start_pos[0], S), idx.top_k, S).reshape(B, iq.shape[1], -1)[:, :T]
     if hasattr(self, "compressor_gate"):
       # cache an indexer key and a pooling gate per token, a pool's key is the gate softmax weighted sum of its keys
-      kg = k.stack(self.compressor_gate(x), dim=2)  # (B, T, kpool, 2, D)
-      kg = _update_cache(self.cache_kg, kg, start_pos, 1)[:, :P].float().reshape(B, -1, idx.kpool, 2, idx.head_dim)
+      kg = keys[:, :P].float().reshape(B, -1, idx.kpool, 2, idx.head_dim)
       k = ((kg[..., 1, :] + self.compressor_ape["weight"]).softmax(2) * kg[..., 0, :]).sum(2)  # (B, S, D)
     else:
-      k = _update_cache(self.cache_kg, k, start_pos, 1)[:, :P].float()  # (B, S, D)
+      k = keys[:, :P].float()  # (B, S, D)
     if idx.qsa:
       k, rot = self.k_norm(k.reshape(B, -1, idx.kpool, idx.head_dim).mean(2)), unwrap(freqs)[:self.max_context:idx.kpool][:P // idx.kpool]
       k = apply_rope(k[..., :idx.rope_dim].unsqueeze(1), rot, idx.rope_interleave).squeeze(1).cat(k[..., idx.rope_dim:], dim=-1)
@@ -568,6 +575,16 @@ class MLATransformerBlock(FFNBlock):
     if config.attn_output_gate: self.attn_gate = Linear(config.dim, config.n_heads * config.v_head_dim, bias=False)
     if config.attn_head_gate: self.attn_gate = Linear(config.dim, config.n_heads, bias=False)
 
+  def store_latents(self, x:Tensor, start_pos:StartPos, freqs:Tensor|None) -> Tensor:
+    B, T, _ = x.shape
+    kv_a = self.attn_kv_a_mqa(x)
+    c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
+    k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
+    if freqs is not None: k_rope = apply_rope(k_rope, freqs, self.config.rope_interleave)
+
+    k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
+    return _update_cache(self.cache_k, k_store, start_pos, 2)
+
   def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
@@ -581,13 +598,7 @@ class MLATransformerBlock(FFNBlock):
     else: q_nope = _heads(q_nope, self.attn_k_b['weight'])
     q = q_nope.cat(q_rope, dim=-1)
 
-    kv_a = self.attn_kv_a_mqa(x)
-    c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
-    k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
-    if freqs is not None: k_rope = apply_rope(k_rope, freqs, self.config.rope_interleave)
-
-    k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    cache = _update_cache(self.cache_k, k_store, start_pos, 2)
+    cache = self.store_latents(x, start_pos, freqs)
     scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
     if (idx_mask is None or dtypes.is_int(idx_mask.dtype)) and len(start_pos) == 1 and mla_topk_supported(x.device, self.config.kv_lora_rank):
       attn = mla_topk_attention(q, cache, idx_mask, start_pos[0], self.config.kv_lora_rank, scale)  # (no indexer: every key there is)
@@ -634,6 +645,13 @@ class MTPBlock(MLATransformerBlock):
     self.enorm, self.hnorm, self.shared_head_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(3))
 
   def project(self, emb:Tensor, hidden:Tensor) -> Tensor: return self.eh_proj(self.enorm(emb).cat(self.hnorm(hidden), dim=-1))
+
+  def fill_cache(self, x:Tensor, pos:int|UOp) -> Tensor:
+    rot = self.freqs_cis[pos:pos+x.shape[1]].unsqueeze(0) if self.freqs_cis is not None else None
+    cache = self.store_latents(x, (pos,), None if self.config.mla_nope else rot)
+    if self.indexer is not None and self.config.max_context > self.indexer.idx.top_k:
+      return cache.realize(self.indexer.store_keys(x, (pos,), rot if self.indexer.idx.rope_dim else None))
+    return cache
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):

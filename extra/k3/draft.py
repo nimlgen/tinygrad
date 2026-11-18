@@ -220,7 +220,7 @@ class MTP:
   def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
     b = self.blk[0]
     h = b.attn_norm(b.project(self.embed(tokens), self.output_norm(hidden[:, :, 0])))
-    return b._attention(h, (pos,), b._indexer_mask(h, (pos,), None))
+    return b.fill_cache(h, pos)
 
   def __call__(self, tokens:Tensor, hidden:Tensor|None, pos:int|UOp, hid:Tensor|None=None, cache:None=None) -> tuple[Tensor, Tensor, None]:
     b = self.blk[0]
