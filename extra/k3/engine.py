@@ -417,12 +417,12 @@ class Engine:
     tables = [(host, host.copy()) for b in self.bufs for i in (0, 2, 3) for host in b[i][1]]
     # Dry execution writes at position zero. Preserve the warm engine's recurrent state as well as the host tables.
     states = [(t, t.empty_like().assign(t)) for t in self.model._states()]
-    Tensor.realize(*(saved for _, saved in states))
+    if states: Tensor.realize(*(saved for _, saved in states))
     try:
       for host, _ in tables: host.fill(0)
       view.window_capture()
     finally:
-      Tensor.realize(*(t.assign(saved) for t, saved in states))
+      if states: Tensor.realize(*(t.assign(saved) for t, saved in states))
       for d in self.devs: Device[d].synchronize()
       for host, previous in tables: host[:] = previous
     self.short_engine = view
