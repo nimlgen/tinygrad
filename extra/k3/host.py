@@ -52,7 +52,7 @@ IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries 
       *((n, "const uint64_t *") for n in "prp sq db cq cq_db".split()),
       *((n, "int64_t *") for n in "tails db_tails heads phases inflight cids".split()),
       *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills bytes".split()),
-      *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split())]
+      *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split()), ("pf_tail", "int64_t")]
 BUFS = ["tag", "scores", "part1", "part2"]
 CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float": ctypes.c_float, "double": ctypes.c_double}
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
@@ -380,7 +380,8 @@ int64_t layer(io_t *s, int64_t li) {
     if (first) {  // (after part 1 is out: the gpus work on it) the next layer's guesses, the fills, this layer's hits unpinned
       int64_t room = 1;
       for (int64_t q = nd; q < 2 * nd; q++) room &= s->inflight[q] < s->entries / 2;
-      if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, s->pf);
+      int64_t tail = s->big >= s->k && s->pf_tail > 0 && s->pf_tail < s->pf ? s->pf_tail : s->pf;
+      if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, t < 2 ? s->pf : tail);
       for (int64_t i = 0; room && i < ns && nf < s->fill; i++) if (pos[skip[i]] == -1) {  // (each once, none another token kept)
         int64_t code = code_of(s, li, skip[i], s->k);
         pos[skip[i]] = -2;

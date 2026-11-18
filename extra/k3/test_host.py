@@ -276,6 +276,31 @@ class TestStepIO(unittest.TestCase):
       self.step()
       self.check_tables()
 
+  def test_primary_tail_prefetch(self):
+    # Each row's prediction has disjoint, ranked experts for the next layer. Check both the number and the exact copy of each guess.
+    for width, big, tail in ((1, K, 2), (2, K, 2), (3, K, 2), (4, K, 0), (4, K, 2), (4, K, 10), (8, K, 2), (4, 2, 2)):
+      with self.subTest(width=width, big=big, tail=tail):
+        self.tearDown()
+        self.drives.join()
+        self.setUp(slots=3 * L * E, T=width, spans=(1, 1), held=(range(1, L),))
+        self.assertEqual(self.io.pf_tail, 0)
+        self.io.pf, self.io.pf_tail, self.io.big, self.io.tau = 5, tail, big, 0
+        self.bias[1].fill(0)
+        scores = np.full((width, E), -16, dtype=np.float32)
+        expected = []
+        for row in range(width):
+          experts = np.arange(row * K, (row + 1) * K)
+          scores[row, experts] = np.arange(K, 0, -1)
+          budget = min(tail, self.io.pf) if row >= 2 and big == K and tail else self.io.pf
+          expected.extend(E + int(expert) + (L * E if rank >= big else 0) for rank, expert in enumerate(experts[:budget]))
+        for gpu, buffers in enumerate(self.gbuf[0]):
+          buffers["scores"][1::ROWS] = np.split(scores, NGPU, axis=1)[gpu]
+        self.assertEqual(host_c().layer(ctypes.byref(self.io), 0), 0)
+        np.testing.assert_array_equal(np.flatnonzero(self.state["guess"]), sorted(expected))
+        self.assertEqual(self.io.guesses, len(expected))
+        codes = np.ascontiguousarray(expected, dtype=np.int64)
+        self.assertEqual(host_c().read_wait(ctypes.byref(self.io), len(codes), codes.ctypes.data), 0)
+
   def test_fill(self): # the experts tau skipped for not being cached are read: kept by the next step (same scores)
     self.io.tau, self.io.pf, self.io.fill = 0.2, 0, 4
     self.step()
