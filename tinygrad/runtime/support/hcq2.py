@@ -18,7 +18,7 @@ from tinygrad.engine.realize import get_call_arg_uops, get_call_name, get_call_o
 class HCQInfo:
   device:tuple[str, ...]
 
-  kernels:tuple[tuple, ...] = () # (device, name, estimates, timestamp slots, profile key, input slots of the buffers, (outs, ins))
+  kernels:tuple[tuple, ...] = () # (device, name, estimates, timestamp slots, profile key, the position of its buffers in the args, (outs, ins))
   estimates:Estimates = Estimates()
 
   slots:tuple[tuple[str, int], ...] = () # per device, the position of its batch slots in the args
@@ -338,13 +338,15 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   estimates = [estimate_uop(c) for c, _, _ in ctx.batch]
   stamps = [tuple(2 * s + 1 for s in ctx.stamps(d, tag)) for tag, (_, d, _) in enumerate(ctx.batch)]
   profile_keys = [c.body.key if c.body.op is Ops.PROGRAM else None for c, _, _ in ctx.batch]
-  args = [[unwrap_lane(c.src[1 + g])[:2] for g in getattr(c.body.arg, "globals", range(len(c.src) - 1))] for c, _, _ in ctx.batch]
-  bufs = [tuple(b.arg.slot for b, _ in a) if all(b.op in (Ops.PARAM, Ops.EXTERN) and lane is None for b, lane in a) else () for a in args]
-  kerns = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys, bufs, [get_call_outs_ins(c) for c, _, _ in ctx.batch]))
   slots = ctx.slots if ctx.profile else {} # profiling reads them
+  args = [[unwrap_lane(c.src[1 + g])[:2] for g in getattr(c.body.arg, "globals", range(len(c.src) - 1))] for c, _, _ in ctx.batch]
+  call_bufs = [[b for b, _ in a] if ctx.profile and all(lane is None for _, lane in a) else [] for a in args]
+  pos = {b: i for i, b in enumerate(dedup([*slots.values(), *flatten(call_bufs)]))}
+  bufs = [tuple(pos[b] for b in cb) for cb in call_bufs]
+  kerns = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys, bufs, [get_call_outs_ins(c) for c, _, _ in ctx.batch]))
   info = HCQInfo(tuple(ctx.queues), skip_wait=skip_wait, kernels=kerns, slots=tuple((d, i) for i, d in enumerate(slots)),
                  estimates=Estimates(*[sum(x*n for x, n in Counter(t).items()) for t in zip(*[vars(e).values() for e in estimates])]).simplify())
-  return sink.call(*slots.values(), hcq=info)
+  return sink.call(*pos, hcq=info)
 
 @rewrite_group(new_ctx=False)
 def sched_batches(l:UOp, profile:bool) -> UOp:
@@ -589,6 +591,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache:bool=
 def hcq_link(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:
   linked = graph_rewrite(linear, Compiled.pm_link, walk=True, name="link programs") if Compiled.pm_link.patterns else linear
   ctx = LinkCtx(input_uops or [])
+  if len(set(ctx.inputs)) != len(ctx.inputs): raise RuntimeError("EXTERNs must not share storage")
   linked = graph_rewrite(linked, pm_resolve_link+Compiled.pm_link, ctx=ctx, walk=True, name="link")
   if ctx.refs: linked = linked.replace(src=(linked.src[0].after(*dedup(ctx.refs)), *linked.src[1:])) # attach refs to linear
   return linked

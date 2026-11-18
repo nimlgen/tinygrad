@@ -10,7 +10,7 @@ from tinygrad.helpers import cpu_profile, suppress_finalizing, disable_gc, VIZ, 
 from tinygrad.uop.ops import UOp, Ops, sint, Variable, ConstLike, PatternMatcher, UPat, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
 from tinygrad.mixin.rand import RandMixin
 from tinygrad.codegen import create_linear, contiguous_mops_to_view
-from tinygrad.engine.realize import run_linear, capturing
+from tinygrad.engine.realize import run_linear, link_linear, capturing
 from tinygrad.device import Buffer
 
 # **** export: storage becomes EXTERN(slot), bound Variables lose their value and ALLOCs get canonical slots. ctx.externs is what's mapped back
@@ -41,25 +41,16 @@ pm_export: PatternMatcher = PatternMatcher([
    c.replace(src=(graph_rewrite(c.body, pm_export, ctx=ExportCtx(ctx.externs), bottom_up=True, name="export call body"),)+c.src[1:])),
 ])
 
-def bind_alloc(b:UOp) -> UOp:
-  if b.device is None: raise RuntimeError("global storage needs a device, give the ALLOC one")
-  return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
-
-# EXTERNs map back to their storage, bound Variables map back to the Variable, its value is in var_vals
-def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp:
+# bound Variables map back to the Variable, its value is in var_vals. storage stays EXTERN, it's bound at link
+def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
   if e.arg.slot >= len(ctx) or as_extern(x:=ctx[e.arg.slot], e.arg.slot) is not e:
     got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
     raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
-  return x.unbound() if x.is_variable else x
+  return x.unbound() if x.is_variable else None
 
-pm_map_back = PatternMatcher([
-  (UPat(Ops.EXTERN, name="e"), map_back_extern),
-  # global ALLOCs are bound to fresh BUFFERs for this invocation
-  (UPat(Ops.ALLOC, name="b"), lambda b: bind_alloc(b) if b.addrspace is AddrSpace.GLOBAL else None),
-])
+pm_map_back = PatternMatcher([(UPat(Ops.EXTERN, name="e"), map_back_extern)])
 
 def map_back(linear:UOp, externs:tuple[UOp, ...]) -> tuple[UOp, dict[str, int]]:
-  # the EXTERNs become the storage and the bound Variables of this invocation, ALLOCs get fresh storage
   linear = graph_rewrite(linear, pm_map_back, ctx=externs, walk=True, enter_calls=True, name="map back")
   # the values of the bound Variables the linear uses
   used_vars = set().union(*[{v.expr for v in si.src[0].variables()} for si in linear.src])
@@ -274,7 +265,8 @@ class Tensor(RandMixin):
   def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
     """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
     fn, externs = self.export(*lst)
-    return map_back(create_linear(fn), externs)
+    linear, var_vals = map_back(create_linear(fn), externs)
+    return link_linear(linear, list(externs)), var_vals
 
   def schedule_linear(self, *lst:Tensor) -> UOp:
     """Creates the schedule needed to realize these Tensor(s)."""
@@ -287,8 +279,8 @@ class Tensor(RandMixin):
     """Runs an exported function compiled to a LINEAR, its EXTERNs are the externs from `Tensor.export`."""
     linear, var_vals = map_back(linear, externs)
     # a capturing jit runs its captured linears later
-    if capturing and CAPTURING: capturing[0].add_linear(linear, var_vals)
-    else: run_linear(linear, var_vals, update_stats=do_update_stats)
+    if capturing and CAPTURING: capturing[0].add_linear(link_linear(linear, list(externs)), var_vals)
+    else: run_linear(linear, var_vals, input_uops=externs, update_stats=do_update_stats)
 
   @disable_gc()
   def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:
