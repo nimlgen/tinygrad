@@ -51,7 +51,7 @@ class Engine:
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
                short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0),
-               window_forecast:bool=False):
+               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
