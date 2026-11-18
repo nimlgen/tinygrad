@@ -40,16 +40,16 @@ pm_export: PatternMatcher = PatternMatcher([
 ])
 
 # bound Variables map back to the Variable, its value is in var_vals. storage stays EXTERN, it's bound at link
-def map_back_vars(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
+def map_back_var(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
   if e.arg.slot >= len(ctx) or (x:=ctx[e.arg.slot]).as_extern(e.arg.slot) is not e:
     got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
     raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
   return x.unbound() if x.is_variable else None
 
-pm_map_back = PatternMatcher([(UPat(Ops.EXTERN, name="e"), map_back_vars)])
+pm_map_back_vars = PatternMatcher([(UPat(Ops.EXTERN, name="e"), map_back_var)])
 
-def map_back(linear:UOp, externs:tuple[UOp, ...]) -> tuple[UOp, dict[str, int]]:
-  linear = graph_rewrite(linear, pm_map_back, ctx=externs, walk=True, enter_calls=True, name="map back")
+def map_back_vars(linear:UOp, externs:tuple[UOp, ...]) -> tuple[UOp, dict[str, int]]:
+  linear = graph_rewrite(linear, pm_map_back_vars, ctx=externs, walk=True, enter_calls=True, name="map back vars")
   # the values of the bound Variables the linear uses
   used_vars = set().union(*[{v.expr for v in si.src[0].variables()} for si in linear.src])
   var_vals: dict[str, int] = {}
@@ -263,7 +263,7 @@ class Tensor(RandMixin):
   def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
     """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
     fn, externs = self.export(*lst)
-    linear, var_vals = map_back(create_linear(fn), externs)
+    linear, var_vals = map_back_vars(create_linear(fn), externs)
     return link_linear(linear, externs), var_vals
 
   def schedule_linear(self, *lst:Tensor) -> UOp:
@@ -275,7 +275,7 @@ class Tensor(RandMixin):
   @staticmethod
   def run(linear:UOp, externs:tuple[UOp, ...], do_update_stats=True) -> None:
     """Runs an exported function compiled to a LINEAR, its EXTERNs are the externs from `Tensor.export`."""
-    linear, var_vals = map_back(linear, externs)
+    linear, var_vals = map_back_vars(linear, externs)
     # a capturing jit runs its captured linears later
     if capturing and CAPTURING: capturing[0].add_linear(linear, externs, var_vals)
     else: run_linear(linear, var_vals, externs=externs, update_stats=do_update_stats)

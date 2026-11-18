@@ -335,12 +335,13 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   slots = ctx.slots if ctx.profile else {} # profiling reads them
   args = [[unwrap_lane(c.src[1 + g])[:2] for g in getattr(c.body.arg, "globals", range(len(c.src) - 1))] for c, _, _ in ctx.batch]
   call_bufs = [[b for b, _ in a] if ctx.profile and all(lane is None for _, lane in a) else [] for a in args]
-  pos = {b: i for i, b in enumerate(dedup([*slots.values(), *flatten(call_bufs)]))}
-  bufs = [tuple(pos[b] for b in cb) for cb in call_bufs]
+  batch_args = dedup([*slots.values(), *flatten(call_bufs)])
+  arg_pos = {b: i for i, b in enumerate(batch_args)}
+  bufs = [tuple(arg_pos[b] for b in cb) for cb in call_bufs]
   kerns = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys, bufs, [get_call_outs_ins(c) for c, _, _ in ctx.batch]))
   info = HCQInfo(tuple(ctx.queues), skip_wait=skip_wait, kernels=kerns, slots=tuple((d, i) for i, d in enumerate(slots)),
                  estimates=Estimates(*[sum(x*n for x, n in Counter(t).items()) for t in zip(*[vars(e).values() for e in estimates])]).simplify())
-  return sink.call(*pos, hcq=info)
+  return sink.call(*batch_args, hcq=info)
 
 @rewrite_group(new_ctx=False)
 def sched_batches(l:UOp, profile:bool) -> UOp:
