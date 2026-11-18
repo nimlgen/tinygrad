@@ -14,6 +14,7 @@ from tinygrad.helpers import round_up
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
+from extra.k3.host import IoT
 from extra.k3.draft import Eagle3, DSpark, MTP
 from extra.k3.eval import window_evaluate, window_dump
 
@@ -323,7 +324,7 @@ class TestEngine(unittest.TestCase):
     eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
                           draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0,
                           counters=lambda: np.zeros(15), jits={1: None, 2: None})
-    eng.steps = lambda *a: Engine.steps(eng, *a)  # type: ignore[arg-type]
+    eng.steps = lambda *a, **kw: Engine.steps(eng, *a, **kw)  # type: ignore[arg-type]
     self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
     self.assertEqual(seen, [[6, 7], [8, 3]])
 
@@ -535,6 +536,101 @@ class TestEngine(unittest.TestCase):
     take(X + [6, 8])
     self.assertEqual(self.eng.get_start_pos(X + [2, 4]), len(X))
     self.assertEqual(take(X + [2, 4]), want)
+
+class TestPrefillPrior(unittest.TestCase):
+  def engine(self, enabled=True) -> Engine:
+    eng = Engine.__new__(Engine)
+    eng.prefill_prior = enabled
+    eng.io = IoT(copies=2, layers=2, decay=.5)
+    eng.state = {"freq": np.zeros(12, dtype=np.float32)}
+    eng.W, eng.chunk, eng.short_window, eng.short_engine = 8, 4, 4, None
+    eng.session, eng.B, eng.v_at = None, 8, UOp.variable("at", 0, 24)
+    eng.tokens, eng.draft, eng.verified = 1, None, np.zeros(3, int)
+    eng.jits = {1: None}
+    eng.model = SimpleNamespace(max_context=32, _cached_tokens=[], _saved=[], fork=lambda tokens, start, step: start, save=lambda tokens: None)
+    eng.model.get_start_pos = lambda tokens: sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, eng.model._cached_tokens)))
+    return eng
+
+  def test_caps_joint_layer_frequency(self):
+    eng = self.engine()
+    freq = eng.state["freq"].reshape(2, 2, 3)
+    freq[:] = [[[20, 30, 50], [0, 1, 0]], [[80, 10, 10], [0, 0, 2]]]
+    original = freq.copy()
+    eng.cap_prefill_prior()
+    np.testing.assert_array_equal(freq[:, 0], original[:, 0] * np.float32(.2))
+    np.testing.assert_array_equal(freq[:, 1], original[:, 1])
+    eng.io.decay = 1
+    freq[:] = original
+    eng.cap_prefill_prior()
+    np.testing.assert_array_equal(freq, original)
+
+  def test_caps_once_after_fork_and_compact_window(self):
+    eng = self.engine()
+    seen = []
+    def window(toks, at, given, label="full"):
+      seen.append((label, at, len(toks)))
+      eng.state["freq"][:] += 20
+    def step(toks, at, given):
+      seen.append(("step", at, float(eng.state["freq"].reshape(2, 2, 3)[:, 0].sum())))
+      return [7], [], None
+    eng.model.fork = lambda *args: 4
+    with patch.multiple(eng, window=window, step=step, pieces=lambda: 1, steps_faster=lambda n: False, counters=lambda: np.zeros(15)), \
+         patch.object(eng, "cap_prefill_prior", wraps=eng.cap_prefill_prior) as cap:
+      eng.short_engine = SimpleNamespace(window=lambda *args: window(*args, label="compact"), chunk=2)
+      eng.window_big, eng.window_copies = 0, False
+      output = eng.generate(list(range(8)))
+      self.assertEqual(next(output), 7)
+      output.close()
+      self.assertEqual([event[:2] for event in seen], [("full", 0), ("compact", 4), ("step", 7)])
+      self.assertEqual([event[2] for event in seen[:2]], [4, 3])
+      self.assertAlmostEqual(seen[2][2], 40, places=4)
+      cap.assert_called_once()
+
+  def test_caps_at_first_output_batch_after_step_only_tail(self):
+    eng = self.engine()
+    eng.state["freq"][:] = 20
+    eng.model.fork = lambda *args: 4
+    eng.jits = {1: None, 2: None}
+    steps = []
+    def step(toks, at, given):
+      steps.append((at, len(toks), float(eng.state["freq"].reshape(2, 2, 3)[:, 0].sum())))
+      return [7] * len(toks), [], None
+    with patch.multiple(eng, window=lambda *a: None, step=step, pieces=lambda: 1, steps_faster=lambda n: n < 4,
+                        counters=lambda: np.zeros(15)):
+      output = eng.generate(list(range(7)))
+      self.assertEqual(next(output), 7)
+      output.close()
+    self.assertEqual(steps[:1], [(4, 2, 120)])
+    self.assertEqual(steps[1][:2], (6, 1))
+    self.assertAlmostEqual(steps[1][2], 40, places=4)
+
+  def test_skips_steps_only_warm_reuse_and_restore(self):
+    eng = self.engine()
+    eng.state["freq"][:] = 100
+    kept = list(range(8))
+    eng.model._cached_tokens = [99, 98]
+    eng.session = (kept, 0, [])
+    eng.keep_jits = [None, lambda at: None]
+    with patch.multiple(eng, step=lambda *a: ([7], [], None), pieces=lambda: 1, steps_faster=lambda n: True, counters=lambda: np.zeros(15)), \
+         patch.object(eng, "cap_prefill_prior", wraps=eng.cap_prefill_prior) as cap:
+      for prompt in (kept + [8], kept + [8, 9, 10]):
+        output = eng.generate(prompt)
+        self.assertEqual(next(output), 7)
+        output.close()
+        self.assertIsNone(eng.session)
+      cap.assert_not_called()
+      np.testing.assert_array_equal(eng.state["freq"], np.full(12, 100, dtype=np.float32))
+
+  def test_disabled_with_actual_window(self):
+    eng = self.engine(False)
+    eng.state["freq"][:] = 100
+    with patch.multiple(eng, window=lambda *a: None, step=lambda *a: ([7], [], None), pieces=lambda: 1, steps_faster=lambda n: False,
+                        counters=lambda: np.zeros(15)), patch.object(eng, "cap_prefill_prior", wraps=eng.cap_prefill_prior) as cap:
+      output = eng.generate([2, 3, 4])
+      self.assertEqual(next(output), 7)
+      output.close()
+      cap.assert_not_called()
+
 
 GLM = TransformerConfig(num_blocks=2, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
   rope_theta=10000.0, rope_dim=8, v_head_dim=16, max_context=16, num_experts=E, num_experts_per_tok=K, expert_gating_func=ExpertGating.SIGMOID,

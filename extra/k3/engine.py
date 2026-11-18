@@ -24,7 +24,8 @@ from extra.k3 import persist
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
 # routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: next-layer guesses per row. PREFETCH_TAIL: lower that cap
 # on rows 2 onward when all experts use their primary copy (zero keeps PREFETCH). SLOTS: on a gpu (default: what's free but SPARE bytes).
-# BIG: a token's experts of a rank under it read in the store's first copy (of copies: host.py)
+# BIG: a token's experts of a rank under it read in the store's first copy (of copies: host.py).
+# PREFILL_PRIOR: after window prefill, cap the total expert frequency per layer at 20 / (1 - decay) before decoding (zero keeps it).
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 PREFETCH_TAIL = getenv("PREFETCH_TAIL", 0)
 BIG = getenv("BIG", 2)
@@ -53,7 +54,7 @@ class Engine:
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
                short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0),
-               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0))):
+               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -62,6 +63,7 @@ class Engine:
     the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
     an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
+    self.prefill_prior = prefill_prior
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
@@ -1110,11 +1112,21 @@ class Engine:
       pos += n
     return pos
 
-  def steps(self, tokens:list[int], pos:int, end:int) -> tuple[list[int], list[int], np.ndarray|None]:
+  def cap_prefill_prior(self):
+    """Keep each layer's expert/copy proportions while limiting the weight of its prefill history."""
+    if self.io.decay >= 1: return
+    freq = self.state["freq"].reshape(self.io.copies, self.io.layers, -1)
+    total = freq.sum(axis=(0, 2))
+    factor = np.minimum(1, (20 / (1 - self.io.decay)) / np.maximum(total, 1))
+    freq *= factor[None, :, None]
+
+  def steps(self, tokens:list[int], pos:int, end:int, *, cap_prior:bool=False) -> tuple[list[int], list[int], np.ndarray|None]:
     """the tokens from pos to end in steps of the most of them there's a graph of (each given the token after it), the last step's outputs"""
     out:tuple[list[int], list[int], np.ndarray|None] = ([], [], None)
     while pos < end:
-      out = self.step(tokens[pos:pos + (T:=max(t for t in self.jits if t <= end - pos))], pos, tokens[pos + 1:pos + 1 + T])
+      T = max(t for t in self.jits if t <= end - pos)
+      if cap_prior and pos + T == end: self.cap_prefill_prior()
+      out = self.step(tokens[pos:pos + T], pos, tokens[pos + 1:pos + 1 + T])
       pos += T
     return out
 
@@ -1124,10 +1136,14 @@ class Engine:
     wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
+    fork_prefilled = start
     if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
-      self.steps(tokens, self.prefill(tokens[:fork + 1], start), fork)
+      fork_prefilled = self.prefill(tokens[:fork + 1], start)
+      self.steps(tokens, fork_prefilled, fork)
       self.model.save(tokens[:fork])
-    (*_, t), g, score = self.steps(tokens, self.prefill(tokens, fork), len(tokens))
+    prefilled = self.prefill(tokens, fork)
+    cap_prior = (fork_prefilled > start or prefilled > fork) and self.prefill_prior
+    (*_, t), g, score = self.steps(tokens, prefilled, len(tokens), cap_prior=cap_prior)
     self.model.save(tokens)
     row, c0, v0, widths = 0, self.counters(), self.verified.copy(), collections.Counter()
     try:
