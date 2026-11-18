@@ -4,7 +4,7 @@
 # host routes, reads the missing experts from the drives into each gpu's pool of slots and gives the gpus the slots and weights in two parts
 # (host.py's step_io, in c alongside the graph), the gpus wait for each (host_wait) and run their units of the experts over the pool
 # DEV=AMD:HIP PYTHONPATH=. python3 extra/k3/engine.py trunk.gguf "prompt"
-import collections, ctypes, functools, itertools, math, os, signal, sys, time
+import collections, copy, ctypes, functools, itertools, math, os, signal, sys, time
 import numpy as np
 from typing import Callable, Iterator, cast
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
@@ -34,18 +34,30 @@ SHORT_CHUNK = 256
 SESSION = 4096  # (a kept session's rows a short request that diverges from it early may write)
 TILES = (16, 64)  # (a window's tiles of an expert's rows: the first that holds its rows an expert on average)
 
+class _WindowArenas(dict):
+  def __init__(self, pool_key:tuple, room:UOp):
+    super().__init__({pool_key: room})
+    self.pool_key = pool_key
+
+  def __setitem__(self, key, value):
+    if key == self.pool_key: raise MemoryError("short window needs more than the shared scratch")
+    super().__setitem__(key, value)
+
+
 class Engine:
   bank:DType = dtypes.half  # (a window's residual streams: in half, the attends read half the bytes)
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0)):
+               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
+               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0)):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
     a scored draft's verify steps of fewer tokens too (their graphs captured), each step's the one its guesses' scores expect most tokens a
     second of. source: the model's gguf (a start's graphs are kept for the next start of the same code, model and config: persist.py). copies:
-    the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG)"""
+    the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
+    an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
@@ -53,6 +65,11 @@ class Engine:
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
     self.window_copies, self.window_big = window_copies, window_big
+    self.short_window, self.short_engine = short_window, cast(Engine|None, None)
+    if short_window:
+      short_chunk = min(SHORT_CHUNK, short_window // 2)
+      if not (0 < short_window < window and 0 < short_chunk < chunk and short_window % short_chunk == short_chunk % len(self.devs) == 0):
+        raise ValueError("ADAPTIVE_SHORT_WINDOW needs a smaller window and an evenly sharded smaller chunk")
     self.window_hot:np.ndarray|None = None
     if not 0 <= window_big <= m["n_experts"]: raise ValueError("WINDOW_BIG exceeds the expert count or is negative")
     self.ms = [m, *copies]
@@ -316,7 +333,7 @@ class Engine:
   # the window's tokens in a bank, a layer adds to its last one. the graphs are a kind's (blocks of the same buffers): a block's buffers its
   # args, the first of the kind's block captures it
 
-  def window_init(self, W:int):
+  def window_init(self, W:int, arenas:dict|None=None):
     """the window's variables and graphs (captured once its state is lent from the pool: window_capture), its state's bytes"""
     m = self.model
     self.chunk_vars = {SHORT_CHUNK: UOp.variable("short_live", 1, SHORT_CHUNK)} if self.chunk > SHORT_CHUNK else {}
@@ -328,7 +345,7 @@ class Engine:
     self.v_c0, self.v_wlive = UOp.variable("c0", 0, W - self.chunk), UOp.variable("wlive", 1, W)
     self.v_n, self.v_s = UOp.variable("streams", 1, S), UOp.variable("stream", 0, S - 1)
     self.v_tap = UOp.variable("tap", 0, self.piece_shapes()["taps"][0][3] - 1)
-    self.arenas:dict = {}  # (the window's graphs never run at the same time: one arena for their scratch)
+    self.arenas:dict = {} if arenas is None else arenas  # (the window's graphs never run at the same time)
     self.wjit = functools.partial(TinyJit, arenas=self.arenas, capture_first=True)
     self.tap_jit, self.mix_jit = self.wjit(self.tap), self.wjit(self.tap_mix)
     self.fill_jit = self.wjit(self.fill) if self.draft else None
@@ -361,6 +378,39 @@ class Engine:
     self.arena, st, sl = (first, first + self.slots_of(used)), self.state, slice(first, first + self.slots_of(used))
     self.drop(sl)
     st["mask"][sl] = 1
+
+  def capture_short_window(self):
+    """Capture an alternate window over the same pool and caches before serving the first prompt."""
+    for d in self.devs: Device[d].synchronize()
+    view = copy.copy(self)
+    view.short_window, view.short_engine = 0, None
+    view.chunk = min(SHORT_CHUNK, self.short_window // 2)
+    view.v_live = UOp.variable("short_window_live", 1, view.chunk)
+    # The persisted graph cache belongs to the full window. The alternate view captures its own graphs.
+    view.saved, view.names, view.source = {}, {}, ""
+    view.__dict__.pop("graph_key", None)
+    # Reject any growth of the pool's compute arena during graph lowering, before executing the dry graph.
+    start, stop = self.arena
+    room = (view.lend({"arena": (((stop - start) * view.part,), dtypes.int8)}, start)[0]["arena"].uop.base if stop > start else
+            UOp.new_buffer(view.devs, 0, dtypes.int8))
+    view.window_init(self.short_window, _WindowArenas((view.devs, 0), room))
+    view.tail = view.lent_from = view.slots - view.slots_of(view.window_bytes) - view.slots_of(view.piece_bytes)
+    assert view.tail >= self.tail
+    view.win = {**view.window_state(view.tail), **view.piece(view.slots - view.slots_of(view.piece_bytes))}
+    # Both windows grow and pin the same model cache through the main engine.
+    view.grow = self.grow  # type: ignore[method-assign]
+    tables = [(host, host.copy()) for b in self.bufs for i in (0, 2, 3) for host in b[i][1]]
+    # Dry execution writes at position zero. Preserve the warm engine's recurrent state as well as the host tables.
+    states = [(t, t.empty_like().assign(t)) for t in self.model._states()]
+    Tensor.realize(*(saved for _, saved in states))
+    try:
+      for host, _ in tables: host.fill(0)
+      view.window_capture()
+    finally:
+      Tensor.realize(*(t.assign(saved) for t, saved in states))
+      for d in self.devs: Device[d].synchronize()
+      for host, previous in tables: host[:] = previous
+    self.short_engine = view
 
   def window_capture(self):
     """the window's graphs captured on its lent state: every kind's on its first block (its buffers the args) on dry chunks at position 0 (the
@@ -789,6 +839,9 @@ class Engine:
     if not self.saved and self.source:
       persist.save(self, self.names, self.graphs(), self.fingerprints())
       self.stage("graphs kept for the next start")
+    if self.short_window and self.short_engine is None:
+      self.capture_short_window()
+      self.stage("short continuation window")
 
   def dry_steps(self):
     for T, jit in self.jits.items():
@@ -859,6 +912,7 @@ class Engine:
       if jit.fxn is not None: jit.reset()
     self.model._rollbacks.clear()
     self.model._copies.clear()
+    self.short_engine = None
     if self.W: self.window_lend()
     self.dry_steps()
 
@@ -965,9 +1019,12 @@ class Engine:
     end = len(tokens) - 1
     P = self.W * self.pieces()  # (a read window's most tokens)
     size = -(-(end - pos) // -(-(end - pos) // P)) if end > pos else P
-    while pos < end and pos + round_up(n:=min(size, end - pos), self.chunk) <= self.max_context:
-      if self.steps_faster(n): break
-      self.window(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
+    while pos < end:
+      n = min(size, end - pos)
+      view = self.short_engine if self.short_engine is not None and pos > 0 and n <= self.short_window else self
+      if pos + round_up(n, view.chunk) > self.max_context or self.steps_faster(n): break
+      if view is not self: view.window_big, view.window_copies = self.window_big, self.window_copies
+      view.window(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
       pos += n
     return pos
 

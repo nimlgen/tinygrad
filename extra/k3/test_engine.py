@@ -92,14 +92,15 @@ class TestEngine(unittest.TestCase):
     self.eng = self.engine(2 * E)
 
   def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=(),
-             source:str="") -> Engine:
+             source:str="", short_window:int=0) -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
     # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
     eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths, source=source)  # (96: the caches', the scratch's)
+                 widths=widths, source=source, short_window=short_window)  # (96: the caches', the scratch's)
+    if short_window: eng.capture_short_window()
     at = eng.arena[1]
     assert at <= 96
     pools = [(caches * (at * part) + b''.join(parts(self.weights, li, e, part)[g] for li in layers for e in range(E))).ljust(eng.slots * part,
@@ -173,6 +174,37 @@ class TestEngine(unittest.TestCase):
       self.eng.window(toks[:-1], 0, toks[1:])
       outs.append(self.eng.forward(Tensor([[toks[-1]]]), 6)[0].numpy())
     np.testing.assert_allclose(outs[1], outs[0], rtol=1e-3, atol=1e-3 * np.abs(outs[0]).max())
+
+  def test_adaptive_short_transition(self):
+    toks = [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7, 3, 5, 4, 9, 1]
+    out, state, keys = [], [], []
+    for short_window in (0, 4):
+      self.eng = eng = self.engine(2 * E, short_window=short_window)
+      self.stub()
+      keys.append(eng.graph_key)
+      large, small = eng.window, eng.short_engine
+      observed = []
+      def record(name, fn):
+        def window(toks, pos, given):
+          observed.append((name, pos, len(toks)))
+          return fn(toks, pos, given)
+        return window
+      eng.window = record("large", large)  # type: ignore[method-assign]
+      if small is not None:
+        self.assertIs(small.pool, eng.pool)
+        self.assertIs(small.state, eng.state)
+        small.window = record("small", small.window)  # type: ignore[method-assign]
+      with patch.object(eng, "steps_faster", return_value=False):
+        self.assertEqual(eng.prefill(toks[:6], 0), 5)
+        self.assertEqual(eng.prefill(toks[:9], 5), 8)
+        self.assertEqual(eng.prefill(toks, 8), 15)
+      self.assertEqual(observed, [("large", 0, 5), ("small" if short_window else "large", 5, 3), ("large", 8, 7)])
+      self.assertEqual(eng.grown, 16)
+      out.append(eng.forward(Tensor([[toks[-1]]]), 15)[0].numpy())
+      state.append([t.numpy() for t in eng.model._states()])
+    self.assertEqual(*keys)
+    np.testing.assert_allclose(out[1], out[0], rtol=1e-3, atol=1e-3)
+    for a, b in zip(*state): np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3)
 
   def test_window_evaluate(self):  # a completion teacher forced through windows (two) scored against its token steps' top 5: as them
     self.stub()
