@@ -175,6 +175,12 @@ class TestEngine(unittest.TestCase):
       outs.append(self.eng.forward(Tensor([[toks[-1]]]), 6)[0].numpy())
     np.testing.assert_allclose(outs[1], outs[0], rtol=1e-3, atol=1e-3 * np.abs(outs[0]).max())
 
+  def test_adaptive_capture_without_recurrent_state(self):
+    self.eng.short_window = 4
+    with patch.object(self.eng.model, "_states", return_value=[]):
+      self.eng.capture_short_window()
+    self.assertIsNotNone(self.eng.short_engine)
+
   def test_adaptive_short_transition(self):
     toks = [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7, 3, 5, 4, 9, 1]
     out, state, keys = [], [], []
