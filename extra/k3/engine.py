@@ -16,7 +16,7 @@ from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS
-from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
+from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
 from extra.k3 import persist
@@ -50,7 +50,8 @@ class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
-               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0)):
+               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0),
+               window_forecast:bool=False):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -64,7 +65,7 @@ class Engine:
     self.dump_taps = taps or []
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
-    self.window_copies, self.window_big = window_copies, window_big
+    self.window_copies, self.window_big, self.window_forecast = window_copies, window_big, window_forecast
     # Layer-major windows must keep the most recent indexer's selection for each query until its last consumer.
     self.index_roles:dict[FFNBlock, str] = {}
     idx = model.config.indexer
@@ -81,6 +82,8 @@ class Engine:
       short_chunk = min(SHORT_CHUNK, short_window // 2)
       if not (0 < short_window < window and 0 < short_chunk < chunk and short_window % short_chunk == short_chunk % len(self.devs) == 0):
         raise ValueError("ADAPTIVE_SHORT_WINDOW needs a smaller window and an evenly sharded smaller chunk")
+    if window_forecast and not window: raise ValueError("window forecast needs a window")
+    self.forecast_counts = host_tensor(self.devs, m["n_experts"], dtypes.uint32) if window_forecast else None
     self.window_hot:np.ndarray|None = None
     if not 0 <= window_big <= m["n_experts"]: raise ValueError("WINDOW_BIG exceeds the expert count or is negative")
     self.ms = [m, *copies]
@@ -378,6 +381,7 @@ class Engine:
     # (a window's routed experts in tiles of an expert's rows sized by its rows an expert: few tokens, 16 rows, else 64)
     self.routes = {t: (self.wjit(functools.partial(self.window_route, t)),
                        {ty: self.wjit(functools.partial(self.window_experts, t, ty)) for ty in dict.fromkeys(self.layer_copies)}) for t in TILES}
+    self.forecast_jit = self.wjit(self.forecast_route) if self.forecast_counts is not None else None
     self.start_jit = self.wjit(self.start)
 
   def window_lend(self):
@@ -398,7 +402,7 @@ class Engine:
     if (need:=self.arenas[key].max_numel()) > room.max_numel():
       raise MemoryError(f"the window's graphs' scratch {need / 1e6:.1f} MB past the pool's {room.max_numel() / 1e6:.1f} MB for it")
     jits = [j for _, j, _ in self.kinds.values()] + [j for r, e in self.routes.values() for j in (r, *e.values())] + \
-           [self.start_jit, self.tap_jit, self.mix_jit, self.fill_jit]
+           [self.start_jit, self.tap_jit, self.mix_jit, self.fill_jit, self.forecast_jit]
     used = max((sum(u.marg[0]) for j in jits if j is not None and j.captured is not None for u in j.captured._linear.toposort()
                 if u.op is Ops.SHRINK and u.src[0] is room), default=0)  # (a planned buffer: the arena's (start, bytes))
     self.arena, st, sl = (first, first + self.slots_of(used)), self.state, slice(first, first + self.slots_of(used))
@@ -443,11 +447,13 @@ class Engine:
     host's flags preset: slot 0), the routes and experts, the rest. their scratch: one arena (SPARE's)"""
     m, self.kinds = self.model, {}
     moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
-    for b, (name, fxn), cap in itertools.product(m.blk, (("attend", self.attend), ("post", self.post)), self.chunk_vars):
-      if name == "post" and b not in moe: continue
+    stages = [("attend", self.attend), ("post", self.post)]
+    if self.forecast_jit is not None: stages.append(("forecast", functools.partial(self.attend, forecast=True)))
+    for b, (name, fxn), cap in itertools.product(m.blk, stages, self.chunk_vars):
+      if name == "post" and b not in moe or name == "forecast" and (b not in moe or cap != min(self.chunk_vars)): continue
       jit, args, first, live = self.chunk_graph(name, b, fxn, cap)
       if first is not b: continue
-      vs = (self.v_pos.bind(0), live, self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name == "attend" else \
+      vs = (self.v_pos.bind(0), live, self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name != "post" else \
         (live, self.v_c0.bind(0), self.v_s.bind(0))
       self.graph(jit, *vs, *args)
     self.graph(self.start_jit, self.v_p0.bind(0))
@@ -457,6 +463,9 @@ class Engine:
 
   def dry(self, b:FFNBlock):  # (moe block b's route and experts in each tile size on a dry chunk)
     li = self.m["layers"].index(self.model.blk.index(b))
+    if self.forecast_jit is not None and li + 1 < len(self.types) and (target:=self.m["layers"][li + 1]) < len(self.model.blk):
+      self.graph(self.forecast_jit, self.v_wlive.bind(min(self.chunk, SHORT_CHUNK)), b.exp_probs_b["bias"],
+                 self.model.blk[target].exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
     for route, experts in self.routes.values():
       self.graph(route, self.v_wlive.bind(self.chunk), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
       self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
@@ -468,7 +477,8 @@ class Engine:
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
     return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "w": ((W, K), f32),
             "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
-            "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half)}
+            "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half),
+            **({"guess_logits": ((min(self.chunk, SHORT_CHUNK), E), f32)} if self.forecast_counts is not None else {})}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
     return {k: Tensor(t.uop.unshard(0)) if k in ("act", "down", "shared") else t for k, t in self.lend(self.window_shapes(), at)[0].items()}
@@ -531,7 +541,7 @@ class Engine:
 
   def chunk_graph(self, name:str, b:FFNBlock, fxn:Callable, n:int) -> tuple[Callable, list[Tensor], FFNBlock, UOp]:
     cap = next(c for c in self.chunk_vars if n <= c)
-    if name == "attend": name += self.index_roles.get(b, "")
+    if name in ("attend", "forecast"): name += self.index_roles.get(b, "")
     return (*self.kind(f"{name}{cap}", b, fxn), self.chunk_vars[cap].bind(n))
 
   def window_mask(self, b:FFNBlock, h:Tensor, pos:UOp, c0:UOp) -> Tensor|None:
@@ -545,7 +555,7 @@ class Engine:
       rows = rows.assign(mask[0].pad_to(rows.shape, value=-1))
     return rows[:h.shape[1]].unsqueeze(0)
 
-  def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_) -> Tensor:
+  def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_, forecast:bool=False) -> Tensor:
     """a chunk's live rows' attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a
     moe's parts before the routed experts into the window's buffers, a dense block's feed forward added to stream s. the rows symbolic: a
     kernel's work the live rows'"""
@@ -558,12 +568,16 @@ class Engine:
     x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
-    logits = logits.reshape(live, len(self.devs), 2, -1)[:, :, 0].reshape(live, -1).contiguous()
+    scores = logits.reshape(live, len(self.devs), 2, -1)
+    logits = scores[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["logits"], logits)]
     shared = self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)
-    return Tensor.realize(*[Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs],
-                          shared.assign(self.split(self.partials(lambda: b._shared(x))).cast(shared.dtype)))[0]
+    result = [Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs]
+    if forecast:
+      predicted = allgather_last(scores[:, :, 1].reshape(live, -1).contiguous().half()).float()
+      result.append(Tensor(self.win["guess_logits"].uop).assign(predicted.pad_to(self.win["guess_logits"].shape)))
+    return Tensor.realize(*result, shared.assign(self.split(self.partials(lambda: b._shared(x))).cast(shared.dtype)))[0]
 
   @staticmethod
   def new_stream(b:FFNBlock) -> bool: return hasattr(b, "attn_res_score") and b.attn_res_score.new_block
@@ -599,7 +613,10 @@ class Engine:
   def state_rows(self, tile:int) -> tuple[int, int]:  # (the state's rows, its tiles of tile rows: the largest tile size's)
     return (R:=max(map(self.rows, TILES))), R // tile
 
-  def window_route(self, tile:int, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
+  def forecast_route(self, live:UOp, bias:Tensor, next_bias:Tensor, tag:Tensor, part2:Tensor, *_) -> Tensor:
+    return self.window_route(TILES[0], live, bias, tag, part2, next_bias=next_bias)
+
+  def window_route(self, tile:int, live:UOp, bias:Tensor, tag:Tensor, part2:Tensor, *_, next_bias:Tensor|None=None) -> Tensor:
     """the gpus route the window's live tokens exactly (its tiles of tile rows of an expert), the expert counts to the host (part 2, then the
     tag)"""
     K, E = self.model.config.num_experts_per_tok, self.m["n_experts"]
@@ -608,7 +625,12 @@ class Engine:
     vals = {"w": w, "pos": pos, "entries": entries.pad((0, R - entries.shape[0]), value=-1), "tiles": tiles.pad((0, NT - tiles.shape[0]), value=-1)}
     kept = Tensor.realize(*(Tensor(self.win[k].uop)[:v.shape[0]].assign(v) for k, v in vals.items()))
     counted = Tensor(part2.uop)[1:1 + E].assign(counts.bitcast(dtypes.uint32))
-    tag = Tensor(tag.uop.after(counted.uop, kept.uop))
+    forecast = []
+    if next_bias is not None:
+      assert self.forecast_counts is not None
+      prediction = moe_counts(Tensor(self.win["guess_logits"].uop), next_bias, K, live)
+      forecast.append(Tensor(self.forecast_counts[0].uop).assign(prediction.bitcast(dtypes.uint32)).uop)
+    tag = Tensor(tag.uop.after(counted.uop, kept.uop, *forecast))
     return tag.assign(tag * 0 + 1).realize()
 
   def window_experts(self, tile:int, types:tuple[tuple[int, int]|None, ...], pool:Tensor, part1:Tensor, *_) -> Tensor:
@@ -775,15 +797,20 @@ class Engine:
       s = n - 1 + int(self.new_stream(b))
       for p0, T, bank in pieces:
         self.win.update(bank)
+        forecast = (self.forecast_jit if self.window_forecast and len(pieces) == 1 and T <= min(self.chunk, SHORT_CHUNK) and
+                    hasattr(b, "ffn_gate_inp") and i < self.m["layers"][moe - 1] else None)
         for c0, nlive in chunks(T):
-          jit, args, _, live = self.chunk_graph("attend", b, self.attend, nlive)
+          name, fxn = ("forecast", functools.partial(self.attend, forecast=True)) if forecast is not None else ("attend", self.attend)
+          jit, args, _, live = self.chunk_graph(name, b, fxn, nlive)
           self.graph(jit, self.v_pos.bind(pos + p0 + c0), live, self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
           self.pump()
         if hasattr(b, "ffn_gate_inp"):
           self.layer = li = self.m["layers"].index(i)
           route, experts = self.routes[next(t for t in TILES if T * K <= t * E or t == TILES[-1])]
           for t in self.bufs[li][0][1]: t[0] = 0  # (the tag: this piece's counts)
-          self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], Tensor(self.tags[li]), self.parts[1][li])
+          args = (Tensor(self.tags[li]), self.parts[1][li])
+          if forecast is None: self.graph(route, self.v_wlive.bind(T), b.exp_probs_b["bias"], *args)
+          else: self.graph(forecast, self.v_wlive.bind(T), b.exp_probs_b["bias"], self.model.blk[self.m["layers"][li + 1]].exp_probs_b["bias"], *args)
           counts = self.counted(li, T)
           used = np.flatnonzero(counts)
           codes = self.window_codes(li, np.union1d(used, ahead[li]) if li in ahead else used)
@@ -791,7 +818,13 @@ class Engine:
             guesses = np.arange(E)
             if T * K < E * TILES[0]:
               freq = self.state["freq"][(li + 1) * E:(li + 2) * E]
-              guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
+              if forecast is not None:
+                assert self.forecast_counts is not None
+                prediction = self.forecast_counts[1][0]
+                if prediction.sum() == T * K and prediction.max() <= T:
+                  guesses = np.lexsort((-freq, -prediction.astype(np.int32)))[:len(used)]
+                else: guesses = np.argsort(-freq, kind="stable")[:len(used)]
+              else: guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
               self.read(codes, codes, wait=False)
             self.read(self.window_codes(li + 1, guesses), codes, wait=False)
             ahead[li + 1] = guesses
@@ -907,6 +940,7 @@ class Engine:
             **({"chain": self.chain_jit} if self.chain_jit else {}), **{f"rollback{n}": j for n, j in m._rollbacks.items()},
             **{f"copy{i}{save}": j for (i, save), j in m._copies.items()},
             **({"start": self.start_jit, "tap": self.tap_jit, "mix": self.mix_jit, **({"fill": self.fill_jit} if self.fill_jit else {}),
+                **({"forecast": self.forecast_jit} if self.forecast_jit else {}),
                 **{f"route{t}": r for t, (r, _) in self.routes.items()},
                 **{f"experts{t}_" + "_".join(f"{ty[0]}_{ty[1]}" if ty else "x" for ty in tys): j for t, (_, e) in self.routes.items()
                    for tys, j in e.items()},

@@ -831,6 +831,25 @@ def _moe_route_tensors(logits:Tensor, bias:Tensor, k:int, tile:int, live:UOp|Non
   tiles = ((first.reshape(1, E) <= start) & (start < (first + padded).reshape(1, E))).where(Tensor.arange(E).reshape(1, E) + 1, 0).sum(-1) - 1
   return ok.reshape(T, k).where(w, 0.0), pos, entries, tiles.cast(dtypes.int32), counts
 
+def moe_counts(logits:Tensor, bias:Tensor, k:int, live:UOp) -> Tensor:
+  T, E = cast(tuple[int, int], logits.shape)
+  if amd_custom_kernels_supported(logits.device) and E % 32 == 0:
+    sel, _ = _moe_topk(logits, bias, k, live)
+  else:
+    sig = logits.float().sigmoid()
+    keys = sig + bias.float()
+    sel = keys.topk(k)[1]
+    valid = (Tensor.arange(T) < Tensor(live)) & (sig.gather(-1, sel).sum(-1) > 0) & ~keys.isnan().any(-1)
+    sel = valid.unsqueeze(-1).where(sel, -1)
+  return (sel.reshape(-1, 1) == Tensor.arange(E)).sum(0, dtype=dtypes.int32)
+
+def _moe_topk(logits:Tensor, bias:Tensor, k:int, live:UOp|None) -> tuple[Tensor, Tensor]:
+  T = logits.shape[0]
+  sel, w = Tensor.empty(T, k, dtype=dtypes.int32, device=logits.device), Tensor.empty(T, k, dtype=dtypes.float32, device=logits.device)
+  sel, w = Tensor.custom_kernel(sel, w, _carry(logits.float().contiguous(), *([] if live is None else [live])), bias.float().contiguous(),
+                                fxn=functools.partial(_route_topk_kernel, k=k, live=T if live is None else _unbind(live)))[:2]
+  return sel, w
+
 def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64, live:UOp|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
   """the tokens' (T, E) router logits routed exactly (route_topk) and sorted by expert into tiles of an expert's rows: their weights (T, k), pos
   (T*k): the row of token t's j-th expert (t*k + j, -1 past live), entries (R): a row's selection t*k + j (-1: padding), tiles (R/tile): a tile's
@@ -838,9 +857,7 @@ def moe_route(logits:Tensor, bias:Tensor, k:int, tile:int=64, live:UOp|None=None
   T, E = cast(tuple[int, int], logits.shape)
   N, R = T*k, round_up(T*k + (tile-1)*E, tile)
   if not amd_custom_kernels_supported(logits.device) or E % 32: return _moe_route_tensors(logits, bias, k, tile, live)
-  sel, w = Tensor.empty(T, k, dtype=dtypes.int32, device=logits.device), Tensor.empty(T, k, dtype=dtypes.float32, device=logits.device)
-  sel, w = Tensor.custom_kernel(sel, w, _carry(logits.float().contiguous(), *([] if live is None else [live])), bias.float().contiguous(),
-                                fxn=functools.partial(_route_topk_kernel, k=k, live=T if live is None else _unbind(live)))[:2]
+  sel, w = _moe_topk(logits, bias, k, live)
   counts, entries, tiles = Tensor.custom_kernel(*(Tensor.empty(n, dtype=dtypes.int32, device=logits.device) for n in (E, R, R // tile)),
                                                 fxn=_route_init_kernel)
   rank = Tensor.empty(N, dtype=dtypes.int32, device=logits.device)

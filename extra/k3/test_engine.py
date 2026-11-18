@@ -92,14 +92,14 @@ class TestEngine(unittest.TestCase):
     self.eng = self.engine(2 * E)
 
   def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=(),
-             source:str="", short_window:int=0) -> Engine:
+             source:str="", short_window:int=0, window_forecast:bool=False) -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
     # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
     eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths, source=source, short_window=short_window)  # (96: the caches', the scratch's)
+                 widths=widths, source=source, short_window=short_window, window_forecast=window_forecast)  # (96: the caches', the scratch's)
     if short_window: eng.capture_short_window()
     at = eng.arena[1]
     assert at <= 96
@@ -211,6 +211,30 @@ class TestEngine(unittest.TestCase):
     self.assertEqual(*keys)
     np.testing.assert_allclose(out[1], out[0], rtol=1e-3, atol=1e-3)
     for a, b in zip(*state): np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3)
+
+  def test_window_forecast(self):
+    sequence = [3, 4, 5, 6]
+    residuals = []
+    for forecast in (False, True):
+      eng = self.eng = self.engine(2 * E, window_forecast=forecast)
+      self.stub()
+      counted = eng.counted
+      predictions = []
+      def capture(li:int, live:int) -> np.ndarray:
+        counts = counted(li, live)
+        if forecast and li == 0:
+          assert eng.forecast_counts is not None
+          scores = eng.win["guess_logits"].numpy()[:live]
+          keys = 1 / (1 + np.exp(-scores)) + eng.bias[li + 1]
+          top = np.argsort(-keys, axis=-1, kind="stable")[:, :K]
+          predictions.append(np.bincount(top.ravel(), minlength=E))
+          for a in eng.forecast_counts[1]: np.testing.assert_array_equal(a, predictions[-1])
+        return counts
+      with patch.object(eng, "counted", capture):
+        eng.window(sequence[:-1], 0, sequence[1:])
+      self.assertEqual(len(predictions), int(forecast))
+      residuals.append(eng.in_order(Tensor(eng.win["bank"].uop), 0, len(sequence) - 1).numpy())
+    np.testing.assert_array_equal(*residuals)
 
   def test_window_evaluate(self):  # a completion teacher forced through windows (two) scored against its token steps' top 5: as them
     self.stub()
