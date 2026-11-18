@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, Device
-from tinygrad.llm.model import TransformerConfig, IndexerConfig, apply_rope, MLATransformerBlock, precompute_freqs_cis
+from tinygrad.llm.model import TransformerConfig, IndexerConfig, apply_rope, MLATransformerBlock, MTPBlock, precompute_freqs_cis
 from tinygrad.llm.hf import e4m3fn_to_fnuz
 from test.runtime.test_llm_quantized import fp8_reference
 
@@ -19,6 +19,23 @@ class TestMLA(unittest.TestCase):
       config = self._make_config(mla_nope=nope, q_lora_rank=16, indexer=indexer)
       (block:=MLATransformerBlock(config))._init_state(Tensor.empty(1, 1, config.dim))
       self.assertEqual(block.freqs_cis is not None, used)
+
+  def test_mtp_fill_cache(self):
+    idx = IndexerConfig(2, 8, 2, rope_dim=8)
+    for indexer, nope in ((None, True), (idx, False), (IndexerConfig(2, 8, 2, kpool=2), True)):
+      with self.subTest(indexer=indexer, nope=nope):
+        block = MTPBlock(self._make_config(q_lora_rank=16, indexer=indexer, mla_nope=nope))
+        x = Tensor.randn(1, 4, block.config.dim).realize()
+        block._init_state(x)
+        caches = [block.cache_k] + ([block.indexer.cache_kg] if block.indexer else [])
+        for cache in caches: cache.assign(-7).realize()
+        block._attention(x, (3,), block._indexer_mask(x, (3,), None)).realize()
+        expected = [cache.numpy().copy() for cache in caches]
+        for cache in caches: cache.assign(-7).realize()
+        block.fill_cache(x, 3).realize()
+        for cache, want in zip(caches, expected):
+          self.assertTrue((want != -7).any())
+          np.testing.assert_array_equal(cache.numpy(), want)
 
   def test_mla_attention_matches_naive(self):
     for interleave in (False, True):
