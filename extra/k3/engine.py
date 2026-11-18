@@ -9,7 +9,7 @@ import numpy as np
 from typing import Callable, Iterator, cast
 from tinygrad import Tensor, TinyJit, UOp, Device, dtypes, nn
 from tinygrad.dtype import DType
-from tinygrad.helpers import DEBUG, getenv, prod, round_up
+from tinygrad.helpers import DEBUG, getenv, prod, round_up, unwrap
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
@@ -65,6 +65,17 @@ class Engine:
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
     self.window_copies, self.window_big = window_copies, window_big
+    # Layer-major windows must keep the most recent indexer's selection for each query until its last consumer.
+    self.index_roles:dict[FFNBlock, str] = {}
+    idx = model.config.indexer
+    if window and idx is not None and model.max_context > idx.top_k and any(model.config.indexer_shared):
+      owner = None
+      for b in model.blk:
+        if getattr(b, "indexer", None) is not None: owner = b
+        elif owner is not None: self.index_roles[owner], self.index_roles[b] = "write", "read"
+      # Other indexers/backends return dense floating masks. Token-major steps already carry those exactly.
+      if self.index_roles and not (idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and amd_custom_kernels_supported(self.devs)):
+        window = short_window = 0
     self.short_window, self.short_engine = short_window, cast(Engine|None, None)
     if short_window:
       short_chunk = min(SHORT_CHUNK, short_window // 2)
@@ -466,10 +477,13 @@ class Engine:
     """a piece's: the bank of its W tokens' residual streams, the draft's inputs. a gpu's rows: its part of every chunk (1, 1, W/gpus, ...)"""
     c, W = self.model.config, self.W // len(self.devs)
     S = self.bank_streams or 1 + sum(map(self.new_stream, self.model.blk))
-    return {"bank": ((1, 1, W, S, c.dim), self.bank), "taps": ((1, 1, W, max(len(self.taps), 1), c.dim), dtypes.float)}
+    shapes:dict[str, tuple[tuple[int, ...], DType]] = {"bank": ((1, 1, W, S, c.dim), self.bank),
+                                                       "taps": ((1, 1, W, max(len(self.taps), 1), c.dim), dtypes.float)}
+    if self.index_roles: shapes["indices"] = ((self.W, unwrap(c.indexer).top_k), dtypes.int32)
+    return shapes
 
   def piece(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on: (1, gpus, W/gpus, ...) split on the gpus)
-    return {k: Tensor(t.uop.unshard(1)) for k, t in self.lend(self.piece_shapes(), at)[0].items()}
+    return {k: t if k == "indices" else Tensor(t.uop.unshard(1)) for k, t in self.lend(self.piece_shapes(), at)[0].items()}
 
   def own(self, t:Tensor, c0:UOp) -> Tensor:  # (the rows of the chunk at c0 of a piece's (1, gpus, W/gpus, ...): each gpu's own)
     n = self.chunk // len(self.devs)
@@ -517,7 +531,19 @@ class Engine:
 
   def chunk_graph(self, name:str, b:FFNBlock, fxn:Callable, n:int) -> tuple[Callable, list[Tensor], FFNBlock, UOp]:
     cap = next(c for c in self.chunk_vars if n <= c)
+    if name == "attend": name += self.index_roles.get(b, "")
     return (*self.kind(f"{name}{cap}", b, fxn), self.chunk_vars[cap].bind(n))
+
+  def window_mask(self, b:FFNBlock, h:Tensor, pos:UOp, c0:UOp) -> Tensor|None:
+    role = self.index_roles.get(b)
+    if role is None: return b._indexer_mask(h, (pos,), None)
+    # The selection is replicated on the peers, with positions absolute in the KV cache and rows local to this piece.
+    rows = Tensor(self.win["indices"].uop)[c0:c0+self.chunk]
+    if role == "write":
+      mask = unwrap(b._indexer_mask(h, (pos,), None))
+      assert mask.dtype == dtypes.int32
+      rows = rows.assign(mask[0].pad_to(rows.shape, value=-1))
+    return rows[:h.shape[1]].unsqueeze(0)
 
   def attend(self, b:FFNBlock, pos:UOp, live:UOp, c0:UOp, n:UOp, s:UOp, *_) -> Tensor:
     """a chunk's live rows' attention at c0 of the window (positions pos..) on its n streams, added to stream s, then its feed forward's mix: a
@@ -526,7 +552,7 @@ class Engine:
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
     h = self.whole(self.mix(getattr(b, "attn_res_score", None), bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live]
-    mask = b._indexer_mask(h, (pos,), None)
+    mask = self.window_mask(b, h, pos, c0)
     a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
     x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
@@ -707,7 +733,7 @@ class Engine:
     self.tok_np[:T], self.given_np[:T] = toks, given
     ps, st = self.slots_of(self.piece_bytes), self.state
     # (the pieces' states: the first the always lent one, the rest lent below the compute state's slots, their experts dropped)
-    banks = [{k: self.win[k] for k in ("bank", "taps")}] + [self.piece(self.tail - i * ps) for i in range(1, -(-T // W))]
+    banks = [{k: self.win[k] for k in self.piece_shapes()}] + [self.piece(self.tail - i * ps) for i in range(1, -(-T // W))]
     self.lent_from = self.tail - (len(banks) - 1) * ps
     assert self.lent_from >= self.arena[1] and not st["mask"][self.lent_from:self.tail].any(), "a piece over the caches or the scratch"
     self.drop(slice(self.lent_from, None), wait=True)

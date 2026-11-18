@@ -687,5 +687,33 @@ class TestMTP(unittest.TestCase):
       want.append(tok:=int(logits.numpy()[0, 0].argmax()))
     self.assertEqual(out, want)
 
+class TestSharedWindowIndices(unittest.TestCase):
+  def test_layer_major_indices(self):
+    class Block:
+      def __init__(self, offset): self.offset = offset
+      def _indexer_mask(self, h, pos, prev):
+        if self.offset is None: return prev
+        last = h[0, :, 0].int() - self.offset
+        return (last-2).stack(last, dim=-1).unsqueeze(0)
+    blocks = [Block(x) for x in (0, None, None, 1, None)]
+    eng = Engine.__new__(Engine)
+    eng.chunk, eng.index_roles = 4, dict(zip(blocks, ("write", "read", "read", "write", "read")))
+    # Two 8-row pieces with different contents, including two chunks and an irregular final chunk.
+    pieces = [Tensor.empty(8, 2, dtype=dtypes.int32).realize() for _ in range(2)]
+    values = Tensor.arange(32).float().square()
+    for i, b in enumerate(blocks):
+      for start, live in [(0, 4), (4, 4), (8, 3)]:
+        eng.win = {"indices": pieces[start//8]}
+        n = UOp.variable("test_live", 1, 4).bind(live)
+        c0 = UOp.variable("test_c0", 0, 4).bind(start%8)
+        h = Tensor.arange(5+start, 9+start)[:n].reshape(1, n, 1)
+        got = eng.window_mask(b, h, 5+start, c0)
+        want = None
+        for ref in blocks[:i+1]: want = ref._indexer_mask(h, (5+start,), want)
+        def attention(ix): return (values[ix] * ix.float().softmax(-1)).sum(-1)
+        np.testing.assert_equal(got.pad_to((1, 4, 2)).numpy(), want.pad_to((1, 4, 2)).numpy())
+        np.testing.assert_allclose(attention(got).pad_to((1, 4)).numpy(), attention(want).pad_to((1, 4)).numpy(), rtol=1e-6)
+    np.testing.assert_equal(pieces[1].numpy()[3], [-1, -1])
+
 if __name__ == "__main__":
   unittest.main()
