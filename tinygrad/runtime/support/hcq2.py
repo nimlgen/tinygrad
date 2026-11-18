@@ -203,7 +203,7 @@ def stage_copy(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if Device[device].has_copy_queue: return None
   out, inp = (UOp.param(i, dtypes.u8, b.nbytes(), device=device) for i, b in enumerate((dst, src)))
   ast = out.index(r:=UOp.range(src.nbytes(), 0, AxisType.WEAK)).store(inp.index(r).load()).end(r).sink(arg=KernelInfo())
-  return lower_and_compile(call.replace(src=(ast, *call.src[1:])))
+  return call.replace(src=(ast, *call.src[1:]))
 
 pm_insert_copy_staging = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), split_rdma),
@@ -571,18 +571,22 @@ pm_resolve_link = PatternMatcher([
 
 hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a buffer-free linear (uops are hash-consed) to its compiled form
 
-@rewrite_group(lambda linear,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
-def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache:bool=False) -> UOp:
-  if any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src): return linear # compiled already
+def is_compiled(linear:UOp) -> bool: return any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src)
 
-  if cache and input_uops is not None:
+def hcq_prep(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:
+  if is_compiled(linear): return linear
+  if input_uops is not None:
     slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
-  linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
-  if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
+  return graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
+
+@rewrite_group(lambda linear,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
+def hcq_compile(linear:UOp, profile:bool, cache:bool=False) -> UOp:
+  if is_compiled(linear): return linear
+  if cache and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_lower_call, walk=True, name="lower call")
   with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
-  if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
+  if cache and final_linear is not linear: hcq_compile_cache[key] = final_linear
   return final_linear
 
 @rewrite_group(lambda _,input_uops=None,ret=None: f"HCQ Link {pluralize('Kernel', len(ret.src))}")
