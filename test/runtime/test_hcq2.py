@@ -22,10 +22,10 @@ class TestHCQ2Schedule(unittest.TestCase):
     for jit in (False, True):
       with self.subTest(jit=jit):
         out, compiled, inputs = compiled_chain(2, jit=jit, device=Device.DEFAULT)
-        linked = link_linear(compiled, input_uops=inputs)
+        linked = link_linear(compiled, inputs)
         before = tuple(inputs)
-        for linear in (compiled, linked): self.assertIs(compile_linear(linear, input_uops=inputs, cache=not jit), linear)
-        self.assertIs(link_linear(linked, input_uops=inputs), linked)
+        for linear in (compiled, linked): self.assertIs(compile_linear(linear, cache=not jit), linear)
+        self.assertIs(link_linear(linked, inputs), linked)
         self.assertEqual(tuple(inputs), before)
         run_linear(linked, input_uops=inputs, jit=True, wait=True)
         self.assertEqual(out.tolist(), [4] * 4)

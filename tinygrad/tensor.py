@@ -20,12 +20,10 @@ class ExportCtx:
   externs: dict[UOp, UOp] = field(default_factory=dict)
   allocs: dict[UOp, UOp] = field(default_factory=dict)
 
-def as_extern(x:UOp, slot:int) -> UOp: return x.replace(op=Ops.EXTERN, arg=replace(x.arg, slot=slot, buffer=None, name=None, val=None))
-
 def to_extern(ctx:ExportCtx, x:UOp) -> UOp|None:
   # realized storage and bound Variables are runtime state
   if not (x.is_bound_var or (x.op is Ops.BUFFER and x.addrspace is AddrSpace.GLOBAL)): return None
-  return ctx.externs.setdefault(x, as_extern(x, len(ctx.externs)))
+  return ctx.externs.setdefault(x, x.as_extern(len(ctx.externs)))
 
 # ALLOCs get canonical scope-local id slots so structurally identical calls hash identically for the schedule cache
 # (fresh slots are all positive from the global counter; negative slots are already canonical)
@@ -43,7 +41,7 @@ pm_export: PatternMatcher = PatternMatcher([
 
 # bound Variables map back to the Variable, its value is in var_vals. storage stays EXTERN, it's bound at link
 def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp|None:
-  if e.arg.slot >= len(ctx) or as_extern(x:=ctx[e.arg.slot], e.arg.slot) is not e:
+  if e.arg.slot >= len(ctx) or (x:=ctx[e.arg.slot]).as_extern(e.arg.slot) is not e:
     got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
     raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
   return x.unbound() if x.is_variable else None
@@ -266,7 +264,7 @@ class Tensor(RandMixin):
     """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
     fn, externs = self.export(*lst)
     linear, var_vals = map_back(create_linear(fn), externs)
-    return link_linear(linear, list(externs)), var_vals
+    return link_linear(linear, externs), var_vals
 
   def schedule_linear(self, *lst:Tensor) -> UOp:
     """Creates the schedule needed to realize these Tensor(s)."""
@@ -279,8 +277,8 @@ class Tensor(RandMixin):
     """Runs an exported function compiled to a LINEAR, its EXTERNs are the externs from `Tensor.export`."""
     linear, var_vals = map_back(linear, externs)
     # a capturing jit runs its captured linears later
-    if capturing and CAPTURING: capturing[0].add_linear(link_linear(linear, list(externs)), var_vals)
-    else: run_linear(linear, var_vals, input_uops=externs, update_stats=do_update_stats)
+    if capturing and CAPTURING: capturing[0].add_linear(link_linear(linear, externs), var_vals)
+    else: run_linear(linear, var_vals, externs=externs, update_stats=do_update_stats)
 
   @disable_gc()
   def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:

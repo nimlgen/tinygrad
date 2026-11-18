@@ -250,21 +250,21 @@ pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat.custom_function("validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
 ])
 
-def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, profile:bool|None=None, cache=False) -> UOp:
+def compile_linear(linear:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=BEAM.value if beam is None else beam) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
   linear = lower_and_compile(linear)
-  linear = hcq_compile(linear, input_uops, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache)
+  linear = hcq_compile(linear, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache and not validate)
   return linear
 
-def link_linear(linear:UOp, input_uops:list[UOp]|None=None) -> UOp: return hcq_link(linear, input_uops=input_uops)
+def link_linear(linear:UOp, externs:Sequence[UOp]|None=None) -> UOp: return hcq_link(linear, externs)
 
-def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequence[UOp]=(), update_stats=True, jit=False, wait=False):
+def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequence[UOp]=(), externs:Sequence[UOp]|None=None,
+               update_stats=True, jit=False, wait=False):
   assert linear.op is Ops.LINEAR, f"run_linear calls on {linear.op}"
   if len(linear.src) == 0: return
-  inputs = list(input_uops)
-  if not jit: linear = link_linear(compile_linear(linear, validate=VALIDATE_WITH_CPU, input_uops=inputs, cache=True), input_uops=inputs)
-  ctx = ExecContext(var_vals or {}, tuple(inputs), update_stats, jit, wait or DEBUG>=2)
+  if not jit: linear = link_linear(compile_linear(linear, validate=VALIDATE_WITH_CPU, cache=externs is not None), externs)
+  ctx = ExecContext(var_vals or {}, tuple(input_uops), update_stats, jit, wait or DEBUG>=2)
   for call in linear.src: track_stats(ctx, call.without_after, perf_counter_us(), pm_exec.rewrite(call.without_after, ctx))
 
 def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None, clear_l2:bool=False) -> Iterator[float]:
