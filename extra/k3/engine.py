@@ -15,7 +15,7 @@ from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, ordered_expert_sum, ordered_expert_sum_supported
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
@@ -54,7 +54,8 @@ class Engine:
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
                short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0),
-               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0))):
+               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0)),
+               ordered_sum:bool=bool(getenv("ORDERED_EXPERT_SUM", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -63,7 +64,7 @@ class Engine:
     the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
     an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
-    self.prefill_prior = prefill_prior
+    self.prefill_prior, self.ordered_sum = prefill_prior, ordered_sum
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
@@ -316,7 +317,12 @@ class Engine:
     y1, w1 = self.experts(li, h[0], self.host(li, 0, scores), self.ks[0] * T)
     y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
     y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
-    return (partial_sum(self.heaviest_first([y1, y2], [w1, w2], T)) * self.model.config.routed_scaling_factor).unsqueeze(0)
+    if (self.ordered_sum and T == 4 and self.ks == (4, 4) and self.lat == 6144 and self.m["layers"][li] < len(self.model.blk)
+        and ordered_expert_sum_supported(y1.device)):
+      y = ordered_expert_sum(y1, y2, w1, w2)
+    else:
+      y = self.heaviest_first([y1, y2], [w1, w2], T)
+    return (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:

@@ -31,6 +31,76 @@ def _gfx_version(device:str|tuple[str, ...]|None) -> tuple[int, ...]:
   with Context(ALLOW_DEVICE_USAGE=1): return getattr(Device[unwrap(device)], "target")
 
 def _is_rdna4(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 12
+def ordered_expert_sum_supported(device:str|tuple[str, ...]|None) -> bool:
+  return amd_custom_kernels_supported(device) and _is_rdna4(device)
+
+_ORDERED_EXPERT_SUM = """
+#define WIDTH 4
+#define FEATURES 6144
+typedef unsigned long size_t;
+extern "C" __attribute__((device, const)) size_t __ockl_get_local_id(unsigned int);
+extern "C" __attribute__((device, const)) size_t __ockl_get_group_id(unsigned int);
+extern "C" __attribute__((device)) void __ockl_barrier(void);
+
+#pragma clang fp contract(off)
+extern "C" __attribute__((global)) __attribute__((amdgpu_flat_work_group_size(128,128)))
+void sorted_expert_sum(float* out, const float* first, const float* second, const float* w1, const float* w2) {
+  const int lane=__ockl_get_local_id(0);
+  const int token=__ockl_get_group_id(0);
+  const int c=128*__ockl_get_group_id(1)+lane;
+  __attribute__((shared)) int order[8];
+  __attribute__((shared)) float scale[8];
+  const int entry=lane;
+  if(entry<8) {
+    float weights[8];
+    #pragma unroll
+    for(int k=0;k<4;k++) {
+      weights[k]=w1[k*WIDTH+token];
+      weights[4+k]=w2[k*WIDTH+token];
+    }
+    int rank=0;
+    #pragma unroll
+    for(int k=0;k<8;k++) {
+      if(k!=entry) rank += weights[k]>weights[entry] || (k<entry && weights[k]==weights[entry]);
+    }
+    order[rank]=entry;
+    scale[rank]=weights[entry];
+  }
+  __builtin_amdgcn_s_barrier();
+  float sum=0.0f;
+  #pragma unroll
+  for(int k=0;k<8;k++) {
+    const int ent=order[k], at=((ent&3)*WIDTH+token)*FEATURES+c;
+    const float weighted=(ent<4 ? first[at] : second[at])*scale[k];
+    // The stock rank reduction sums the selected product with +0 from
+    // the other seven entries before adding it to the running sum.
+    sum += weighted+0.0f;
+  }
+  out[token*FEATURES+c]=sum;
+}
+"""
+
+@functools.cache
+def _ordered_expert_sum_kernel(out:UOp, first:UOp, second:UOp, w1:UOp, w2:UOp, *, device:str) -> UOp:
+  sink = UOp.sink(out.base, first.base, second.base, w1.base, w2.base, UOp.special(128, "lidx0"),
+                  UOp.special(4, "gidx0"), UOp.special(48, "gidx1"), arg=KernelInfo("sorted_expert_sum"))
+  with Context(ALLOW_DEVICE_USAGE=1): binary = Device[device].compiler.compile_cached(_ORDERED_EXPERT_SUM)
+  return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)),
+                             UOp(Ops.SOURCE, arg=_ORDERED_EXPERT_SUM), UOp(Ops.BINARY, arg=binary)))
+
+def ordered_expert_sum(first:Tensor, second:Tensor, w1:Tensor, w2:Tensor) -> Tensor:
+  """Combine eight finite route weights per token in descending order, breaking ties by release and table index."""
+  peers = first.shape[0]
+  assert first.shape == second.shape == (peers, 16, 6144) and first.uop.shard_shape[0] == second.uop.shard_shape[0] == 1
+  assert w1.shape == w2.shape == (16,) and w1.uop.axis is None and w2.uop.axis is None
+  assert all(t.dtype == dtypes.float32 for t in (first, second, w1, w2))
+  resolved = unwrap(first.device)
+  device = resolved if isinstance(resolved, str) else tuple(resolved)
+  out = Tensor.empty(peers, 4, 6144, device=device, dtype=dtypes.float32, axis=first.uop.axis)
+  return Tensor.custom_kernel(out, first.contiguous(), second.contiguous(), w1.contiguous(), w2.contiguous(),
+                              fxn=functools.partial(_ordered_expert_sum_kernel, device=device[0] if isinstance(device, tuple) else device))[0]
+
+
 def _is_cdna(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 9
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
