@@ -1177,6 +1177,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return ret.reshape(()) if not shape else ret.view_as(shape, axis)
   @staticmethod
   def extern(shape:tuple[int, ...], dtype:DType, device, name:str): return UOp.alloc(shape, dtype, 0, device=device, name=name).replace(op=Ops.EXTERN)
+  def as_extern(self, slot:int) -> UOp: return self.replace(op=Ops.EXTERN, arg=replace(self.arg, slot=slot, buffer=None, name=None, val=None))
   def alloc_like(self, slot:int|None=None, addrspace=AddrSpace.GLOBAL): return UOp.alloc(self.max_shard_shape, self.dtype, slot, addrspace)
 
   @staticmethod
@@ -1887,6 +1888,11 @@ def to_max_shape(shape:tuple[sint, ...]) -> tuple[int, ...]: return tuple(int(x.
 
 _substitute = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: ctx.get(x,None))])
 pm_resolve_params = PatternMatcher([(UPat(Ops.PARAM, name="p"), lambda ctx,p: ctx[p.arg.slot] if p.arg.slot >= 0 else None)])
+
+def bind_alloc(b:UOp) -> UOp:
+  if b.device is None: raise RuntimeError("global storage needs a device, give the ALLOC one")
+  return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
+
 # flatten LINEAR-in-LINEAR: any nested LINEAR child gets inlined into its parent's src
 pm_flatten_linear = PatternMatcher([
   (UPat(Ops.LINEAR, custom_early_reject={Ops.LINEAR}, name="lin"),

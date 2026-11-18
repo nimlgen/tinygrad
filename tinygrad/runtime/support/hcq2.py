@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, DEBUG, VIZ, ALL2ALL, PROFILE
 from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_RUNTIME_DEV, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc
-from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType
+from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType, bind_alloc
 from tinygrad.dtype import dtypes, AddrSpace, truncate
 from tinygrad.renderer import Estimates, TinyELF
 from tinygrad.runtime.support.c import Struct
@@ -165,7 +165,7 @@ def cstruct(struct_t:type[Struct], **fields:UOp|int) -> UOp:
 def replace_buffer(ctx:tuple[list[UOp], dict[UOp, int]], b:UOp) -> UOp:
   bufs, slots = ctx
   if slots.setdefault(b, len(bufs)) == len(bufs): bufs.append(b)
-  return b.replace(op=Ops.EXTERN, arg=replace(b.arg, slot=slots[b], buffer=None))
+  return b.as_extern(slots[b])
 pm_replace_buffers = PatternMatcher([(UPat(Ops.BUFFER, name="b"), lambda ctx, b: replace_buffer(ctx, b))])
 
 def unwrap_call(call:UOp) -> UOp|None:
@@ -523,7 +523,7 @@ Compiled.pm_link = PatternMatcher([])
 class LinkCtx: inputs:list[UOp]; refs:list[UOp] = field(default_factory=list) # noqa: E702
 
 def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp:
-  if b.arg.name is None: return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
+  if b.arg.name is None: return bind_alloc(b)
   dev, spec = Device[b.device], b.arg.spec or BufferSpec(cpu_access=True)
   r = Buffer(dev.device, max(b.max_numel(), 1) * b.dtype.itemsize, options=spec, preallocate=True)
   return UOp.from_buffer(r, b.dtype, HCQ_RUNTIME_DEV.device)

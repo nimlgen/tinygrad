@@ -8,6 +8,7 @@ from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, least_upper_dtyp
 from tinygrad.helpers import all_int, getenv, fetch, PROFILE, TracingKey, is_numpy_ndarray, prod
 from tinygrad.helpers import cpu_profile, suppress_finalizing, disable_gc, VIZ, CAPTURING, is_disk_device, canonicalize_device
 from tinygrad.uop.ops import UOp, Ops, sint, Variable, ConstLike, PatternMatcher, UPat, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
+from tinygrad.uop.ops import bind_alloc
 from tinygrad.mixin.rand import RandMixin
 from tinygrad.codegen import create_linear, contiguous_mops_to_view
 from tinygrad.engine.realize import run_linear, capturing
@@ -20,12 +21,10 @@ class ExportCtx:
   externs: dict[UOp, UOp] = field(default_factory=dict)
   allocs: dict[UOp, UOp] = field(default_factory=dict)
 
-def as_extern(x:UOp, slot:int) -> UOp: return x.replace(op=Ops.EXTERN, arg=replace(x.arg, slot=slot, buffer=None, name=None, val=None))
-
 def to_extern(ctx:ExportCtx, x:UOp) -> UOp|None:
   # realized storage and bound Variables are runtime state
   if not (x.is_bound_var or (x.op is Ops.BUFFER and x.addrspace is AddrSpace.GLOBAL)): return None
-  return ctx.externs.setdefault(x, as_extern(x, len(ctx.externs)))
+  return ctx.externs.setdefault(x, x.as_extern(len(ctx.externs)))
 
 # ALLOCs get canonical scope-local id slots so structurally identical calls hash identically for the schedule cache
 # (fresh slots are all positive from the global counter; negative slots are already canonical)
@@ -41,13 +40,9 @@ pm_export: PatternMatcher = PatternMatcher([
    c.replace(src=(graph_rewrite(c.body, pm_export, ctx=ExportCtx(ctx.externs), bottom_up=True, name="export call body"),)+c.src[1:])),
 ])
 
-def bind_alloc(b:UOp) -> UOp:
-  if b.device is None: raise RuntimeError("global storage needs a device, give the ALLOC one")
-  return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
-
 # EXTERNs map back to their storage, bound Variables map back to the Variable, its value is in var_vals
 def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp:
-  if e.arg.slot >= len(ctx) or as_extern(x:=ctx[e.arg.slot], e.arg.slot) is not e:
+  if e.arg.slot >= len(ctx) or (x:=ctx[e.arg.slot]).as_extern(e.arg.slot) is not e:
     got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
     raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
   return x.unbound() if x.is_variable else x
