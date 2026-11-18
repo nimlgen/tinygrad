@@ -797,14 +797,14 @@ def _lane_of(x:UOp, src:UOp) -> UOp:  # (x of lane src, a float)
 
 @functools.cache
 def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:float, rows:int|UOp) -> UOp:
-  """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D words of two halves) at its first
+  """out (B*T, H, V): query row b*T + t (at position start + t) attending to the cache's rows (B, 1, N, D halves) at its first
   start + t + 1 slots of idx[b, t] (or every position) at or before it (its keys first, as topk_indices has them), on the f16 tensor cores
   (RDNA4). a workgroup a row: its heads in tiles of 16 (the WMMA rows), a block of 16 keys at a time gathered into LDS (loaded into registers
   the block before). a tile's 4 waves each the scores of a quarter of D (summed through LDS), then each its online softmax of the block's
   scores and the values of a quarter of V"""
   start = _unbind(start)
   B, H, T, D = cast(tuple[int, int, int, int], q.shape)
-  N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]), cast(int, out.shape[2])
+  N, DW, V = cast(int, cache.shape[2]), cast(int, cache.shape[3]) // 2, cast(int, out.shape[2])
   K, RW = cast(int, idx[0].shape[2]) if idx else N, DW + 4  # (a row's words in LDS: the 16 rows of a fragment on different banks)
   tiles = -(-H // 16)
   assert tiles <= 2 and D == 2*DW and D % 64 == 0 and V % 128 == 0 and DW % (8*tiles) == 0
@@ -829,7 +829,9 @@ def _mla_wmma_kernel(out:UOp, q:UOp, cache:UOp, *idx:UOp, start:int|UOp, scale:f
     pos = idx[0][b, t, slot.minimum(K - 1)].load() if idx else slot
     ok = (slot < keys) & (pos <= start + t) & (pos >= 0)
     at = ok.where(pos, 0).minimum(N - 1)
-    return [ok.cast(dtypes.uint32)] + [v[j] for i in range(0, per, vec) for v in [_amd_load(cache[b, 0, at, wi*per + i], vec)] for j in range(vec)]
+    # Gather the selected cache halves directly, then pack their bits for LDS.
+    words = [_amd_load(cache[b, 0, at, 2*(wi*per + i)], 2*vec).bitcast(dtypes.uint32) for i in range(0, per, vec)]
+    return [ok.cast(dtypes.uint32)] + [w[j] for w in words for j in range(vec)]
   ahead = UOp.alloc((per + 1,), dtypes.uint32, addrspace=AddrSpace.REG)
   ahead = ahead.after(UOp.group(*(ahead[i].store(w) for i, w in enumerate(block_words(kb.const_like(0))))))
   cur = [ahead.after(kb)[i].load() for i in range(per + 1)]
@@ -878,7 +880,7 @@ def mla_wmma_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
   out = Tensor.empty(B*N, H, values, dtype=dtypes.float32, device=q.device, axis=None if q.uop.axis is None else 1)
   if isinstance(start, UOp): cache = Tensor(cache.uop.after(start))
   if idx is not None and not isinstance(T, int): idx = idx.pad_to(idx.max_shape)
-  out = Tensor.custom_kernel(out, _carry(q.pad_to(q.max_shape).contiguous(), T), cache.bitcast(dtypes.uint32),
+  out = Tensor.custom_kernel(out, _carry(q.pad_to(q.max_shape).contiguous(), T), cache,
                              *([] if idx is None else [idx.cast(dtypes.int32).contiguous()]),
                              fxn=functools.partial(_mla_wmma_kernel, start=start, scale=scale, rows=_unbind(B*T)))[0]
   return out.reshape(B, N, H, values)[:, :T].transpose(1, 2)

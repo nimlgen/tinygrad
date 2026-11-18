@@ -1,7 +1,8 @@
 import pathlib, tempfile, unittest
 import numpy as np
 from gguf import GGUFWriter
-from tinygrad import Tensor, nn
+from tinygrad import Tensor, UOp, dtypes, nn
+from tinygrad.llm.kernels.amd import mla_wmma_attention
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, IndexerConfig, MLATransformerBlock, GatedDeltaNetBlock, ExpertGating
 
 def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False, experts:bool=True):
@@ -34,6 +35,14 @@ def write_kimi_gguf(path:pathlib.Path, arch:str, indexer:bool=False, experts:boo
   writer.close()
 
 class TestMLA(unittest.TestCase):
+  def test_wmma_reads_existing_cache(self):
+    q = Tensor.empty(1, 16, 16, 576, device="NULL").realize()
+    cache = Tensor.empty(1, 1, 4096, 576, device="NULL", dtype=dtypes.half).realize()
+    pos = UOp.variable("start_pos", 0, 4096 - 16).bind(20)
+    linear, _ = mla_wmma_attention(q, cache, None, pos, 512, 0.05).linear_with_vars()
+    call, = linear.src
+    self.assertIn(cache.uop.base, call.src[1:])
+
   def _make_config(self, **kwargs):
     return TransformerConfig(**{
       "num_blocks": 1, "dim": 64, "hidden_dim": 128, "n_heads": 4, "n_kv_heads": 1,
