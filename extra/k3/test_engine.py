@@ -299,8 +299,12 @@ class TestEngine(unittest.TestCase):
 
   def test_steps_faster(self):  # steps or a window of n tokens: a window the store's experts not cached read (5 s here) and a token's (measured:
     # their median), a step measured (of the most tokens there's a graph of)
-    eng = SimpleNamespace(step_s={1: [], 2: []}, window_s=[], jits={1: None}, bias=[0], m={"n_experts": 1000}, slots=25, part=10**9, devs=("A",))
+    eng = SimpleNamespace(step_s={1: [], 2: []}, window_s=[], jits={1: None}, bias=[0], m={"n_experts": 1000},
+                          slots=25, part=10**9, store_part=10**9, devs=("A",))
     self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 526)], [True, False])  # type: ignore[arg-type]  # (before any measured)
+    eng.slots *= 2
+    eng.part //= 2  # same cache capacity and bytes per stored expert
+    self.assertTrue(Engine.steps_faster(eng, 80))  # type: ignore[arg-type]
     eng.window_s = [(9182, 60.0), (9595, 17.0), (9182, 16.5)]  # (a cold first one, sizes alike: a line through them would be anything)
     eng.step_s[1] = [0.035, 0.04]
     self.assertEqual([Engine.steps_faster(eng, n) for n in (64, 120, 526, 9000)], [True, True, False, False])  # type: ignore[arg-type]
