@@ -253,9 +253,7 @@ pm_exec = PatternMatcher([
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=BEAM.value if beam is None else beam) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
-  linear = lower_and_compile(linear)
-  linear = hcq_compile(linear, bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache and not validate)
-  return linear
+  return hcq_compile(lower_and_compile(linear), bool(PROFILE or DEBUG >= 2) if profile is None else profile, cache=cache and not validate)
 
 def link_linear(linear:UOp, externs:Sequence[UOp]|None=None) -> UOp: return hcq_link(linear, externs)
 

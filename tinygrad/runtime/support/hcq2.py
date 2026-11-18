@@ -569,8 +569,6 @@ hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a bu
 
 @rewrite_group(lambda linear,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
 def hcq_compile(linear:UOp, profile:bool, cache:bool=False) -> UOp:
-  if any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src): return linear # compiled already
-
   linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
   if cache and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_lower_call, walk=True, name="lower call")
