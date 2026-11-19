@@ -55,7 +55,7 @@ class Engine:
                copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
                short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0), expert_slot_bytes:int=getenv("EXPERT_SLOT_BYTES", 0),
                window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0)),
-               ordered_sum:bool=bool(getenv("ORDERED_EXPERT_SUM", 0))):
+               ordered_sum:bool=bool(getenv("ORDERED_EXPERT_SUM", 0)), shared_early:bool=bool(getenv("SHARED_FFN_EARLY", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -64,7 +64,7 @@ class Engine:
     the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
     an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
-    self.prefill_prior, self.ordered_sum = prefill_prior, ordered_sum
+    self.prefill_prior, self.ordered_sum, self.shared_early = prefill_prior, ordered_sum, shared_early
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
@@ -144,6 +144,9 @@ class Engine:
       if isinstance(b, GatedDeltaNetBlock): b.keep = tokens - 1
     for li, b in enumerate(blocks):
       b._routed = functools.partial(self.routed, li)  # type: ignore[method-assign]
+      if (shared_early and ordered_sum and m["layers"][li] < len(model.blk) and self.lat == 6144 and self.ks == (4, 4)
+          and hasattr(b, "ffn_gate_shexp") and ordered_expert_sum_supported(self.devs)):
+        b._feed_forward = functools.partial(self.early_shared_ffn, li, b)  # type: ignore[method-assign]
       b.ffn_gate_inp.weight = Tensor.empty(0)
     weights = {id(t) for t in nn.state.get_parameters(stack)}  # (not realized here: some are decoded in the step's graph)
     # (a draft holding the trunk's weights would realize them as its state: decoded, their quantized kernels lost)
@@ -308,26 +311,52 @@ class Engine:
     if self.draft.blk: outs.append(Tensor(self.dx.uop)[row:row + 1].assign(hid.reshape(1, -1).float()).uop)
     return Tensor(self.cres.uop.after(*outs))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0])).realize()
 
-  def routed(self, li:int, x:Tensor, h:Tensor) -> Tensor:
+  def early_shared_ffn(self, li:int, block:FFNBlock, x:Tensor) -> Tensor:
+    if not self.shared_early or x.shape[1] != 4: return FFNBlock._feed_forward(block, x)
+    return self.routed(li, x, block._expert_input(x), block)
+
+  def routed(self, li:int, x:Tensor, h:Tensor, shared_block:FFNBlock|None=None) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, each gpu's units
     of the experts it gives in two parts, summed over the gpus"""
     T, s = x.shape[1], w(x) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
     scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
-    y1, w1 = self.experts(li, h[0], self.host(li, 0, scores), self.ks[0] * T)
+    act = shared = None
+    if shared_block is not None:
+      # The host can submit this layer's reads while the independent shared gate/up run.
+      tag = self.routing_tag(li, scores)
+      tagged = Tensor(x.reshape(T, -1).uop.after(tag.uop)).reshape(x.shape)
+      act = gated_activation(shared_block.ffn_gate_shexp(tagged), shared_block.ffn_up_shexp(tagged), shared_block.config).contiguous()
+      first = Tensor((part:=self.parts[0][li].uop).after(wait(part, act.uop)))
+    else:
+      first = self.host(li, 0, scores)
+    y1, w1 = self.experts(li, h[0], first, self.ks[0] * T)
     y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
-    y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
+    if shared_block is not None and act is not None:
+      shared = shared_block.ffn_down_shexp(act)
+      if hasattr(shared_block, "ffn_gate_inp_shexp"):
+        shared = shared * (x * shared_block.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
+      shared = shared.contiguous()
+      second = Tensor((part:=self.parts[1][li].uop).after(wait(part, y1.uop, shared.uop)))
+    else:
+      second = self.host(li, 1, y1)
+    y2, w2 = self.experts(li, h[0], second, self.ks[1] * T)
     if (self.ordered_sum and T == 4 and self.ks == (4, 4) and self.lat == 6144 and self.m["layers"][li] < len(self.model.blk)
         and ordered_expert_sum_supported(y1.device)):
       y = ordered_expert_sum(y1, y2, w1, w2)
     else:
       y = self.heaviest_first([y1, y2], [w1, w2], T)
-    return (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
+    out = (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
+    return out if shared_block is None else shared_block._expert_output(out, shared)
+
+  def routing_tag(self, li:int, scores:Tensor) -> Tensor:
+    s = scores[0, 0].reshape(len(self.devs), -1)[:, :1]
+    return Tensor(self.tags[li]).assign((s == s).where(1, 2).cast(dtypes.uint32))
 
   def host(self, li:int, i:int, dep:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after dep (part 1: the scores, the host told they're in:
     a gpu's tag set 1 after its scores, 2 on a NaN)"""
-    if i == 0: dep = Tensor(self.tags[li]).assign(((s:=dep[0, 0].reshape(len(self.devs), -1)[:, :1]) == s).where(1, 2).cast(dtypes.uint32))
+    if i == 0: dep = self.routing_tag(li, dep)
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, dep.uop)))
 
   def experts(self, li:int, h:Tensor, table:Tensor, n:int) -> tuple[Tensor, Tensor]:
