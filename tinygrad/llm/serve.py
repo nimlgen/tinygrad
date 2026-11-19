@@ -129,7 +129,8 @@ class Handler(VizHandler):
     tool_calls: list[dict] = []
     for m in re.finditer(router.call, router.buf, re.DOTALL):
       if (parsed := parse_tool_call(m.group(1))) is None:
-        stderr_log(f"{colored('failed to parse tool call', 'red')}: {m.group(1)[:200]}\n")
+        call = m.group(1) if len(m.group(1)) <= 400 else f"{m.group(1)[:200]} ... {m.group(1)[-200:]}"
+        stderr_log(f"{colored('failed to parse tool call', 'red')}: {call}\n")
         yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
       else:
         name, args = parsed
