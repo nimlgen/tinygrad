@@ -252,14 +252,14 @@ class TestEngine(unittest.TestCase):
     # steps' experts take q8 activations. without its routed experts a window is 0.15 apart)
     self.assertLess(max(k for _, k in stats), 1e-2)
 
-  def test_grow(self):  # the caches' slots of a context's positions (in steps of a piece) pinned as it grows, their experts dropped
+  def test_grow(self):  # the caches' slots of a context's positions (in steps of a chunk) pinned as it grows, their experts dropped
     eng, st = self.eng, self.eng.state
     st["expert_in"][0], st["slot_of"][len(st["slot_of"]) - 1] = len(st["slot_of"]) - 1, 0  # (an expert in the caches' first slot)
     self.assertEqual(st["mask"].sum(), eng.arena[1] - eng.arena[0])  # (the window's scratch's)
     eng.grow(1)
-    self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.W, 1, -1, -1))
-    eng.grow(eng.W + 1)
-    self.assertEqual((eng.grown, st["mask"].sum()), (2 * eng.W, eng.slots_of(eng.cache_bytes) + eng.arena[1] - eng.arena[0]))
+    self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.chunk, 1, -1, -1))
+    eng.grow(eng.max_context)
+    self.assertEqual((eng.grown, st["mask"].sum()), (eng.max_context, eng.slots_of(eng.cache_bytes) + eng.arena[1] - eng.arena[0]))
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     for bank, tol in ((dtypes.float, 3e-3), (dtypes.half, 1e-2)):  # (the streams in half: as close as their rounding)
@@ -471,7 +471,7 @@ class TestEngine(unittest.TestCase):
     self.stub()
     d = eng.draft
     assert isinstance(d, DSpark) and d.cache.uop.axis == 3
-    eng.grow(len(toks))
+    eng.grow(eng.max_context)
     def want(anchors:list[int], pos:int) -> np.ndarray:
       g, _, _ = d(Tensor(anchors, dtype=dtypes.int32).shard(eng.devs), Tensor(list(range(pos + 1, pos + 1 + len(anchors))), dtype=dtypes.int32)
                   .shard(eng.devs), 2, (0, eng.model.max_context))

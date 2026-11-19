@@ -221,7 +221,7 @@ class Engine:
                     for a in [next(j for j, d in enumerate(shape) if d >= model.max_context)] for row in [prod(shape[a + 1:]) * dt.itemsize]]
     for i, (o, k) in enumerate(self.caches): setattr(o, k, caches[str(i)] if axes[i] is None else Tensor(caches[str(i)].uop.unshard(axes[i])))
     # (the caches grow by a step of rows, zeroed in a graph: a step's rows at a position)
-    self.grown, self.grow_step = 0, min(window or 8192, model.max_context)
+    self.grown, self.grow_step = 0, min(chunk or 8192, model.max_context)
     self.v_grown, self.zero_jit = UOp.variable("grown", 0, model.max_context - self.grow_step), TinyJit(self.zero, capture_first=True)
     # the host's state, kept by step_io: each code's (layer * E + expert) slot (-1: not cached) and each slot's code (-1: free), the decayed
     # use counts, the guesses' reads in flight, the guesses their layer hasn't routed, pinned slots, the victims of the next reads
@@ -750,7 +750,7 @@ class Engine:
   def nbytes(qtype:int, n:int) -> int: return n // _GGML_QUANT[qtype][0] * _GGML_QUANT[qtype][1]
 
   def grow(self, n:int):
-    """the caches' rows of the first n positions (in steps of a window piece) kept from the experts: their slots' experts dropped (once read,
+    """the caches' rows of the first n positions (in steps of a chunk) kept from the experts: their slots' experts dropped (once read,
     if in flight), the slots pinned (step_io's mask, read's keep), the rows zeroed (they were experts': a cache's keys past a context masked)"""
     if n <= self.grown: return
     new, st = min(round_up(n, self.grow_step), self.max_context), self.state
