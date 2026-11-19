@@ -1036,7 +1036,7 @@ class Engine:
     assert DEBUG < 2, "DEBUG>=2 syncs in the step's launch, before the host's part runs: a hang"
     io, T, t0 = self.io, len(toks), time.perf_counter()
     assert T in self.jits and pos + T <= self.max_context
-    self.grow(pos + T)
+    self.grow(max(pos + T, getattr(self.draft, "window", 0)) + self.tokens)
     io.tokens, io.victims_n, self.res_np[0] = T, 32 * T, 0
     self.tok_np[:T], self.given_np[:T] = toks, ((given or []) + [-1] * T)[:T]
     host_c().flags(ctypes.byref(io), 0)
