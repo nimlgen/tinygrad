@@ -61,6 +61,7 @@ VICTIMS = 1024
 HOST_C = f"#include <stdint.h>\n#define VICTIMS {VICTIMS}\n" + "typedef struct { " + " ".join(f"{t} {n};" for n, t in IO) + " } io_t;\nenum { " + \
   ", ".join(f"B_{b.upper()}" for b in BUFS) + ", NB };\n" + r"""
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 typedef struct { uint32_t cdw0, nsid; uint64_t rsvd, mptr, prp1, prp2; uint32_t cdw10, cdw11, cdw12, pad[3]; } sqe_t;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -175,19 +176,74 @@ static int64_t slots_free(const io_t *s, int64_t sl, int64_t w) {
   return 1;
 }
 
+static uint64_t *heap;
+static int64_t *at, heap_slots, heap_groups, *heap_spans;
+static float *counted;
+
+static uint64_t heap_entry(float use, int64_t b) {
+  uint32_t u;
+  __builtin_memcpy(&u, &use, 4);
+  return (uint64_t)(u >> 31 ? ~u : u | 1u << 31) << 32 | (uint64_t)b;
+}
+
+static void place(uint64_t *h, int64_t *at, int64_t i, uint64_t x) {
+  h[i] = x;
+  if (at) at[(uint32_t)x] = i;
+}
+
+static void sift(uint64_t *h, int64_t *at, int64_t n, int64_t i, uint64_t x) {
+  for (int64_t p = (i - 1) / 2; i > 0 && x < h[p]; i = p, p = (i - 1) / 2) place(h, at, i, h[p]);
+  for (int64_t j; (j = 2 * i + 1) < n; i = j) {
+    if (j + 1 < n && h[j + 1] < h[j]) j++;
+    if (h[j] > x) break;
+    place(h, at, i, h[j]);
+  }
+  place(h, at, i, x);
+}
+
+static float slot_count(const io_t *s, int64_t sl) { return s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : -1; }
+
+static float block_use(int64_t b, int64_t w) {
+  float use = 0;
+  for (int64_t u = b * w; u < b * w + w; u++) use += counted[u];
+  return use;
+}
+
+static void recount(const io_t *s, int64_t sl, int64_t n) {
+  for (int64_t u = sl; u < sl + n; u++) counted[u] = slot_count(s, u);
+  for (int64_t c = 0; c < group_count(s); c++) {
+    int64_t w = s->span[c], nb = s->slots / w, *a = at + c * s->slots;
+    for (int64_t b = sl / w; b <= (sl + n - 1) / w && b < nb; b++) sift(heap + c * s->slots, a, nb, a[b], heap_entry(block_use(b, w), b));
+  }
+}
+
+static void sync_heaps(const io_t *s) {
+  int64_t same = heap_slots == s->slots && heap_groups == group_count(s);
+  for (int64_t c = 0; same && c < heap_groups; c++) same = heap_spans[c] == s->span[c];
+  if (same) {
+    for (int64_t sl = 0; sl < s->slots; sl++) if (slot_count(s, sl) != counted[sl]) recount(s, sl, 1);
+    return;
+  }
+  heap_slots = s->slots, heap_groups = group_count(s);
+  heap_spans = realloc(heap_spans, heap_groups * sizeof(int64_t)), counted = realloc(counted, heap_slots * sizeof(float));
+  heap = realloc(heap, heap_groups * heap_slots * sizeof(uint64_t)), at = realloc(at, heap_groups * heap_slots * sizeof(int64_t));
+  for (int64_t c = 0; c < heap_groups; c++) heap_spans[c] = s->span[c];
+  for (int64_t sl = 0; sl < s->slots; sl++) counted[sl] = slot_count(s, sl);
+  for (int64_t c = 0; c < heap_groups; c++) for (int64_t b = 0, w = s->span[c]; b < s->slots / w; b++)
+    sift(heap + c * s->slots, at + c * s->slots, b + 1, b, heap_entry(block_use(b, w), b));
+}
+
 // the victims of the next misses and guesses in each slot group: its n least used free slots of its span (empty ones first), least used first
 static void pick(io_t *s, int64_t n) {
-  float f[s->slots], key[VICTIMS];
-  for (int64_t sl = 0; sl < s->slots; sl++) f[sl] = !free_slot(s, sl) ? __builtin_inff() : s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : -1;
   for (int64_t c = 0; c < group_count(s); c++) {
-    int64_t w = s->span[c], m = 0, *v = s->victims + c * VICTIMS;
-    for (int64_t sl = 0; sl + w <= s->slots; sl += w) {
-      float sum = f[sl];
-      for (int64_t u = sl + 1; u < sl + w; u++) sum += f[u];
-      if (sum == __builtin_inff() || (m == n && sum >= key[m - 1])) continue;
-      int64_t j = m < n ? m++ : m - 1;
-      for (; j > 0 && key[j - 1] > sum; j--) key[j] = key[j - 1], v[j] = v[j - 1];
-      key[j] = sum, v[j] = sl;
+    int64_t w = s->span[c], nb = s->slots / w, m = 0, nf = nb > 0, *a = at + c * s->slots, *v = s->victims + c * VICTIMS;
+    uint64_t *h = heap + c * s->slots, frontier[nb + 1];
+    for (frontier[0] = h[0]; m < n && nf > 0;) {
+      int64_t b = (uint32_t)frontier[0], i = a[b];
+      if (slots_free(s, b * w, w)) v[m++] = b * w;
+      if (2 * i + 1 < nb) sift(frontier, 0, nf, 0, h[2 * i + 1]);
+      else nf--, sift(frontier, 0, nf, 0, frontier[nf]);
+      if (2 * i + 2 < nb) sift(frontier, 0, nf + 1, nf, h[2 * i + 2]), nf++;
     }
     s->nvict[c] = m;
   }
@@ -195,6 +251,7 @@ static void pick(io_t *s, int64_t n) {
 
 static void drop(io_t *s, int64_t code) {
   for (int64_t u = s->slot_of[code]; u < s->slot_of[code] + s->span[group_of(s, code)]; u++) s->expert_in[u] = -1;
+  recount(s, s->slot_of[code], s->span[group_of(s, code)]);
   s->slot_of[code] = -1;
 }
 
@@ -206,6 +263,7 @@ static int64_t take(io_t *s, int64_t code) {
     for (s->nvict[c]--; i < s->nvict[c]; i++) v[i] = v[i + 1];
     for (int64_t u = sl; u < sl + w; u++) if (s->expert_in[u] >= 0) drop(s, s->expert_in[u]);
     for (int64_t u = sl; u < sl + w; u++) s->expert_in[u] = code;
+    recount(s, sl, w);
     s->slot_of[code] = (int32_t)sl, s->mask[sl] = 1;
     return sl;
   }
@@ -301,7 +359,7 @@ static void prefetch(io_t *s, const uint64_t *b, int64_t lj, int64_t row, int64_
 // weight 0 (the gemvs skip it). then the counts, li's guesses settled (used when routed), the decayed use counts and the next layer's
 // victims (but this layer's slots).
 // 0, -1 a read failed, -2 a timeout, -3 no victims
-int64_t layer(io_t *s, int64_t li) {
+static int64_t step_layer(io_t *s, int64_t li) {
   int64_t E = s->E, ng = s->ngpu, T = s->tokens, nd = s->nd, K1 = s->k1, K2 = s->k - K1;
   const uint64_t *b = s->bufs + li * NB * ng;
   double t0 = now();
@@ -410,11 +468,18 @@ int64_t layer(io_t *s, int64_t li) {
   }
   for (int64_t j = 0; j < nu; j++) s->freq[ucode[j]] += 1;
   for (int64_t i = 0; i < nf; i++) s->freq[codes[nm + i]] += 1;  // (a fill counts as routed: it was)
+  for (int64_t c = li * E; c < s->copies * s->layers * E; c += s->layers * E)
+    for (int64_t e = 0; e < E; e++) if (s->slot_of[c + e] >= 0) recount(s, s->slot_of[c + e], s->span[group_of(s, c + e)]);
   for (int64_t j = 0; j < nu; j++) s->mask[s->slot_of[ucode[j]]] = 1;
   pick(s, s->victims_n);
   for (int64_t j = 0; j < nu; j++) s->mask[s->slot_of[ucode[j]]] = 0;
   s->t_gpu += t1 - t0, s->t_route += t2 - t1, s->t_reads += t3 - t2, s->t_after += now() - t3;
   return 0;
+}
+
+int64_t layer(io_t *s, int64_t li) {
+  sync_heaps(s);
+  return step_layer(s, li);
 }
 
 // n codes read into slots on the demand queues, waited for (the reads ahead go on). 0, -1 a read failed, -2 a timeout
@@ -446,9 +511,10 @@ void flags(io_t *s, uint32_t value) {
 int64_t step_io(io_t *s) {
   int64_t r = 0;
   s->slowest = 0, npend = pend_at = 0;
+  sync_heaps(s);
   for (int64_t li = 0; li < s->layers; li++) {
     double t = now();
-    r = layer(s, li);
+    r = step_layer(s, li);
     if (r) return r;
     if (now() - t > s->slowest) s->slowest = now() - t;
   }
