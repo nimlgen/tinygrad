@@ -93,16 +93,14 @@ class TestEngine(unittest.TestCase):
     self.eng = self.engine(2 * E)
 
   def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=(),
-             source:str="", short_window:int=0, window_forecast:bool=False,
-             shared_early:bool=False) -> Engine:
+             source:str="", short_window:int=0, window_forecast:bool=False) -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
     # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
     eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths, source=source, short_window=short_window, window_forecast=window_forecast,
-                 ordered_sum=shared_early, shared_early=shared_early)  # (96: the caches', the scratch's)
+                 widths=widths, source=source, short_window=short_window, window_forecast=window_forecast)  # (96: the caches', the scratch's)
     if short_window: eng.capture_short_window()
     at = eng.arena[1]
     assert at <= 96
@@ -124,7 +122,7 @@ class TestEngine(unittest.TestCase):
     tables:dict[int, list[Tensor]] = {}
     n = len(eng.types) * E
     slots_of = slot_of or [eng.state["slot_of"][c * n:(c + 1) * n] // w for c, w in enumerate(eng.spans)]
-    def host(li:int, i:int, dep:Tensor) -> Tensor:  # (part 1's dep: the scores)
+    def host(li:int, i:int, dep:Tensor, *_) -> Tensor:  # (part 1's dep: the scores)
       if i == 0:
         sig = dep[:, 0].to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
@@ -183,20 +181,6 @@ class TestEngine(unittest.TestCase):
     with patch.object(self.eng.model, "_states", return_value=[]):
       self.eng.capture_short_window()
     self.assertIsNotNone(self.eng.short_engine)
-
-  def test_early_shared_preserves_cpu_fallback(self):
-    x = Tensor([[2, 3, 5, 7]])
-    outputs, engines = [], []
-    for enabled in (False, True):
-      self.eng = eng = self.engine(2 * E, tokens=4, source=str(self.trunk), shared_early=enabled)
-      engines.append(eng)
-      self.stub()
-      self.assertFalse(any(getattr(b._feed_forward, "func", None) == eng.early_shared_ffn for b in eng.model.blk))
-      outputs.append(eng.forward(x, 0)[0].numpy())
-    self.assertNotEqual(engines[0].graph_key, engines[1].graph_key)
-    self.assertFalse(engines[0].shared_early)
-    self.assertTrue(engines[1].shared_early)
-    np.testing.assert_array_equal(*outputs)
 
   def test_adaptive_short_transition(self):
     toks = [3, 5, 7, 1, 2, 9, 4, 6, 8, 2, 7, 3, 5, 4, 9, 1]
