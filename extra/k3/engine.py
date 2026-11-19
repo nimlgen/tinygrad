@@ -17,8 +17,8 @@ from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, MLATra
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, \
   ordered_expert_sum, ordered_expert_sum_supported
-from tinygrad.llm.kernels.amd_gguf import find_packed, expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, \
-  TILE_QUANTS
+from tinygrad.llm.kernels.amd_gguf import find_packed, expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, \
+  HALFWORD_QUANTS, TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
 from extra.k3 import persist
