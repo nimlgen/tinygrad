@@ -192,11 +192,10 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
   rows = math.gcd(out_features, 4)
   tokens = share if type(share) is int else n if share and (n:=cast(int, out.shape[0])) <= 8 else 1
-  row = UOp.range(out.shape[0]//tokens*out_features//rows, 0, AxisType.GLOBAL)
-  wave = UOp.range(rows, 3, AxisType.LOCAL)
-  token_output = row*rows+wave
-  chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
-  token, output = token_output // out_features * tokens, token_output % out_features
+  rowblock, row = UOp.range(out.shape[0]//tokens, 0, AxisType.GLOBAL), UOp.range(out_features//rows, 1, AxisType.GLOBAL)
+  wave = UOp.range(rows, 4, AxisType.LOCAL)
+  chunk, lane = UOp.range(chunks, 2, AxisType.GLOBAL), UOp.range(32, 3, AxisType.LOCAL)
+  token, output = rowblock*tokens, row*rows+wave
   group = lane+chunk*32
   if tables:  # (group_dot's lookup tables in LDS)
     lts = [UOp.alloc((int(t.numel()),), t.dtype, addrspace=AddrSpace.LOCAL) for t in tables]
@@ -207,12 +206,12 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     return (g < group_count).where(group_dot(token+t, output, g.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
   if live is None: value = [dot(t, group) for t in range(tokens)]
   else:  # live(token, group): the group's dot is read and added at all (a loop of one or no iterations: the loads in it)
-    i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 4, AxisType.LOOP)
+    i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 5, AxisType.LOOP)
     acc = _reg((tokens,), 0)
     acc = acc.after(UOp.group(*[acc[t].store(acc.after(i)[t].load() + dot(t, group + i)) for t in range(tokens)]).end(i))
     value = [acc[t].load() for t in range(tokens)]
   stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=True).cast(out.dtype)) for t,v in enumerate(value)]
-  return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  return UOp.group(*stores).end(rowblock, row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _xor_lane(v:UOp, m:int) -> UOp:
   return UOp.custom_function(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | m<<10}))",
@@ -419,7 +418,7 @@ def _expert_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, slots:UOp, *
   # row k reads the weight rows at slots[k // per]*stride + offset words (64 bit: a pool can pass 2**31 words) and the activation row k % rows
   # (a slot's per rows share their weight loads). weighted: extra[0] the rows' weights, their weighted sums out's rows. live: extra[0] the
   # rows' weights (unweighted), a slot's rows skipped where they're all 0
-  def gate(row:UOp, base:UOp) -> UOp: return base.cast(dtypes.int64) + slots[row // per].cast(dtypes.int64)*stride + offset
+  def gate(row:UOp, base:UOp) -> UOp: return base + slots[row // per].cast(dtypes.weakint)*stride + offset
   def xtoken(row:UOp) -> UOp: return row % xq.shape[0]
   w, grids = (extra[0], extra[1:]) if weighted or live else (None, extra)
   return _quant_decode_body(out, raw, xq, xd, xs, grids, out_features, in_features, ggml_type, cdna, gate, xtoken,
