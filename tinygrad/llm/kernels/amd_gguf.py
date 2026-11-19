@@ -214,6 +214,48 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
   stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=True).cast(out.dtype)) for t,v in enumerate(value)]
   return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
+def _xor_lane(v:UOp, m:int) -> UOp:
+  return UOp.custom_function(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | m<<10}))",
+                             shape=v.shape, dtype=dtypes.float, fmt=True).call(v)
+
+def _decode_linear_dense(out:UOp, out_features:int, group_count:int, group_dot, name:str, tables:tuple[UOp, ...]=()) -> UOp:
+  def waste(lanes:int) -> int: return lanes*((group_count+lanes-1)//lanes) - group_count
+  lanes = min((l for l in (32, 16, 8) if out_features % (32//l) == 0), key=lambda l: (waste(l), -l))
+  outs_per_wave, slots = 32 // lanes, (group_count+lanes-1)//lanes
+  per = (slots + 15) // 16
+  if group_count <= 48 and out_features >= 2048: per = min(max(per, 4), slots)
+  chunks = (slots + per-1) // per
+  rows = math.gcd(out_features // outs_per_wave, 4)
+  while rows > 1 and rows*chunks > 16: rows //= 2
+  multi = int(out.shape[0]) if 1 < out.shape[0] <= 8 else 1
+  BPB = out_features//(rows*outs_per_wave)
+  row = UOp.range(out.shape[0]//multi*BPB, 0, AxisType.GLOBAL)
+  wave, chunk, lane = UOp.range(rows, 1, AxisType.LOCAL), UOp.range(chunks, 3, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  sub, which = lane % lanes, lane // lanes
+  output = ((row*rows+wave)*outs_per_wave + which) % out_features
+  tokens = [((row*rows+wave)*outs_per_wave + which) // out_features] if multi == 1 else [UOp.const(t, dtypes.weakint) for t in range(multi)]
+  if tables:
+    tid, nthreads = (wave*chunks + chunk)*32 + lane, rows*chunks*32
+    lds = []
+    for tab in tables:
+      n = int(tab.numel())
+      l = UOp.alloc((n,), tab.dtype, addrspace=AddrSpace.LOCAL)
+      idx = [tid + k*nthreads for k in range((n+nthreads-1)//nthreads)]
+      lds.append(l.after(UOp.group(*[l[i.valid(i < n) if n % nthreads else i].store(tab[i.minimum(n-1)].load()) for i in idx]).barrier()))
+    tables = tuple(lds)
+  def dot(token:UOp, group:UOp) -> UOp:
+    return (group < group_count).where(group_dot(token, output, group.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
+  totals = [functools.reduce(lambda a,s: a + dot(t, sub+(chunk*per+s)*lanes), range(1, per), dot(t, sub+chunk*per*lanes)) for t in tokens]
+  for offset in (16, 8, 4, 2, 1)[(32//lanes).bit_length()-1:]: totals = [total + _xor_lane(total, offset) for total in totals]
+  if chunks > 1:
+    lds_t = UOp.alloc((len(totals), rows, chunks, outs_per_wave), dtypes.float32, addrspace=AddrSpace.LOCAL)
+    lds_t = lds_t.after(UOp.group(*(lds_t[t, wave, chunk, which.valid(sub.eq(0))].store(total) for t, total in enumerate(totals))).barrier())
+    totals = [functools.reduce(lambda a,c: a + lds_t[t, wave, c, which].load(), range(1, chunks), lds_t[t, wave, 0, which].load())
+              for t in range(len(totals))]
+  first = sub.eq(0) & chunk.eq(0)
+  stores = [out[token, output.valid(first)].store(total.cast(out.dtype)) for token, total in zip(tokens, totals)]
+  return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
   from tinygrad.runtime.autogen import ggml_common as ggml
   grid, words = {IQ2_XS: (ggml.iq2xs_grid, 2), IQ2_S: (ggml.iq2s_grid, 2),
@@ -338,6 +380,7 @@ def _quant_decode_body(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, grids:tuple[UOp
   def is_live(token:UOp, group:UOp) -> UOp:
     base = group//gpk*out.shape[0] + token if w is not None else token
     return functools.reduce(lambda a, b: a | b, [unwrap(live)[base + t].load().ne(0) for t in range(cast(int, tokens))])
+  if len(out.shape) == 2: return _decode_linear_dense(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], grids)
   return _decode_linear(out, out_features, groups, group_dot, name+QUANT_NAMES[ggml_type], share, grids, None if live is None else is_live)
 
 @functools.cache
@@ -742,11 +785,9 @@ def q8_linear(layer:Linear, x:Tensor, xq:tuple[Tensor, ...]=(), rows:int|UOp|Non
   else:
     fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cdna=cdna)
     srcs = (*(xq or q8_quantize(x, tokens, in_features)), *extra)
-    out_shape += ((in_features+1023)//1024,)
   out = keyed_empty((layer.weight.uop.key, *(s.uop.key for s in srcs)), out_shape, dtypes.float32, x.device,
                     None if layer.shard_axis is None else 1-layer.shard_axis)
   result = Tensor.custom_kernel(out, layer.weight, *srcs, fxn=functools.partial(fxn, out_features=local_out, in_features=in_features))[0]
-  if len(result.shape) == 3: result = result.sum(-1)
   # row parallel: every device wrote the partial sum of its input features, the sum over the devices is the allreduce (PARTIALS: its caller's)
   if splits > 1 and PARTIALS[0]: return result.reshape(splits, *x.shape[:-1], out_features)
   if splits > 1: result = partial_sum(result.reshape(splits, tokens, out_features))
