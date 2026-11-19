@@ -255,11 +255,11 @@ class TestEngine(unittest.TestCase):
   def test_grow(self):  # the caches' slots of a context's positions (in steps of a chunk) pinned as it grows, their experts dropped
     eng, st = self.eng, self.eng.state
     st["expert_in"][0], st["slot_of"][len(st["slot_of"]) - 1] = len(st["slot_of"]) - 1, 0  # (an expert in the caches' first slot)
-    self.assertEqual(st["mask"].sum(), eng.arena[1] - eng.arena[0])  # (the window's scratch's)
+    self.assertEqual(st["mask"].sum(), 0)
     eng.grow(1)
     self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.chunk, 1, -1, -1))
     eng.grow(eng.max_context)
-    self.assertEqual((eng.grown, st["mask"].sum()), (eng.max_context, eng.slots_of(eng.cache_bytes) + eng.arena[1] - eng.arena[0]))
+    self.assertEqual((eng.grown, st["mask"].sum()), (eng.max_context, eng.slots_of(eng.cache_bytes)))
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     for bank, tol in ((dtypes.float, 3e-3), (dtypes.half, 1e-2)):  # (the streams in half: as close as their rounding)

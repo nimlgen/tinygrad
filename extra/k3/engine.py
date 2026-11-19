@@ -412,7 +412,7 @@ class Engine:
 
   def window_lend(self):
     """the window's state lent from the pool's last slots, its graphs captured on it, their scratch (one arena) lent from the pool's first slots
-    past the caches' (what of them it takes kept from the experts: pinned)"""
+    past the caches' (what of them it takes the experts' between prefills)"""
     self.tail = self.lent_from = self.slots - self.slots_of(self.window_bytes) - self.slots_of(self.piece_bytes)
     self.win = {**self.window_state(self.tail), **self.piece(self.slots - self.slots_of(self.piece_bytes))}
     first, key = self.slots_of(self.cache_bytes), (self.devs, 0)
@@ -431,9 +431,7 @@ class Engine:
            [self.start_jit, self.tap_jit, self.mix_jit, self.fill_jit, self.forecast_jit]
     used = max((sum(u.marg[0]) for j in jits if j is not None and j.captured is not None for u in j.captured._linear.toposort()
                 if u.op is Ops.SHRINK and u.src[0] is room), default=0)  # (a planned buffer: the arena's (start, bytes))
-    self.arena, st, sl = (first, first + self.slots_of(used)), self.state, slice(first, first + self.slots_of(used))
-    self.drop(sl)
-    st["mask"][sl] = 1
+    self.arena = (first, first + self.slots_of(used))
 
   def capture_short_window(self):
     """Capture an alternate window over the same pool and caches before serving the first prompt."""
@@ -770,7 +768,8 @@ class Engine:
   def pieces(self) -> int:
     """a read window's pieces: lent below the window's state, past the caches' stripes and the scratch (their rows pinned as they grow, the
     rest the experts'), the pool past them and two layers' experts (the one routed, the one read ahead)"""
-    free = min(self.tail - self.arena[1], self.tail - int(self.state["mask"].sum()) - 2 * self.m["n_experts"] * self.max_primary_span)
+    (a0, a1), mask = self.arena, self.state["mask"]
+    free = min(self.tail - a1, self.tail - (a1 - a0) - int(mask[:a0].sum() + mask[a1:].sum()) - 2 * self.m["n_experts"] * self.max_primary_span)
     return 1 + max(0, free // self.slots_of(self.piece_bytes))
 
   def window(self, toks:list[int], pos:int, given:list[int]):
@@ -778,7 +777,9 @@ class Engine:
     a layer's experts read once a read window. the caches and states as after steps of them, the draft's cache"""
     T, C, W, t0 = len(toks), self.chunk, self.W, time.perf_counter()
     E, L = self.m["n_experts"], len(self.types)
-    self.window_hot = None
+    self.window_hot, arena = None, slice(*self.arena)
+    self.drop(arena, wait=True)
+    self.state["mask"][arena] = 1
     if self.window_big and len(self.ms) > 1 and T * self.model.config.num_experts_per_tok < E * TILES[0]:
       freq = self.state["freq"][:L*E].reshape(L, E)
       hot = np.zeros((L, E), dtype=bool)
@@ -804,7 +805,7 @@ class Engine:
       for c0 in range(0, n, C): self.graph(self.fill_jit, self.v_pos.bind(pos + p0 + c0), self.v_p0.bind(p0), self.v_c0.bind(c0))
     for d in self.devs: Device[d].synchronize()
     self.win.update(banks[0])
-    self.lent_from = self.tail
+    self.lent_from, self.state["mask"][arena] = self.tail, 0
     self.window_s.append((T, time.perf_counter() - t0))
 
   def steps_faster(self, n:int) -> bool:
