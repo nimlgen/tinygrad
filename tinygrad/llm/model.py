@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.llm.kernels.amd import Linear, ExpertWeights, fp8_matmul, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, \
-  indexer_scores, topk_indices, mla_topk_attention, mla_topk_supported, res_mix_norm, kda_decode, RES_MAX_STREAMS, allgather_last
+  indexer_scores, topk_indices, mla_topk_attention, mla_topk_supported, res_mix_norm, kda_decode, RES_MAX_STREAMS, allgather_last, allgather_lasts
 from tinygrad.llm.gguf import gguf_parse, gguf_shard, GGUFPackedTable, _GGML_QUANT, _GGML_NATIVE
 from tinygrad.llm.kernels.amd_gguf import q8_linear, head_linear, QUANT_SIZES
 from tinygrad.llm.hf import hf_load
@@ -352,6 +352,10 @@ class FFNBlock:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
     return idx_mask
 
+  def _attend(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, live:UOp|None) -> tuple[Tensor, Tensor|None]:
+    mask = self._indexer_mask(x, start_pos, idx_mask)
+    return self._attention(x, start_pos, mask, live), mask
+
   def __call__(self, x: Tensor, start_pos: StartPos, idx_mask: Tensor|None=None, live:UOp|None=None):
     self._init_state(x)
     if hasattr(self, 'ple'): self.ple._init_state(x)
@@ -367,9 +371,7 @@ class FFNBlock:
         res_ffn = functools.partial(self.ffn_res_score, norm=ffn_norm)
         attn_norm = ffn_norm = lambda h: h
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
-        h = attn_norm(h)
-        mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask, live), mask
+        return self._attend(attn_norm(h), start_pos, idx_mask, live)
       x, mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(ffn_norm(h)), None))[0].contiguous()
       return (out, mask) if mask is not None and mask is not idx_mask else out
@@ -575,9 +577,14 @@ class MLATransformerBlock(FFNBlock):
     if config.attn_output_gate: self.attn_gate = Linear(config.dim, config.n_heads * config.v_head_dim, bias=False)
     if config.attn_head_gate: self.attn_gate = Linear(config.dim, config.n_heads, bias=False)
 
-  def store_latents(self, x:Tensor, start_pos:StartPos, freqs:Tensor|None) -> Tensor:
+  def _latents(self, x:Tensor) -> tuple[Tensor|None, Tensor]:
+    if self.config.q_lora_rank == 0: return None, allgather_last(self.attn_kv_a_mqa(x), exact=True)
+    q_a, kv_a = allgather_lasts(self.attn_q_a(x), self.attn_kv_a_mqa(x), exact=True)
+    return self.attn_q_a_norm(q_a), kv_a
+
+  def store_latents(self, x:Tensor, start_pos:StartPos, freqs:Tensor|None, kv_a:Tensor|None=None) -> Tensor:
     B, T, _ = x.shape
-    kv_a = self.attn_kv_a_mqa(x)
+    if kv_a is None: kv_a = allgather_last(self.attn_kv_a_mqa(x), exact=True)
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
     k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
     if freqs is not None: k_rope = apply_rope(k_rope, freqs, self.config.rope_interleave)
@@ -585,10 +592,17 @@ class MLATransformerBlock(FFNBlock):
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     return _update_cache(self.cache_k, k_store, start_pos, 2)
 
-  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None) -> Tensor:
+  def _attend(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, live:UOp|None) -> tuple[Tensor, Tensor|None]:
+    latents = self._latents(x)
+    mask = self._indexer_mask(x, start_pos, idx_mask, latents[0])
+    return self._attention(x, start_pos, mask, live, latents), mask
+
+  def _attention(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None=None, live:UOp|None=None,
+                 latents:tuple[Tensor|None, Tensor]|None=None) -> Tensor:
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
-    q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
+    q_a, kv_a = self._latents(x) if latents is None else latents
+    q_proj = self.attn_q(x) if q_a is None else self.attn_q_b(q_a)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
     freqs = Tensor.stack(*(unwrap(self.freqs_cis)[p:p+T] for p in start_pos)) if not self.config.mla_nope else None
@@ -598,7 +612,7 @@ class MLATransformerBlock(FFNBlock):
     else: q_nope = _heads(q_nope, self.attn_k_b['weight'])
     q = q_nope.cat(q_rope, dim=-1)
 
-    cache = self.store_latents(x, start_pos, freqs)
+    cache = self.store_latents(x, start_pos, freqs, kv_a)
     scale = (self.config.yarn and self.config.yarn.mscale or 1.0) ** 2 / self.config.head_dim ** 0.5
     if (idx_mask is None or dtypes.is_int(idx_mask.dtype)) and len(start_pos) == 1 and mla_topk_supported(x.device, self.config.kv_lora_rank):
       attn = mla_topk_attention(q, cache, idx_mask, start_pos[0], self.config.kv_lora_rank, scale)  # (no indexer: every key there is)
@@ -623,10 +637,11 @@ class MLATransformerBlock(FFNBlock):
     if self.config.attn_head_gate: return self.attn_output(attn * self.attn_gate(x).sigmoid().repeat_interleave(self.config.v_head_dim, -1))
     return self.attn_output(attn * self.attn_gate(x).sigmoid() if self.config.attn_output_gate else attn)
 
-  def _indexer_mask(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None) -> Tensor|None:
+  def _indexer_mask(self, x:Tensor, start_pos:StartPos, idx_mask:Tensor|None, q_a:Tensor|None=None) -> Tensor|None:
     # a full indexer layer selects the top-k tokens for itself and the shared layers after it
     if self.indexer is not None and self.config.max_context > self.indexer.idx.top_k:
-      return self.indexer(x, self.attn_q_a_norm(self.attn_q_a(x)), start_pos, self.freqs_cis)
+      if q_a is None: q_a = self.attn_q_a_norm(allgather_last(self.attn_q_a(x), exact=True))
+      return self.indexer(x, q_a, start_pos, self.freqs_cis)
     return idx_mask
 
   def _init_state(self, x:Tensor):
@@ -890,6 +905,7 @@ class Transformer:
     if arch == 'bailingmoe3': entries = {k.replace('ssm_f_a', 'ssm_f').replace('ssm_g_a', 'ssm_g'):v for k,v in entries.items()}
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     assert shard >= 1, f"shard must be at least 1, got {shard}"
+    rope_permuted = not kda and arch != "glm-dsa"
     shard_map, repeats = {}, {}
     if shard > 1:
       if not kv.get(f'{arch}.attention.kv_lora_rank') and n_kv_heads < shard and shard % n_kv_heads == 0:
@@ -901,13 +917,17 @@ class Transformer:
       # shard MLA heads, routed experts and their latent projections (gathered after) while replicating the other latent projections, KV
       # cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
-        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'ffn_routed_down.weight', 'ffn_routed_up.weight')},
+        'ffn_up.weight', 'attn_q_a.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'ffn_routed_down.weight',
+        'ffn_routed_up.weight')},
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
+      if not rope_permuted: rules['attn_kv_a_mqa.weight'] = 0
       if kda: rules.update({w: 0 for w in ('ssm_conv1d_q.weight', 'ssm_conv1d_k.weight', 'ssm_f.weight',
         'ssm_conv1d_v.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_beta.weight', 'ssm_f_b.weight', 'ssm_g.weight', 'ssm_g_b.weight', 'attn_gate.weight')})
       if all(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) == 0 for k,(_,shape,typ) in entries.items() if 'ffn_down_shexp.' in k):
         rules.update({'ffn_gate_shexp.weight': 0, 'ffn_up_shexp.weight': 0, 'ffn_down_shexp.weight': 1})
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
+      for name in entries:
+        if name.endswith('.nextn.eh_proj.weight'): shard_map.pop(name.removesuffix('nextn.eh_proj.weight') + 'attn_kv_a_mqa.weight', None)
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
     ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if 'ffn_down_exps.' in k)
     state_dict = gguf_shard(entries, devices, {k: 0 if ep and '_exps.' in k else v for k,v in shard_map.items()}, repeats)
@@ -972,7 +992,7 @@ class Transformer:
 
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
-      if kda or arch == 'glm-dsa' or '.indexer.' in name: continue
+      if not rope_permuted or '.indexer.' in name: continue
       if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
         state_dict[name] = permute_rope(state_dict[name], n_heads, rope_dim)
       elif arch == 'llama' and 'attn_k.weight' in name:

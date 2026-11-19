@@ -1108,9 +1108,19 @@ def partial_sum(x:Tensor) -> Tensor:
   out = Tensor.empty(n, dtype=dtypes.float32, device=x.device)
   return Tensor.custom_kernel(out, x.float().reshape(x.shape[0], n).contiguous(), *_mailboxes(x.device), fxn=fxn)[0].reshape(x.shape[1:])
 
+def _gather_offset(el:UOp, peer:int, peers:int, widths:tuple[int, ...], rows:int) -> UOp:
+  width = sum(widths)
+  row, col = el // width, el % width
+  if len(widths) == 1: return (row*peers + peer)*width + col
+  offsets = list(itertools.accumulate(widths, initial=0))
+  addresses = [rows*peers*off + (row*peers + peer)*w + col-off for w,off in zip(widths, offsets)]
+  return functools.reduce(lambda addr,i: (col < offsets[i+1]).where(addresses[i], addr), reversed(range(len(widths)-1)), addresses[-1])
+
 @functools.cache
-def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:int, EP:int) -> UOp:
-  # Each GPU broadcasts its compact local slice once. Mailbox slots/epochs share the allreduce protocol; no padded zero vectors or sums.
+def _allgather_kernel(out:UOp, counter:UOp, *src:UOp, n:int, widths:tuple[int, ...], T:int, EP:int) -> UOp:
+  # Each GPU broadcasts its compact local slices (rows of widths, side by side) once. Mailbox slots/epochs share the allreduce protocol; no padded
+  # zero vectors or sums.
+  xs, mb, width, offs = src[:len(widths)], src[len(widths):], sum(widths), list(itertools.accumulate(widths, initial=0))
   N, G = len(mb), n // (T * EP)
   wg, t = UOp.range(G, 0, AxisType.GLOBAL), UOp.range(T, 1, AxisType.LOCAL)
   li = [t*EP+i for i in range(EP)]
@@ -1119,7 +1129,12 @@ def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:
   deadline = _sys("__builtin_readsteadycounter()", dtypes.uint64, epoch) + AR_TIMEOUT_MS*100000
   par = (epoch & 1).cast(dtypes.weakint)
   def reg(s:int|UOp, l:UOp) -> UOp: return ((wg*2+par)*(N+1)+s)*AR_WORDS+l
-  vals = [x.reshape(-1)[e].load() for e in els]
+  def load(e:UOp) -> UOp:
+    if len(xs) == 1: return xs[0].reshape(-1)[e].load()
+    row, col = e // width, e % width
+    vals = [x.reshape(-1)[(row*w + col - o).valid((col >= o) & (col < o + w))].load() for x, w, o in zip(xs, widths, offs)]
+    return functools.reduce(lambda acc, i: (col < offs[i + 1]).where(vals[i], acc), reversed(range(len(vals) - 1)), vals[-1])
+  vals = [load(e) for e in els]
   words = [(epoch.cast(dtypes.uint64)<<32) | v.bitcast(dtypes.uint32).cast(dtypes.uint64) for v in vals]
   sent = [mb[k][reg(me, l)].store(v) for k in range(1, N) for l, v in zip(li, words)]
   fenced = _sys('__builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");', dtypes.void, UOp.const(0, dtypes.int).after(*sent))
@@ -1136,21 +1151,41 @@ def _allgather_kernel(out:UOp, x:UOp, counter:UOp, *mb:UOp, n:int, width:int, T:
   def value(i:int) -> UOp:
     word = kept[i].load()
     return (word>>32).cast(dtypes.uint32).eq(epoch).where(word.cast(dtypes.uint32).bitcast(dtypes.float32), math.nan)
-  outputs = [out.reshape(-1)[e//width*(N*width)+s*width+e%width].store(me.eq(s).where(v, value(s*EP+i)))
+  outputs = [out.reshape(-1)[_gather_offset(e, s, N, widths, n//width)].store(me.eq(s).where(v, value(s*EP+i)))
              for s in range(N) for i,(e,v) in enumerate(zip(els, vals))]
   done = counter.after(UOp.group(*outputs).barrier())[wg.valid(t.eq(0))].store(epoch.cast(dtypes.int32))
   return UOp.group(*outputs, done).end(wg, t).sink(arg=KernelInfo(name="allgather", opts_to_apply=()))
 
-def allgather_last(x:Tensor) -> Tensor:
-  """x sharded on its last axis on every device whole: small float ones in a kernel of the gpus' mailboxes, else each shard copied to the other
-  devices once (larger float ones on the gpus in half)"""
-  if x.uop.axis != x.ndim-1 or not isinstance(devs:=x.device, tuple): return x
-  if not all(isinstance(d, int) for d in x.shape): return allgather_last(x.pad_to(x.max_shape)).shrink(tuple((0, d) for d in x.shape))
-  if x.dtype != dtypes.float32 or not (shape:=_mailbox_shape(x, n:=prod(x.uop.max_shard_shape))):
-    w, y = x.shape[-1] // len(devs), x.half() if x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs) else x
-    return Tensor.cat(*(y[..., i*w:(i+1)*w] for i in range(len(devs))), dim=-1).cast(x.dtype)
-  fxn = functools.partial(_allgather_kernel, n=n, width=x.max_shape[-1]//len(devs), T=shape[0], EP=shape[1])
-  return Tensor.custom_kernel(Tensor.empty(x.shape, dtype=x.dtype, device=x.device), x.contiguous(), *_mailboxes(x.device), fxn=fxn)[0]
+def allgather_last(x:Tensor, *, exact:bool=False) -> Tensor: return allgather_lasts(x, exact=exact)[0]
+
+def allgather_lasts(*xs:Tensor, exact:bool=False) -> list[Tensor]:
+  """xs sharded on their last axes on every device whole, each device's parts side by side: small float ones in a kernel of the gpus'
+  mailboxes, else each shard copied to the other devices once (larger float ones on the gpus in half unless exact)"""
+  if not xs: return []
+  if len(xs) > 1 and not all(x.uop.axis == x.ndim-1 and isinstance(x.device, tuple) and x.device == xs[0].device
+                             and x.shape[:-1] == xs[0].shape[:-1] for x in xs):
+    return [allgather_last(x, exact=exact) for x in xs]
+  if xs[0].uop.axis != xs[0].ndim-1 or not isinstance(xs[0].device, tuple): return list(xs)
+  if not all(isinstance(d, int) for x in xs for d in x.shape):
+    return [g.shrink(tuple((0, d) for d in x.shape)) for g, x in zip(allgather_lasts(*(x.pad_to(x.max_shape) for x in xs), exact=exact), xs)]
+  devs = xs[0].device
+  widths = tuple(int(x.shape[-1]) // len(devs) for x in xs)
+  n = sum(prod(x.uop.max_shard_shape) for x in xs)
+  shape = _mailbox_shape(xs[0], n)
+  if shape is None and len(xs) > 1 and amd_custom_kernels_supported(devs) and _is_rdna4(devs):
+    shape = next(((n // g, 1) for g in range(1, AR_GROUPS + 1) if n % g == 0 and n // g <= min(256, AR_WORDS)), None)
+  if any(x.dtype != dtypes.float32 for x in xs) or shape is None:
+    def whole(x:Tensor, w:int) -> Tensor:
+      y = x.half() if not exact and x.dtype == dtypes.float32 and amd_custom_kernels_supported(devs) else x
+      return Tensor.cat(*(y[..., i*w:(i+1)*w] for i in range(len(devs))), dim=-1).cast(x.dtype)
+    return [whole(x, w) for x, w in zip(xs, widths)]
+  fxn = functools.partial(_allgather_kernel, n=n, widths=widths, T=shape[0], EP=shape[1])
+  counter, *mbs = _mailboxes(devs)
+  out = Tensor.empty((*xs[0].shape[:-1], len(devs) * sum(widths)), dtype=dtypes.float32, device=devs)
+  out = Tensor.custom_kernel(out, counter, *(x.contiguous() for x in xs), *mbs, fxn=fxn)[0]
+  if len(xs) == 1: return [out]
+  rows = int(prod(out.shape[:-1]))
+  return [part.reshape(*out.shape[:-1], w*len(devs)) for part,w in zip(out.flatten().split([rows*len(devs)*w for w in widths]), widths)]
 
 # ******** the residual streams' mix and the sublayer's rmsnorm, a workgroup a token ********
 

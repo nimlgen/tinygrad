@@ -13,7 +13,7 @@ from tinygrad.helpers import DEBUG, getenv, prod, round_up, unwrap
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
-from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, AttentionResidual, gated_activation
+from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, MLATransformerBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, ordered_expert_sum, ordered_expert_sum_supported
 from tinygrad.llm.kernels.amd_gguf import expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, HALFWORD_QUANTS, TILE_QUANTS
@@ -584,13 +584,16 @@ class Engine:
     if name in ("attend", "forecast"): name += self.index_roles.get(b, "")
     return (*self.kind(f"{name}{cap}", b, fxn), self.chunk_vars[cap].bind(n))
 
-  def window_mask(self, b:FFNBlock, h:Tensor, pos:UOp, c0:UOp) -> Tensor|None:
+  def window_mask(self, b:FFNBlock, h:Tensor, pos:UOp, c0:UOp, q_a:Tensor|None=None) -> Tensor|None:
+    def select() -> Tensor|None:
+      if isinstance(b, MLATransformerBlock): return b._indexer_mask(h, (pos,), None, q_a)
+      return b._indexer_mask(h, (pos,), None)
     role = self.index_roles.get(b)
-    if role is None: return b._indexer_mask(h, (pos,), None)
+    if role is None: return select()
     # The selection is replicated on the peers, with positions absolute in the KV cache and rows local to this piece.
     rows = Tensor(self.win["indices"].uop)[c0:c0+self.chunk]
     if role == "write":
-      mask = unwrap(b._indexer_mask(h, (pos,), None))
+      mask = unwrap(select())
       assert mask.dtype == dtypes.int32
       rows = rows.assign(mask[0].pad_to(rows.shape, value=-1))
     return rows[:h.shape[1]].unsqueeze(0)
@@ -602,8 +605,13 @@ class Engine:
     rows = (c0 // len(self.devs), self.chunk // len(self.devs))
     bank = Tensor(self.win["bank"].uop)
     h = self.whole(self.mix(getattr(b, "attn_res_score", None), bank.flatten(1, 2), b.attn_norm, n, rows).cast(self.bank))[:, :live]
-    mask = self.window_mask(b, h, pos, c0)
-    a = self.partials(lambda: b._attention(h, (pos,), mask, live))
+    if isinstance(b, MLATransformerBlock):
+      latents = b._latents(h)
+      mask = self.window_mask(b, h, pos, c0, latents[0])
+      a = self.partials(lambda: b._attention(h, (pos,), mask, live, latents))
+    else:
+      mask = self.window_mask(b, h, pos, c0)
+      a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
     x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
