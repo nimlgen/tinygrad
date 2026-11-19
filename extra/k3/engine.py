@@ -506,7 +506,7 @@ class Engine:
     router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    return {"h": ((W, self.lat), f32), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "w": ((W, K), f32),
+    return {"h": ((W, self.lat), dtypes.half), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "w": ((W, K), f32),
             "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
             "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half),
             **({"guess_logits": ((min(self.chunk, SHORT_CHUNK), E), f32)} if self.forecast_counts is not None else {})}
@@ -680,7 +680,7 @@ class Engine:
     tiles = Tensor(self.win["tiles"].uop)[:self.state_rows(tile)[1]]
     slots = Tensor(part1.uop)[1:1 + E].bitcast(dtypes.int32)
     at, xrow = (tiles >= 0).where(slots[tiles.maximum(0)], -1), (entries >= 0).where(entries // K, -1)
-    h = Tensor(self.win["h"].uop).cast(dtypes.half).contiguous()
+    h = Tensor(self.win["h"].uop)
     for c, ty in enumerate(types):
       if ty is None: continue
       tslot = ((at >= 0) & (at % C == c)).where(at // C, -1)
