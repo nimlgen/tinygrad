@@ -201,7 +201,9 @@ static void sift(uint64_t *h, int64_t *at, int64_t n, int64_t i, uint64_t x) {
   place(h, at, i, x);
 }
 
-static float slot_count(const io_t *s, int64_t sl) { return s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : -1; }
+static float slot_count(const io_t *s, int64_t sl) {
+  return s->expert_in[sl] >= 0 ? s->freq[s->expert_in[sl]] : s->mask[sl] ? __builtin_inff() : -1;
+}
 
 static float block_use(int64_t b, int64_t w) {
   float use = 0;
