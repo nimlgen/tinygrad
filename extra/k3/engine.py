@@ -313,15 +313,14 @@ class Engine:
     return Tensor(self.cres.uop.after(*outs))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0])).realize()
 
   def feed_forward(self, li:int, b:FFNBlock, x:Tensor) -> Tensor:
-    """moe block b's (layer li's) feed forward on the tokens x (1, T, dim): without a latent, its shared experts' partials (a gpu's, if row
-    parallel) summed over the gpus with the routed experts'"""
+    """moe block b's (layer li's) feed forward on the tokens x (1, T, dim): without a latent, its shared experts on the gpus while the host
+    routes"""
     if b.config.expert_latent_dim: return b._expert_output(self.routed(li, x, b._expert_input(x)), b._shared(x))
-    return self.routed(li, x, x, self.partials(lambda: b._shared(x)))
+    return self.routed(li, x, x, b._shared(x))
 
   def routed(self, li:int, x:Tensor, h:Tensor, shared:Tensor|None=None) -> Tensor:
     """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, shared on the
-    gpus while it routes, each gpu's units of the experts it gives in two parts, summed over the gpus with shared (its row parallel partials
-    (gpus, 1, T, lat) in the sum)"""
+    gpus while it routes, each gpu's units of the experts it gives in two parts, summed over the gpus, then shared added"""
     T, s = x.shape[1], w(x) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
     scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
@@ -334,9 +333,8 @@ class Engine:
       y = ordered_expert_sum(y1, y2, w1, w2)
     else:
       y = self.heaviest_first([y1, y2], [w1, w2], T)
-    out = y * self.model.config.routed_scaling_factor
-    if shared is not None and shared.ndim > x.ndim: return partial_sum(out + shared[:, 0]).unsqueeze(0)
-    return partial_sum(out).unsqueeze(0) + (0 if shared is None else shared)
+    out = (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
+    return out if shared is None else out + shared
 
   def routing_tag(self, li:int, scores:Tensor) -> Tensor:
     s = scores[0, 0].reshape(len(self.devs), -1)[:, :1]
