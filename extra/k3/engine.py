@@ -711,7 +711,8 @@ class Engine:
     G, K = len(self.devs), self.model.config.num_experts_per_tok
     pos, w = Tensor(self.win["pos"].uop).reshape(-1, K)[c0:c0 + live], Tensor(self.win["w"].uop)[c0:c0 + live]
     out = (Tensor(self.win["down"].uop).reshape(G, -1, self.lat)[:, pos.maximum(0)].float() * w.unsqueeze(-1)).sum(2)
-    y = b._expert_output((partial_sum(out) * self.model.config.routed_scaling_factor).unsqueeze(0), None)
+    out = out * self.model.config.routed_scaling_factor
+    y = b._expert_output(partial_sum(out).unsqueeze(0), None) if self.model.config.expert_latent_dim else out.unsqueeze(1)
     return self.add(s, c0, y, self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
