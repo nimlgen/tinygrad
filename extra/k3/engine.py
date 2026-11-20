@@ -480,9 +480,9 @@ class Engine:
     moe = [b for b in m.blk if hasattr(b, "ffn_gate_inp")]
     stages = [("attend", self.attend), ("post", self.post)]
     if self.forecast_jit is not None: stages.append(("forecast", functools.partial(self.attend, forecast=True)))
-    for b, (name, fxn), cap in itertools.product(m.blk, stages, self.chunk_vars):
-      if name == "post" and b not in moe or name == "forecast" and (b not in moe or cap != min(self.chunk_vars)): continue
-      jit, args, first, live = self.chunk_graph(name, b, fxn, cap)
+    for b, (name, fxn), cap, c0 in itertools.product(m.blk, stages, self.chunk_vars, (0, self.chunk)):
+      if name == "post" and b not in moe or name == "forecast" and (b not in moe or cap != min(self.chunk_vars) or c0): continue
+      jit, args, first, live = self.chunk_graph(name, b, fxn, cap, c0)
       if first is not b: continue
       vs = (self.v_pos.bind(0), live, self.v_c0.bind(0), self.v_n.bind(1), self.v_s.bind(0)) if name != "post" else \
         (live, self.v_c0.bind(0), self.v_s.bind(0))
@@ -570,10 +570,11 @@ class Engine:
     first, jit, args = self.kinds[(name, b)]
     return jit, args, first
 
-  def chunk_graph(self, name:str, b:FFNBlock, fxn:Callable, n:int) -> tuple[Callable, list[Tensor], FFNBlock, UOp]:
+  def chunk_graph(self, name:str, b:FFNBlock, fxn:Callable, n:int, c0:int=0) -> tuple[Callable, list[Tensor], FFNBlock, UOp]:
+    """b's graph of a stage for a chunk of n rows at c0: two of each, the chunks' in turn (the host queues a chunk's while the one before runs)"""
     cap = next(c for c in self.chunk_vars if n <= c)
     if name in ("attend", "forecast"): name += self.index_roles.get(b, "")
-    return (*self.kind(f"{name}{cap}", b, fxn), self.chunk_vars[cap].bind(n))
+    return (*self.kind(f"{name}{cap}:{c0 // self.chunk % 2}", b, fxn), self.chunk_vars[cap].bind(n))
 
   def window_mask(self, b:FFNBlock, h:Tensor, pos:UOp, c0:UOp, q_a:Tensor|None=None) -> Tensor|None:
     def select() -> Tensor|None:
@@ -855,7 +856,7 @@ class Engine:
                     hasattr(b, "ffn_gate_inp") and i < self.m["layers"][moe - 1] else None)
         for c0, nlive in chunks(T):
           name, fxn = ("forecast", functools.partial(self.attend, forecast=True)) if forecast is not None else ("attend", self.attend)
-          jit, args, _, live = self.chunk_graph(name, b, fxn, nlive)
+          jit, args, _, live = self.chunk_graph(name, b, fxn, nlive, c0)
           self.graph(jit, self.v_pos.bind(pos + p0 + c0), live, self.v_c0.bind(c0), self.v_n.bind(n), self.v_s.bind(s), *args)
           self.pump()
         if hasattr(b, "ffn_gate_inp"):
@@ -888,7 +889,7 @@ class Engine:
           for p in self.bufs[li][2][1]: p[1:1 + E] = table.astype(np.int32).view(np.uint32)
           self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
           for c0, nlive in chunks(T):
-            jit, args, _, live = self.chunk_graph("post", b, self.post, nlive)
+            jit, args, _, live = self.chunk_graph("post", b, self.post, nlive, c0)
             self.graph(jit, live, self.v_c0.bind(c0), self.v_s.bind(s), *args)
             self.pump()
         for j, (blk, mixed) in enumerate(self.taps):
