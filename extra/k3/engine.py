@@ -82,7 +82,8 @@ class Engine:
         if getattr(b, "indexer", None) is not None: owner = b
         elif owner is not None: self.index_roles[owner], self.index_roles[b] = "write", "read"
       # Other indexers/backends return dense floating masks. Token-major steps already carry those exactly.
-      if self.index_roles and not (idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and amd_custom_kernels_supported(self.devs)):
+      if self.index_roles and not (idx.kpool == 1 and not (idx.msa or idx.qsa) and idx.head_dim % 16 == 0 and
+                                   amd_custom_kernels_supported(self.devs)):
         window = short_window = 0
     self.short_window, self.short_engine = short_window, cast(Engine|None, None)
     if short_window:
