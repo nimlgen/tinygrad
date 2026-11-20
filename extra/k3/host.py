@@ -448,8 +448,8 @@ static int64_t step_layer(io_t *s, int64_t li) {
     if (first) {  // (after part 1 is out: the gpus work on it) the next layer's guesses, the fills, this layer's hits unpinned
       int64_t room = 1;
       for (int64_t q = nd; q < 2 * nd; q++) room &= s->inflight[q] < s->entries / 2;
-      int64_t tail = s->big >= s->k && s->pf_tail > 0 && s->pf_tail < s->pf ? s->pf_tail : s->pf;
-      if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, t < 2 ? s->pf : tail);
+      int64_t tail = s->big >= s->k && s->pf_tail > 0 && s->pf_tail < s->pf ? s->pf_tail : s->pf, few = s->kmin < tail ? s->kmin : tail;
+      if (room && li + 1 < s->layers) for (int64_t t = 0; t < T; t++) prefetch(s, b, li + 1, t * s->rows + 1, t < 2 ? s->pf : t < full ? tail : few);
       for (int64_t i = 0; room && i < ns && nf < s->fill; i++) if (pos[skip[i]] == -1) {  // (each once, none another token kept)
         int64_t code = code_of(s, li, skip[i], s->k);
         pos[skip[i]] = -2;
