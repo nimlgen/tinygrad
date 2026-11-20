@@ -41,7 +41,8 @@ def wait(buf:UOp, *deps:UOp) -> UOp: return UOp.custom_function("host_wait").cal
 # [ready | a copy's slots | its weights | the next copy's ..], k1*T then (k-k1)*T entries a copy: entry j*T+t token t's j-th expert and its
 # weight in the copy it's read from, padded with slot 0, weight 0 (the union of the tokens' experts read once). tokens: a step's. the copies of
 # the experts: code c * layers * E + layer * E + expert, its slot span[c] slots of the pool (slot_of: its first), big: a token's experts of a
-# rank under it in copy 0, the rest too if cached there (big >= 0), else in the first copy that holds them
+# rank under it in copy 0 unless only another copy has them cached (big < k), the rest too if cached there (big >= 0), else in the first copy
+# that holds them
 IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries shift slots victims_n pf fill copies big slot_groups".split()),
       *((n, "float") for n in "tau tauc beta decay".split()), ("bufs", "const uint64_t *"), ("bias", "const float **"),
       ("slot_of", "int32_t *"), ("expert_in", "int64_t *"), ("freq", "float *"), ("flying", "int32_t *"), ("guess", "uint8_t *"),

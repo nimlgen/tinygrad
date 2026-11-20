@@ -247,13 +247,13 @@ class TestStepIO(unittest.TestCase):
       for guard in guards: np.testing.assert_array_equal(guard, 0xa5a5a5a5)
 
   def test_copies(self): # two copies (copy 0's slots two of the pool's, copy 1 holding layers 1..): a token's experts of a rank under big in
-    # copy 0, the others in copy 0 if cached there (big >= 0), else in copy 1 where it holds their layer
+    # copy 0 unless only copy 1 has them cached (big < k), the others in copy 0 if cached there (big >= 0), else in copy 1 where it holds their layer
     for big in (-1, 0, 2, K):
       self.tearDown()
       self.setUp(slots=3 * L * E, T=2, spans=(2, 1), held=(range(1, L),))
-      self.io.big = big
+      self.io.big, self.io.pf = big, 0
       for _ in range(4):
-        before = self.state["slot_of"][:L * E] >= 0
+        before, held = self.state["slot_of"][:L * E] >= 0, self.state["slot_of"][L * E:] >= 0
         self.step()
         self.check_tables()
         for li in range(L):
@@ -268,7 +268,8 @@ class TestStepIO(unittest.TestCase):
           for t in range(2):
             ws = np.concatenate([w0.reshape(-1, 2)[:, t], w1.reshape(-1, 2)[:, t]])
             top = set(np.argsort(-ws)[:max(big, 0)].tolist())
-            self.assertFalse(top & {len(w0) // 2 + j for j, w in enumerate(w1.reshape(-1, 2)[:, t]) if w > 0})
+            s1t, w1t = s1.reshape(-1, 2)[:, t], w1.reshape(-1, 2)[:, t]
+            self.assertFalse(top & {len(w0) // 2 + j for j, w in enumerate(w1t) if w > 0 and not held[self.state["expert_in"][s1t[j]] - L * E]})
     self.tearDown()
     self.setUp(slots=80, T=2, spans=(2, 1), held=(range(1, L),))
     self.io.big = 2
