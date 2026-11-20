@@ -54,8 +54,7 @@ class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0),
-               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0)),
-               ordered_sum:bool=bool(getenv("ORDERED_EXPERT_SUM", 0))):
+               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -64,7 +63,7 @@ class Engine:
     the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
     an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
-    self.prefill_prior, self.ordered_sum = prefill_prior, ordered_sum
+    self.prefill_prior = prefill_prior
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
@@ -325,7 +324,7 @@ class Engine:
     y1, w1 = self.experts(li, h[0], first, self.ks[0] * T)
     y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
     y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
-    if (self.ordered_sum and T == 4 and self.ks == (4, 4) and self.lat == 6144 and self.m["layers"][li] < len(self.model.blk)
+    if (T == 4 and self.ks == (4, 4) and self.lat == 6144 and self.m["layers"][li] < len(self.model.blk)
         and ordered_expert_sum_supported(y1.device)):
       y = ordered_expert_sum(y1, y2, w1, w2)
     else:
