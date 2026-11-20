@@ -502,11 +502,11 @@ class Engine:
       self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
 
   def window_shapes(self) -> dict[str, tuple[tuple[int, ...], DType]]:
-    """the window's compute state (a piece of W tokens'): the moe's inputs (the routed experts' inputs, the shared experts' outputs, the
-    router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
+    """the window's compute state (a piece of W tokens'): the moe's inputs (the routed experts' inputs, each gpu's partials of the shared
+    experts' outputs, the router's logits), its routes, a gpu's rows of the experts' activations and outputs"""
     c, W, E, K = self.model.config, self.W, self.m["n_experts"], self.model.config.num_experts_per_tok
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
-    return {"h": ((W, self.lat), dtypes.half), "shared": ((1, W // len(self.devs), c.dim), f32), "logits": ((W, E), f32), "w": ((W, K), f32),
+    return {"h": ((W, self.lat), dtypes.half), "shared": ((W, c.dim), self.bank), "logits": ((W, E), f32), "w": ((W, K), f32),
             "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
             "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half),
             **({"guess_logits": ((min(self.chunk, SHORT_CHUNK), E), f32)} if self.forecast_counts is not None else {})}
@@ -611,12 +611,13 @@ class Engine:
     logits = scores[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["logits"], logits)]
-    shared = self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)
+    shared = Tensor(self.win["shared"].uop).reshape(len(self.devs), -1, self.model.config.dim)[:, c0:c0 + self.chunk]
     result = [Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs]
     if forecast:
       predicted = allgather_last(scores[:, :, 1].reshape(live, -1).contiguous().half()).float()
       result.append(Tensor(self.win["guess_logits"].uop).assign(predicted.pad_to(self.win["guess_logits"].shape)))
-    return Tensor.realize(*result, shared.assign(self.split(self.partials(lambda: b._shared(x))).cast(shared.dtype)))[0]
+    shexp = self.as_partials(self.partials(lambda: b._shared(x)))[:, 0]
+    return Tensor.realize(*result, shared.assign(shexp.pad_to(shared.shape).cast(shared.dtype)))[0]
 
   @staticmethod
   def new_stream(b:FFNBlock) -> bool: return hasattr(b, "attn_res_score") and b.attn_res_score.new_block
@@ -646,6 +647,11 @@ class Engine:
 
   def kept(self, t:Tensor) -> Tensor:  # (t (1, gpus, ...) on every gpu split on axis 1: each gpu keeps its own, nothing copied)
     return Tensor(t.uop._shard(1, UOp.range(len(self.devs), 0, AxisType.DEVICE)).unshard(1))
+
+  def as_partials(self, y:Tensor) -> Tensor:  # (y's partials (gpus, 1, live, dim): a whole y (1, live, dim) the first gpu's, the others' zeros)
+    if y.ndim == 4: return y
+    first = Tensor.arange(len(self.devs)).to(y.device).reshape(1, -1, 1, 1, 1) == 0
+    return self.kept(first.where(y.reshape(1, 1, *y.shape), 0))[0]
 
   def rows(self, tile:int) -> int:  # (a window's rows in tiles of tile rows: its selections, each expert's padded)
     return round_up(self.W * self.model.config.num_experts_per_tok + (tile - 1) * self.m["n_experts"], tile)
@@ -706,14 +712,15 @@ class Engine:
     return Tensor(out.uop).assign(y.reshape(out.shape)).reshape(len(self.devs), NT * tile, -1)
 
   def post(self, b:FFNBlock, live:UOp, c0:UOp, s:UOp, *_) -> Tensor:
-    """a chunk's live rows' routed experts' outputs (their rows of down weighted, summed over the gpus) and shared experts' outputs into the
-    block's, added to stream s"""
+    """a chunk's live rows' routed experts' outputs (their rows of down weighted) and shared experts' outputs summed over the gpus into the
+    block's, added to stream s: without a latent, both in one reduce scatter"""
     G, K = len(self.devs), self.model.config.num_experts_per_tok
     pos, w = Tensor(self.win["pos"].uop).reshape(-1, K)[c0:c0 + live], Tensor(self.win["w"].uop)[c0:c0 + live]
     out = (Tensor(self.win["down"].uop).reshape(G, -1, self.lat)[:, pos.maximum(0)].float() * w.unsqueeze(-1)).sum(2)
     out = out * self.model.config.routed_scaling_factor
-    y = b._expert_output(partial_sum(out).unsqueeze(0), None) if self.model.config.expert_latent_dim else out.unsqueeze(1)
-    return self.add(s, c0, y, self.own(Tensor(self.win["shared"].uop).unsqueeze(0), c0)).realize()
+    shared = Tensor(self.win["shared"].uop).reshape(G, -1, self.model.config.dim)[:, c0:c0 + live].float().unsqueeze(1)
+    if not self.model.config.expert_latent_dim: return self.add(s, c0, out.unsqueeze(1) + shared).realize()
+    return self.add(s, c0, b._expert_output(partial_sum(out).unsqueeze(0), None), self.split(shared)).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
     return Tensor(self.win["taps"].uop)[:, :, :, j].assign(Tensor(self.win["bank"].uop)[:, :, :, s].float()).realize()
