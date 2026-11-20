@@ -993,7 +993,7 @@ def mla_topk_attention(q:Tensor, cache:Tensor, idx:Tensor|None, start:int|UOp, v
 # two parities of a slot per gpu and of the sums, AR_WORDS words each, a value and its epoch in a word (no torn reads, no flags). the epochs
 # are the workgroups' counters on each gpu, the same on all of them: every gpu runs the same allreduces. no gpu is an epoch ahead of another's
 # reads (it waits for their values)
-AR_GROUPS, AR_WORDS, AR_TIMEOUT_MS, AR_TWO_SHOT = 64, 1024, 50, 4096
+AR_GROUPS, AR_WORDS, AR_TIMEOUT_MS, AR_TWO_SHOT = 64, 1024, 1000, 4096
 
 @functools.cache
 def _mailboxes(devs:tuple[str, ...]) -> tuple[Tensor, ...]:
