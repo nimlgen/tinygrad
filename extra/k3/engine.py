@@ -17,7 +17,7 @@ from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, MLATra
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, \
   ordered_expert_sum, ordered_expert_sum_supported
-from tinygrad.llm.kernels.amd_gguf import find_packed, expert_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, \
+from tinygrad.llm.kernels.amd_gguf import find_packed, copies_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, \
   HALFWORD_QUANTS, TILE_QUANTS
 from extra.k3.host import IoT, host_c, wait, reads, free_bytes, host_tensor, VICTIMS
 from extra.k3.draft import Eagle3, DSpark, MTP, load
@@ -350,20 +350,21 @@ class Engine:
     """each gpu's units of layer li's n experts of a table (a copy's n slots, padded with slot 0, their weights a token's: j*T + t, then the next
     copy's) on h (T, lat): (gpus, n, lat) and the weights (n,). entry j*T+t is token t's j-th expert, from the copy where its weight isn't 0,
     the act in the q8 of the down gemv's input"""
-    u, ys, ws = self.units, [], []
+    u, sets = self.units, []
     for c, types in enumerate(self.copies):
       if types[li] is None: continue
       (gu_type, down_type), stride, at = types[li], self.layer_spans[c][li] * self.part, 1 + 2 * c * n
       off = self.nbytes(gu_type, 2 * u * self.lat)
-      slots, w = table[at:at + n].bitcast(dtypes.int32), table[at + n:at + 2 * n].bitcast(dtypes.float32)
-      if amd_custom_kernels_supported(h.device):
-        gu = expert_linear(self.pools[gu_type], slots, h, 2 * u, self.lat, gu_type, stride, split=True, live=w)
-        ys.append(expert_linear(self.pools[down_type], slots, gu, self.lat, u, down_type, stride, off, act=self.act, live=w))
-      else:
-        gu = self.gemv(stride, slots, h, 2 * u, self.lat, gu_type, 0)
-        ys.append(self.gemv(stride, slots, self.act(*gu.split(u, -1)), self.lat, u, down_type, off))
-      ws.append(w)
-    return functools.reduce(Tensor.add, [(w.reshape(1, -1, 1) != 0).where(y, 0) for y, w in zip(ys, ws)]), functools.reduce(Tensor.add, ws)
+      sets.append((gu_type, down_type, stride, off, table[at:at + n].bitcast(dtypes.int32), table[at + n:at + 2 * n].bitcast(dtypes.float32)))
+    ws = functools.reduce(Tensor.add, [w for *_, w in sets])
+    if amd_custom_kernels_supported(h.device):
+      gu = copies_linear([(self.pools[g], slots, g, stride, 0, w) for g, _, stride, _, slots, w in sets], h, 2 * u, self.lat, split=True)
+      return copies_linear([(self.pools[d], slots, d, stride, off, w) for _, d, stride, off, slots, w in sets], gu, self.lat, u, act=self.act), ws
+    ys = []
+    for gu_type, down_type, stride, off, slots, w in sets:
+      gu = self.gemv(stride, slots, h, 2 * u, self.lat, gu_type, 0)
+      ys.append((w.reshape(1, -1, 1) != 0).where(self.gemv(stride, slots, self.act(*gu.split(u, -1)), self.lat, u, down_type, off), 0))
+    return functools.reduce(Tensor.add, ys), ws
 
   @staticmethod
   def heaviest_first(ys:list[Tensor], ws:list[Tensor], T:int) -> Tensor:
