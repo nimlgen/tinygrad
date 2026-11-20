@@ -27,7 +27,6 @@ from extra.k3 import persist
 # routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: next-layer guesses per row (rows 2 onward 2 when all experts
 # use their primary copy). SLOTS: on a gpu (default: what's free but SPARE bytes).
 # BIG: a token's experts of a rank under it read in the store's first copy (of copies: host.py).
-# PREFILL_PRIOR: after window prefill, cap the total expert frequency per layer at 20 / (1 - decay) before decoding (zero keeps it).
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 BIG = getenv("BIG", 2)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 7 << 28)
@@ -54,7 +53,7 @@ class Engine:
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
                copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0),
-               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0))):
+               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -63,7 +62,6 @@ class Engine:
     the manifests of the store's other copies of the experts (of some of its layers: a step's expert read in one of them, BIG). short_window:
     an alternate window capacity for continuations, sharing the same pool and caches"""
     self.model, self.m, self.devs, self.draft, self.keep_logits = model, m, model.token_embd.weight.device, draft, logits
-    self.prefill_prior = prefill_prior
     self.source, self.saved, self.names = source, cast(dict, {}), {}
     self.t_stage = time.perf_counter()
     self.dump_taps = taps or []
@@ -1182,7 +1180,7 @@ class Engine:
       self.steps(tokens, fork_prefilled, fork)
       self.model.save(tokens[:fork])
     prefilled = self.prefill(tokens, fork)
-    cap_prior = (fork_prefilled > start or prefilled > fork) and self.prefill_prior
+    cap_prior = fork_prefilled > start or prefilled > fork
     (*_, t), g, score = self.steps(tokens, prefilled, len(tokens), cap_prior=cap_prior)
     self.model.save(tokens)
     row, c0, v0, widths = 0, self.counters(), self.verified.copy(), collections.Counter()

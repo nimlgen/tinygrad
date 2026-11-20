@@ -615,9 +615,8 @@ class TestEngine(unittest.TestCase):
     self.assertEqual(take(X + [2, 4]), want)
 
 class TestPrefillPrior(unittest.TestCase):
-  def engine(self, enabled=True) -> Engine:
+  def engine(self) -> Engine:
     eng = Engine.__new__(Engine)
-    eng.prefill_prior = enabled
     eng.io = IoT(copies=2, layers=2, decay=.5)
     eng.state = {"freq": np.zeros(12, dtype=np.float32), "mask": np.zeros(8, np.uint8), "flying": np.zeros(12, np.int32)}
     eng.m, eng.tail, eng.arena, eng.max_primary_span, eng.grow = {"n_experts": 3}, 8, (0, 0), 1, lambda n: None
@@ -698,16 +697,6 @@ class TestPrefillPrior(unittest.TestCase):
         self.assertIsNone(eng.session)
       cap.assert_not_called()
       np.testing.assert_array_equal(eng.state["freq"], np.full(12, 100, dtype=np.float32))
-
-  def test_disabled_with_actual_window(self):
-    eng = self.engine(False)
-    eng.state["freq"][:] = 100
-    with patch.multiple(eng, window=lambda *a: None, step=lambda *a: ([7], [], None), pieces=lambda: 1, steps_faster=lambda n: False,
-                        counters=lambda: np.zeros(15)), patch.object(eng, "cap_prefill_prior", wraps=eng.cap_prefill_prior) as cap:
-      output = eng.generate([2, 3, 4])
-      self.assertEqual(next(output), 7)
-      output.close()
-      cap.assert_not_called()
 
 
 GLM = TransformerConfig(num_blocks=2, dim=DIM, hidden_dim=FF, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=VOCAB, head_dim=24,
