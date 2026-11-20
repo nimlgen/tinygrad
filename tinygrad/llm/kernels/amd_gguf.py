@@ -155,30 +155,32 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, act:Callable|None=None) -
 def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, share=False, tables:tuple[UOp, ...]=(),
                    live:Callable|None=None) -> UOp:
   chunks = out.shape[2]
-  # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
+  # A wave per four outputs/chunk; group neighboring rows to amortize workgroup scheduling.
   span = 2 if group_count <= 16 and out_features % 2 == 0 else 1
-  rows = math.gcd(out_features//span, 4)
+  outs = math.gcd(out_features//span, 4)
+  rows = math.gcd(out_features//(span*outs), 4)
   tokens = share if type(share) is int else n if share and (n:=cast(int, out.shape[0])) <= 8 else 1
-  rowblock, row = UOp.range(out.shape[0]//tokens, 0, AxisType.GLOBAL), UOp.range(out_features//(rows*span), 1, AxisType.GLOBAL)
+  rowblock, row = UOp.range(out.shape[0]//tokens, 0, AxisType.GLOBAL), UOp.range(out_features//(rows*span*outs), 1, AxisType.GLOBAL)
   chunk, lane, half = UOp.range(chunks, 2, AxisType.GLOBAL), UOp.range(32//span, 3, AxisType.LOCAL), UOp.range(span, 4, AxisType.LOCAL)
   wave = UOp.range(rows, 5, AxisType.LOCAL)
-  token, output = rowblock*tokens, (row*rows+wave)*span+half
+  token, outputs = rowblock*tokens, [((row*rows+wave)*outs+o)*span+half for o in range(outs)]
   group = lane+chunk*32
   if tables:  # (group_dot's lookup tables in LDS)
     lts = [UOp.alloc((int(t.numel()),), t.dtype, addrspace=AddrSpace.LOCAL) for t in tables]
     fill = UOp.group(*[lt[(i:=lane+half*(32//span)+wave*32+k*rows*32).valid(i < n)].store(t[i.minimum(n-1)].load()) for lt, t in zip(lts, tables)
                        for n in [int(t.numel())] for k in range(-(-n//(rows*32)))]).barrier()
     tables = tuple(lt.after(fill) for lt in lts)
-  def dot(t:int, g:UOp) -> UOp:
+  def dot(t:int, output:UOp, g:UOp) -> UOp:
     return (g < group_count).where(group_dot(token+t, output, g.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
-  if live is None: value = [dot(t, group) for t in range(tokens)]
+  pairs = list(itertools.product(range(tokens), outputs))
+  if live is None: value = [dot(t, output, group) for t, output in pairs]
   else:  # live(token, group): the group's dot is read and added at all (a loop of one or no iterations: the loads in it)
     i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 6, AxisType.LOOP)
-    acc = _reg((tokens,), 0)
-    acc = acc.after(UOp.group(*[acc[t].store(acc.after(i)[t].load() + dot(t, group + i)) for t in range(tokens)]).end(i))
-    value = [acc[t].load() for t in range(tokens)]
+    acc = _reg((len(pairs),), 0)
+    acc = acc.after(UOp.group(*[acc[k].store(acc.after(i)[k].load() + dot(t, output, group + i)) for k, (t, output) in enumerate(pairs)]).end(i))
+    value = [acc[k].load() for k in range(len(pairs))]
   stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=span == 1).cast(out.dtype))
-            for t,v in enumerate(value)]
+            for (t, output), v in zip(pairs, value)]
   return UOp.group(*stores).end(rowblock, row, wave, chunk, lane, half).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _xor_lane(v:UOp, m:int) -> UOp:
