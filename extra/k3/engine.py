@@ -768,9 +768,12 @@ class Engine:
   def pieces(self) -> int:
     """a read window's pieces: lent below the window's state, past the caches' stripes and the scratch (their rows pinned as they grow, the
     rest the experts'), the pool past them and two layers' experts (the one routed, the one read ahead)"""
-    (a0, a1), mask = self.arena, self.state["mask"]
-    free = min(self.tail - a1, self.tail - (a1 - a0) - int(mask[:a0].sum() + mask[a1:].sum()) - 2 * self.m["n_experts"] * self.max_primary_span)
+    free = min(self.tail - self.arena[1], self.free_slots() - 2 * self.m["n_experts"] * self.max_primary_span)
     return 1 + max(0, free // self.slots_of(self.piece_bytes))
+
+  def free_slots(self) -> int:
+    (a0, a1), mask = self.arena, self.state["mask"]
+    return self.tail - (a1 - a0) - int(mask[:a0].sum() + mask[a1:].sum())
 
   def window(self, toks:list[int], pos:int, given:list[int]):
     """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
@@ -861,8 +864,7 @@ class Engine:
                 else: guesses = np.argsort(-freq, kind="stable")[:len(used)]
               else: guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
               self.read(codes, codes, wait=False)
-            self.read(self.window_codes(li + 1, guesses), codes, wait=False)
-            ahead[li + 1] = guesses
+            if self.read(self.window_codes(li + 1, guesses), codes, wait=False): ahead[li + 1] = guesses
           t0 = time.perf_counter()
           self.read(codes, codes, wait=True)
           self.io.t_reads += time.perf_counter() - t0
@@ -913,30 +915,38 @@ class Engine:
     io.t_gpu += time.perf_counter() - t0
     return counts
 
-  def read(self, codes:np.ndarray, busy:np.ndarray, wait:bool):
+  def read(self, codes:np.ndarray, busy:np.ndarray, wait:bool) -> bool:
     """the codes not cached read into the least used slots but those of busy's codes (in use or read): waited for (and those read ahead), or
     not (read ahead)"""
     st, io = self.state, self.io
     reads = [np.ascontiguousarray(a, np.int64) for a in (codes[st["flying"][codes] > 0], codes[st["slot_of"][codes] < 0])]
     if wait and len(reads[0]) and (err:=host_c().read_wait(ctypes.byref(io), len(reads[0]), reads[0].ctypes.data)):
       raise RuntimeError(f"window reads failed {err}")
-    if not len(miss:=reads[1]): return
+    if not len(miss:=reads[1]): return True
     old, E, LE = st["expert_in"], self.m["n_experts"], len(self.types) * self.m["n_experts"]
-    keep = (np.arange(self.slots) >= self.lent_from) | ((old >= 0) & (old % LE >= self.layer * E) & (old % LE < (self.layer + 2) * E))
-    keep |= (st["mask"] > 0) | np.isin(old, busy) | ((old >= 0) & (st["flying"][np.maximum(old, 0)] > 0))
-    victims = np.zeros(len(miss), np.int64)
-    groups = self.span_groups.reshape(-1)[miss // E]
+    keep = (np.arange(self.slots) >= self.lent_from) | (st["mask"] > 0) | np.isin(old, busy) | ((old >= 0) & (st["flying"][np.maximum(old, 0)] > 0))
+    rank = np.where(keep, 2, (old >= 0) & (old % LE >= self.layer * E) & (old % LE < (self.layer + 2) * E))
+    plan = miss if wait else np.concatenate([miss, np.setdiff1d(busy[st["slot_of"][busy] < 0], miss)])
+    victims, groups, worst = np.zeros(len(plan), np.int64), self.span_groups.reshape(-1)[plan // E], 0
     for c in np.unique(groups):
       at, w = np.nonzero(groups == c)[0], self.spans[c]
-      key = np.where(keep, np.inf, np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0))[:self.slots // w * w].reshape(-1, w).sum(1)
-      victims[at] = np.argsort(key, kind="stable")[:len(at)] * w
-      if np.isinf(key[victims[at] // w]).any(): raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
+      units = rank[:self.slots // w * w].reshape(-1, w).max(1)
+      key = np.where(old >= 0, st["freq"][np.maximum(old, 0)], -1.0)[:self.slots // w * w].reshape(-1, w).sum(1)
+      victims[at] = np.lexsort((key, units))[:len(at)] * w
+      worst = max(worst, int(units[victims[at] // w].max()))
+      rank[(victims[at][:, None] + np.arange(w)).flatten()] = 2
+    if not wait and worst: return False
+    if worst == 2: raise RuntimeError(f"window layer {self.layer}: {len(miss)} reads, the pool's free slots fewer")
+    victims, groups = np.ascontiguousarray(victims[:len(miss)]), groups[:len(miss)]
+    for c in np.unique(groups):
+      at, w = np.nonzero(groups == c)[0], self.spans[c]
       self.drop(units:=(victims[at][:, None] + np.arange(w)).flatten())
-      st["slot_of"][miss[at]], st["expert_in"][units], keep[units] = victims[at], np.repeat(miss[at], w), True
+      st["slot_of"][miss[at]], st["expert_in"][units] = victims[at], np.repeat(miss[at], w)
     io.misses += len(miss)
-    if not wait: return host_c().read_ahead(ctypes.byref(io), len(miss), miss.ctypes.data)
-    if (err:=host_c().read_codes(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)):
+    if not wait: host_c().read_ahead(ctypes.byref(io), len(miss), miss.ctypes.data)
+    elif (err:=host_c().read_codes(ctypes.byref(io), len(miss), miss.ctypes.data, victims.ctypes.data)):
       raise RuntimeError(f"window reads failed {err}")
+    return True
 
   # *** the host's side
 
@@ -1130,8 +1140,10 @@ class Engine:
     """tokens from pos on but the last fed in windows of up to W of them (an even split, a layer at a time over each), the last one's chunk
     partial (its rows padded), unless steps of them are faster (steps_faster), the position after them"""
     if not self.W: return pos
-    end = len(tokens) - 1
-    P = self.W * self.pieces()  # (a read window's most tokens)
+    end, E, K, w = len(tokens) - 1, self.m["n_experts"], self.model.config.num_experts_per_tok, self.max_primary_span
+    self.grow(end + self.chunk)
+    free = self.free_slots() - w * int((self.state["flying"] > 0).sum())
+    if not (P:=self.W * self.pieces() if free >= E * w else min(free // (K * w), self.W)): return pos  # (a read window's most tokens)
     size = -(-(end - pos) // -(-(end - pos) // P)) if end > pos else P
     while pos < end:
       n = min(size, end - pos)

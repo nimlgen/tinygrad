@@ -2,7 +2,7 @@
 # the engine's forward against master's model with the routed experts on a tiny random kimi-k3 on two CPU "gpus": every expert in the pools
 # (a slot a code, each gpu its units), the host's part stubbed by exact routing (TAU=0: a token's top k in the store's two parts)
 # DEV=CPU PYTHONPATH=. python3 extra/k3/test_engine.py (DEV=AMD: the jitted steps with the host's step_io too)
-import itertools, json, pathlib, re, tempfile, unittest
+import ctypes, itertools, json, pathlib, re, tempfile, unittest
 from unittest.mock import patch
 from typing import Callable
 from dataclasses import replace
@@ -14,7 +14,7 @@ from tinygrad.helpers import round_up
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
 from extra.k3.engine import Engine
-from extra.k3.host import IoT
+from extra.k3.host import IoT, host_c
 from extra.k3.draft import Eagle3, DSpark, MTP
 from extra.k3.eval import window_evaluate, window_dump
 
@@ -260,6 +260,40 @@ class TestEngine(unittest.TestCase):
     self.assertEqual((eng.grown, st["mask"][0], st["expert_in"][0], st["slot_of"][-1]), (eng.chunk, 1, -1, -1))
     eng.grow(eng.max_context)
     self.assertEqual((eng.grown, st["mask"].sum()), (eng.max_context, eng.slots_of(eng.cache_bytes)))
+
+  def test_prefill_few_free_slots(self):
+    ids, eng, layers = [2, 0, 27, 24, 26, 17, 26, 10, 14], self.eng, [1, 2]
+    eng.keep_logits = True
+    self.stub()
+    def run(t:int, pos:int) -> np.ndarray:
+      eng.tok_np[:1], eng.given_np[:1] = [t], ids[pos + 1:pos + 2] or [-1]
+      return eng.run(1, eng.v_pos.bind(pos))[1].numpy()
+    for pos, t in enumerate(ids[:-1]): run(t, pos)
+    states, want = [s.numpy() for s in eng.model._states()], run(ids[-1], len(ids) - 1)
+    st, at, part = eng.state, eng.arena[1], eng.part
+    eng.grow(eng.max_context)
+    mask, slot_of, expert_in = st["mask"].copy(), st["slot_of"].copy(), st["expert_in"].copy()
+    def put(code:int, slot:int):
+      for g, data in enumerate(parts(self.weights, layers[code // E], code % E, part)):
+        eng.pool.uop.buffer.bufs[g].as_memoryview(allow_zero_copy=True)[slot * part:(slot + 1) * part] = data
+    def codes(ptr:int, n:int) -> list[int]: return np.ctypeslib.as_array((ctypes.c_int64 * n).from_address(ptr)).tolist() if n else []
+    def read_codes(io, n:int, cs:int, slots:int) -> int:
+      for c, s in zip(codes(cs, n), codes(slots, n)): put(c, s)
+      return 0
+    def read_ahead(io, n:int, cs:int):
+      for c in codes(cs, n): put(c, int(st["slot_of"][c]))
+    fake = SimpleNamespace(flags=host_c().flags, pump=lambda io: 0, read_wait=lambda io, n, cs: 0, read_codes=read_codes, read_ahead=read_ahead)
+    eng.step_s[max(eng.jits)].append(10.0)
+    for free in (E + 2, E - 2):
+      with self.subTest(free=free), patch("extra.k3.engine.host_c", lambda: fake):
+        st["slot_of"][:], st["expert_in"][:], st["mask"][:eng.tail], st["mask"][slice(*eng.arena)] = -1, -1, 1, 0
+        st["mask"][at:at + free] = 0
+        self.assertEqual(eng.prefill(ids, 0), len(ids) - 1)
+        st["mask"][:], st["slot_of"][:], st["expert_in"][:] = mask, slot_of, expert_in
+        for code in range(len(layers) * E): put(code, at + code)
+        for got, w in zip([s.numpy() for s in eng.model._states()] + [run(ids[-1], len(ids) - 1)], states + [want]):
+          np.testing.assert_allclose(got, w, rtol=3e-3, atol=3e-3 * np.abs(w).max())
+        self.assertEqual(got.argmax(), want.argmax())
 
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     for bank, tol in ((dtypes.float, 3e-3), (dtypes.half, 1e-2)):  # (the streams in half: as close as their rounding)
@@ -542,12 +576,14 @@ class TestPrefillPrior(unittest.TestCase):
     eng = Engine.__new__(Engine)
     eng.prefill_prior = enabled
     eng.io = IoT(copies=2, layers=2, decay=.5)
-    eng.state = {"freq": np.zeros(12, dtype=np.float32)}
+    eng.state = {"freq": np.zeros(12, dtype=np.float32), "mask": np.zeros(8, np.uint8), "flying": np.zeros(12, np.int32)}
+    eng.m, eng.tail, eng.arena, eng.max_primary_span, eng.grow = {"n_experts": 3}, 8, (0, 0), 1, lambda n: None
     eng.W, eng.chunk, eng.short_window, eng.short_engine = 8, 4, 4, None
     eng.session, eng.B, eng.v_at = None, 8, UOp.variable("at", 0, 24)
     eng.tokens, eng.draft, eng.verified = 1, None, np.zeros(3, int)
     eng.jits = {1: None}
-    eng.model = SimpleNamespace(max_context=32, _cached_tokens=[], _saved=[], fork=lambda tokens, start, step: start, save=lambda tokens: None)
+    eng.model = SimpleNamespace(max_context=32, _cached_tokens=[], _saved=[], fork=lambda tokens, start, step: start, save=lambda tokens: None,
+                                config=SimpleNamespace(num_experts_per_tok=1))
     eng.model.get_start_pos = lambda tokens: sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, eng.model._cached_tokens)))
     return eng
 
