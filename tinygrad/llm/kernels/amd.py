@@ -1089,7 +1089,8 @@ def reduce_scatter(p:Tensor) -> Tensor:
   ring, in step k device j adds its part of the rows of device j-k to what it got and sends it on (in half, as partial_sum sums)"""
   devs, S = cast(tuple[str, ...], p.device), p.shape[1:]
   n, size = len(devs), S[0] // len(devs)
-  local = _per_device(Tensor.custom_kernel(Tensor.empty(*p.shape, dtype=dtypes.half, device=devs, axis=0), p, fxn=_cast_kernel)[0])
+  sent = dtypes.half if p.dtype == dtypes.float32 and amd_custom_kernels_supported(p.device) else p.dtype
+  local = _per_device(Tensor.custom_kernel(Tensor.empty(*p.shape, dtype=sent, device=devs, axis=0), p, fxn=_cast_kernel)[0])
   def part(j:int, i:int) -> UOp: return local.mselect(j).reshape(S).shrink(((i * size, (i + 1) * size), *((0, s) for s in S[1:])))
   got:dict[tuple[int, int], UOp] = {}
   for k in range(1, n):
