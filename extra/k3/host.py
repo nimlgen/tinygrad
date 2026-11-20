@@ -274,9 +274,9 @@ static int64_t take(io_t *s, int64_t code) {
 
 static int64_t code_of(const io_t *s, int64_t li, int64_t e, int64_t r) {
   int64_t code = li * s->E + e;
-  if (r < s->big || (s->big >= 0 && s->slot_of[code] >= 0)) return code;
-  for (int64_t c = 1; c < s->copies; c++) if (s->ptr[code + c * s->layers * s->E + 1] > s->ptr[code + c * s->layers * s->E])
-    return code + c * s->layers * s->E;
+  if (s->big >= 0 && s->slot_of[code] >= 0) return code;
+  for (int64_t c = 1, other = code + s->layers * s->E; c < s->copies; c++, other += s->layers * s->E)
+    if (s->ptr[other + 1] > s->ptr[other] && (r >= s->big || (s->big < s->k && s->slot_of[other] >= 0))) return other;
   return code;
 }
 
