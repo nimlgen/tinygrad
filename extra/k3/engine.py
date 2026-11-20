@@ -52,7 +52,7 @@ class Engine:
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0)):
+               copies:tuple[dict, ...]=(), short_window:int=0):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -82,7 +82,7 @@ class Engine:
     if short_window:
       short_chunk = min(SHORT_CHUNK, short_window // 2)
       if not (0 < short_window < window and 0 < short_chunk < chunk and short_window % short_chunk == short_chunk % len(self.devs) == 0):
-        raise ValueError("ADAPTIVE_SHORT_WINDOW needs a smaller window and an evenly sharded smaller chunk")
+        raise ValueError("a short window needs a smaller window and an evenly sharded smaller chunk")
     self.forecast_counts = host_tensor(self.devs, m["n_experts"], dtypes.uint32) if window else None
     self.ms = [m, *copies]
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
@@ -1251,7 +1251,7 @@ if __name__ == "__main__":
   taps = [(int(t.rstrip("m")), t.endswith("m")) for t in getenv("TAPS", "").split(",") if t]
   eng = Engine(model, stores[0][1], tokens=max(widths) if draft else 1, guess=getenv("GUESS", ""), draft=draft, logits=bool(getenv("EVAL", "")),
                chunk=getenv("CHUNK", 256), window=getenv("WINDOW", 0), taps=taps, widths=tuple(widths), source=sys.argv[1],
-               copies=tuple(m for _, m in stores[1:]))
+               copies=tuple(m for _, m in stores[1:]), short_window=getenv("SHORT_WINDOW", 0))
   eng.drives(*(d for d, _ in stores))
   eng.warm()
   print(f"warm in {time.perf_counter() - st:.0f} s, {eng.slots} slots a gpu", flush=True)
