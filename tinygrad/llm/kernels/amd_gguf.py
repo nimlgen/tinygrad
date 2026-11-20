@@ -97,7 +97,7 @@ def _iq4_bytes(packed:UOp, shift:int|UOp) -> UOp:
 
 def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
   # scales/mins (6-bit each) live in block bytes 4-15: three words total, same for the whole super-block's lanes
-  w1, w2, w3 = _amd_load(raw[base+1]), _amd_load(raw[base+2]), _amd_load(raw[base+3])
+  w1, w2, w3 = raw[base+1].load(), raw[base+2].load(), raw[base+3].load()
   sb = (subgroup & 3) * 8  # byte within word
   byte1, byte2, byte3 = (w1 >> sb) & 255, (w2 >> sb) & 255, (w3 >> sb) & 255
   scale = (subgroup < 4).where(byte1 & 63, (byte3 & 15) | ((byte1 >> 6) << 4))
@@ -427,6 +427,7 @@ def copies_linear(sets:list[tuple[Tensor, Tensor, int, int, int, Tensor|None]], 
                   act:Callable|None=None, split:bool=False, weighted:bool=False, rows:int=1, per:int=1) -> Tensor:
   """expert_linear over the weight sets (pool, slots, ggml_type, stride, offset, live) of a table's copies in one kernel: out[k] the sum of the
   sets' where their live[k] isn't 0 (a row read from the copy that has it). weighted: one set, live its w"""
+  sets = sorted(sets, key=lambda s: s[2] not in GRID_QUANTS)
   pool, slots = sets[0][:2]
   words = [dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32 for _, _, ggml_type, _, _, _ in sets]
   for (_, _, ggml_type, stride, offset, _), word in zip(sets, words):
