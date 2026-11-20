@@ -372,10 +372,10 @@ static int64_t step_layer(io_t *s, int64_t li) {
   int64_t sel[64], pos[4096], usel[512], urank[512], ucode[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0,
           late = 0, ns = 0, nf = 0;
   uint8_t hit[512], need[4096] = {0};
+  int64_t full = s->tau > 0 && s->tail ? s->tail : T;
   int32_t slot[4096];
   slots_past_big(s, li, slot);
   for (int64_t e = 0; e < E; e++) pos[e] = -1;
-  int64_t full = s->tau > 0 && s->tail ? s->tail : T;
   for (int64_t t = 0; t < T; t++) {
     logits_of(s, b, t * s->rows, logits);
     int64_t c = tc[t] = route(s, logits, s->bias[li], slot, 1, sel, tw + t * 64, sig, skip, &ns);
