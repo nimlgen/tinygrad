@@ -295,6 +295,17 @@ class TestEngine(unittest.TestCase):
           np.testing.assert_allclose(got, w, rtol=3e-3, atol=3e-3 * np.abs(w).max())
         self.assertEqual(got.argmax(), want.argmax())
 
+  def test_failed_window(self):
+    ids, eng = [3, 5, 7, 1, 2, 9, 4, 6, 8, 3, 1, 7], self.engine(2 * E + 4)
+    bank, counted = eng.win["bank"], eng.counted
+    def fail(*args) -> np.ndarray:
+      if eng.win["bank"] is not bank: raise RuntimeError("window reads failed")
+      return counted(*args)
+    eng.steps_faster, eng.counted, eng.model._cached_tokens = lambda n: False, fail, ids[:2]  # type: ignore[method-assign]
+    with self.assertRaises(RuntimeError): next(eng.generate(ids))
+    self.assertEqual((eng.win["bank"] is bank, eng.lent_from, eng.model._cached_tokens, eng.state["mask"][slice(*eng.arena)].any()),
+                     (True, eng.tail, [], False))
+
   def test_window_pieces(self):  # a read window of 2 pieces (its pool lends a second piece's bank): states, logits as after steps
     for bank, tol in ((dtypes.float, 3e-3), (dtypes.half, 1e-2)):  # (the streams in half: as close as their rounding)
       with self.subTest(bank=bank):

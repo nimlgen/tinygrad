@@ -798,17 +798,19 @@ class Engine:
     assert self.lent_from >= self.arena[1] and not st["mask"][self.lent_from:self.tail].any(), "a piece over the caches or the scratch"
     self.drop(slice(self.lent_from, None), wait=True)
     pieces = [(p0, min(W, T - p0), bank) for p0, bank in zip(range(0, T, W), banks)]
-    for p0, _, bank in pieces:
-      self.win.update(bank)
-      self.graph(self.start_jit, self.v_p0.bind(p0))
-    host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
-    self.layers(pieces, pos)
-    for p0, n, bank in pieces if self.fill_jit else []:
-      self.win.update(bank)
-      for c0 in range(0, n, C): self.graph(self.fill_jit, self.v_pos.bind(pos + p0 + c0), self.v_p0.bind(p0), self.v_c0.bind(c0))
-    for d in self.devs: Device[d].synchronize()
-    self.win.update(banks[0])
-    self.lent_from, self.state["mask"][arena] = self.tail, 0
+    try:
+      for p0, _, bank in pieces:
+        self.win.update(bank)
+        self.graph(self.start_jit, self.v_p0.bind(p0))
+      host_c().flags(ctypes.byref(self.io), 0)  # (the tags cleared)
+      self.layers(pieces, pos)
+      for p0, n, bank in pieces if self.fill_jit else []:
+        self.win.update(bank)
+        for c0 in range(0, n, C): self.graph(self.fill_jit, self.v_pos.bind(pos + p0 + c0), self.v_p0.bind(p0), self.v_c0.bind(c0))
+      for d in self.devs: Device[d].synchronize()
+    finally:
+      self.win.update(banks[0])
+      self.lent_from, self.state["mask"][arena] = self.tail, 0
     self.window_s.append((T, time.perf_counter() - t0))
 
   def steps_faster(self, n:int) -> bool:
@@ -1179,7 +1181,8 @@ class Engine:
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
     fork_prefilled = start
-    if (fork:=self.model.fork(tokens, start, 1 if self.W else self.chunk or 1)) > start:
+    fork, self.model._cached_tokens = self.model.fork(tokens, start, 1 if self.W else self.chunk or 1), []
+    if fork > start:
       fork_prefilled = self.prefill(tokens[:fork + 1], start)
       self.steps(tokens, fork_prefilled, fork)
       self.model.save(tokens[:fork])
@@ -1208,6 +1211,9 @@ class Engine:
           self.model._cached_tokens = tokens[:]
           yield kept
         t = toks[row]
+    except Exception:
+      self.model._cached_tokens = []
+      raise
     finally:
       if (n:=sum(widths.values())):
         dt, _, refs, hits, *_, gpu, _, reads, _, _, after = (self.counters() - c0) / n
