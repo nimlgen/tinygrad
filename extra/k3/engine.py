@@ -52,8 +52,7 @@ class Engine:
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0),
-               window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0))):
+               copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0)):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
     every expert each (its units), in steps of a token or (a draft's verify steps) of tokens, a prompt in windows of up to window tokens (their
     attention in chunks), keeping their logits or not. taps: without a draft, the (block, mixed) streams a window keeps (draft.taps). widths:
@@ -67,7 +66,6 @@ class Engine:
     self.dump_taps = taps or []
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
-    self.window_forecast = window_forecast
     # Layer-major windows must keep the most recent indexer's selection for each query until its last consumer.
     self.index_roles:dict[FFNBlock, str] = {}
     idx = model.config.indexer
@@ -85,8 +83,7 @@ class Engine:
       short_chunk = min(SHORT_CHUNK, short_window // 2)
       if not (0 < short_window < window and 0 < short_chunk < chunk and short_window % short_chunk == short_chunk % len(self.devs) == 0):
         raise ValueError("ADAPTIVE_SHORT_WINDOW needs a smaller window and an evenly sharded smaller chunk")
-    if window_forecast and not window: raise ValueError("window forecast needs a window")
-    self.forecast_counts = host_tensor(self.devs, m["n_experts"], dtypes.uint32) if window_forecast else None
+    self.forecast_counts = host_tensor(self.devs, m["n_experts"], dtypes.uint32) if window else None
     self.ms = [m, *copies]
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
@@ -834,7 +831,7 @@ class Engine:
       s = n - 1 + int(self.new_stream(b))
       for p0, T, bank in pieces:
         self.win.update(bank)
-        forecast = (self.forecast_jit if self.window_forecast and len(pieces) == 1 and T <= min(self.chunk, SHORT_CHUNK) and
+        forecast = (self.forecast_jit if len(pieces) == 1 and T <= min(self.chunk, SHORT_CHUNK) and
                     hasattr(b, "ffn_gate_inp") and i < self.m["layers"][moe - 1] else None)
         for c0, nlive in chunks(T):
           name, fxn = ("forecast", functools.partial(self.attend, forecast=True)) if forecast is not None else ("attend", self.attend)

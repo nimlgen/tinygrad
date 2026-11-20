@@ -86,8 +86,8 @@ class TestEngine(unittest.TestCase):
   def test_window_tag(self):  # the tag the host waits on written by a kernel that reads the counts it gives the host (and the forecast's): a
     # gpu orders a graph's kernels by the buffers they touch, not by the graph's order
     def base(u:UOp) -> UOp: return u if u.op in (Ops.PARAM, Ops.BUFFER) else base(u.src[0])
+    eng = self.engine(2 * E)
     for forecast in (False, True):
-      eng = self.engine(2 * E, window_forecast=forecast)
       jit, tag = (eng.forecast_jit, 2) if forecast else (eng.routes[min(eng.routes)][0], 1)  # (its args: the biases, the tag, the counts)
       writers = 0
       for c in [c for c in jit.captured._linear.src if c.op is Ops.CALL]:
@@ -110,14 +110,14 @@ class TestEngine(unittest.TestCase):
     self.eng = self.engine(2 * E)
 
   def engine(self, slots:int, draft:Callable[[Transformer], DSpark]|None=None, caches:bytes=b'\0', tokens:int=2, widths:tuple[int, ...]=(),
-             source:str="", short_window:int=0, window_forecast:bool=False) -> Engine:
+             source:str="", short_window:int=0) -> Engine:
     # (the engine on the trunk (and draft's on it), every expert in its slot past the context's caches and the window's scratch (the pool's
     # first slots, of caches' bytes))
     part, layers = 4096, [1, 2]
     m = {"n_experts": E, "lat": LAT, "units": [FF // G] * G, "part_bytes": [part] * G, "expert_type": "Q8_0", "block": [32, 34], "layers": layers}
     model = Transformer.from_gguf(self.trunk, shard=G)[0]
     eng = Engine(model, m, slots=slots + 96, tokens=tokens, chunk=4, window=8, draft=draft(model) if draft else None,
-                 widths=widths, source=source, short_window=short_window, window_forecast=window_forecast)  # (96: the caches', the scratch's)
+                 widths=widths, source=source, short_window=short_window)  # (96: the caches', the scratch's)
     if short_window: eng.capture_short_window()
     at = eng.arena[1]
     assert at <= 96
@@ -249,7 +249,8 @@ class TestEngine(unittest.TestCase):
     sequence = [3, 4, 5, 6]
     residuals = []
     for forecast in (False, True):
-      eng = self.eng = self.engine(2 * E, window_forecast=forecast)
+      eng = self.eng = self.engine(2 * E)
+      if not forecast: eng.forecast_jit = None
       self.stub()
       counted = eng.counted
       predictions = []
