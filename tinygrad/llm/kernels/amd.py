@@ -1078,19 +1078,13 @@ def _per_device(x:Tensor) -> UOp:  # (the buffer of a kernel's output split over
   assert u.op is Ops.AFTER and u.src[0].op is Ops.UNSHARD, f"not a split kernel output: {u.op}"
   return u.src[0].src[0].after(*u.src[1:])
 
-@functools.cache
-def _cast_kernel(out:UOp, x:UOp) -> UOp:
-  o, s = out.flatten(), x.flatten()
-  i = UOp.range(o.shape[0], 0)
-  return o[i].store(s[i].load().cast(o.dtype)).end(i).sink(arg=KernelInfo(name="cast"))
-
 def reduce_scatter(p:Tensor) -> Tensor:
   """the sum over the devices of their partials p (devices, R, ...) split on axis 0, split on its rows over the devices (R, ...): around the
   ring, in step k device j adds its part of the rows of device j-k to what it got and sends it on (in half, as partial_sum sums)"""
   devs, S = cast(tuple[str, ...], p.device), p.shape[1:]
   n, size = len(devs), S[0] // len(devs)
   sent = dtypes.half if p.dtype == dtypes.float32 and amd_custom_kernels_supported(p.device) else p.dtype
-  local = _per_device(Tensor.custom_kernel(Tensor.empty(*p.shape, dtype=sent, device=devs, axis=0), p, fxn=_cast_kernel)[0])
+  local = _per_device(Tensor.empty(*p.shape, dtype=sent, device=devs, axis=0).assign(p.cast(sent)))
   def part(j:int, i:int) -> UOp: return local.mselect(j).reshape(S).shrink(((i * size, (i + 1) * size), *((0, s) for s in S[1:])))
   got:dict[tuple[int, int], UOp] = {}
   for k in range(1, n):
