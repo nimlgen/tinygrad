@@ -31,7 +31,7 @@ from extra.k3 import persist
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
 PREFETCH_TAIL = getenv("PREFETCH_TAIL", 0)
 BIG = getenv("BIG", 2)
-SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 2 << 30)
+SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 7 << 28)
 # (the drives' bytes a second, a window's seconds a token, a step's before any are measured: tinys3's, 195 GB/s (k3's store not cached in 4.8 s),
 # 1.26 ms, 50 ms)
 READ_BW, WINDOW_TOKEN_S, STEP_S = 195e9, 1.3e-3, 0.05
