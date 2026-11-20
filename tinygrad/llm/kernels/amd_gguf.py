@@ -156,28 +156,30 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
                    live:Callable|None=None) -> UOp:
   chunks = out.shape[2]
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
-  rows = math.gcd(out_features, 4)
+  span = 2 if group_count <= 16 and out_features % 2 == 0 else 1
+  rows = math.gcd(out_features//span, 4)
   tokens = share if type(share) is int else n if share and (n:=cast(int, out.shape[0])) <= 8 else 1
-  rowblock, row = UOp.range(out.shape[0]//tokens, 0, AxisType.GLOBAL), UOp.range(out_features//rows, 1, AxisType.GLOBAL)
-  wave = UOp.range(rows, 4, AxisType.LOCAL)
-  chunk, lane = UOp.range(chunks, 2, AxisType.GLOBAL), UOp.range(32, 3, AxisType.LOCAL)
-  token, output = rowblock*tokens, row*rows+wave
+  rowblock, row = UOp.range(out.shape[0]//tokens, 0, AxisType.GLOBAL), UOp.range(out_features//(rows*span), 1, AxisType.GLOBAL)
+  chunk, lane, half = UOp.range(chunks, 2, AxisType.GLOBAL), UOp.range(32//span, 3, AxisType.LOCAL), UOp.range(span, 4, AxisType.LOCAL)
+  wave = UOp.range(rows, 5, AxisType.LOCAL)
+  token, output = rowblock*tokens, (row*rows+wave)*span+half
   group = lane+chunk*32
   if tables:  # (group_dot's lookup tables in LDS)
     lts = [UOp.alloc((int(t.numel()),), t.dtype, addrspace=AddrSpace.LOCAL) for t in tables]
-    fill = UOp.group(*[lt[(i:=lane+wave*32+k*rows*32).valid(i < n)].store(t[i.minimum(n-1)].load()) for lt, t in zip(lts, tables)
+    fill = UOp.group(*[lt[(i:=lane+half*(32//span)+wave*32+k*rows*32).valid(i < n)].store(t[i.minimum(n-1)].load()) for lt, t in zip(lts, tables)
                        for n in [int(t.numel())] for k in range(-(-n//(rows*32)))]).barrier()
     tables = tuple(lt.after(fill) for lt in lts)
   def dot(t:int, g:UOp) -> UOp:
     return (g < group_count).where(group_dot(token+t, output, g.minimum(group_count-1), *tables), UOp.const(0, dtypes.float32))
   if live is None: value = [dot(t, group) for t in range(tokens)]
   else:  # live(token, group): the group's dot is read and added at all (a loop of one or no iterations: the loads in it)
-    i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 5, AxisType.LOOP)
+    i = UOp.range(((group < group_count) & live(token, group.minimum(group_count-1))).where(1, 0), 6, AxisType.LOOP)
     acc = _reg((tokens,), 0)
     acc = acc.after(UOp.group(*[acc[t].store(acc.after(i)[t].load() + dot(t, group + i)) for t in range(tokens)]).end(i))
     value = [acc[t].load() for t in range(tokens)]
-  stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=True).cast(out.dtype)) for t,v in enumerate(value)]
-  return UOp.group(*stores).end(rowblock, row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  stores = [out[token+t, output, chunk.valid(lane.eq(0))].store(warp_reduce(v, full_wave=span == 1).cast(out.dtype))
+            for t,v in enumerate(value)]
+  return UOp.group(*stores).end(rowblock, row, wave, chunk, lane, half).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _xor_lane(v:UOp, m:int) -> UOp:
   return UOp.custom_function(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | m<<10}))",
