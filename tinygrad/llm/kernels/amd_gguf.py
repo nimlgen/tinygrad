@@ -185,7 +185,7 @@ def _xor_lane(v:UOp, m:int) -> UOp:
 
 def _decode_linear_dense(out:UOp, out_features:int, group_count:int, group_dot, name:str, tables:tuple[UOp, ...]=()) -> UOp:
   def waste(lanes:int) -> int: return lanes*((group_count+lanes-1)//lanes) - group_count
-  lanes = min((l for l in (32, 16, 8) if out_features % (32//l) == 0), key=lambda l: (waste(l), -l))
+  lanes = 32 if group_count <= 16 else min((l for l in (32, 16, 8) if out_features % (32//l) == 0), key=lambda l: (waste(l), -l))
   outs_per_wave, slots = 32 // lanes, (group_count+lanes-1)//lanes
   per = (slots + 15) // 16
   if group_count <= 48 and out_features >= 2048: per = min(max(per, 4), slots)
