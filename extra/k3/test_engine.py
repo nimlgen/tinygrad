@@ -175,6 +175,21 @@ class TestEngine(unittest.TestCase):
     self.eng.model.rollback(1)
     np.testing.assert_allclose(logits([7], 2)[0], want[2], rtol=1e-4, atol=1e-4)
 
+  def test_sampled(self):  # at a temperature a step's token drawn from the softmax of its logits over it (gumbel-max), at 0 the greedy one
+    self.stub()
+    eng, want, n = self.eng, self.want(3, 0), 256
+    eng.tok_np[:1], eng.given_np[:1], eng.rng = [3], [-1], np.random.default_rng(0)
+    eng.model._copy(0, save=True)
+    def draw() -> int:
+      eng.model._copy(0, save=False)
+      eng.key_np[:] = eng.rng.integers(1 << 32, size=2)
+      eng.jits[1](eng.v_pos.bind(0))
+      return int(eng.res_np[1])
+    self.assertEqual(draw(), want.argmax())
+    eng.temperature_np[:] = 2.0
+    p = np.exp((want - want.max()) / 2.0)
+    self.assertLess(np.abs(np.bincount([draw() for _ in range(n)], minlength=VOCAB) / n - p / p.sum()).sum() / 2, 0.2)
+
   def test_window(self):  # a prompt of 9: a window of its first 8 (two chunks), then a token: the logits after it as a token a step's
     self.stub()
     toks = [3, 5, 7, 1, 2, 9, 4, 6, 8]
@@ -385,7 +400,7 @@ class TestEngine(unittest.TestCase):
     model = SimpleNamespace(fork=lambda *a: 0, save=lambda t: None, rollback=lambda n: None)
     eng = SimpleNamespace(get_start_pos=lambda t: 0, model=model, prefill=lambda t, p: p, step=lambda *a: next(steps), tokens=2, max_context=8,
                           draft=True, proposal=lambda g, *a: seen.append(g) or g[:1], verified=np.zeros(3, int), W=0, chunk=0,
-                          counters=lambda: np.zeros(15), jits={1: None, 2: None}, io=SimpleNamespace(tail=1))
+                          counters=lambda: np.zeros(15), jits={1: None, 2: None}, io=SimpleNamespace(tail=1), temperature_np=np.zeros(1))
     eng.steps = lambda *a, **kw: Engine.steps(eng, *a, **kw)  # type: ignore[arg-type]
     self.assertEqual([t for _, t in zip(range(4), Engine.generate(eng, [0]))], [5, 6, 9, 8])  # type: ignore[arg-type]
     self.assertEqual(seen, [[6, 7], [8, 3]])
@@ -609,7 +624,7 @@ class TestPrefillPrior(unittest.TestCase):
     eng.W, eng.chunk, eng.short_window, eng.short_engine = 8, 4, 4, None
     eng.session, eng.B, eng.v_at = None, 8, UOp.variable("at", 0, 24)
     eng.tokens, eng.draft, eng.verified = 1, None, np.zeros(3, int)
-    eng.jits = {1: None}
+    eng.jits, eng.temperature_np = {1: None}, np.zeros(1)
     eng.model = SimpleNamespace(max_context=32, _cached_tokens=[], _saved=[], fork=lambda tokens, start, step: start, save=lambda tokens: None,
                                 config=SimpleNamespace(num_experts_per_tok=1))
     eng.model.get_start_pos = lambda tokens: sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens, eng.model._cached_tokens)))

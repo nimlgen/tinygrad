@@ -172,6 +172,9 @@ class Engine:
                                                                   for _ in range(2))
     # ([done | tokens | guesses | their scores (a scored draft's, f32)])
     self.res, (self.res_np,) = host_tensor(self.devs[0], 1 + n * (1 + 2 * max(self.width, 1)), dtypes.int32)
+    self.temperature, (self.temperature_np,) = host_tensor(self.devs[0], 1, dtypes.float32)
+    self.key, (self.key_np,) = host_tensor(self.devs[0], 2, dtypes.uint32)
+    self.rng = np.random.default_rng()
     self.jits = {T: TinyJit(functools.partial(self.run, T), capture_first=True) for T in sorted({1, tokens, *widths})}
     self.keep_jits = (TinyJit(self.keep, capture_first=True), TinyJit(self.unkeep, capture_first=True))
     self.widths = sorted({tokens, *widths}) if draft is not None and draft.scored else [tokens]
@@ -278,8 +281,9 @@ class Engine:
     return m.output(m.output_norm(x))[0].float(), Tensor.stack(*(hidden[t] for t in taps), dim=2) if taps else None
 
   def run(self, T:int, pos:UOp) -> tuple[Tensor, Tensor]:
-    """the greedy token after each of the step's tokens and (a draft) its guesses of the tokens after that (after the given one where there's
-    one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits (kept, else done)"""
+    """the token after each of the step's tokens (sampled at the temperature) and (a draft) its guesses of the tokens after that (after the
+    given one where there's one: a prompt's next) into host memory, then its done word (the host reads them without a sync), their logits
+    (kept, else done)"""
     done, logits, *dx = self.outputs(T, pos)
     Tensor.realize(done, logits, *dx)
     return done, logits
@@ -287,7 +291,8 @@ class Engine:
   def outputs(self, T:int, pos:UOp) -> list[Tensor]:
     """run's tensors: the done word, the logits (kept, else the done word) and the draft's hidden states"""
     logits, hidden = self.forward(self.tok[:T].reshape(1, T), pos)
-    out, dx = (toks:=logits.argmax(-1)), []
+    u = Tensor._rand(self.key, self.key.zeros_like(), logits.shape, dtypes.float32).maximum(1e-12)
+    out, dx = (toks:=(logits + (self.temperature * -(-u.log()).log()).shard_like(logits)).argmax(-1)), []
     if self.draft is not None:
       # the token after each row (the given one, else the target's) and the rows kept (the step's tokens it matches from the second on): the
       # draft's guesses after the last kept row's
@@ -1052,7 +1057,7 @@ class Engine:
     assert T in self.jits and pos + T <= self.max_context
     self.grow(max(pos + T, getattr(self.draft, "window", 0)) + self.tokens)
     io.tokens, io.victims_n, self.res_np[0] = T, 32 * T, 0
-    self.tok_np[:T], self.given_np[:T] = toks, ((given or []) + [-1] * T)[:T]
+    self.tok_np[:T], self.given_np[:T], self.key_np[:] = toks, ((given or []) + [-1] * T)[:T], self.rng.integers(1 << 32, size=2)
     host_c().flags(ctypes.byref(io), 0)
     _, self.logits = self.jits[T](self.v_pos.bind(pos))
     t1 = time.perf_counter()
@@ -1178,9 +1183,10 @@ class Engine:
     return out
 
   def generate(self, tokens:list[int], temperature:float=0.0):
-    """the greedy tokens after tokens (any temperature), appended as they come: fed from get_start_pos in chunks (prefill) and the rest in steps
-    (steps), then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept up to the first
-    wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
+    """the tokens after tokens sampled at temperature (greedy at 0), appended as they come: fed from get_start_pos in chunks (prefill) and the
+    rest in steps (steps), then a token a step or (a draft) a verify step of [the next, the draft's chain of guesses after it]: the guesses kept
+    up to the first wrong one, the target's token after them next, the recurrent states rolled back to after the kept ones"""
+    self.temperature_np[:] = temperature
     start = self.get_start_pos(tokens)
     # (where tokens diverge from the tokens fed before, a window's any length: its states saved)
     fork_prefilled = start
