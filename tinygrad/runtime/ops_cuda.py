@@ -11,7 +11,7 @@ from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.runtime.autogen import cuda
 from tinygrad.runtime.support.compiler_cuda import pretty_ptx
 from tinygrad.runtime.support.c import init_c_var
-from tinygrad.runtime.support.hcq2 import ccall, layout_args, patch, make_program
+from tinygrad.runtime.support.hcq2 import ccall, layout_args, patch, make_program, addr, move_args
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl  # noqa: F401  # pylint: disable=unused-import
 if DEV.target("CUDA").interface == "MOCK": import test.mockgpu.cuda.cuda  # noqa: F401  # pylint: disable=unused-import
 
@@ -31,18 +31,18 @@ def cu_launch_kernel(ctx:CUDADevice, call:UOp, prg:UOp) -> tuple:
   return (cuda.cuLaunchKernel, func, *global_size, *local_size, 0, None, 0, patch(buf, hdr + rows).index(0))
 
 pm_cuda = PatternMatcher([ # None is the stream
-  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), cu_launch_kernel),
-  (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), allow_any_len=True),
+  (UPat(Ops.PROGRAM, name="prg").call(name="call", allow_any_len=True), cu_launch_kernel),
+  (UPat(Ops.STORE).call(UPat.var("dst"), UPat.var("src"), allow_any_len=True),
    lambda ctx, dst, src: (cuda.cuMemcpyAsync, dst.getaddr(ctx.device), src.getaddr(ctx.device), src.max_numel() * src.dtype.itemsize, None)),
-  (UPat(Ops.CALL, src=(UPat.native("copy"), UPat(name="dst"), UPat(name="src"), UPat(name="n"))),
-   lambda ctx, dst, src, n: (cuda.cuMemcpyAsync, dst.getaddr(ctx.device), src.getaddr(ctx.device), n.val, None)),
-  (UPat(Ops.CALL, src=(UPat.native("wait"), UPat(name="sig"), UPat(name="val"))),
-   lambda ctx, sig, val: (cuda.cuStreamWaitValue32_v2, None, sig.getaddr(ctx.device), val.cast(dtypes.uint32), cuda.CU_STREAM_WAIT_VALUE_GEQ)),
-  (UPat(Ops.CALL, src=(UPat.native("store"), UPat(name="sig"), UPat(name="val"))),
-   lambda ctx, sig, val: (cuda.cuStreamWriteValue32_v2, None, sig.getaddr(ctx.device), val.cast(dtypes.uint32), cuda.CU_STREAM_WRITE_VALUE_DEFAULT)),
-  (UPat(Ops.CALL, src=(UPat.native("timestamp"), UPat(name="sig"))), # [sig][stamp]
-   lambda ctx, sig: (cuda.cuLaunchHostFunc, None, UOp.extern((1,), dtypes.uint64, ctx.device, "stamp").getaddr(ctx.host),
-                     sig[1:2].getaddr(ctx.device))),
+  (UPat.var("dst").index(UPat.var("di")).store(UPat.var("src").index(UPat.var("si")).load()).end(UPat(Ops.RANGE, name="r")),
+   lambda ctx, dst, di, src, si, r: (cuda.cuMemcpyAsync, *move_args(ctx.device, dst, di, src, si, r), None)),
+  (UPat.var("buf").index(UPat.var("i")).load().backedge(UPat(Ops.RANGE), UPat(Ops.LOAD) < UPat.var("v")),
+   lambda ctx, buf, i, v: (cuda.cuStreamWaitValue32_v2, None, addr(buf, i, ctx.device), v.cast(dtypes.uint32), cuda.CU_STREAM_WAIT_VALUE_GEQ)),
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.native("gettime").call()),
+   lambda ctx, buf, i:
+   (cuda.cuLaunchHostFunc, None, UOp.extern((1,), dtypes.uint64, ctx.device, "stamp").getaddr(ctx.host), addr(buf, i, ctx.device))),
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.var("v")),
+   lambda ctx, buf, i, v: (cuda.cuStreamWriteValue32_v2, None, addr(buf, i, ctx.device), v.cast(dtypes.uint32), cuda.CU_STREAM_WRITE_VALUE_DEFAULT)),
 ])
 
 def cuda_submit(s:UOp, ccallfn:Callable[[Any, *tuple[UOp, ...]], UOp]=ccall) -> UOp:

@@ -1312,7 +1312,7 @@ def uopfunc(fn:Callable[..., UOp]) -> Callable[..., UOp]: # sugar for body.call(
     bound = inspect.signature(fn).bind(*args, **kwargs).arguments
     ins = {n: a for n, a in bound.items() if isinstance(a, UOp)}
     f = graph_rewrite(fn(**(bound|{n: param(i, n, a) for i, (n, a) in enumerate(ins.items())})), pm_renumber_slots,
-                      init_ctx=CountCtx, walk=True)
+                      init_ctx=CountCtx, walk=True, name=fn.__name__)
     with Context(TRACK_MATCH_STATS=0): return f.call(*ins.values(), name=name or fn.__name__)
   return functools.wraps(fn)(outlined)
 

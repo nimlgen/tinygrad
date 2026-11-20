@@ -1,14 +1,15 @@
 from __future__ import annotations
 import subprocess, pathlib, struct, ctypes, tempfile, functools, platform, weakref, threading, array, sys
+from typing import cast
 from tinygrad.helpers import to_mv, round_up, cache_dir, unwrap, prod, dedup, to_tuple
 import tinygrad.runtime.support.objc as objc
-from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface
+from tinygrad.device import Device, Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface
 from tinygrad.renderer import Compiler, CompileError, TinyELF
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.cstyle import MetalRenderer
 from tinygrad.runtime.autogen import metal
 from tinygrad.runtime.support.c import DLL
-from tinygrad.runtime.support.hcq2 import HWQueue, ccall, patch, layout_args, to_name
+from tinygrad.runtime.support.hcq2 import ccall, patch, layout_args, to_name, TIMESTAMP
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.engine.realize import get_call_kernel_args
 
@@ -100,8 +101,9 @@ def mtl_msg(obj:UOp, sel:str, *args:UOp|int, out:UOp|None=None) -> UOp:
   return mtl_send(obj.index(0).load(), UOp(Ops.BINARY, arg=sel.encode() + b"\0").index(0), *words, out=out)
 
 @uopfunc
-def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, q:MetalQueue, stamp:UOp|None=None) -> UOp:
-  cmds, hdr, devs, dev = q.cmds, round_up(q.nbytes, 8) + 24, q.devs, q.dev # a command buffer for the commands [first, first + count)
+def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, cmds:tuple[UOp, ...], nbytes:int, dev:MetalDevice,
+            stamp:UOp|None=None) -> UOp:
+  hdr, devs = round_up(nbytes, 8) + 24, (dev.device,) # a command buffer for the commands [first, first + count)
   cb, enc = [UOp.alloc((1,), dtypes.uint64, 0, device=devs[0], name=t) for t in ("mtl_cb", "mtl_enc")]
   fence, event = [mtl_handle(devs, h).index(0).load() for h in ("fence", "event")]
   c = mtl_msg(mtl_handle(devs, "queue"), "commandBuffer", out=cb)
@@ -126,45 +128,41 @@ def mtl_run(icb:UOp, value:UOp, first:UOp|int, count:int, last:bool, q:MetalQueu
   if last: c = mtl_msg(cb.after(c), "encodeSignalEvent:value:", event, value)
   return mtl_msg(cb.after(c), "commit").sink()
 
-class MetalQueue(HWQueue):
-  dev:MetalDevice
-  def __init__(self, submit:UOp):
-    super().__init__(submit)
-    self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[UOp](), list[tuple[int, int]](), list[UOp](), 0
+def metal_encode(s:UOp) -> UOp:
+  (call, *deps), q = s.src, s.src[0].src[1]
+  dev = cast(MetalDevice, Device[q.device])
+  rows, cmds, sizes, stamps, nbytes = list[tuple[int, UOp]](), list[UOp](), list[tuple[int, int]](), list[UOp](), 0
+  for c in call.body.src:
+    if c.op is Ops.CALL and c.body.op is Ops.PROGRAM:
+      args, obj = get_call_kernel_args(c, c.body, (dev.device,)), TinyELF.from_program(c.body)
+      rows += (krows:=layout_args(args, off:=round_up(nbytes, 256)))
+      nbytes = max([o + w.dtype.itemsize for o, w in krows], default=off + 8)
 
-  def exec(self, call:UOp, prg:UOp):
-    args, obj = get_call_kernel_args(call, prg, self.devs), TinyELF.from_program(prg)
-    self.rows += (rows:=layout_args(args, off:=round_up(self.nbytes, 256)))
-    self.nbytes = max([o + w.dtype.itemsize for o, w in rows], default=off + 8)
+      # symbolic sizes, set on the command at run time
+      dims = sum(c.body.arg.launch_dims(c), ())
+      if any(isinstance(d, UOp) for d in dims):
+        sizes.append((len(cmds), at:=round_up(nbytes, 8)))
+        rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at)
+        nbytes = at + 48
+      consts = [UOp.const(1 if isinstance(d, UOp) else d, dtypes.uint64) for d in (*dims, off)]
+      cmds.append(UOp(Ops.LINEAR, src=(UOp(Ops.BINARY, arg=obj.lib), UOp(Ops.BINARY, arg=obj.name.encode()), *consts))) # [lib, name, dims, off]
+    elif c.op is Ops.STORE and c.src[1] is TIMESTAMP: stamps.append(c.src[0].src[0])
+    elif c.op is Ops.STORE: value = c.src[1]
 
-    # symbolic sizes, set on the command at run time
-    dims = sum(prg.arg.launch_dims(call), ())
-    if any(isinstance(d, UOp) for d in dims):
-      self.sizes.append((len(self.cmds), at:=round_up(self.nbytes, 8)))
-      self.rows += layout_args([UOp.const(d, dtypes.uint64) for d in dims], at)
-      self.nbytes = at + 48
-    consts = [UOp.const(1 if isinstance(d, UOp) else d, dtypes.uint64) for d in (*dims, off)]
-    self.cmds.append(UOp(Ops.LINEAR, src=(UOp(Ops.BINARY, arg=obj.lib), UOp(Ops.BINARY, arg=obj.name.encode()), *consts))) # [lib, name, dims, off]
+  n, zero, pipes, lin = len(cmds), round_up(nbytes, 8), dedup(c.src[:2] for c in cmds), UOp(Ops.LINEAR, src=tuple(cmds))
+  buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=q.device, name="icb")
+  icb = patch(buf.after(buf.store(lin), *deps), rows + [(zero + 8 * i, UOp.const(0, dtypes.uint64)) for i in range(3)])
 
-  def wait(self, dst:UOp, val:UOp, eq=False): pass # the fence orders the queue
-  def timestamp(self, dst:UOp): self.stamps.append(dst)
-  def signal(self, dst:UOp, val:UOp): self.value = val
+  # symbolic sizes
+  for ci, off in sizes:
+    cmd = icb.bitcast(dtypes.uint64)[zero // 8 + 4 + ci:zero // 8 + 5 + ci]
+    icb = icb.after(mtl_msg(cmd, "concurrentDispatchThreadgroups:threadsPerThreadgroup:", icb.index(off), icb.index(off + 24)))
 
-  def submit(self, cmdbuf:UOp) -> UOp:
-    n, zero, pipes, cmds = len(self.cmds), round_up(self.nbytes, 8), dedup(c.src[:2] for c in self.cmds), UOp(Ops.LINEAR, src=tuple(self.cmds))
-    buf = UOp.alloc((zero + 24 + 8 * (1 + n + len(pipes)),), dtypes.uint8, device=self.devs[0], name="icb")
-    icb = patch(buf.after(buf.store(cmds), *self.deps), self.rows + [(zero + 8 * i, UOp.const(0, dtypes.uint64)) for i in range(3)])
-
-    # symbolic sizes
-    for ci, off in self.sizes:
-      cmd = icb.bitcast(dtypes.uint64)[zero // 8 + 4 + ci:zero // 8 + 5 + ci]
-      icb = icb.after(mtl_msg(cmd, "concurrentDispatchThreadgroups:threadsPerThreadgroup:", icb.index(off), icb.index(off + 24)))
-
-    # collect timestamps using cmdbuf metrics, so sep cmdbufs
-    if not self.stamps: return mtl_run(icb, self.value, 0, n, True, self)
-    slots, r = self.stamps[0].src[0], UOp.range(n - 1, next(UOp.unique_num), dtype=dtypes.uint64) # slots: [signal, timeline, [x, cb, x, end]...]
-    if n > 1: icb = icb.after(mtl_run(icb.after(r), self.value, r, 1, False, self, slots.shrink(((4 + 4 * r, 8 + 4 * r),))).end(r))
-    return mtl_run(icb, self.value, n - 1, 1, True, self, slots.shrink(((4 * n, 4 * n + 4),)))
+  # collect timestamps using cmdbuf metrics, so sep cmdbufs
+  if not stamps: return mtl_run(icb, value, 0, n, True, tuple(cmds), nbytes, dev)
+  slots, r = stamps[0].src[0], UOp.range(n - 1, next(UOp.unique_num), dtype=dtypes.uint64) # slots: [signal, timeline, [x, cb, x, end]...]
+  if n > 1: icb = icb.after(mtl_run(icb.after(r), value, r, 1, False, tuple(cmds), nbytes, dev, slots.shrink(((4 + 4 * r, 8 + 4 * r),))).end(r))
+  return mtl_run(icb, value, n - 1, 1, True, tuple(cmds), nbytes, dev, slots.shrink(((4 * n, 4 * n + 4),)))
 
 # *****************
 # device
@@ -185,7 +183,7 @@ class MetalAllocator(Allocator['MetalDevice']):
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 Compiled.pm_encode += PatternMatcher([
-  (UPat.sink(arg=KernelInfo("metal_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), lambda s: MetalQueue(s).encode()),
+  (UPat.sink(arg=KernelInfo("metal_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), metal_encode),
 ])
 
 def poll_event(p:UOp, t:UOp) -> UOp|None:

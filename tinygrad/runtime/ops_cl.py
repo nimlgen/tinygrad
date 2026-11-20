@@ -4,12 +4,12 @@ from tinygrad.runtime.autogen import opencl as cl, libc
 from tinygrad.runtime.support import c
 from tinygrad.helpers import to_char_p_p, from_mv, cpu_profile, OSX, DEBUG, suppress_finalizing, unwrap, round_up, is_image_shape
 from tinygrad.renderer.cstyle import OpenCLRenderer
-from tinygrad.device import BufferStorage, BufferSpec, HostAllocator, Compiled, MMIOInterface
+from tinygrad.device import Device, BufferStorage, BufferSpec, HostAllocator, Compiled, MMIOInterface
 from tinygrad.renderer import Compiler, CompileError, TinyELF
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
 from tinygrad.engine.realize import get_call_kernel_args
-from tinygrad.runtime.support.hcq2 import HWQueue, ccall, encode_cmdbuf, make_program
+from tinygrad.runtime.support.hcq2 import ccall, make_program, emit, encode_cmdbuf, addr, report_addr, pm_hcq
 
 CC_CB = c.CFUNCTYPE[None, [c.POINTER[ctypes.c_char], c.POINTER[None], cl.size_t, c.POINTER[None]]]
 BP_CB = c.CFUNCTYPE[None, [cl.cl_program, c.POINTER[None]]]
@@ -46,38 +46,46 @@ def cl_run(buf:UOp, cmds:tuple) -> UOp: # one in-order queue, every call after t
     cb = cb.after(h)
   return cb.sink()
 
-class CLQueue(HWQueue):
-  dev:CLDevice
-  def q64(self, *vals) -> int: return self.q(*[UOp.const(v, dtypes.uint64) if isinstance(v, int) else v.cast(dtypes.uint64) for v in vals])
-  def call(self, fn, *args):
-    self.cmds.append((fn, *[UOp.const(a, dtypes.uint64) if isinstance(a, int) else self.q64(a) // 8 - 1 if isinstance(a, UOp) else a for a in args]))
+def cl_q64(words:list[UOp], *vals) -> int:
+  words += [UOp.const(v, dtypes.uint64) if isinstance(v, int) else v.cast(dtypes.uint64) for v in vals]
+  return 8 * len(words)
+def cl_call(words:list[UOp], fn, *args) -> tuple:
+  return (fn, *[UOp.const(a, dtypes.uint64) if isinstance(a, int) else cl_q64(words, a) // 8 - 1 if isinstance(a, UOp) else a for a in args])
 
-  def exec(self, call:UOp, prg:UOp):
-    args, images = get_call_kernel_args(call, prg, self.devs), []
-    kernel = (p:=make_program(prg, 8, self.devs[0])).after(p.store(prg)).bitcast(dtypes.u64).index(0).load()
-    for i, (_, _, dt, shape) in enumerate(TinyELF.from_program(prg).signature):
-      if is_image_shape(shape): # [format][desc][errcode]
-        desc = (cl.CL_MEM_OBJECT_IMAGE2D, shape[1], shape[0], 0, 0, round_up(shape[1], 256 if OSX else 1) * 4 * dt.itemsize, 0, 0, args[i])
-        end = self.q64(cl.CL_RGBA | {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dt.itemsize] << 32, *desc, 0)
-        self.call(cl.clCreateImage, self.dev.handles[0], cl.CL_MEM_READ_WRITE, (end - 88,), (end - 80,), 0, (end - 8,))
-        images.append((end - 8) // 8)
-      else: end = self.q64(args[i])
-      self.call(cl.clSetKernelArg, kernel, i, args[i].dtype.itemsize, (end - 8,))
-    global_size, local_size = prg.arg.launch_dims(call)
-    end = self.q64(*[g * l for g, l in zip(global_size, local_size)], *local_size) # [global][local]
-    self.call(cl.clEnqueueNDRangeKernel, self.dev.handles[1], kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0)
-    self.cmds += [(cl.clReleaseMemObject, w) for w in images]
+def cl_exec(ctx:tuple[CLDevice, list[UOp]], call:UOp, prg:UOp) -> list[tuple]:
+  (dev, words), cmds, images = ctx, list[tuple](), list[int]()
+  args = get_call_kernel_args(call, prg, (dev.device,))
+  kernel = (p:=make_program(prg, 8, dev.device)).after(p.store(prg)).bitcast(dtypes.u64).index(0).load()
+  for i, (_, _, dt, shape) in enumerate(TinyELF.from_program(prg).signature):
+    if is_image_shape(shape): # [format][desc][errcode]
+      desc = (cl.CL_MEM_OBJECT_IMAGE2D, shape[1], shape[0], 0, 0, round_up(shape[1], 256 if OSX else 1) * 4 * dt.itemsize, 0, 0, args[i])
+      end = cl_q64(words, cl.CL_RGBA | {2:cl.CL_HALF_FLOAT, 4:cl.CL_FLOAT}[dt.itemsize] << 32, *desc, 0)
+      cmds.append(cl_call(words, cl.clCreateImage, dev.handles[0], cl.CL_MEM_READ_WRITE, (end - 88,), (end - 80,), 0, (end - 8,)))
+      images.append((end - 8) // 8)
+    else: end = cl_q64(words, args[i])
+    cmds.append(cl_call(words, cl.clSetKernelArg, kernel, i, args[i].dtype.itemsize, (end - 8,)))
+  global_size, local_size = prg.arg.launch_dims(call)
+  end = cl_q64(words, *[g * l for g, l in zip(global_size, local_size)], *local_size) # [global][local]
+  cmds.append(cl_call(words, cl.clEnqueueNDRangeKernel, dev.handles[1], kernel, 3, 0, (end - 48,), (end - 24,), 0, 0, 0))
+  return cmds + [(cl.clReleaseMemObject, w) for w in images]
 
-  def wait(self, sig:UOp, val:UOp, eq=False): pass # the queue is in order
-  def signal(self, sig:UOp, val:UOp): self.call(libc.memcpy, sig.getaddr(self.devs), (self.q64(val) - 8,), 8) # synchronize finishes the queue
-  def timestamp(self, sig:UOp): self.call(cl.clEnqueueMarkerWithWaitList, self.dev.handles[1], 0, 0, sig.getaddr(self.devs)) # [event][time]
+pm_cl = PatternMatcher([
+  (UPat(Ops.PROGRAM, name="prg").call(name="call", allow_any_len=True), cl_exec),
+  (UPat(Ops.BACKEDGE), lambda: []), # the queue is in order
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.native("gettime").call()), lambda ctx, buf, i: # [event][time]
+   [cl_call(ctx[1], cl.clEnqueueMarkerWithWaitList, ctx[0].handles[1], 0, 0, report_addr(buf, i, ctx[0].device))]),
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.var("v")), lambda ctx, buf, i, v: # synchronize finishes the queue
+   [cl_call(ctx[1], libc.memcpy, addr(buf, i, ctx[0].device), (cl_q64(ctx[1], v) - 8,), 8)]),
+]) + pm_hcq
 
-  def encode(self) -> UOp:
-    self.cmds:list[tuple] = []
-    return cl_run(encode_cmdbuf(self, self.lin), tuple(self.cmds))
+def cl_encode(s:UOp) -> UOp:
+  (call, *deps), q = s.src, s.src[0].src[1]
+  ctx = (Device[q.device], words:=list[UOp]())
+  cmds = [cmd for c in call.body.src for cmd in unwrap(pm_cl.rewrite(c, ctx=ctx))]
+  return cl_run(encode_cmdbuf(*emit(words), q, deps), tuple(cmds))
 
 Compiled.pm_encode += PatternMatcher([(UPat.sink(arg=KernelInfo("cl_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"),
-                                       lambda s: CLQueue(s).encode())])
+                                       cl_encode)])
 
 # *****************
 # device

@@ -3,7 +3,8 @@ import os, ctypes, functools, mmap, struct, array, math, contextlib
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator
 from tinygrad.renderer import TinyELF
-from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
+from tinygrad.runtime.support.hcq2 import HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program, encode_cmdbuf
+from tinygrad.runtime.support.hcq2 import pkt, select, assemble, dwords, addr, pm_hcq
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.system import FileIOInterface, System
 from tinygrad.runtime.autogen import kgsl, mesa, libc
@@ -55,151 +56,153 @@ def qcom_submit(req:UOp, ret:UOp, fd:UOp) -> UOp: # the kernel driver takes the 
   ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
   return ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.index(0))).sink()
 
-class QCOMComputeQueue(HWQueue):
-  dev:QCOMDevice
-  def cmd(self, opcode:int, *vals): self.q(pkt7_hdr(opcode, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
+def cp(op:int, *vals, runs:UOp|None=None) -> UOp: return pkt(op, pkt7_hdr(op, dwords(vals)), *vals, runs=runs)
+def reg(r:int, *vals) -> UOp: return pkt(mesa.CP_TYPE4_PKT, pkt4_hdr(r, dwords(vals)), *vals)
 
-  def reg(self, reg:int, *vals): self.q(pkt4_hdr(reg, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
+def qcom_cache_flush(dev:QCOMDevice, write_back=True, invalidate=False, sync=True, memsync=False) -> list[UOp]:
+  # TODO: 7xx support.
+  pkts = list[UOp]()
+  if write_back: # dirty cache write-back, into the device's dummy buffer
+    pkts += [cp(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, UOp.extern((0x1000,), dtypes.uint8, dev.device, "dummy").getaddr(dev.device), 0)]
+  if invalidate: pkts += [cp(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE)] # invalidate cache lines (following reads from RAM).
+  if memsync: pkts += [cp(mesa.CP_WAIT_MEM_WRITES)]
+  if sync: pkts += [cp(mesa.CP_WAIT_FOR_IDLE)]
+  return pkts
 
-  def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
-    # TODO: 7xx support.
-    if write_back: # dirty cache write-back, into the device's dummy buffer
-      dummy = UOp.extern((0x1000,), dtypes.uint8, self.devs[0], "dummy")
-      self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, dummy.getaddr(self.devs), 0)
-    if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
-    if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
-    if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
+def qcom_signal(dev:QCOMDevice, mem:UOp, value:UOp) -> list[UOp]:
+  if dev.gpu_id[:2] < (7, 3):
+    return [cp(mesa.CP_WAIT_FOR_IDLE), cp(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), mem, value.cast(dtypes.uint32)),
+            *qcom_cache_flush(dev, write_back=True, invalidate=False, sync=False, memsync=False)]
+  # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
+  raise RuntimeError('CP_EVENT_WRITE7 is not supported')
 
-  def memory_barrier(self): self._cache_flush(write_back=True, invalidate=True, sync=True, memsync=True)
+def qcom_kernargs(dev:QCOMDevice, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
+  kargs = list(zip(get_call_kernel_args(call, prg, (dev.device,)), data.signature))
+  uavs = [(dt,shape,a) for a,(_,_,dt,shape) in kargs if is_image_shape(shape)]
+  # NIR can reorder images to different texture slots
+  ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
 
-  def signal(self, signal:UOp, value:UOp):
-    self.cmd(mesa.CP_WAIT_FOR_IDLE)
-    if self.dev.gpu_id[:2] < (7, 3):
-      self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), signal.getaddr(self.devs), value.cast(dtypes.uint32))
-      self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
-    else:
-      # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
-      raise RuntimeError('CP_EVENT_WRITE7 is not supported')
+  args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
+  args += layout_args(data.samplers, data.samp_off)
+  ubos = [a for a,(_,_,_,shape) in kargs if not is_image_shape(shape)]
+  if data.NIR:
+    args += layout_args(ubos, data.buf_off)
+    if data.wgsz != 0xfc: args += layout_args(list(prg.arg.launch_dims(call)[1]), data.wgsz * 4)
+  else: args += list(zip(data.buf_offs, ubos))
 
-  def timestamp(self, signal:UOp):
-    self.cmd(mesa.CP_WAIT_FOR_IDLE)
-    self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True), signal.getaddr(self.devs))
+  def _tex(b, ibo=False):
+    imgdt, shape, addr = b
+    pitch = shape[1] * 4 * imgdt.itemsize
+    fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
+    return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
+            qreg.a6xx_tex_const_1(width=shape[1], height=shape[0]),
+            qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, addr,
+            qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+  args += layout_args(flatten(map(_tex, texs)), data.tex_off) + layout_args(flatten(map(functools.partial(_tex, ibo=True), ibos)), data.ibo_off)
+  return UOp(Ops.LINEAR, src=tuple(pack_args(args, data.kernargs_alloc_size)), arg="kernargs")
 
-  def wait(self, signal:UOp, value:UOp):
-    self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY), signal.getaddr(self.devs),
-             value.cast(dtypes.uint32), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
+def qcom_exec(dev:QCOMDevice, call:UOp, prg:UOp) -> list[UOp]:
+  data, lib = qcom_build_program(dev, prg, devs:=(dev.device,))
+  global_size, local_size = prg.arg.launch_dims(call)
+  if data.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
+  if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
+    raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
 
-  def kernargs(self, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
-    kargs = list(zip(get_call_kernel_args(call, prg, self.devs), data.signature))
-    uavs = [(dt,shape,a) for a,(_,_,dt,shape) in kargs if is_image_shape(shape)]
-    # NIR can reorder images to different texture slots
-    ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
+  def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
+  global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
-    args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
-    args += layout_args(data.samplers, data.samp_off)
-    ubos = [a for a,(_,_,_,shape) in kargs if not is_image_shape(shape)]
-    if data.NIR:
-      args += layout_args(ubos, data.buf_off)
-      if data.wgsz != 0xfc: args += layout_args(list(prg.arg.launch_dims(call)[1]), data.wgsz * 4)
-    else: args += list(zip(data.buf_offs, ubos))
+  args_addr, lib_addr = qcom_kernargs(dev, call, prg, data).getaddr(devs), lib.getaddr(devs)
+  stack_addr = UOp.extern((data.hw_stack_offset * 4,), dtypes.uint8, dev.device, "stack").getaddr(devs)
 
-    def _tex(b, ibo=False):
-      imgdt, shape, addr = b
-      pitch = shape[1] * 4 * imgdt.itemsize
-      fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
-      return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
-              qreg.a6xx_tex_const_1(width=shape[1], height=shape[0]),
-              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, addr,
-              qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
-    args += layout_args(flatten(map(_tex, texs)), data.tex_off) + layout_args(flatten(map(functools.partial(_tex, ibo=True), ibos)), data.ibo_off)
-    return UOp(Ops.LINEAR, src=tuple(pack_args(args, data.kernargs_alloc_size)), arg="kernargs")
+  pkts = [cp(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))]
+  pkts += [reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(cs_state=True, cs_uav=True))]
+  pkts += [reg(mesa.REG_A6XX_SP_UPDATE_CNTL, 0x0)]
+  pkts += [reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80))] # is this right? mesa uses 1
+  pkts += [reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40))] # mesa also uses 1
+  pkts += [reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL,
+                                                                  constant_demotion_enable=data.NIR))]
+  pkts += [reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))]
+  pkts += [reg(mesa.REG_A6XX_TPL1_MODE_CNTL, qreg.a6xx_tpl1_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL))]
+  pkts += [reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)]
+  pkts += [cp(mesa.CP_WAIT_FOR_IDLE)]
 
-  def exec(self, call:UOp, prg:UOp):
-    data, lib = qcom_build_program(self.dev, prg, self.devs)
-    global_size, local_size = prg.arg.launch_dims(call)
-    if data.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
-    if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
-      raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
+  pkts += [reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
+               qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+               global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=mesa.THREAD64),
+               cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))]
 
-    def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
-    global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
+  pkts += [reg(mesa.REG_A6XX_SP_CS_CNTL_0,
+               qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=data.hregs, fullregfootprint=data.fregs,
+                                      branchstack=data.brnchstck),
+               qreg.a6xx_sp_cs_cntl_1(constantrammode=mesa.CONSTLEN_256, shared_size=data.shared_size), # should this be CONSTLEN_512?
+               0, data.prg_offset, lib_addr,
+               qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
+               qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=data.pvtmem_size_total))]
 
-    args_addr, lib_addr = self.kernargs(call, prg, data).getaddr(self.devs), lib.getaddr(self.devs)
-    stack_addr = UOp.extern((data.hw_stack_offset * 4,), dtypes.uint8, self.devs[0], "stack").getaddr(self.devs)
+  # the kernargs sit in the cmdbuf, so the const upload is sized to them (in vec4s) rather than to the whole constlen: it must not read past
+  pkts += [cp(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                         state_block=mesa.SB6_CS_SHADER, num_unit=data.kernargs_alloc_size // 16), args_addr)]
+  pkts += [cp(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                         state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(data.image_size, 128)), lib_addr)]
 
-    self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
-    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(cs_state=True, cs_uav=True))
-    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, 0x0)
-    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
-    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
-    self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL,
-                                                                constant_demotion_enable=data.NIR))
-    self.reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))
-    self.reg(mesa.REG_A6XX_TPL1_MODE_CNTL, qreg.a6xx_tpl1_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL))
-    self.reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
-    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+  pkts += [reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc,
+               qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))]
 
-    self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
-             qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
-             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=mesa.THREAD64),
-             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+  pkts += [reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))]
+  # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
+  # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
+  pkts += [reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(data.image_size, 128)))]
 
-    self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
-             qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=data.hregs, fullregfootprint=data.fregs, branchstack=data.brnchstck),
-             qreg.a6xx_sp_cs_cntl_1(constantrammode=mesa.CONSTLEN_256, shared_size=data.shared_size), # should this be CONSTLEN_512?
-             0, data.prg_offset, lib_addr,
-             qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
-             qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=data.pvtmem_size_total))
+  if data.samp_cnt > 0:
+    pkts += [cp(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                           state_block=mesa.SB6_CS_TEX, num_unit=data.samp_cnt), args_addr + data.samp_off)]
+    pkts += [reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, args_addr + data.samp_off)]
+    pkts += [reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE,
+                 UOp.extern((0x1000,), dtypes.uint8, dev.device, "border_color").getaddr(devs))]
 
-    # the kernargs sit in the cmdbuf, so the const upload is sized to them (in vec4s) rather than to the whole constlen: it must not read past
-    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
-                                                             state_block=mesa.SB6_CS_SHADER, num_unit=data.kernargs_alloc_size // 16), args_addr)
-    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
-                                                             state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(data.image_size, 128)), lib_addr)
+  if data.tex_cnt > 0:
+    pkts += [cp(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                           state_block=mesa.SB6_CS_TEX, num_unit=min(16, data.tex_cnt)), args_addr + data.tex_off)]
+    pkts += [reg(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, args_addr + data.tex_off)]
 
-    self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
+  if data.ibo_cnt > 0:
+    pkts += [cp(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
+                                                           state_block=mesa.SB6_CS_SHADER, num_unit=data.ibo_cnt), args_addr + data.ibo_off)]
+    pkts += [reg(mesa.REG_A6XX_SP_CS_UAV_BASE, args_addr + data.ibo_off)]
 
-    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))
-    # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
-    # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
-    self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(data.image_size, 128)))
+  pkts += [reg(mesa.REG_A6XX_SP_CS_CONFIG, qreg.a6xx_sp_cs_config(enabled=True, nsamp=data.samp_cnt, ntex=data.tex_cnt, nuav=data.ibo_cnt))]
 
-    if data.samp_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_TEX, num_unit=data.samp_cnt), args_addr + data.samp_off)
-      self.reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, args_addr + data.samp_off)
-      self.reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE,
-               UOp.extern((0x1000,), dtypes.uint8, self.devs[0], "border_color").getaddr(self.devs))
+  if data.NIR:
+    pkts += [reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
+                 qreg.a6xx_sp_cs_const_config_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
+                 qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))]
+    pkts += [cp(mesa.CP_EXEC_CS, 0, qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]),
+                qreg.cp_exec_cs_3(_ngroups_z=global_size[2]), runs=call)]
+  else: pkts += [cp(mesa.CP_RUN_OPENCL, 0, runs=call)]
 
-    if data.tex_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_TEX, num_unit=min(16, data.tex_cnt)), args_addr + data.tex_off)
-      self.reg(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, args_addr + data.tex_off)
+  return pkts + qcom_cache_flush(dev, write_back=True, invalidate=False, sync=False, memsync=False)
 
-    if data.ibo_cnt > 0:
-      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
-                                                               state_block=mesa.SB6_CS_SHADER, num_unit=data.ibo_cnt), args_addr + data.ibo_off)
-      self.reg(mesa.REG_A6XX_SP_CS_UAV_BASE, args_addr + data.ibo_off)
+pm_qcom = PatternMatcher([
+  (UPat(Ops.PROGRAM, name="prg").call(name="call", allow_any_len=True), lambda ctx, call, prg: qcom_exec(ctx, call, prg)),
+  (UPat.var("buf").index(UPat.var("i")).load().backedge(UPat(Ops.RANGE), UPat(Ops.LOAD) < UPat.var("v")),
+   lambda ctx, buf, i, v: [cp(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY), addr(buf, i, ctx.device),
+                              v.cast(dtypes.uint32), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))]),
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.native("gettime").call()), lambda ctx, buf, i:
+   [cp(mesa.CP_WAIT_FOR_IDLE),
+    cp(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True), addr(buf, i, ctx.device))]),
+  (UPat.var("buf").index(UPat.var("i")).store(UPat.var("v")), lambda ctx, buf, i, v: qcom_signal(ctx, addr(buf, i, ctx.device), v)),
+  (UPat.native("memory_barrier").call(allow_any_len=True),
+   lambda ctx: qcom_cache_flush(ctx, write_back=True, invalidate=True, sync=True, memsync=True)),
+]) + pm_hcq
 
-    self.reg(mesa.REG_A6XX_SP_CS_CONFIG, qreg.a6xx_sp_cs_config(enabled=True, nsamp=data.samp_cnt, ntex=data.tex_cnt, nuav=data.ibo_cnt))
-
-    if data.NIR:
-      self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
-               qreg.a6xx_sp_cs_const_config_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
-               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))
-      self.cmd(mesa.CP_EXEC_CS, 0,
-               qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
-    else: self.cmd(mesa.CP_RUN_OPENCL, 0)
-
-    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
-
-  def submit(self, cmdbuf:UOp) -> UOp:
-    ib, ib_off = unwrap_view(cmdbuf)
-    fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("kgsl_fd", "kgsl_ctx")]
-    obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
-    req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.device), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
-                  numcmds=1, context_id=ctxid)
-    return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=self.devs[0], name="submit_ret"), fd)
+def qcom_encode(s:UOp) -> UOp:
+  (call, *deps), q = s.src, s.src[0].src[1]
+  ib, ib_off = unwrap_view(cmdbuf:=encode_cmdbuf(*assemble(select(call.body.src, pm_qcom, Device[q.device])), q, deps))
+  fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("kgsl_fd", "kgsl_ctx")]
+  obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(q.device) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
+  req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.device), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
+                numcmds=1, context_id=ctxid)
+  return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=q.device, name="submit_ret"), fd)
 
 class QCOMProgramData:
   def __init__(self, dev:QCOMDevice, obj:TinyELF):
@@ -296,7 +299,7 @@ class QCOMAllocator(Allocator['QCOMDevice']):
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
 
 Compiled.pm_encode += PatternMatcher([
-  (UPat.sink(arg=KernelInfo("qcom_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), lambda s: QCOMComputeQueue(s).encode()),
+  (UPat.sink(arg=KernelInfo("qcom_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), qcom_encode),
 ])
 
 class QCOMDevice(Compiled):

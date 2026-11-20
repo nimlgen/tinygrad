@@ -4,8 +4,7 @@ from tinygrad import Tensor, Device, TinyJit, dtypes
 from tinygrad.device import Buffer
 from tinygrad.engine.realize import run_linear
 from tinygrad.uop.ops import UOp
-from tinygrad.runtime.ops_amd import AMDSDMAQueue
-from tinygrad.runtime.support.hcq2 import make_submit
+from tinygrad.runtime.ops_amd import amd_sdma_submit, amd_queue_args
 from tinygrad.runtime.support.usb import HALF, CHUNK, SLOT
 from test.null.test_hcq2 import lower_hcq
 import numpy as np
@@ -96,8 +95,7 @@ class TestUSBIntegrity(USBTestCase):
     target = (put[0] // ring_size + 1) * ring_size - 4
     if nbytes := target - put[0]:
       nops = UOp.from_buffer(Buffer("CPU", nbytes, initial_value=bytes(nbytes)), dtypes.uint8)
-      hq = AMDSDMAQueue(make_submit(dev=self.dev.device, queue="COPY:0", deps=(nops,)))
-      run_linear(lower_hcq(hq.submit(nops)))
+      run_linear(lower_hcq(amd_sdma_submit(nops, *amd_queue_args(self.dev, "COPY:0", q))))
     wait_cond(lambda: read[0], value=target)
     self.assertEqual(put[0], target)
 

@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from collections import defaultdict
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
@@ -76,11 +75,12 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[
     for q in (list(qs) if prio is None else prio):
       if not (cmds:=qs[q]): continue
       c = cmds[0]
-      if (name:=ins_name(c)) is not None and name.startswith("wait"):
-        sig, target = mem[word(c.src[1])], val(c.src[2])
-        if sig != target if name == "wait_eq" else sig < target: continue
-      elif name == "store":
-        mem[w:=word(c.src[1])] = val(c.src[2])
+      if c.op is Ops.BACKEDGE:
+        done, cond, eq = c.src[0], c.src[2], c.src[2].op is Ops.CMPEQ
+        sig, target = mem[word(done.src[0])], val((cond.src[0] if eq else cond).src[1])
+        if sig != target if eq else sig < target: continue
+      elif c.op is Ops.STORE:
+        mem[w:=word(c.src[0])] = val(c.src[1])
         if w[0].arg.name == "timeline": log.append(w[0].device)
       elif c in cs: log.append(cs.index(c))
       cmds.pop(0)
@@ -161,7 +161,7 @@ class TestHCQ2Schedule(unittest.TestCase):
   def scheduled(self, *ts:Tensor) -> list[UOp]: return [self.check(b) for b in scheduled(*ts)]
   def batch(self, *ts:Tensor) -> UOp: return unwrap(self.scheduled(*ts)[0])
   def kernels(self, batch:UOp) -> list[str]:
-    return [ins_name(c) or "kernel" for c in queues(batch)[("NULL", "COMPUTE:0")] if ins_name(c) in ("exec_barrier", None)]
+    return [ins_name(c) or "kernel" for c in queues(batch)[("NULL", "COMPUTE:0")] if c.op is Ops.CALL and ins_name(c) in ("exec_barrier", None)]
 
   def test_kernels_run_in_order(self): self.assertEqual(orders(self.batch(chain(self.x, 3))), {(0, 1, 2)})
 
@@ -230,8 +230,9 @@ class TestHCQ2Link(unittest.TestCase):
   def test_repeated_word_loops(self): # for (i..10) cmdbuf[off[i]] = var
     var, offs = UOp.alloc((1,), dtypes.uint32, device="CPU", name="var"), [4 * i * i for i in range(10)]
     var = hcq2.patch(var, [], bytes(4)) # initialize at link: the allocator may return a reused buffer
-    hq = SimpleNamespace(blob=bytearray(offs[-1] + 4), patches=[(o, var.index(0).load()) for o in offs], devs=("CPU",), queue="COPY:0", deps=())
-    lowered = lower_hcq(var.after(hcq2.encode_cmdbuf(hq, device="CPU")).index(0).store(var.index(0).load() + 1))
+    q = UOp.param(0, dtypes.u8, 1, "CPU", name="COPY:0")
+    cmdbuf = hcq2.encode_cmdbuf(bytes(offs[-1] + 4), [(o, var.index(0).load()) for o in offs], q, device="CPU")
+    lowered = lower_hcq(var.after(cmdbuf).index(0).store(var.index(0).load() + 1))
     self.assertEqual(len([u for u in lowered.src[0].without_after.src[0].toposort() if u.op is Ops.RANGE]), 1)
     linked = hcq2.hcq_link(lower_and_compile(lowered))
     args = zip(lowered.src[0].without_after.src[1:], linked.src[0].without_after.src[1:])

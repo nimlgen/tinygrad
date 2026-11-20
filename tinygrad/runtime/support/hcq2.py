@@ -3,7 +3,7 @@ from typing import cast, Any, Sequence, Callable
 import itertools, ctypes, struct, time
 from dataclasses import replace, dataclass, field
 from collections import defaultdict, Counter
-from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, DEBUG, VIZ, ALL2ALL, PROFILE
+from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, round_up, DEBUG, VIZ, ALL2ALL, PROFILE
 from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_RUNTIME_DEV, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc
 from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType
@@ -85,7 +85,46 @@ def announce(slots:dict[str, UOp], num_queues:dict[str, int], dep:UOp) -> list[U
   bumped = [timeline(dev).after(dep).index(1).store(timeline_value(dev) + 1) for dev in slots]
   return bumped + [buf.after(dep).index(2 * num_queues[dev]).store(timeline_value(dev) + 1) for dev, buf in slots.items()]
 
-def ins(name:str, *src:UOp|int) -> UOp: return UOp.native(name).call(*[UOp.const(s, dtypes.u32) if isinstance(s, int) else s for s in src])
+VOID = UOp.param(-1, dtypes.void, ())
+TIMESTAMP = UOp.native("gettime", dtype=dtypes.u64).call()
+
+def wait(buf:UOp, value:UOp|int, at:UOp|int=0, eq:bool=False) -> UOp:
+  done = buf.after(loop:=UOp.loop(next(UOp.unique_num))).index(at).load()
+  return done.backedge(loop, done != value if eq else done < value)
+
+def write(buf:UOp, at:UOp|int, *words:UOp|int) -> UOp:
+  ws = flatten([UOp.const(w, dtypes.u32)] if isinstance(w, int) else [w.cast(dtypes.u32), (w >> 32).cast(dtypes.u32)] if w.dtype.itemsize == 8
+               else [w] for w in words)
+  return buf.index(UOp.stack(*[sint_to_uop(at + k) for k in range(len(ws))])).store(UOp.stack(*ws))
+
+def move(dst:UOp, src:UOp, nbytes:int, dst_at:UOp|int=0, src_at:UOp|int=0) -> UOp:
+  r = UOp.range(nbytes, next(UOp.unique_num))
+  return dst.index(r + dst_at).store(src.index(r + src_at).load()).end(r)
+
+pm_hcq = PatternMatcher([
+  (UPat.native("exec_barrier").call(allow_any_len=True), lambda: []),
+  (UPat.native("memory_barrier").call(allow_any_len=True), lambda: []),
+])
+
+def addr(buf:UOp, i:UOp, dev:str) -> UOp:
+  if i.op is not Ops.CONST: return buf.without_after.getaddr(dev) + (i * buf.dtype.itemsize).cast(dtypes.u64)
+  return buf.without_after.getaddr(dev) + UOp.const(i.arg * buf.dtype.itemsize, dtypes.u64) if i.arg else buf.without_after.getaddr(dev)
+
+def report_addr(buf:UOp, i:UOp, dev:str) -> UOp: return addr(buf, i.const_like(i.arg - 1), dev)
+
+def move_args(dev:str, dst:UOp, di:UOp, src:UOp, si:UOp, r:UOp) -> tuple[UOp, UOp, int]:
+  start = {r: r.const_like(0)}
+  return addr(dst, di.substitute(start).simplify(), dev), addr(src, si.substitute(start).simplify(), dev), (int(r.vmax) + 1) * dst.dtype.itemsize
+
+def dwords(vals:Sequence[UOp|int]) -> int: return sum(v.dtype.itemsize // 4 if isinstance(v, UOp) else 1 for v in vals)
+
+def pkt(op:int, *words:UOp|int, runs:UOp|None=None) -> UOp:
+  srcs, consts = list[UOp](), list[int]()
+  for w in words:
+    if isinstance(w, int): consts.append(w & 0xffffffff)
+    else: srcs, consts = srcs + ([UOp(Ops.BINARY, arg=struct.pack(f"<{len(consts)}I", *consts))] if consts else []) + [w], []
+  if consts: srcs.append(UOp(Ops.BINARY, arg=struct.pack(f"<{len(consts)}I", *consts)))
+  return UOp.native(op, runs if runs is not None else VOID).call(*srcs)
 
 def lockstep(streams:list[list[tuple]]) -> list[UOp]: # a step issues the next (issue, complete, range) command of each stream, then completes all
   # the trip each command starts at, a command without a range is one trip
@@ -267,10 +306,11 @@ class BatchCtx:
   def stamps(self, dev:str, tag:int) -> tuple[int, ...]: return (st:=len(self.queues[dev])+1+2*tag, st + 1) if self.profile else ()
 
 def _wait_ins(ctx:BatchCtx, waits:dict[tuple[str, str], int]) -> list[UOp]:
-  return [ins("wait", ctx.queue_signal(d, q), UOp.const(t + 1, dtypes.u64)) for (d, q), t in waits.items()]
+  return [wait(ctx.queue_signal(d, q), UOp.const(t + 1, dtypes.u64)) for (d, q), t in waits.items()]
 
 def _start_ins(ctx:BatchCtx, dev:str, queue:str) -> list[UOp]:
-  return [ins("wait", timeline(d), timeline_value(d)) for d in [dev, *sorted(ctx.peers.get((dev, queue), ()))]] + [ins("memory_barrier")]
+  waits = [wait(timeline(d), timeline_value(d)) for d in [dev, *sorted(ctx.peers.get((dev, queue), ()))]]
+  return waits + [UOp.native("memory_barrier").call(*waits)]
 
 def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   queue_of = [(dev, queue) for _, dev, queue in ctx.batch] # the (device, queue) of each call by tag
@@ -281,11 +321,10 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   dep_tags:list[list[int]] = [tracker.access_resources(acc, tag) for tag, acc in enumerate(accs)]
 
   # add barriers when a call deps on another call of its queue
-  barriers, last_barrier = set[int](), dict[tuple[str, str], int]()
+  barriers, last_barrier = dict[int, int](), dict[tuple[str, str], int]()
   for tag, (deps, queue) in enumerate(zip(dep_tags, queue_of)):
-    if any(queue_of[t] == queue and t >= last_barrier.get(queue, 0) for t in deps):
-      barriers.add(tag)
-      last_barrier[queue] = tag
+    if (same:=[t for t in deps if queue_of[t] == queue and t >= last_barrier.get(queue, 0)]):
+      barriers[tag], last_barrier[queue] = max(same), tag
 
   # keep only latest tags to wait for each queue
   call_waits = [{queue_of[t]: t for t in sorted(deps) if queue_of[t] != queue_of[tag]} for tag, deps in enumerate(dep_tags)]
@@ -308,13 +347,14 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   signal_tags = {tag for waits in [*call_waits, *close_waits.values()] for tag in waits.values()}
 
   def ins_for_call(tag:int) -> tuple[list[UOp], list[UOp]]: # the commands before and after a call
-    (_, dev, queue), barrier = ctx.batch[tag], [ins("exec_barrier")] if tag in barriers else []
-    stamps = [ins("timestamp", ctx.slot(dev, i)) for i in ctx.stamps(dev, tag)]
-    signal = [ins("store", ctx.queue_signal(dev, queue), UOp.const(tag + 1, dtypes.u64))] if tag in signal_tags else []
-    return barrier + _wait_ins(ctx, call_waits[tag]) + [ins("memory_barrier")] * bool(call_waits[tag]) + stamps[:1], stamps[1:] + signal
+    (_, dev, queue), barrier = ctx.batch[tag], [UOp.native("exec_barrier").call(ctx.batch[barriers[tag]][0])] if tag in barriers else []
+    stamps = [ctx.slot(dev, i).index(1).store(TIMESTAMP) for i in ctx.stamps(dev, tag)]
+    signal = [ctx.queue_signal(dev, queue).index(0).store(UOp.const(tag + 1, dtypes.u64))] if tag in signal_tags else []
+    waits = _wait_ins(ctx, call_waits[tag])
+    return barrier + waits + [UOp.native("memory_barrier").call(*waits)] * bool(waits) + stamps[:1], stamps[1:] + signal
 
   # closers advance device timelines
-  close_cmds = {dev: _wait_ins(ctx, close_waits[dev]) + [ins("store", timeline(dev), timeline_value(dev) + 1)] for dev in ctx.queues}
+  close_cmds = {dev: _wait_ins(ctx, close_waits[dev]) + [timeline(dev).index(0).store(timeline_value(dev) + 1)] for dev in ctx.queues}
 
   # wait for timeline accessing devices for the first time
   order = dedup(queue_of + list(closers.values()))
@@ -372,86 +412,68 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 
 # **** encode: queue programs become cmdbufs
 
-class HWQueue:
-  q_rewrite = PatternMatcher([
-    # rewrites from calls
-    (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), lambda ctx, call, prg: ctx.exec(call, prg)),
-    (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), allow_any_len=True),
-     lambda ctx, dst, src: ctx.copy(dst, src, src.max_numel() * src.dtype.itemsize)),
-    (UPat(Ops.CALL, src=(UPat.native("encdec", name="s"),), name="c", allow_any_len=True), lambda ctx, c, s: ctx.encdec(c, s)),
+def packets_of(c:UOp, pm:PatternMatcher, ctx:Any) -> list[UOp]:
+  if c.op is Ops.END and c.src[0].op is Ops.LINEAR:
+    return [UOp(Ops.LINEAR, src=tuple(flatten(packets_of(x, pm, ctx) for x in c.src[0].src))).end(c.src[1])]
+  if (pkts:=pm.rewrite(c, ctx=ctx)) is None: raise RuntimeError(f"no packets for {c.op} on {ctx}")
+  return pkts
 
-    # ins
-    (UPat(Ops.CALL, src=(UPat.native("copy"), UPat(name="dst"), UPat(name="src"), UPat(name="n"))),
-     lambda ctx, dst, src, n: ctx.copy(dst, src, n.val)),
-    (UPat(Ops.CALL, src=(UPat.native("memory_barrier"),)), lambda ctx: ctx.memory_barrier()),
-    (UPat(Ops.CALL, src=(UPat.native("exec_barrier"),)), lambda ctx: ctx.exec_barrier()),
-    (UPat(Ops.CALL, src=(UPat.native("wait"), UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val)),
-    (UPat(Ops.CALL, src=(UPat.native("wait_eq"), UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.wait(dst, val, eq=True)),
-    (UPat(Ops.CALL, src=(UPat.native("timestamp"), UPat(name="dst"))), lambda ctx, dst: ctx.timestamp(dst)),
-    (UPat(Ops.CALL, src=(UPat.native("store"), UPat(name="dst"), UPat(name="val"))), lambda ctx, dst, val: ctx.signal(dst, val)),
-    (UPat(Ops.CALL, src=(UPat.native("write"),), allow_any_len=True, name="u"), lambda ctx, u: ctx.write(*u.src[1:])),
+def selected(cmds:Sequence[UOp], pkts:list[list[UOp]]) -> list[UOp]: # in VIZ each command becomes its packets
+  if VIZ: UOp(Ops.LINEAR, src=tuple(cmds)).substitute({c: UOp(Ops.LINEAR, src=tuple(p)) for c, p in zip(cmds, pkts) if p != [c]},
+                                                      name="select packets")
+  return flatten(pkts)
 
-    # loop in cmdbufs
-    (UPat(Ops.END, src=(UPat(Ops.LINEAR, name="body"), UPat(Ops.RANGE, name="r"))), lambda ctx, body, r: ctx.loop(body, r)),
-  ])
+def select(cmds:Sequence[UOp], pm:PatternMatcher, ctx:Any) -> list[UOp]: return selected(cmds, [packets_of(c, pm, ctx) for c in cmds])
 
-  def __init__(self, submit:UOp): # submit: sink(commands).call(queue).after(deps)
-    call, self.deps = submit.src[0], submit.src[1:]
-    self.lin, q = call.body, call.src[1]
-    self.devs, self.queue = (q.device,), q.arg.name
-    self.dev = Device[self.devs[0]]
-    self.blob, self.patches = bytearray(), list[tuple[int|UOp, UOp]]()
+def emit(words:Sequence[UOp], at:int=0) -> tuple[bytes, list[tuple[int|UOp, UOp]]]:
+  blob, rows = bytearray(), list[tuple[int|UOp, UOp]]()
+  for w in words:
+    c = w
+    while c.op is Ops.CAST: c = c.src[0]
+    if c.op is Ops.BINARY: blob += c.arg
+    elif c.op is Ops.CONST: blob += struct.pack(unwrap(w.dtype.fmt), truncate[w.dtype](c.val))
+    else:
+      rows.append((at + len(blob), w))
+      blob += bytes(w.dtype.itemsize)
+  return bytes(blob), rows
 
-  def q(self, *words:UOp|int) -> int:
-    for w in words:
-      if isinstance(w, int): self.blob += struct.pack("I", truncate[dtypes.u32](w))
-      else:
-        c = w
-        while c.op is Ops.CAST: c = c.src[0]
-        if c.op is Ops.BINARY: self.blob += c.arg
-        elif c.op is not Ops.CONST:
-          self.patches.append((len(self.blob), w))
-          self.blob += bytes(w.dtype.itemsize)
-        else: self.blob += struct.pack(unwrap(w.dtype.fmt), truncate[w.dtype](c.val))
-    return len(self.blob)
+def assemble(pkts:Sequence[UOp]) -> tuple[bytes, list[tuple[int|UOp, UOp]]]:
+  blob, rows = bytearray(), list[tuple[int|UOp, UOp]]()
+  for p in pkts:
+    if p.op is Ops.END:
+      (trip, words), r = assemble(p.src[0].src), p.src[1]
+      # each trip gets its words as dwords: a trip need not be 8 bytes aligned
+      rows += [(len(blob) + o + 4 * k + r * len(trip), (w >> (32 * k)).cast(dtypes.u32)) for o, w in words for k in range(w.dtype.itemsize // 4)]
+      blob += trip * (int(r.vmax) + 1)
+    else:
+      data, rs = emit(p.src[1:], len(blob))
+      blob += data
+      rows += rs
+  return bytes(blob), rows
 
-  def loop(self, body:UOp, r:UOp):
-    start, first = len(self.blob), len(self.patches)
-    for u in body.src: self.q_rewrite.rewrite(u, ctx=self)
-    trip, words = len(self.blob) - start, self.patches[first:]
-    # each trip gets its words as dwords: a trip need not be 8 bytes aligned
-    self.patches[first:] = [(o + 4 * k + r * trip, (w >> (32 * k)).cast(dtypes.u32)) for o, w in words for k in range(w.dtype.itemsize // 4)]
-    self.blob += self.blob[start:] * int(r.vmax)
-
-  def memory_barrier(self): pass # a copy queue has nothing to flush
-  def exec_barrier(self): pass
-  def submit(self, cmdbuf:UOp) -> UOp: raise NotImplementedError("queues need a submit")
-  def encode(self) -> UOp: return self.submit(encode_cmdbuf(self, self.lin)) # submit(linear) becomes submit(cmdbuf)
-
-def encode_cmdbuf(hq:HWQueue, lin:UOp|None=None, name:str="cmdbuf", device:str|tuple[str, ...]|None=None) -> UOp:
-  for u in lin.src if lin is not None else (): hq.q_rewrite.rewrite(u, ctx=hq) # the commands of the linear go to the stream
-  stream = bytes(hq.blob)
-
+def encode_cmdbuf(blob:bytes, rows:list[tuple[int|UOp, UOp]], q:UOp, deps:Sequence[UOp]=(), device:str|None=None, name:str="cmdbuf") -> UOp:
   # loop over pathes with the same value
-  rt = [(o, w) for o, w in hq.patches if isinstance(o, int) and o % 4 == 0 and w.dtype.itemsize in (4, 8) and not _is_link_patch(w)]
+  rt = [(o, w) for o, w in rows if isinstance(o, int) and o % 4 == 0 and w.dtype.itemsize in (4, 8) and not _is_link_patch(w)]
   uses = {w: [o for o, _ in grp] for w, grp in itertools.groupby(sorted(rt, key=lambda p: p[1].key), key=lambda p: p[1])}
   looped = {w: (at, UOp.range(len(at), next(UOp.unique_num))) for w, at in uses.items() if len(at) > 1}
-  dwords = [(UOp(Ops.BINARY, arg=struct.pack(f"<{len(at)}I", *at)).bitcast(dtypes.u32).index(r).load() + 4 * k, (w >> 32 * k).cast(dtypes.u32))
-            for w, (at, r) in looped.items() for k in range(w.dtype.itemsize // 4)]
-  patches = [(o, w) for o, w in hq.patches if w not in looped] + dwords
+  looped_words = [(UOp(Ops.BINARY, arg=struct.pack(f"<{len(at)}I", *at)).bitcast(dtypes.u32).index(r).load() + 4 * k, (w >> 32 * k).cast(dtypes.u32))
+                  for w, (at, r) in looped.items() for k in range(w.dtype.itemsize // 4)]
+  patches = [(o, w) for o, w in rows if w not in looped] + looped_words
   nested = dedup([g.src[0] for g in UOp.sink(*[w for _, w in patches]).toposort() if g.op is Ops.GETADDR and g.src[0].op is Ops.LINEAR])
 
   # nested linears (like kernargs) merge into a buffer per name, patched before the stream
   bufs = []
   for lname, ls in itertools.groupby(sorted(nested, key=lambda l: l.arg), key=lambda l: l.arg):
-    hq.blob, hq.patches = bytearray(), []
-    offs = {l: (hq.q(UOp(Ops.BINARY, arg=bytes(-len(hq.blob) % 128))), hq.q(*l.src)) for l in ls}
-    bufs.append((offs, encode_cmdbuf(hq, name=lname)))
+    sec, sec_rows, offs = b"", list[tuple[int|UOp, UOp]](), dict[UOp, tuple[int, int]]()
+    for l in ls:
+      words, rs = emit(l.src, at:=round_up(len(sec), 128))
+      sec, sec_rows, offs[l] = sec.ljust(at, b"\0") + words, sec_rows + rs, (at, at + len(words))
+    bufs.append((offs, encode_cmdbuf(sec, sec_rows, q, deps, name=lname)))
   views = {l: buf.without_after[o:e] for offs, buf in bufs for l, (o, e) in offs.items()}
 
-  buf = UOp.alloc((len(stream),), dtypes.u8, device=device or hq.devs[0], name=to_name(name, hq.queue)).after(*hq.deps)
+  buf = UOp.alloc((len(blob),), dtypes.u8, device=device or q.device, name=to_name(name, q.arg.name)).after(*deps)
   words = UOp.sink(*[w for _, w in patches]).substitute(views).src
-  return patch(buf, list(zip([o for o, _ in patches], words)), stream).after(*[b for _, b in bufs])
+  return patch(buf, list(zip([o for o, _ in patches], words)), blob).after(*[b for _, b in bufs])
 
 # **** lower: cmdbufs become a host program
 

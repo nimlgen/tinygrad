@@ -6,7 +6,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import ceildiv, round_up, to_tuple, flatten, wait_cond
 from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.runtime.autogen import nvme, pci
-from tinygrad.runtime.support.hcq2 import to_name, ins, unwrap_view, copy_submit
+from tinygrad.runtime.support.hcq2 import to_name, unwrap_view, copy_submit, wait, write
 from tinygrad.runtime.support.memory import AddrSpace, MemoryManager, MMIOInterface
 from tinygrad.runtime.support.system import PCIDevice, PCIIfaceBase, System, filter_visible_devices
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
@@ -127,7 +127,7 @@ def nvme_copies(queue:UOp, calls:list[UOp]) -> list[list[tuple]]: # builds the c
   drive, gpu, qn = to_tuple(get_call_arg_uops(calls[0])[1].device)[0], queue.device, queue.arg.name
   dev, q = cast(NVMEDevice, Device[drive]).nvme, nvme_queue(drive, gpu, qn)
   def mem(name:str, size:int, dtype=dtypes.uint8) -> UOp: return UOp.extern((size,), dtype, drive, to_name(gpu, qn, name))
-  sq, cq, regs = mem("sq", 0x1000).getaddr(gpu), mem("cq", 0x1000).getaddr(gpu), mem("regs", dev.regs.nbytes).getaddr(gpu)
+  sq, cq, regs = mem("sq", 0x400, dtypes.uint32), mem("cq", 0x400, dtypes.uint32), mem("regs", dev.regs.nbytes // 4, dtypes.uint32)
 
   # where this submit starts in the queue, bumped once for all its commands
   cmds = [ceildiv(get_call_arg_uops(c)[1].nbytes(), dev.max_xfer) for c in calls]
@@ -142,27 +142,28 @@ def nvme_copies(queue:UOp, calls:list[UOp]) -> list[list[tuple]]: # builds the c
       f"{drive} reads whole blocks of {1 << dev.lba_shift} bytes into page aligned memory, not {src.nbytes()} bytes at {soff} to {doff}"
     prps, lba0 = dbase.getaddr(drive) + doff // 0x1000 * 16, src.getaddr(drive) >> dev.lba_shift
     def done(end:UOp|int) -> list[UOp]: # completes the read's commands before end: waits for the last one's cqe, then rings the cq doorbell
-      return [ins("wait", cq + ((n + end - 1) % q.entries) * CQE + 12, 1), ins("write", regs + q.cq_db, ((n + end) % q.entries).cast(dtypes.uint32))]
+      return [wait(cq, 1, ((n + end - 1) % q.entries) * (CQE // 4) + 3), write(regs, q.cq_db // 4, ((n + end) % q.entries).cast(dtypes.uint32))]
     def issue(cmd:UOp|int, count:int) -> list[UOp]: # issues the read's commands cmd to cmd + count
       ops = []
       for j in range(count): # write the sqe, then copy prp1 and prp2 (the next page or a list) from the table
         c, slot = cmd + j, (n + cmd + j) % q.entries
         nb = rem if isinstance(c, int) and c == full else dev.max_xfer
-        entry, lba, page = sq + slot * SQE, lba0 + c * (dev.max_xfer >> dev.lba_shift), c * (dev.max_xfer // 0x1000)
+        entry, lba, page = sq.getaddr(gpu) + slot * SQE, lba0 + c * (dev.max_xfer >> dev.lba_shift), c * (dev.max_xfer // 0x1000)
         cid = c % 0xffff + 1 # the cid is 16 bits: never 0, so the cqe reads as nonzero, and unique among the commands in flight
-        ops += [ins("write", entry, UOp.const(cid << 16 | nvme.nvme_cmd_read, dtypes.uint32), 1, *[0] * 8, lba.cast(dtypes.uint32),
-                    (lba >> 32).cast(dtypes.uint32), (nb >> dev.lba_shift) - 1, 0, 0, 0),
-                ins("copy", entry + 24, prps + page * 16, 16 if ceildiv(nb, 0x1000) > 2 else 8)] + \
-               ([ins("copy", entry + 32, prps + (page + 1) * 16, 8)] if ceildiv(nb, 0x1000) == 2 else [])
-      cqe = cq + ((n + cmd + count - 1) % q.entries) * CQE + 12 # the wave's last cqe, cleared before ringing the doorbell
-      return ops + [ins("write", cqe, 0), ins("write", regs + q.sq_db, ((n + cmd + count) % q.entries).cast(dtypes.uint32))]
+        ops += [write(sq, slot * (SQE // 4), cid << 16 | nvme.nvme_cmd_read, 1, *[0] * 8, lba.cast(dtypes.uint32),
+                      (lba >> 32).cast(dtypes.uint32), (nb >> dev.lba_shift) - 1, 0, 0, 0),
+                UOp.native("memcpy").call(entry + 24, prps + page * 16, UOp.const(16 if ceildiv(nb, 0x1000) > 2 else 8, dtypes.u64))] + \
+               ([UOp.native("memcpy").call(entry + 32, prps + (page + 1) * 16, UOp.const(8, dtypes.u64))] if ceildiv(nb, 0x1000) == 2 else [])
+      cqe = ((n + cmd + count - 1) % q.entries) * (CQE // 4) + 3 # the wave's last cqe, cleared before ringing the doorbell
+      return ops + [write(cq, cqe, 0), write(regs, q.sq_db // 4, ((n + cmd + count) % q.entries).cast(dtypes.uint32))]
     # waves of commands, each issued before the previous one is completed: two are in flight, so the drive always has one queued
     nwaves, left = full // (wave:=(q.entries - 1) // 2), full % wave + (rem > 0)
     first = [(issue(0, wave), list[UOp](), None)] if nwaves else []
     r = UOp.range(nwaves - 1, next(UOp.unique_num), dtype=dtypes.u64) # loops over the waves after the first
     middle = [(issue((r + 1) * wave, wave), done((r + 1) * wave), r)] if nwaves > 1 else []
     last = [(issue(nwaves * wave, left), done(nwaves * wave) if nwaves else [], None)] if left else []
-    copies.append(first + middle + last + [([], (done(full + (rem > 0)) if full or rem else []) + [ins("memory_barrier")], None)])
+    closing = done(full + (rem > 0)) if full or rem else []
+    copies.append(first + middle + last + [([], closing + [UOp.native("memory_barrier").call(*closing[:1])] * bool(closing), None)])
   return copies
 
 def nvme_submit(s:UOp) -> UOp|None:

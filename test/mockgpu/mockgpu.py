@@ -1,10 +1,9 @@
-import ctypes, time, os, builtins, fcntl, typing
+import ctypes, time, os, builtins, fcntl, typing, functools
 from tinygrad.helpers import DEV, dedup, to_tuple, round_up
 from tinygrad.device import Compiled, Device
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, KernelInfo
 from tinygrad.runtime.support.system import FileIOInterface, System
-from tinygrad.runtime.support.hcq2 import HWQueue
 from tinygrad.runtime.autogen import libc
 from test.mockgpu.nv.nvdriver import NVDriver
 from test.mockgpu.amd.amddriver import AMDDriver
@@ -39,18 +38,21 @@ def kick_gpus(body:UOp, loop:UOp, cond:UOp) -> UOp|None: # each iteration of a s
 Compiled.pm_lower += PatternMatcher([(UPat(Ops.BACKEDGE, src=(UPat(name="body"), UPat(name="loop"), UPat(name="cond"))), kick_gpus)])
 
 # this links AMD emulator's kernel back to the original kernel
-def emit_kernel_info(ctx:HWQueue, prg:UOp) -> None:
-  from tinygrad.runtime.ops_amd import AMDComputeQueue, _amd_program_image
-  if isinstance(ctx, AMDComputeQueue):
-    from tinygrad.viz.serve import get_elf_section
-    name = prg.src[0].arg.name.encode() + b"\x00"
-    text = get_elf_section(prg.src[3].arg, ".text").header
-    text_size = text.sh_addr + text.sh_size - _amd_program_image(ctx.dev, prg.src[3].arg)[0].entry_point_offset
-    ctx.pkt3(ctx.pm4.PACKET3_NOP, *memoryview(name.ljust(round_up(len(name), 4), b"\x00")).cast("I"), text_size)
+def emit_kernel_info(ctx:tuple, call:UOp, prg:UOp) -> list[UOp]:
+  from tinygrad.runtime import ops_amd
+  from tinygrad.viz.serve import get_elf_section
+  name = prg.src[0].arg.name.encode() + b"\x00"
+  text = get_elf_section(prg.src[3].arg, ".text").header
+  text_size = text.sh_addr + text.sh_size - ops_amd._amd_program_image(ctx[0], prg.src[3].arg)[0].entry_point_offset
+  nop = ops_amd.pkt3(ops_amd.pm4_nv.PACKET3_NOP, *memoryview(name.ljust(round_up(len(name), 4), b"\x00")).cast("I"), text_size)
+  return [nop] + ops_amd.amd_exec(ctx, call, prg)
 
-HWQueue.q_rewrite = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), allow_any_len=True), emit_kernel_info),
-]) + HWQueue.q_rewrite
+@functools.cache
+def hook_kernel_info() -> None:
+  from tinygrad.runtime import ops_amd
+  ops_amd.pm_pm4 = PatternMatcher([(UPat(Ops.PROGRAM, name="prg").call(name="call", allow_any_len=True), emit_kernel_info)]) + ops_amd.pm_pm4
+Compiled.pm_encode = PatternMatcher([(UPat.sink(arg=KernelInfo("amd_compute_submit")).call(UPat()).after(allow_any_len=True),
+                                      lambda: hook_kernel_info())]) + Compiled.pm_encode
 
 original_memoryview = builtins.memoryview
 class TrackedMemoryView:

@@ -5,7 +5,7 @@ from tinygrad.helpers import OSX, mv_address, flatten, to_tuple, unwrap, ceildiv
 from tinygrad.device import BufferStorage, MMIOInterface, Compiled, Allocator, Buffer, BufferSpec, Device, HCQ_RUNTIME_DEV
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
-from tinygrad.runtime.support.hcq2 import ccall, ins, patch
+from tinygrad.runtime.support.hcq2 import ccall, patch, wait, move
 with contextlib.suppress(ImportError):
   import _posixshmem
   from tinygrad.runtime.autogen import io_uring, libc
@@ -131,7 +131,7 @@ def disk_copy_rewriter(s:UOp) -> UOp|None:
 
   # [chunks read, chunks copied] at the start of the gpu's stage
   dev = s.without_after.src[1].device
-  counts = UOp.extern((STAGE_SZ,), dtypes.uint8, dev, "disk_stage")[:16].bitcast(dtypes.uint64)
+  counts = (stage:=UOp.extern((STAGE_SZ,), dtypes.uint8, dev, "disk_stage"))[:16].bitcast(dtypes.uint64)
 
   # cpu part
   done, off, gpu_ops = s, 0, collections.defaultdict[UOp, list[UOp]](list)
@@ -141,11 +141,12 @@ def disk_copy_rewriter(s:UOp) -> UOp|None:
 
   # gpu part
   for k, c in enumerate(copies):
-    first, slots = counts.index(0).load() + off, counts.getaddr(dev) + 4096 + srcs.index(2 * k).load() % 4096
+    first, slots = counts.index(0).load() + off, 4096 + srcs.index(2 * k).load() % 4096
     off += ceildiv(c.src[2].nbytes(), CHUNK_SZ)
     for chunk in range(ceildiv(c.src[2].nbytes(), CHUNK_SZ)):
-      n, dst, nb = first + chunk, c.src[1].getaddr() + chunk * CHUNK_SZ, min(CHUNK_SZ, c.src[2].nbytes() - chunk * CHUNK_SZ)
-      gpu_ops[c] += [ins("wait", counts, n + 1), ins("copy", dst, slots + n % SLOTS * SLOT_SZ, nb), ins("store", counts[1:], n + 1)]
+      n, nb = first + chunk, min(CHUNK_SZ, c.src[2].nbytes() - chunk * CHUNK_SZ)
+      gpu_ops[c] += [wait(counts, n + 1), move(c.src[1].bitcast(dtypes.uint8), stage, nb, chunk * CHUNK_SZ, slots + n % SLOTS * SLOT_SZ),
+                     counts.index(1).store(n + 1)]
   return done.substitute({lin: lin.replace(src=tuple(flatten(gpu_ops.get(c, [c]) for c in lin.src)))}, enter_calls=True)
 Compiled.pm_encode = PatternMatcher([(UPat.sink().call(UPat(Ops.PARAM)).after(allow_any_len=True, name="s"),
   disk_copy_rewriter)]) + Compiled.pm_encode

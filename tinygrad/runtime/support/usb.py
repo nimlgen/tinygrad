@@ -5,7 +5,7 @@ from tinygrad.helpers import DEBUG, DEV, HCQ_RUNTIME_DEV, to_mv, round_up, ceild
 from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, uopfunc
 from tinygrad.device import Buffer, BufferSpec, Compiled, Device
-from tinygrad.runtime.support.hcq2 import HCQ_DEVS, ccall, patch, unwrap_view, all_devices_in, to_name, get_time_ms, ins
+from tinygrad.runtime.support.hcq2 import HCQ_DEVS, ccall, patch, unwrap_view, all_devices_in, to_name, get_time_ms, wait, move
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support import c
 
@@ -369,18 +369,18 @@ def usb_table(hosts:list[tuple[UOp, int]], n:int, win:int, dev:str) -> UOp: # [a
 def usb_chunks(call:UOp, first:int, run:int) -> list[UOp]: # gpu side. first: chunk id of the copy and of its run
   dst, src = call.src[1:]
   vram, (host, win), ops = (dst if is_host(src) else src).bitcast(dtypes.uint8), usb_window(call), list[UOp]()
-  sram = usb_sram(dev:=vram.device).getaddr(dev)
+  sram = usb_sram(dev:=vram.device)
 
   for r, nb in chunks(host.nbytes(), win):
-    n, va = (i:=UOp.const(r, dtypes.uint64)) + first, vram.getaddr(dev) + i * win
+    n, va = (i:=UOp.const(r, dtypes.uint64)) + first, i * win
     if is_host(src): # copyin: wait sentinel, copy, release
-      end = sram + (((n - run) & 1) + 1) * HALF
-      cmds = [ins("wait_eq", end - 4, usb_sentinel(n)), ins("copy", va, end - usb_wire(nb), nb), ins("store", end - 4, 0)]
+      end, words = (((n - run) & 1) + 1) * HALF, sram.bitcast(dtypes.uint32)
+      cmds = [wait(words, usb_sentinel(n), at:=end // 4 - 1, eq=True), move(vram, sram, nb, va, end - usb_wire(nb)), words.index(at).store(0)]
     else: # copyout: wait go, fill, signal
-      cmds = [ins("wait", usb_go(dev), n + 1), ins("store", usb_go(dev), 0)]
-      cmds += [ins("copy", sram + wo, va + po, pb) for wo, po, pb in ((0, 0, min(nb, CHUNK)), (HALF, CHUNK, nb - CHUNK)) if pb > 0]
-      cmds += [ins("store", usb_cq(dev), 0)]
-    cmds += [ins("store", usb_fence(dev), n + 1)]
+      cmds = [wait(usb_go(dev), (n + 1).cast(dtypes.uint32)), usb_go(dev).index(0).store(0)]
+      cmds += [move(sram, vram, pb, wo, va + po) for wo, po, pb in ((0, 0, min(nb, CHUNK)), (HALF, CHUNK, nb - CHUNK)) if pb > 0]
+      cmds += [usb_cq(dev).index(0).store(0)]
+    cmds += [usb_fence(dev).index(0).store((n + 1).cast(dtypes.uint32))]
     ops += [UOp(Ops.LINEAR, src=tuple(cmds)).end(r)] if isinstance(r, UOp) else cmds # full chunks as one block
   return ops
 
