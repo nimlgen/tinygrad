@@ -24,12 +24,11 @@ from extra.k3.draft import Eagle3, DSpark, MTP, load
 from extra.k3 import persist
 
 # TAU: a token's experts under this weight left out unless cached, TAUC: those under it left out cached or not, BETA: a cached expert's
-# routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: next-layer guesses per row. PREFETCH_TAIL: lower that cap
-# on rows 2 onward when all experts use their primary copy (zero keeps PREFETCH). SLOTS: on a gpu (default: what's free but SPARE bytes).
+# routing bonus, FILL: the experts tau left out read anyway (a layer), PREFETCH: next-layer guesses per row (rows 2 onward 2 when all experts
+# use their primary copy). SLOTS: on a gpu (default: what's free but SPARE bytes).
 # BIG: a token's experts of a rank under it read in the store's first copy (of copies: host.py).
 # PREFILL_PRIOR: after window prefill, cap the total expert frequency per layer at 20 / (1 - decay) before decoding (zero keeps it).
 TAU, TAUC, BETA, FILL, PREFETCH = getenv("TAU", 0.065), getenv("TAUC", 0.0), getenv("BETA", 0.07), getenv("FILL", 2), getenv("PREFETCH", 5)
-PREFETCH_TAIL = getenv("PREFETCH_TAIL", 0)
 BIG = getenv("BIG", 2)
 SLOTS, SPARE = getenv("SLOTS", 0), getenv("SPARE", 7 << 28)
 # (the drives' bytes a second, a window's seconds a token, a step's before any are measured: tinys3's, 195 GB/s (k3's store not cached in 4.8 s),
@@ -239,7 +238,7 @@ class Engine:
     if expert_slot_bytes: self.state["span_group"] = self.span_groups
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
                   fill=FILL, decay=0.5 ** (1 / 8), copies=len(self.ms), big=BIG, slot_groups=len(self.spans) if expert_slot_bytes else 0,
-                  pf_tail=PREFETCH_TAIL, tail=1)
+                  pf_tail=2, tail=1)
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     if window:
       self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
