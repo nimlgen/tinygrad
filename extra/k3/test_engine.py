@@ -759,11 +759,12 @@ class TestMTP(unittest.TestCase):
     self.eng = eng = Engine(model, ms[0], slots=sum(-(-p // 8192) * len(ls) for p, _, ls in copies) * E + 160, tokens=tokens, chunk=4, window=8,
                             draft=MTP(model), copies=tuple(ms[1:]) if own else ())
     pools, at, self.slot_of = [bytearray(eng.slots * eng.part) for _ in range(G)], round_up(eng.arena[1], 2), []
-    for c, (part, weights, layers) in enumerate(copies):
-      w, self.slot_of = -(-part // eng.part), [*self.slot_of, np.zeros(2 * E, np.int32)]
+    for c, (_, weights, layers) in enumerate(copies):
+      self.slot_of = [*self.slot_of, np.zeros(2 * E, np.int32)]
       for li, e in itertools.product(range(2), range(E)):
         if ms[0]["layers"][li] not in layers: continue
-        for g, b in enumerate(parts(weights, ms[0]["layers"][li], e, part)): pools[g][at * eng.part:at * eng.part + part] = b
+        w = eng.layer_spans[c if own else 0][li]
+        for g, b in enumerate(parts(weights, ms[0]["layers"][li], e, w * eng.part)): pools[g][at * eng.part:(at + w) * eng.part] = b
         self.slot_of[c][li * E + e], code = at // w, (c * 2 + li) * E + e
         if own or c == 0: eng.state["slot_of"][code], eng.state["expert_in"][at:at + w] = at, code
         at += w
@@ -840,7 +841,7 @@ class TestMTP(unittest.TestCase):
         np.testing.assert_equal(x, y)
     want = run(None, policy=lambda li, j: 0)
     same(run([(16384, self.weights, [1, 2]), (8192, self.weights, [1])]), want)
-    self.assertEqual(self.eng.spans, [2, 1])
+    self.assertEqual(self.eng.spans, [1])
     same(got:=run([(16384, self.weights, [1, 2]), (8192, other, [1])]), run([(8192, self.weights, [1, 2]), (8192, other, [1])], own=False))
     self.assertFalse(np.allclose(got[0], want[0], rtol=1e-2))
 
