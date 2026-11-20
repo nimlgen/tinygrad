@@ -657,14 +657,13 @@ class Engine:
     R, NT = self.state_rows(tile)  # (the routes padded to the state's rows: the experts graph's tiles past them skipped)
     vals = {"w": w, "pos": pos, "entries": entries.pad((0, R - entries.shape[0]), value=-1), "tiles": tiles.pad((0, NT - tiles.shape[0]), value=-1)}
     kept = Tensor.realize(*(Tensor(self.win[k].uop)[:v.shape[0]].assign(v) for k, v in vals.items()))
-    counted = Tensor(part2.uop)[1:1 + E].assign(counts.bitcast(dtypes.uint32))
-    forecast = []
+    counted = [Tensor(part2.uop)[1:1 + E].assign(counts.bitcast(dtypes.uint32))]
     if next_bias is not None:
       assert self.forecast_counts is not None
       prediction = moe_counts(Tensor(self.win["guess_logits"].uop), next_bias, K, live)
-      forecast.append(Tensor(self.forecast_counts[0].uop).assign(prediction.bitcast(dtypes.uint32)).uop)
-    tag = Tensor(tag.uop.after(counted.uop, kept.uop, *forecast))
-    return tag.assign(tag * 0 + 1).realize()
+      counted.append(Tensor(self.forecast_counts[0].uop).assign(prediction.bitcast(dtypes.uint32)))
+    most = Tensor.cat(*(Tensor(c.uop.unshard(0)).reshape(len(self.devs), -1) for c in counted), dim=1).max(1, keepdim=True)
+    return Tensor(tag.uop.after(kept.uop)).assign((most <= live).where(1, 2).cast(dtypes.uint32)).realize()
 
   def window_experts(self, tile:int, types:tuple[tuple[int, int]|None, ...], pool:Tensor, part1:Tensor, *_) -> Tensor:
     """the window's routed experts once the host gave their slots (part 1: an expert's slot * copies + its copy): each gpu its units of the

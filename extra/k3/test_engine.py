@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import numpy as np
 from gguf import GGUFWriter, GGMLQuantizationType, quants
 from tinygrad import Tensor, Device, UOp, nn, dtypes
+from tinygrad.uop.ops import Ops
+from tinygrad.engine.realize import get_call_arg_uops, get_call_outs_ins
 from tinygrad.helpers import round_up
 from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, ExpertGating, MLATransformerBlock, Indexer, IndexerConfig
@@ -80,6 +82,21 @@ class TestEngine(unittest.TestCase):
       buf = [(None, tags), None, None, (None, [np.r_[0, a], np.r_[0, b]])]
       e = SimpleNamespace(m={"n_experts":4}, io=None, bufs=[buf], model=SimpleNamespace(config=SimpleNamespace(num_experts_per_tok=2)))
       with self.assertRaisesRegex(RuntimeError, "expert counts"): Engine.counted(e, 0, live)
+
+  def test_window_tag(self):  # the tag the host waits on written by a kernel that reads the counts it gives the host (and the forecast's): a
+    # gpu orders a graph's kernels by the buffers they touch, not by the graph's order
+    def base(u:UOp) -> UOp: return u if u.op in (Ops.PARAM, Ops.BUFFER) else base(u.src[0])
+    for forecast in (False, True):
+      eng = self.engine(2 * E, window_forecast=forecast)
+      jit, tag = (eng.forecast_jit, 2) if forecast else (eng.routes[min(eng.routes)][0], 1)  # (its args: the biases, the tag, the counts)
+      writers = 0
+      for c in [c for c in jit.captured._linear.src if c.op is Ops.CALL]:
+        args, (outs, ins) = get_call_arg_uops(c), get_call_outs_ins(c)
+        if not any(base(args[i]).op is Ops.PARAM and base(args[i]).arg.slot == tag for i in outs): continue
+        writers, read = writers + 1, [base(args[i]) for i in ins]
+        self.assertIn(tag + 1, [u.arg.slot for u in read if u.op is Ops.PARAM])
+        if forecast: self.assertIn(eng.forecast_counts[0].uop.base, read)
+      self.assertEqual(writers, 1)
 
   def setUp(self):
     Engine.bank = dtypes.float  # (a window's streams in float: as steps' to their rounding; the half bank: test_window_pieces)
