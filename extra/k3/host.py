@@ -52,7 +52,7 @@ IO = [*((n, "int64_t") for n in "layers E ngpu k kmin k1 rows tokens nd entries 
       *((n, "const uint64_t *") for n in "prp sq db cq cq_db".split()),
       *((n, "int64_t *") for n in "tails db_tails heads phases inflight cids".split()),
       *((n, "int64_t") for n in "refs hits late misses guesses used wasted fills bytes".split()),
-      *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split()), ("pf_tail", "int64_t")]
+      *((n, "double") for n in "t_gpu t_route t_reads t_after slowest".split()), ("pf_tail", "int64_t"), ("tail", "int64_t")]
 BUFS = ["tag", "scores", "part1", "part2"]
 CTYPES:dict[str, type[ctypes._SimpleCData]] = {"int64_t": ctypes.c_int64, "float": ctypes.c_float, "double": ctypes.c_double}
 class IoT(ctypes.Structure): _fields_ = [(n, ctypes.c_void_p if "*" in t else CTYPES[t]) for n, t in IO]
@@ -371,18 +371,26 @@ static int64_t step_layer(io_t *s, int64_t li) {
   float logits[4096], sig[4096], tw[512];
   int64_t sel[64], pos[4096], usel[512], urank[512], ucode[512], codes[512], ms[512], skip[512], tj[512], tc[8], p1[8], nu = 0, nm = 0, nh = 0,
           late = 0, ns = 0, nf = 0;
-  uint8_t hit[512];
+  uint8_t hit[512], need[4096] = {0};
   int32_t slot[4096];
   slots_past_big(s, li, slot);
   for (int64_t e = 0; e < E; e++) pos[e] = -1;
+  int64_t full = s->tau > 0 && s->tail ? s->tail : T;
   for (int64_t t = 0; t < T; t++) {
     logits_of(s, b, t * s->rows, logits);
     int64_t c = tc[t] = route(s, logits, s->bias[li], slot, 1, sel, tw + t * 64, sig, skip, &ns);
-    for (int64_t j = 0; j < c; j++) {
-      if (pos[sel[j]] < 0) pos[sel[j]] = nu, usel[nu] = sel[j], urank[nu++] = j;
-      if (j < urank[pos[sel[j]]]) urank[pos[sel[j]]] = j;
-      tj[t * 64 + j] = pos[sel[j]];
+    for (int64_t j = 0; j < c; j++) tj[t * 64 + j] = sel[j], need[sel[j]] |= t < full || j < s->kmin || slot[sel[j]] >= 0;
+  }
+  for (int64_t t = 0; t < T; t++) {
+    int64_t c = 0;
+    for (int64_t j = 0; j < tc[t]; j++) {
+      int64_t e = tj[t * 64 + j];
+      if (!need[e]) continue;
+      if (pos[e] < 0) pos[e] = nu, usel[nu] = e, urank[nu++] = j;
+      if (j < urank[pos[e]]) urank[pos[e]] = j;
+      tw[t * 64 + c] = tw[t * 64 + j], tj[t * 64 + c++] = pos[e];
     }
+    tc[t] = c;
   }
   for (int64_t j = 0; j < nu; j++) {
     int64_t sl = s->slot_of[ucode[j] = code_of(s, li, usel[j], urank[j])];

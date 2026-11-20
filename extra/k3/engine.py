@@ -236,7 +236,7 @@ class Engine:
     if expert_slot_bytes: self.state["span_group"] = self.span_groups
     self.io = IoT(layers=L, E=E, ngpu=G, k=K, kmin=K // 4, k1=self.ks[0], rows=2, slots=slots, tau=TAU, tauc=TAUC, beta=BETA, pf=PREFETCH,
                   fill=FILL, decay=0.5 ** (1 / 8), copies=len(self.ms), big=BIG, slot_groups=len(self.spans) if expert_slot_bytes else 0,
-                  pf_tail=PREFETCH_TAIL)
+                  pf_tail=PREFETCH_TAIL, tail=2)
     for name, a in self.state.items(): setattr(self.io, name, a.ctypes.data)
     if window:
       self.stage(f"pool: {slots} slots ({slots * self.part / 1e9:.2f} GB, of it lent: the caches' {self.cache_bytes / 1e9:.2f} GB as they grow, "
@@ -1167,11 +1167,13 @@ class Engine:
   def steps(self, tokens:list[int], pos:int, end:int, *, cap_prior:bool=False) -> tuple[list[int], list[int], np.ndarray|None]:
     """the tokens from pos to end in steps of the most of them there's a graph of (each given the token after it), the last step's outputs"""
     out:tuple[list[int], list[int], np.ndarray|None] = ([], [], None)
+    self.io.tail = 0
     while pos < end:
       T = max(t for t in self.jits if t <= end - pos)
       if cap_prior and pos + T == end: self.cap_prefill_prior()
       out = self.step(tokens[pos:pos + T], pos, tokens[pos + 1:pos + 1 + T])
       pos += T
+    self.io.tail = 2
     return out
 
   def generate(self, tokens:list[int], temperature:float=0.0):
