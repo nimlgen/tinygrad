@@ -656,7 +656,6 @@ class TestPrefillPrior(unittest.TestCase):
     with patch.multiple(eng, window=window, step=step, pieces=lambda: 1, steps_faster=lambda n: False, counters=lambda: np.zeros(15)), \
          patch.object(eng, "cap_prefill_prior", wraps=eng.cap_prefill_prior) as cap:
       eng.short_engine = SimpleNamespace(window=lambda *args: window(*args, label="compact"), chunk=2)
-      eng.window_big, eng.window_copies = 0, False
       output = eng.generate(list(range(8)))
       self.assertEqual(next(output), 7)
       output.close()
@@ -844,36 +843,6 @@ class TestMTP(unittest.TestCase):
     self.assertEqual(self.eng.spans, [1])
     same(got:=run([(16384, self.weights, [1, 2]), (8192, other, [1])]), run([(8192, self.weights, [1, 2]), (8192, other, [1])], own=False))
     self.assertFalse(np.allclose(got[0], want[0], rtol=1e-2))
-
-  def test_window_hot(self):
-    eng = self.engine(2, [(16384, self.weights, [1, 2]), (8192, self.weights, [1])])
-    eng.window_big = 2
-    toks = [3, 5, 7]
-    eng.state["freq"].fill(0)
-    eng.window(toks, 0, toks[1:] + [-1])
-    self.assertTrue(eng.window_hot.all())
-    eng.state["freq"].fill(0)
-    eng.state["freq"][:E] = np.arange(E)
-    eng.window(toks, 0, toks[1:] + [-1])
-    np.testing.assert_array_equal(np.flatnonzero(eng.window_hot[0]), [E-2, E-1])
-    eng.drop(eng.state["slot_of"][:E].copy())
-    np.testing.assert_array_equal(eng.window_codes(0, np.arange(E)), np.r_[np.arange(E-2) + len(eng.types)*E, E-2, E-1])
-
-  def test_window_copies(self):  # a window's experts not cached in the first copy (half of block 1's) read in the second where it holds their
-    # layer: its streams as an engine's of a copy of the second's weights for them
-    toks, rng = [3, 5, 7, 1, 2, 9, 4], np.random.default_rng(3)
-    other = {n: rng.normal(0, 0.3, w.shape).astype(np.float32) if n.startswith('blk.1.') and '_exps.' in n else w for n, w in self.weights.items()}
-    mixed = {n: np.concatenate([other[n][:E // 2], w[E // 2:]]) if n.startswith('blk.1.') and '_exps.' in n else w for n, w in self.weights.items()}
-    def bank(copies:list) -> np.ndarray:
-      eng = self.engine(2, copies)
-      if len(copies) > 1:
-        eng.drop(eng.state["slot_of"][:E // 2].copy())
-        np.testing.assert_array_equal(eng.window_codes(0, np.arange(E)), np.arange(E))
-        eng.window_copies = True
-      eng.window(toks, 0, toks[1:] + [-1])
-      return eng.in_order(Tensor(eng.win["bank"].uop), 0, len(toks)).numpy()
-    want = bank([(8192, mixed, [1, 2])])
-    np.testing.assert_allclose(bank([(16384, self.weights, [1, 2]), (8192, other, [1])]), want, rtol=1e-3, atol=1e-3 * np.abs(want).max())
 
   def test_chain(self):
     eng, (toks, _) = self.engine(4), self.greedy(4)

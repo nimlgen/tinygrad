@@ -53,8 +53,7 @@ class Engine:
   bank_streams:int|None = None  # (the bank's streams: the model's blocks' if None)
   def __init__(self, model:Transformer, m:dict, slots:int=SLOTS, tokens:int=1, guess:str="", draft:Eagle3|DSpark|MTP|None=None, logits:bool=False,
                chunk:int=0, window:int=0, taps:list[tuple[int, bool]]|None=None, widths:tuple[int, ...]=(), source:str="",
-               copies:tuple[dict, ...]=(), window_copies:bool=bool(getenv("WINDOW_COPIES", 0)), window_big:int=getenv("WINDOW_BIG", 0),
-               short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0),
+               copies:tuple[dict, ...]=(), short_window:int=getenv("ADAPTIVE_SHORT_WINDOW", 0),
                window_forecast:bool=bool(getenv("WINDOW_FORECAST", 0)), prefill_prior:bool=bool(getenv("PREFILL_PRIOR", 0)),
                ordered_sum:bool=bool(getenv("ORDERED_EXPERT_SUM", 0))):
     """the moe blocks of model with their routed experts streamed from the store of manifest m into a pool of slots on each gpu, a part of
@@ -71,7 +70,7 @@ class Engine:
     self.dump_taps = taps or []
     stack = [*model.blk, *(draft.blk if draft is not None else [])]
     blocks = [stack[b] for b in m["layers"] if b < len(stack)]
-    self.window_copies, self.window_big, self.window_forecast = window_copies, window_big, window_forecast
+    self.window_forecast = window_forecast
     # Layer-major windows must keep the most recent indexer's selection for each query until its last consumer.
     self.index_roles:dict[FFNBlock, str] = {}
     idx = model.config.indexer
@@ -91,8 +90,6 @@ class Engine:
         raise ValueError("ADAPTIVE_SHORT_WINDOW needs a smaller window and an evenly sharded smaller chunk")
     if window_forecast and not window: raise ValueError("window forecast needs a window")
     self.forecast_counts = host_tensor(self.devs, m["n_experts"], dtypes.uint32) if window_forecast else None
-    self.window_hot:np.ndarray|None = None
-    if not 0 <= window_big <= m["n_experts"]: raise ValueError("WINDOW_BIG exceeds the expert count or is negative")
     self.ms = [m, *copies]
     L, E, K, G, self.lat, self.units = len(blocks), m["n_experts"], model.config.num_experts_per_tok, len(self.devs), m["lat"], m["units"][0]
     assert all(len(set(c["part_bytes"])) == 1 and c["units"] == [self.units] * G and c["lat"] == self.lat for c in self.ms), \
@@ -788,15 +785,9 @@ class Engine:
     """the tokens at positions pos.. (a read window) through every block, a layer at a time over its pieces of up to W tokens (each its bank):
     a layer's experts read once a read window. the caches and states as after steps of them, the draft's cache"""
     T, C, W, t0 = len(toks), self.chunk, self.W, time.perf_counter()
-    E, L = self.m["n_experts"], len(self.types)
-    self.window_hot, arena = None, slice(*self.arena)
+    arena = slice(*self.arena)
     self.drop(arena, wait=True)
     self.state["mask"][arena] = 1
-    if self.window_big and len(self.ms) > 1 and T * self.model.config.num_experts_per_tok < E * TILES[0]:
-      freq = self.state["freq"][:L*E].reshape(L, E)
-      hot = np.zeros((L, E), dtype=bool)
-      np.put_along_axis(hot, np.argsort(-freq, axis=1, kind="stable")[:, :self.window_big], True, axis=1)
-      self.window_hot = (hot & (freq > 0)) | (freq.max(axis=1, keepdims=True) == 0)
     self.grow(pos + round_up(T, C))
     assert T <= W * self.pieces() and pos + round_up(T, C) <= self.max_context
     self.tok_np[:T], self.given_np[:T] = toks, given
@@ -838,7 +829,7 @@ class Engine:
     the gpus' counts: the layers before are done with their slots), their slots given to the gpus, kept till the layer's done. when a
     piece's tokens route to half of a layer's experts or more, every next layer's are read ahead (queued behind the layer's own) while the
     gpus work"""
-    n, E, K, L = 1, self.m["n_experts"], self.model.config.num_experts_per_tok, len(self.types)
+    n, E, K = 1, self.m["n_experts"], self.model.config.num_experts_per_tok
     ahead:dict[int, np.ndarray] = {}
     moe = sum(hasattr(b, "ffn_gate_inp") for b in self.model.blk)
     def chunks(T:int) -> list[tuple[int, int]]: return [(c0, min(self.chunk, T - c0)) for c0 in range(0, T, self.chunk)]
@@ -879,7 +870,7 @@ class Engine:
           t0 = time.perf_counter()
           self.read(codes, codes, wait=True)
           self.io.t_reads += time.perf_counter() - t0
-          table = np.maximum(self.state["slot_of"][every:=self.window_codes(li, np.arange(E))], 0) * len(self.ms) + every // (L * E)
+          table = np.maximum(self.state["slot_of"][self.window_codes(li, np.arange(E))], 0) * len(self.ms)
           for p in self.bufs[li][2][1]: p[1:1 + E] = table.astype(np.int32).view(np.uint32)
           self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
           for c0, nlive in chunks(T):
@@ -893,14 +884,8 @@ class Engine:
       n = s + 1
 
   def window_codes(self, li:int, experts:np.ndarray) -> np.ndarray:
-    """the codes of layer li's experts a window reads: the first copy's if cached there (a step's rule past its big ranks: host.py's
-    code_of), else of the first other copy that holds the layer"""
-    code = li * self.m["n_experts"] + experts
-    if not self.window_copies and self.window_hot is None: return code
-    other = next((c for c, ty in enumerate(self.layer_copies[li]) if c and ty is not None), 0)
-    big = ((self.state["slot_of"][code] >= 0) & (self.io.big >= 0)) | (other == 0)
-    if self.window_hot is not None: big |= self.window_hot[li, experts]
-    return np.where(big, code, code + other * len(self.types) * self.m["n_experts"])
+    """the codes of layer li's experts a window reads: the first copy's"""
+    return li * self.m["n_experts"] + experts
 
   def graph(self, jit:Callable, *args) -> Tensor:  # (a window graph on the window's state)
     return jit(*args, *self.win.values())
@@ -1160,7 +1145,6 @@ class Engine:
       n = min(size, end - pos)
       view = self.short_engine if self.short_engine is not None and pos > 0 and n <= self.short_window else self
       if pos + round_up(n, view.chunk) > self.max_context or self.steps_faster(n): break
-      if view is not self: view.window_big, view.window_copies = self.window_big, self.window_copies
       view.window(tokens[pos:pos + n], pos, tokens[pos + 1:pos + 1 + n])
       pos += n
     return pos
