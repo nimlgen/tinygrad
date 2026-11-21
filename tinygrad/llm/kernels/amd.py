@@ -176,7 +176,8 @@ class Linear(nn.Linear):
     # (a symbolic token count: the matmul on the max rows, static and its own kernel, as the quantized ones)
     return self.dense(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
   def dense(self, x:Tensor) -> Tensor:
-    if x.dtype == dtypes.float and self.weight.dtype == dtypes.half and amd_custom_kernels_supported(self.weight.device):
+    if x.dtype == dtypes.float and self.weight.dtype == dtypes.half and x.numel() >= 16 * self.in_features and \
+       amd_custom_kernels_supported(self.weight.device):
       return (y:=x.half().dot(self.weight.T, dtype=dtypes.float)) if self.bias is None else y + self.bias
     return super().__call__(x)
 
