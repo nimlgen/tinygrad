@@ -319,9 +319,8 @@ class Engine:
     y1, w1 = self.experts(li, h[0], first, self.ks[0] * T)
     y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
     y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
-    if (T == 4 and self.ks == (4, 4) and self.lat == 6144 and self.m["layers"][li] < len(self.model.blk)
-        and ordered_expert_sum_supported(y1.device)):
-      y = ordered_expert_sum(y1, y2, w1, w2)
+    if self.m["layers"][li] < len(self.model.blk) and ordered_expert_sum_supported(y1.device):
+      y = ordered_expert_sum(y1, y2, w1, w2, T)
     else:
       y = self.heaviest_first([y1, y2], [w1, w2], T)
     out = (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)

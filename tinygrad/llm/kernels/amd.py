@@ -35,8 +35,6 @@ def ordered_expert_sum_supported(device:str|tuple[str, ...]|None) -> bool:
   return amd_custom_kernels_supported(device) and _is_rdna4(device)
 
 _ORDERED_EXPERT_SUM = """
-#define WIDTH 4
-#define FEATURES 6144
 typedef unsigned long size_t;
 extern "C" __attribute__((device, const)) size_t __ockl_get_local_id(unsigned int);
 extern "C" __attribute__((device, const)) size_t __ockl_get_group_id(unsigned int);
@@ -48,19 +46,18 @@ void sorted_expert_sum(float* out, const float* first, const float* second, cons
   const int lane=__ockl_get_local_id(0);
   const int token=__ockl_get_group_id(0);
   const int c=128*__ockl_get_group_id(1)+lane;
-  __attribute__((shared)) int order[8];
-  __attribute__((shared)) float scale[8];
+  __attribute__((shared)) int order[K1+K2];
+  __attribute__((shared)) float scale[K1+K2];
   const int entry=lane;
-  if(entry<8) {
-    float weights[8];
+  if(entry<K1+K2) {
+    float weights[K1+K2];
     #pragma unroll
-    for(int k=0;k<4;k++) {
-      weights[k]=w1[k*WIDTH+token];
-      weights[4+k]=w2[k*WIDTH+token];
-    }
+    for(int k=0;k<K1;k++) weights[k]=w1[k*WIDTH+token];
+    #pragma unroll
+    for(int k=0;k<K2;k++) weights[K1+k]=w2[k*WIDTH+token];
     int rank=0;
     #pragma unroll
-    for(int k=0;k<8;k++) {
+    for(int k=0;k<K1+K2;k++) {
       if(k!=entry) rank += weights[k]>weights[entry] || (k<entry && weights[k]==weights[entry]);
     }
     order[rank]=entry;
@@ -69,11 +66,11 @@ void sorted_expert_sum(float* out, const float* first, const float* second, cons
   __builtin_amdgcn_s_barrier();
   float sum=0.0f;
   #pragma unroll
-  for(int k=0;k<8;k++) {
-    const int ent=order[k], at=((ent&3)*WIDTH+token)*FEATURES+c;
-    const float weighted=(ent<4 ? first[at] : second[at])*scale[k];
+  for(int k=0;k<K1+K2;k++) {
+    const int ent=order[k];
+    const float weighted=(ent<K1 ? first[(ent*WIDTH+token)*FEATURES+c] : second[((ent-K1)*WIDTH+token)*FEATURES+c])*scale[k];
     // The stock rank reduction sums the selected product with +0 from
-    // the other seven entries before adding it to the running sum.
+    // the other entries before adding it to the running sum.
     sum += weighted+0.0f;
   }
   out[token*FEATURES+c]=sum;
@@ -82,21 +79,24 @@ void sorted_expert_sum(float* out, const float* first, const float* second, cons
 
 @functools.cache
 def _ordered_expert_sum_kernel(out:UOp, first:UOp, second:UOp, w1:UOp, w2:UOp, *, device:str) -> UOp:
+  (width, features), k1, k2 = out.shape[-2:], w1.shape[0] // out.shape[-2], w2.shape[0] // out.shape[-2]
+  src = f"#define WIDTH {width}\n#define FEATURES {features}\n#define K1 {k1}\n#define K2 {k2}\n" + _ORDERED_EXPERT_SUM
   sink = UOp.sink(out.base, first.base, second.base, w1.base, w2.base, UOp.special(128, "lidx0"),
-                  UOp.special(4, "gidx0"), UOp.special(48, "gidx1"), arg=KernelInfo("sorted_expert_sum"))
-  with Context(ALLOW_DEVICE_USAGE=1): binary = Device[device].compiler.compile_cached(_ORDERED_EXPERT_SUM)
+                  UOp.special(width, "gidx0"), UOp.special(features // 128, "gidx1"), arg=KernelInfo("sorted_expert_sum"))
+  with Context(ALLOW_DEVICE_USAGE=1): binary = Device[device].compiler.compile_cached(src)
   return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=(*sink.src, sink)),
-                             UOp(Ops.SOURCE, arg=_ORDERED_EXPERT_SUM), UOp(Ops.BINARY, arg=binary)))
+                             UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
 
-def ordered_expert_sum(first:Tensor, second:Tensor, w1:Tensor, w2:Tensor) -> Tensor:
-  """Combine eight finite route weights per token in descending order, breaking ties by release and table index."""
-  peers = first.shape[0]
-  assert first.shape == second.shape == (peers, 16, 6144) and first.uop.shard_shape[0] == second.uop.shard_shape[0] == 1
-  assert w1.shape == w2.shape == (16,) and w1.uop.axis is None and w2.uop.axis is None
+def ordered_expert_sum(first:Tensor, second:Tensor, w1:Tensor, w2:Tensor, T:int) -> Tensor:
+  """(gpus, T, features): the T tokens' expert outputs of the two parts first (gpus, k1*T, features) and second (gpus, k2*T, features), entry
+  j*T+t token t's, weighted by w1 (k1*T,) and w2 (k2*T,), finite, and summed in descending weight order, ties by part and entry"""
+  peers, features = first.shape[0], first.shape[-1]
+  assert first.shape[1] == w1.shape[0] and second.shape[1] == w2.shape[0] and second.shape[-1] == features and features % 128 == 0
+  assert first.uop.shard_shape[0] == second.uop.shard_shape[0] == 1 and w1.uop.axis is None and w2.uop.axis is None
   assert all(t.dtype == dtypes.float32 for t in (first, second, w1, w2))
   resolved = unwrap(first.device)
   device = resolved if isinstance(resolved, str) else tuple(resolved)
-  out = Tensor.empty(peers, 4, 6144, device=device, dtype=dtypes.float32, axis=first.uop.axis)
+  out = Tensor.empty(peers, T, features, device=device, dtype=dtypes.float32, axis=first.uop.axis)
   return Tensor.custom_kernel(out, first.contiguous(), second.contiguous(), w1.contiguous(), w2.contiguous(),
                               fxn=functools.partial(_ordered_expert_sum_kernel, device=device[0] if isinstance(device, tuple) else device))[0]
 
