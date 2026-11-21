@@ -850,29 +850,25 @@ class Engine:
           counts = self.counted(li, T)
           used = np.flatnonzero(counts)
           codes = self.window_codes(li, np.union1d(used, ahead[li]) if li in ahead else used)
-          small = T * K < E * TILES[0]
-          def read_ahead():
-            if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(used) >= E // 2):
-              guesses = np.arange(E)
-              if small:
-                freq = self.state["freq"][(li + 1) * E:(li + 2) * E]
-                if forecast is not None:
-                  assert self.forecast_counts is not None
-                  prediction = self.forecast_counts[1][0]
-                  if prediction.sum() == T * K and prediction.max() <= T:
-                    guesses = np.lexsort((-freq, -prediction.astype(np.int32)))[:len(used)]
-                  else: guesses = np.argsort(-freq, kind="stable")[:len(used)]
-                else: guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
-                self.read(codes, codes, wait=False)
-              if self.read(self.window_codes(li + 1, guesses), codes, wait=False): ahead[li + 1] = guesses
-          if small: read_ahead()
+          if li + 1 < moe and li + 1 not in ahead and (li in ahead or len(used) >= E // 2):
+            guesses = np.arange(E)
+            if T * K < E * TILES[0]:
+              freq = self.state["freq"][(li + 1) * E:(li + 2) * E]
+              if forecast is not None:
+                assert self.forecast_counts is not None
+                prediction = self.forecast_counts[1][0]
+                if prediction.sum() == T * K and prediction.max() <= T:
+                  guesses = np.lexsort((-freq, -prediction.astype(np.int32)))[:len(used)]
+                else: guesses = np.argsort(-freq, kind="stable")[:len(used)]
+              else: guesses = np.argpartition(freq, E - len(used))[E - len(used):] if len(used) else guesses[:0]
+              self.read(codes, codes, wait=False)
+            if self.read(self.window_codes(li + 1, guesses), codes, wait=False): ahead[li + 1] = guesses
           t0 = time.perf_counter()
           self.read(codes, codes, wait=True)
           self.io.t_reads += time.perf_counter() - t0
           table = np.maximum(self.state["slot_of"][self.window_codes(li, np.arange(E))], 0) * len(self.ms)
           for p in self.bufs[li][2][1]: p[1:1 + E] = table.astype(np.int32).view(np.uint32)
           self.graph(experts[self.layer_copies[li]], self.pool, self.parts[0][li])
-          if not small: read_ahead()
           for c0, nlive in chunks(T):
             jit, args, _, live = self.chunk_graph("post", b, self.post, nlive, c0)
             self.graph(jit, live, self.v_c0.bind(c0), self.v_s.bind(s), *args)
