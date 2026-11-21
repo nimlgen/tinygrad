@@ -1097,6 +1097,17 @@ def reduce_scatter(p:Tensor) -> Tensor:
       got[(t, (j + 1) % n)] = (part(j, t) if k == 1 else (got[(t, j)] + part(j, t)).contiguous()).copy_to_device(devs[(j + 1) % n])
   return Tensor(UOp.mstack(*[(got[(t, t)] + part(t, t)).contiguous() for t in range(n)]).unshard(0)).cast(p.dtype)
 
+def all_to_all(x:Tensor) -> Tensor:
+  """x (R, ..., F) split on its last axis over the devices, split on its rows instead (R, ..., F): each device's rows of every device's
+  columns copied to it"""
+  devs, S = cast(tuple[str, ...], x.device), x.uop.shard_shape
+  n, size, w = len(devs), S[0] // len(devs), S[-1]
+  local = _per_device(Tensor.empty(*x.shape, dtype=x.dtype, device=devs, axis=x.ndim - 1).assign(x))
+  def part(j:int, i:int) -> UOp:
+    p = local.mselect(j).reshape(S).shrink(((i * size, (i + 1) * size), *((0, s) for s in S[1:])))
+    return (p if i == j else p.copy_to_device(devs[i])).pad(tuple((0, 0) for _ in S[:-1]) + ((j * w, (n - 1 - j) * w),))
+  return Tensor(UOp.mstack(*[functools.reduce(lambda a, b: a + b, [part(j, i) for j in range(n)]).contiguous() for i in range(n)]).unshard(0))
+
 def partial_sum(x:Tensor) -> Tensor:
   """the sum over the devices of their partials x (devices, ...) split on axis 0, on every device: small ones in a kernel of the gpus' mailboxes,
   larger float ones on the gpus in half (their copies half the bytes)"""
