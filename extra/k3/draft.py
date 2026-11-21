@@ -7,7 +7,7 @@ from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.uop.ops import smax
 from tinygrad.helpers import prod, round_up
 from tinygrad.llm.model import Transformer, FFNBlock, precompute_freqs_cis, apply_rope, YaRNConfig
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, mla_topk_attention, mla_topk_supported, allgather_last
 from tinygrad.llm.kernels.amd_gguf import q8_0_linear
 
 def weight(t:Tensor, devs:tuple[str, ...], axis:int|None=None, q8:bool=True) -> Tensor|Linear:
@@ -116,7 +116,7 @@ class DSpark:
     self.freqs_cis = precompute_freqs_cis(self.hd, max_context, tl["rope_parameters"]["rope_theta"]).to(devs).realize()
     st = nn.state.safe_load(f"{path}/model.safetensors")
     # split by heads, by the mlp's rows, the markov term by the vocabulary (a guess at a time reads all of it)
-    split = {"q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1, "markov_w2": 0}
+    split = {"fc": 0, "q_proj": 0, "k_proj": 0, "v_proj": 0, "o_proj": 1, "gate_proj": 0, "up_proj": 0, "down_proj": 1, "markov_w2": 0}
     self.w = {k[:-len(".weight")]: weight(v, devs, split.get(k.split(".")[-2]), q8 and k.startswith(("layers.", "fc.", "markov_head.markov_w2")))
               for k, v in st.items() if k.endswith(".weight")}
     self.markov = nn.Embedding(*st["markov_head.markov_w1.weight"].shape)  # (the r-dim embedding of the token before a guess)
@@ -134,7 +134,7 @@ class DSpark:
   def fill(self, tokens:Tensor, hidden:Tensor, pos:int|UOp) -> Tensor:
     """the cache after the context's keys and values of positions pos.. on the target's taps hidden (1, T, taps, dim)"""
     T = hidden.shape[1]
-    c = self.norm(self.lin(hidden.reshape(1, T, -1), "fc"), "hidden_norm")
+    c = self.norm(allgather_last(self.lin(hidden.reshape(1, T, -1), "fc"), exact=True), "hidden_norm")
     stores = []
     for l in range(self.L):
       for i, x in enumerate(self.kv(c, f"layers.{l}.self_attn.", self.freqs_cis[pos:pos + T])):
