@@ -589,17 +589,17 @@ class Engine:
       mask = self.window_mask(b, h, pos, c0)
       a = self.partials(lambda: b._attention(h, (pos,), mask, live))
     bank = Tensor(self.win["bank"].uop.after(self.add(s, c0, a).uop))
-    x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live.vmax]
+    x = self.whole(self.mix(getattr(b, "ffn_res_score", None), bank.flatten(1, 2), b.ffn_norm, s + 1, rows).cast(self.bank))[:, :live]
     if not hasattr(b, "ffn_gate_inp"): return self.add(s, c0, self.partials(lambda: b._feed_forward(x))).realize()
     logits = (w(x[0]) if isinstance(w:=self.scorer(b), Linear) else x[0] @ w.T).float()
-    scores = logits.reshape(live.vmax, len(self.devs), 2, -1)
-    logits = scores[:, :, 0].reshape(live.vmax, -1).contiguous()
+    scores = logits.reshape(live, len(self.devs), 2, -1)
+    logits = scores[:, :, 0].reshape(live, -1).contiguous()
     logits = allgather_last(logits)  # (a gpu's experts' logits, everyone's on every gpu)
     outs = [(self.win["h"], b._expert_input(x)[0]), (self.win["logits"], logits)]
     shared = Tensor(self.win["shared"].uop).reshape(len(self.devs), -1, self.model.config.dim)[:, c0:c0 + self.chunk]
     result = [Tensor(t.uop)[c0:c0 + self.chunk].assign(v.pad_to((self.chunk, v.shape[1])).cast(t.dtype)) for t, v in outs]
     if forecast:
-      predicted = allgather_last(scores[:, :, 1].reshape(live.vmax, -1).contiguous().half()).float()
+      predicted = allgather_last(scores[:, :, 1].reshape(live, -1).contiguous().half()).float()
       result.append(Tensor(self.win["guess_logits"].uop).assign(predicted.pad_to(self.win["guess_logits"].shape)))
     shexp = self.as_partials(self.partials(lambda: b._shared(x)))[:, 0]
     return Tensor.realize(*result, shared.assign(shexp.pad_to(shared.shape).cast(shared.dtype)))[0]
