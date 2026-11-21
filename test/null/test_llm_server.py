@@ -31,11 +31,11 @@ class TestParseToolCall(unittest.TestCase):
     self.assertEqual(parse_tool_call("tools.ping-v1"), ("tools.ping-v1", {}))
 
   def test_kimi_long_write(self):
-    head = ('tool="write" index="1"<|sep|><|open|>argument key="path" type="string"<|sep|>/tmp/dm-ec-remote-audit/CORRUPTS.md<|close|>argument<|sep|>'
+    head = ('tool="write" index="1"<|sep|><|open|>argument key="path" type="string"<|sep|>/tmp/notes/LONG.md<|close|>argument<|sep|>'
             '<|open|>argument key="content" type="string"<|sep|>')
-    content = '# Data-corruption audit\n\n| a | "b" & c |\n```c\nif (x < y && *p) return -1;\n```\n' * 200
+    content = '# Notes\n\n| a | "b" & c |\n```c\nif (x < y && *p) return -1;\n```\n' * 200
     self.assertEqual(parse_tool_call(head + content + '<|close|>argument<|sep|>\n'),
-                     ("write", {"path":"/tmp/dm-ec-remote-audit/CORRUPTS.md", "content":content}))
+                     ("write", {"path":"/tmp/notes/LONG.md", "content":content}))
     self.assertIsNone(parse_tool_call(head + content))
 
   def test_invalid_glm_call(self):
