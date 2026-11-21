@@ -172,9 +172,13 @@ class Linear(nn.Linear):
       # symbolic token count: padded to the max chunk size (static shapes), the kernel's rows those there are, the rest sliced off
       out = q8_linear(self, x.pad_to(x.max_shape), rows=cast(UOp, prod(x.shape[:-1])))
       return out.shrink(tuple((0, s) for s in (*out.shape[:out.ndim - x.ndim], *x.shape[:-1], self.out_features)))
-    if isinstance(x.numel(), int): return super().__call__(x)
+    if isinstance(x.numel(), int): return self.dense(x)
     # (a symbolic token count: the matmul on the max rows, static and its own kernel, as the quantized ones)
-    return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    return self.dense(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+  def dense(self, x:Tensor) -> Tensor:
+    if x.dtype == dtypes.float and self.weight.dtype == dtypes.half and amd_custom_kernels_supported(self.weight.device):
+      return (y:=x.half().dot(self.weight.T, dtype=dtypes.float)) if self.bias is None else y + self.bias
+    return super().__call__(x)
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
