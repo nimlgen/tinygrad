@@ -141,7 +141,7 @@ class TestEngine(unittest.TestCase):
     slots_of = slot_of or [eng.state["slot_of"][c * n:(c + 1) * n] // w for c, w in enumerate(eng.spans)]
     def host(li:int, i:int, dep:Tensor, *_) -> Tensor:  # (part 1's dep: the scores)
       if i == 0:
-        sig = dep[:, 0].to("CPU").sigmoid()
+        sig = dep[:, 0].contiguous().to("CPU").sigmoid()
         sel = (sig + Tensor(eng.bias[li], device="CPU")).topk(K)[1]
         w = sig.gather(-1, sel) / sig.gather(-1, sel).sum(-1, keepdim=True)
         def table(ks:slice) -> Tensor:  # (an entry a token's expert's slot and weight, j*T+t)

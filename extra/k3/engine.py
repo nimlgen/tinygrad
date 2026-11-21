@@ -304,18 +304,19 @@ class Engine:
     return Tensor(self.cres.uop.after(*outs))[:1].assign(Tensor.ones(1, dtype=dtypes.int32, device=self.devs[0])).realize()
 
   def feed_forward(self, li:int, b:FFNBlock, x:Tensor) -> Tensor:
-    """moe block b's (layer li's) feed forward on the tokens x (1, T, dim): without a latent, its shared experts on the gpus while the host
-    routes"""
-    if b.config.expert_latent_dim: return b._expert_output(self.routed(li, x, b._expert_input(x)), b._shared(x))
-    return self.routed(li, x, x, b._shared(x))
-
-  def routed(self, li:int, x:Tensor, h:Tensor, shared:Tensor|None=None) -> Tensor:
-    """layer li's routed experts on the tokens x (1, T, dim), h their expert inputs (1, T, lat): the gpus' scores to the host, shared on the
-    gpus while it routes, each gpu's units of the experts it gives in two parts, summed over the gpus, then shared added"""
+    """moe block b's (layer li's) feed forward on the tokens x (1, T, dim): the gpus' scores to the host, then the experts' inputs and the shared
+    experts on the gpus while it routes"""
     T, s = x.shape[1], w(x) if isinstance(w:=self.scorers[li], Linear) else x[0] @ w.T
     scores = Tensor(self.scores[li])[:T].assign(s.float().reshape(-1, len(self.devs), 2, self.m["n_experts"] // len(self.devs))
                                                 .permute(0, 2, 1, 3).reshape(-1, 2, self.m["n_experts"]))
-    first = self.host(li, 0, scores, self.routing_tag(li, scores), *([] if shared is None else [shared]))
+    x = Tensor(x.contiguous().uop.after((tag:=self.routing_tag(li, scores)).uop))
+    h, shared = b._expert_input(x), b._shared(x)
+    return b._expert_output(self.routed(li, h, self.host(li, 0, scores, tag, h, *([] if shared is None else [shared]))), shared)
+
+  def routed(self, li:int, h:Tensor, first:Tensor) -> Tensor:
+    """layer li's routed experts on the expert inputs h (1, T, lat): each gpu's units of the experts it gives in two parts (first: part 1's
+    table), summed over the gpus"""
+    T = h.shape[1]
     y1, w1 = self.experts(li, h[0], first, self.ks[0] * T)
     y1 = y1.contiguous()  # (a buffer: part 2 waited for after it)
     y2, w2 = self.experts(li, h[0], self.host(li, 1, y1), self.ks[1] * T)
@@ -323,8 +324,7 @@ class Engine:
       y = ordered_expert_sum(y1, y2, w1, w2, T)
     else:
       y = self.heaviest_first([y1, y2], [w1, w2], T)
-    out = (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
-    return out if shared is None else out + shared
+    return (partial_sum(y) * self.model.config.routed_scaling_factor).unsqueeze(0)
 
   def routing_tag(self, li:int, scores:Tensor) -> Tensor:
     s = scores[0, 0].reshape(len(self.devs), -1)[:, :1]
@@ -332,7 +332,7 @@ class Engine:
 
   def host(self, li:int, i:int, *deps:Tensor) -> Tensor:
     """part i of layer li's slots and weights once the host releases it, waited for after deps (in their order: part 1's the scores, the
-    tag, then the shared experts the gpus run while the host routes)"""
+    tag, then the experts' inputs and the shared experts the gpus run while the host routes)"""
     return Tensor((t:=self.parts[i][li].uop).after(wait(t, *(d.uop for d in deps))))
 
   def experts(self, li:int, h:Tensor, table:Tensor, n:int) -> tuple[Tensor, Tensor]:
