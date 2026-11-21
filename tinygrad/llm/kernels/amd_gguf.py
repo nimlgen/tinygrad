@@ -644,7 +644,7 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
   token_block, output_block = UOp.range(out.shape[0]//tile, 0), UOp.range(out_features//(32*waves), 1)
   lane, wave = UOp.range(32, -1, axis_type=AxisType.WARP), UOp.range(waves, 3, axis_type=AxisType.LOCAL)
   ph, col, tid = lane//16, lane%16, wave*32 + lane
-  def output(o:int|UOp, w:UOp, c:UOp) -> UOp:
+  def output(o:int|UOp, w:UOp, c:UOp|int) -> UOp:
     return (output_block*waves + w)*16 + c + o*(out_features//2) if act is not None else (output_block*waves + w)*32 + o*16 + c
   outputs = tuple(output(o, wave, col) for o in range(2))
   if tables:
