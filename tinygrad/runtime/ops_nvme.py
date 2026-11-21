@@ -35,8 +35,6 @@ class NVMEDev:
   def __init__(self, pci_dev:PCIDevice):
     self.pci_dev = pci_dev
     pci_dev.write_config(pci.PCI_COMMAND, pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, 2)
-    if (exp:=pci_dev.find_cap(pci.PCI_CAP_ID_EXP)) and pci_dev.read_config(exp + pci.PCI_EXP_DEVCAP2, 4) & 0x4:
-      pci_dev.write_config(exp + pci.PCI_EXP_DEVCTL2, pci_dev.read_config(exp + pci.PCI_EXP_DEVCTL2, 2) & ~pci.PCI_EXP_DEVCTL2_COMP_TIMEOUT | 0x9, 2)
     self.regs = pci_dev.map_bar(0, fmt='I')
     cap = self.regs[nvme.NVME_REG_CAP // 4] | self.regs[nvme.NVME_REG_CAP // 4 + 1] << 32
     self.db_stride, timeout_ms = 4 << (cap >> 32 & 0xf), (cap >> 24 & 0xff) * 500
