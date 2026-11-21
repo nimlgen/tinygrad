@@ -644,9 +644,9 @@ TILE_QUANTS = (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ3_XXS)
 def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_features:int, in_features:int, ggml_type:int, stride:int,
                        offset:int, act:Callable|None, tile:int, gather:bool, skip:bool) -> UOp:
   # a workgroup: a tile's rows (16, 32 or 64) and 256 outputs (act: 128, a wave's gate tile and its up tile), 8 waves of 2 output tiles. a group
-  # of 32 inputs at a time a wave reads its rows from x as they are and decodes its outputs' weights to halves, the scales in them (a tile of 16
-  # rows: from LDS a block at a time, its lanes' reads of a row's words in turn, where they fit). skip: a tile's 16 rows whose first is padding
-  # (live -1) left out
+  # of 32 inputs at a time the tile's rows go through LDS (two buffers by its parity) and a wave decodes its outputs' weights to halves, the
+  # scales in them (a tile of 16 rows: from LDS a block at a time, its lanes' reads of a row's words in turn, where they fit, its rows read from x
+  # as they are). skip: a tile's 16 rows whose first is padding (live -1) left out
   rows_src, tables = extra[:gather + skip], extra[gather + skip:]
   xrow, live = rows_src[0] if gather else None, rows_src[-1] if skip else None
   waves, type_words = 8, QUANT_SIZES[ggml_type]//raw.dtype.itemsize
@@ -663,24 +663,33 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
     grid = grid.after(*(grid[tid*2 + i].store(grid_src[tid*2 + i]) for i in range(2)))
     signs = signs.after(*(signs[tid*2 + i].store(sign_src[tid*2 + i]) for i in range(2)))
   slot = tiles[token_block].cast(dtypes.int32)
-  # a step: steps groups (their weights decoded together: more in flight)
+  # a step: steps groups (their rows' words staged, their weights decoded together: more in flight between two barriers)
   steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
   blk, sib = UOp.range((slot >= 0).where(in_features//GGML_BLOCK_SIZE, 0), 4, AxisType.LOOP), UOp.range(8//steps, 20, AxisType.LOOP)
   step = blk*(8//steps) + sib
   def row(o:int, c:UOp|int) -> UOp: return slot.maximum(0).cast(dtypes.int64)*stride + offset + output(o, wave, c)*output_words + blk*type_words
-  if tile == 16 and waves*32*QUANT_SIZES[ggml_type] <= 32768:
+  if (small:=tile == 16 and waves*32*QUANT_SIZES[ggml_type] <= 32768):
     src = UOp.alloc((waves*32*type_words,), raw.dtype, addrspace=AddrSpace.LOCAL)
     src = src.after(UOp.group(*(src[((o*waves + wave)*16 + c)*type_words + w].store(raw[row(o, c) + w]) for o in range(2) for c in range(16)
                                 for w in ((lane + i*32).minimum(type_words - 1) for i in range(-(-type_words//32))))).barrier())
     bases = [((o*waves + wave)*16 + col)*type_words for o in range(2)]
   else: src, bases = raw, [row(o, col) for o in range(2)]
   def xr(r:UOp) -> UOp: return r if xrow is None else xrow[r].cast(dtypes.int32).maximum(0).cast(dtypes.weakint)
+  # a row's 16 words of the group, rows 20 words apart (a lane's 4 words of a fragment in one read, the 16 rows' on different banks)
+  lds = UOp.alloc((2*steps*tile*20,), dtypes.uint32, addrspace=AddrSpace.LOCAL)
+  staged = [lds[(((step % 2)*steps + k)*tile + r//16)*20 + r%16].store(_amd_load(x[xr(token_block*tile + r//16), ((step*steps + k)*16 + r%16)*2], 2)
+                                                                     .bitcast(dtypes.uint32))
+            for k in range(steps) for r in (tid + i*waves*32 for i in range(tile*16 // (waves*32)))]
+  lds = src if small else lds.after(UOp.group(*staged).barrier())
   def halves(w:UOp) -> list[UOp]: return [(w >> (16*i)).cast(dtypes.uint16).bitcast(dtypes.half) for i in range(2)]
   def pair(v:UOp) -> UOp: return v.cast(dtypes.half).bitcast(dtypes.uint16).cast(dtypes.uint32) * 0x10001
   # a lane's inputs of a 16 step h: the first 8 (ph 0) or the last 8, its weights' words 2ph and 2ph+1 of the step's 4
   def afrags(buf:UOp, k:int, t:int) -> list[UOp]:
-    r, i0 = xr(token_block*tile + t*16 + col), (step*steps + k)*32
-    return [UOp.stack(*(x.after(buf)[r, i0 + h*16 + 8*ph + j] for j in range(8))) for h in range(2)]
+    if small:
+      r, i0 = xr(token_block*tile + t*16 + col), (step*steps + k)*32
+      return [UOp.stack(*(x.after(buf)[r, i0 + h*16 + 8*ph + j] for j in range(8))) for h in range(2)]
+    return [UOp.stack(*(v for w in range(4) for v in halves(buf[(((step % 2)*steps + k)*tile + t*16 + col)*20 + h*8 + 4*ph + w].load())))
+            for h in range(2)]
   accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(tile//16)] for _ in outputs]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
   bfrags:list[list[list[UOp]]] = []
@@ -702,11 +711,11 @@ def _expert_f16_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_featu
         bfrags[k][o].append(UOp.stack(*(v for j in range(2) for v in word(h*4 + 2*ph + j, j))))
   updates = []
   for t in range(tile//16):
-    on = sib if live is None else UOp.range((live[token_block*tile + t*16] >= 0).where(1, 0).after(src), 5 + t, AxisType.LOOP)
+    on = sib if live is None else UOp.range((live[token_block*tile + t*16] >= 0).where(1, 0).after(lds), 5 + t, AxisType.LOOP)
     vals = [accs[o][t].after(on) for o in range(len(outputs))]
     for k in range(steps):
       for o in range(len(outputs)):
-        for afrag, bfrag in zip(afrags(src if live is None else src.after(on), k, t), bfrags[k][o]):
+        for afrag, bfrag in zip(afrags(lds if live is None else lds.after(on), k, t), bfrags[k][o]):
           vals[o] = UOp.wmma(afrag, bfrag, vals[o], WMMA_ARG[0], 32)
     stored = UOp.group(*(accs[o][t].store(v) for o, v in enumerate(vals)))
     updates.append(stored if live is None else stored.end(on))
