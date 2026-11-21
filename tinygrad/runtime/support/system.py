@@ -255,6 +255,10 @@ class PCIDevice:
   def write_config_flush(self, offset:int, value:int, size:int):
     self.write_config(offset, value, size)
     self.read_config(offset, size)
+  def find_cap(self, cap_id:int) -> int:
+    ptr = self.read_config(pci.PCI_CAPABILITY_LIST, 1) & ~3
+    while ptr and self.read_config(ptr + pci.PCI_CAP_LIST_ID, 1) != cap_id: ptr = self.read_config(ptr + pci.PCI_CAP_LIST_NEXT, 1) & ~3
+    return ptr
 
   @functools.cache
   def region(self, idx:int=vfio.VFIO_PCI_CONFIG_REGION_INDEX) -> tuple[FileIOInterface, int]: # fd and offset of a bar or the config space
