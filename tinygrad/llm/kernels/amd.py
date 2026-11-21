@@ -1017,7 +1017,7 @@ def _ar_shape(n:int) -> tuple[int, int]|None:
   """(threads, values a thread) of a workgroup of an allreduce of n: small ones in narrow workgroups, larger in up to 24 of 256 threads"""
   for T, EP in (((128, 1),) if n <= 2048 else ()) + ((256, 1), (256, 2), (256, 4)):
     if n % (T * EP) == 0 and n // (T * EP) <= (AR_GROUPS if n <= 2048 else 24): return T, EP
-  return next(((T, EP) for T, EP in ((256, 4), (128, 4), (64, 4)) if n % (T * EP) == 0 and n // (T * EP) <= AR_GROUPS), None)
+  return next(((T, EP) for T, EP in ((256, 4), (128, 4), (64, 4), (128, 1)) if n % (T * EP) == 0 and n // (T * EP) <= AR_GROUPS), None)
 
 def _sys(fmt:str, dtype, *src:UOp) -> UOp: return UOp.custom_function(fmt, dtype=dtype, fmt=True).call(*src)
 

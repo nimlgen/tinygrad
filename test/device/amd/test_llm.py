@@ -894,7 +894,7 @@ class TestAllgather(unittest.TestCase):
   def test_allgather_last(self): # a last axis shard on every gpu whole (4 RDNA4 gpus: their mailboxes, else a copy in half), over replays
     for ndev in (2, 4):
       devs = tuple(f"{Device.DEFAULT}:{i}" for i in range(ndev))
-      for shape in ((1, 3584), (2, 7168), (3, 72)):
+      for shape in ((1, 3584), (2, 7168), (3, 72), (3, 3584)):
         x = Tensor(p:=np.random.default_rng(ndev).standard_normal(shape).astype(np.float32)).shard(devs, 1).realize()
         gather = TinyJit(lambda x: allgather_last(x * 2).contiguous().realize())
         for _ in range(3): y = gather(x)
