@@ -15,7 +15,7 @@ from tinygrad.engine.jit import _TinyJit
 from tinygrad.uop.ops import Ops, AxisType
 from tinygrad.llm.model import Transformer, FFNBlock, GatedDeltaNetBlock, MLATransformerBlock, AttentionResidual, gated_activation
 from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, PARTIALS, \
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, partial_sum, allgather_last, reduce_scatter, all_to_all, PARTIALS, \
   ordered_expert_sum, ordered_expert_sum_supported
 from tinygrad.llm.kernels.amd_gguf import find_packed, copies_linear, expert_tiles, moe_route, moe_counts, q8_0_linear, QUANT_NAMES, \
   HALFWORD_QUANTS, TILE_QUANTS
@@ -698,14 +698,17 @@ class Engine:
 
   def post(self, b:FFNBlock, live:UOp, c0:UOp, s:UOp, *_) -> Tensor:
     """a chunk's live rows' routed experts' outputs (their rows of down weighted) and shared experts' outputs summed over the gpus into the
-    block's, added to stream s: without a latent, both in one reduce scatter"""
+    block's, added to stream s: without a latent, both in one reduce scatter, with one the routed ones reduce scattered to their rows' gpus,
+    normed there and gathered for the up projection's columns, sent back to their rows' gpus"""
     G, K = len(self.devs), self.model.config.num_experts_per_tok
     pos, w = Tensor(self.win["pos"].uop).reshape(-1, K)[c0:c0 + live], Tensor(self.win["w"].uop)[c0:c0 + live]
     out = (Tensor(self.win["down"].uop).reshape(G, -1, self.lat)[:, pos.maximum(0)].float() * w.unsqueeze(-1)).sum(2)
     out = out * self.model.config.routed_scaling_factor
     shared = Tensor(self.win["shared"].uop).reshape(G, -1, self.model.config.dim)[:, c0:c0 + live].float().unsqueeze(1)
     if not self.model.config.expert_latent_dim: return self.add(s, c0, out.unsqueeze(1) + shared).realize()
-    return self.add(s, c0, b._expert_output(partial_sum(out).unsqueeze(0), None), self.split(shared)).realize()
+    rows = reduce_scatter(out.pad_to((G, self.chunk, self.lat)))
+    up = b.ffn_routed_up(self.whole(b.ffn_routed_norm(rows).half().reshape(1, self.chunk, self.lat)))[0]
+    return self.add(s, c0, shared, all_to_all(up.half()).reshape(1, G, self.chunk // G, -1)).realize()
 
   def tap(self, s:UOp, j:UOp, *_) -> Tensor:  # (the draft's input: stream s after a block its tap j)
     return Tensor(self.win["taps"].uop)[:, :, :, j].assign(Tensor(self.win["bank"].uop)[:, :, :, s].float()).realize()
