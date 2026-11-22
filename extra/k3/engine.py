@@ -493,7 +493,7 @@ class Engine:
     R, f32, i32 = max(map(self.rows, TILES)), dtypes.float32, dtypes.int32
     return {"h": ((W, self.lat), self.tiles_dtype), "shared": ((W, c.dim), self.bank), "logits": ((W, E), f32), "w": ((W, K), f32),
             "pos": ((W * K,), i32), "entries": ((R,), i32), "tiles": ((R // TILES[0],), i32),
-            "act": ((R, self.units), self.tiles_dtype), "down": ((R, self.lat), dtypes.half),
+            "act": ((R, self.units), dtypes.half), "down": ((R, self.lat), dtypes.half),
             **({"guess_logits": ((min(self.chunk, SHORT_CHUNK), E), f32)} if self.forecast_counts is not None else {})}
 
   def window_state(self, at:int) -> dict[str, Tensor]:  # (lent from the pool's slots from at on)
