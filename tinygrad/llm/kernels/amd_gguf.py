@@ -627,12 +627,13 @@ def _iq3_signs(device:str|tuple[str, ...]|None, dtype:DType=dtypes.half) -> Tens
   return Tensor.const(tuple(mask(i, h, p) for i in range(128) for h in range(2) for p in range(dtype.itemsize)), dtypes.uint32).to(device, force=True)
 
 def _iq3_grid(device:str|tuple[str, ...]|None, dtype:DType=dtypes.half) -> Tensor:
-  """the IQ3_XXS grid's words' bytes as dtype values: a word's itemsize uint32s"""
+  """the IQ3_XXS grid's words' bytes as dtype values: a word's itemsize uint32s (fp8: times (2*scale+1)/8, the grid a 4-bit scale's)"""
   from tinygrad.runtime.autogen import ggml_common as ggml
-  n = 4 // dtype.itemsize
-  def value(b:int) -> int: return float_to_fp8(b, dtype) if dtype in dtypes.fp8s else struct.unpack("<H", struct.pack("<e", b))[0]
-  return Tensor.const(tuple(sum(value((v >> 8*(n*p + b)) & 255) << (dtype.itemsize*8*b) for b in range(n)) for v in ggml.iq3xxs_grid
-                            for p in range(dtype.itemsize)), dtypes.uint32).to(device, force=True)
+  n, fp8 = 4 // dtype.itemsize, dtype in dtypes.fp8s
+  def value(b:float) -> int: return float_to_fp8(b, dtype) if fp8 else struct.unpack("<H", struct.pack("<e", b))[0]
+  return Tensor.const(tuple(sum(value(((v >> 8*(n*p + b)) & 255)*(2*sc + 1)/8 if fp8 else (v >> 8*(n*p + b)) & 255) << (dtype.itemsize*8*b)
+                                for b in range(n)) for sc in range(16 if fp8 else 1) for v in ggml.iq3xxs_grid for p in range(dtype.itemsize)),
+                      dtypes.uint32).to(device, force=True)
 
 # a pair of a word's bytes b as halves 1024+b (a byte_perm under 0x64) less the zero, times the scale plus the bias
 _F16_PAIR = UOp.custom_function("({{ typedef _Float16 h2 __attribute__((ext_vector_type(2))); __builtin_bit_cast(unsigned, "
@@ -660,18 +661,17 @@ def _expert_wmma_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_feat
   def output(o:int|UOp, w:UOp, c:UOp|int) -> UOp:
     return (output_block*waves + w)*16 + c + o*(out_features//2) if act is not None else (output_block*waves + w)*32 + o*16 + c
   outputs = tuple(output(o, wave, col) for o in range(2))
-  if tables:
-    (grid_src, sign_src), isz = tables, x.dtype.itemsize
-    grid, signs = (UOp.alloc((256*isz,), dtypes.uint32, addrspace=AddrSpace.LOCAL) for _ in range(2))
-    grid = grid.after(*(grid[tid*isz + i].store(grid_src[tid*isz + i]) for i in range(isz)))
-    signs = signs.after(*(signs[tid*isz + i].store(sign_src[tid*isz + i]) for i in range(isz)))
+  def staged(table:UOp) -> UOp:
+    lds, n = UOp.alloc((int(table.numel()),), dtypes.uint32, addrspace=AddrSpace.LOCAL), int(table.numel())//256
+    return lds.after(*(lds[tid*n + i].store(table[tid*n + i]) for i in range(n)))
+  if tables: grid, signs = (staged(t) for t in tables)
   slot = tiles[token_block].cast(dtypes.int32)
   # a step: steps groups (their rows' words staged, their weights decoded together: more in flight between two barriers)
   steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
   blk, sib = UOp.range((slot >= 0).where(in_features//GGML_BLOCK_SIZE, 0), 4, AxisType.LOOP), UOp.range(8//steps, 20, AxisType.LOOP)
   step = blk*(8//steps) + sib
   def row(o:int, c:UOp|int) -> UOp: return slot.maximum(0).cast(dtypes.int64)*stride + offset + output(o, wave, c)*output_words + blk*type_words
-  if (small:=tile == 16 and waves*32*QUANT_SIZES[ggml_type] <= 32768):
+  if (small:=tile == 16 and waves*32*QUANT_SIZES[ggml_type] + sum(4*int(t.numel()) for t in tables) <= 32768):
     src = UOp.alloc((waves*32*type_words,), raw.dtype, addrspace=AddrSpace.LOCAL)
     src = src.after(UOp.group(*(src[((o*waves + wave)*16 + c)*type_words + w].store(raw[row(o, c) + w]) for o in range(2) for c in range(16)
                                 for w in ((lane + i*32).minimum(type_words - 1) for i in range(-(-type_words//32))))).barrier())
@@ -695,23 +695,24 @@ def _expert_wmma_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_feat
             for h in range(2)]
   accs = [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(tile//16)] for _ in outputs]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
+  sums = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in
+          [[UOp.alloc((8,), dtypes.float32, addrspace=AddrSpace.REG) for _ in range(tile//16)] for _ in outputs]] if fp8 else accs
   bfrags:list[list[list[UOp]]] = []
-  scales:list[list[UOp]] = []
   for k in range(steps):
     sub = sib*steps + k
     bfrags.append([])
-    scales.append([])
     for o, base in enumerate(bases):
       bfrags[k].append([])
-      scales[k].append(_wmma_scale(src, base, sub, 0, ggml_type)[0])
       for h in range(2):
         scale, zero, minimum = _wmma_scale(src, base, sub, h, ggml_type)
         scale = scale.cast(dtypes.half)
         zero2, bias2 = UOp.const((0x6400 + zero) * 0x10001, dtypes.uint32), pair(-minimum)
         def word(i:UOp, half:int) -> list[UOp]:  # (the lane's word i of the group: its four weights, half of its signs' group)
+          if tables and fp8:
+            sw = _load_u32(src, base, 66+sub*4)
+            return [grid[(sw >> 28)*256 + _load_byte(src, base, 2+sub*8+i)].load() ^ signs[((sw >> (7*(i//2))) & 127)*2 + half].load()]
           if tables:
-            q, bits = _load_byte(src, base, 2+sub*8+i)*isz, (((_load_u32(src, base, 66+sub*4) >> (7*(i//2))) & 127)*2 + half)*isz
-            if fp8: return [grid[q].load() ^ signs[bits].load()]
+            q, bits = _load_byte(src, base, 2+sub*8+i)*2, ((_load_u32(src, base, 66+sub*4) >> (7*(i//2))) & 127)*4 + half*2
             return [v for p in range(2) for v in halves(_F16_SIGNED.call(grid[q + p].load(), pair(scale), signs[bits + p].load()))]
           q = _quant_word(src, base, sub, i, ggml_type, None)
           return [v for sel in (0x04010400, 0x04030402) for v in halves(_F16_PAIR.call(q, zero2, pair(scale), bias2, UOp.const(sel, dtypes.uint32)))]
@@ -720,16 +721,19 @@ def _expert_wmma_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_feat
   updates = []
   for t in range(tile//16):
     on = sib if live is None else UOp.range((live[token_block*tile + t*16] >= 0).where(1, 0).after(lds), 5 + t, AxisType.LOOP)
-    vals = [accs[o][t].after(on) for o in range(len(outputs))]
+    vals = [sums[o][t].after(on) for o in range(len(outputs))]
     for k in range(steps):
       for o in range(len(outputs)):
-        acc = UOp.const(0.0, dtypes.float).broadcast(8) if fp8 else vals[o]
         for afrag, bfrag in zip(afrags(lds if live is None else lds.after(on), k, t), bfrags[k][o]):
-          acc = UOp.wmma(afrag, bfrag, acc, WMMA_ARG[0], 32)
-        vals[o] = vals[o] + acc*scales[k][o] if fp8 else acc
-    stored = UOp.group(*(accs[o][t].store(v) for o, v in enumerate(vals)))
+          vals[o] = UOp.wmma(afrag, bfrag, vals[o], WMMA_ARG[0], 32)
+    stored = UOp.group(*(sums[o][t].store(v) for o, v in enumerate(vals)))
     updates.append(stored if live is None else stored.end(on))
-  update = UOp.group(*updates).end(sib, blk)
+  update = UOp.group(*updates).end(sib)
+  if fp8:
+    added = [accs[o][t].store(accs[o][t].after(update) + sums[o][t].after(update)*_half(src[base])*2) for o, base in enumerate(bases)
+             for t in range(tile//16)]
+    update = UOp.group(*(sums[o][t].after(*added).store(sums[o][t].const_like(0)) for o in range(len(outputs)) for t in range(tile//16)))
+  update = update.end(blk)
   def value(o:int, t:int, j:int) -> UOp: return accs[o][t].after(update)[j].load()
   rows = [[(token_block*tile + t*16 + ph*8 + j).valid(slot >= 0) for j in range(8)] for t in range(tile//16)]
   if act is not None: stores = [out[r, outputs[0]].store(act(value(0, t, j), value(1, t, j)).cast(out.dtype)) for t, rs in enumerate(rows)
