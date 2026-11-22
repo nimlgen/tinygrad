@@ -661,17 +661,17 @@ def _expert_wmma_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_feat
   def output(o:int|UOp, w:UOp, c:UOp|int) -> UOp:
     return (output_block*waves + w)*16 + c + o*(out_features//2) if act is not None else (output_block*waves + w)*32 + o*16 + c
   outputs = tuple(output(o, wave, col) for o in range(2))
-  def staged(table:UOp) -> UOp:
+  def local(table:UOp) -> UOp:
     lds, n = UOp.alloc((int(table.numel()),), dtypes.uint32, addrspace=AddrSpace.LOCAL), int(table.numel())//256
     return lds.after(*(lds[tid*n + i].store(table[tid*n + i]) for i in range(n)))
-  if tables: grid, signs = (staged(t) for t in tables)
+  if tables: grid, signs = (local(t) for t in tables)
   slot = tiles[token_block].cast(dtypes.int32)
   # a step: steps groups (their rows' words staged, their weights decoded together: more in flight between two barriers)
   steps = next(n for n in (2, 1) if (in_features // Q8_GROUP_SIZE) % n == 0)
   blk, sib = UOp.range((slot >= 0).where(in_features//GGML_BLOCK_SIZE, 0), 4, AxisType.LOOP), UOp.range(8//steps, 20, AxisType.LOOP)
   step = blk*(8//steps) + sib
   def row(o:int, c:UOp|int) -> UOp: return slot.maximum(0).cast(dtypes.int64)*stride + offset + output(o, wave, c)*output_words + blk*type_words
-  if (small:=tile == 16 and waves*32*QUANT_SIZES[ggml_type] + sum(4*int(t.numel()) for t in tables) <= 32768):
+  if (small:=tile == 16 and waves*32*QUANT_SIZES[ggml_type] <= 32768):
     src = UOp.alloc((waves*32*type_words,), raw.dtype, addrspace=AddrSpace.LOCAL)
     src = src.after(UOp.group(*(src[((o*waves + wave)*16 + c)*type_words + w].store(raw[row(o, c) + w]) for o in range(2) for c in range(16)
                                 for w in ((lane + i*32).minimum(type_words - 1) for i in range(-(-type_words//32))))).barrier())
@@ -744,6 +744,10 @@ def _expert_wmma_kernel(out:UOp, raw:UOp, x:UOp, tiles:UOp, *extra:UOp, out_feat
   estimates = Estimates(2*weights, weights*QUANT_SIZES[ggml_type]//GGML_BLOCK_SIZE, weights*QUANT_SIZES[ggml_type]//GGML_BLOCK_SIZE)
   return UOp.group(*stores).end(token_block, output_block, lane, wave).sink(
     arg=KernelInfo(name=f"expert_{QUANT_NAMES[ggml_type]}_{'fp8' if fp8 else 'f16'}_wmma", opts_to_apply=(), estimates=estimates))
+
+def tiles_dtype(device:str|tuple[str, ...]|None, ggml_types:Sequence[int]) -> DType:
+  """the expert tiles' x dtype for weights of ggml_types on device: fp8 where they all decode to it (IQ3_XXS on RDNA4), else half"""
+  return dtypes.fp8e4m3 if amd_custom_kernels_supported(device) and _is_rdna4(device) and set(ggml_types) <= {IQ3_XXS} else dtypes.half
 
 def expert_tiles(pool:Tensor, tiles:Tensor, x:Tensor, out_features:int, in_features:int, ggml_type:int, stride:int, offset:int=0,
                  xrow:Tensor|None=None, act:Callable|None=None, out:Tensor|None=None, tile:int=64, live:Tensor|None=None,
