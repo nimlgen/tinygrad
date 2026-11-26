@@ -2,30 +2,20 @@ from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
 import decimal
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, Context, to_tuple, tqdm, unwrap
-from tinygrad.helpers import BEAM, ALL2ALL, size_to_str, time_to_str, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
-from tinygrad.uop.ops import get_process_replay_loc, Ops, PatternMatcher, UOp, UPat, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
-from tinygrad.uop.ops import pm_flatten_linear
+from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansipad, prod, Context, to_tuple, unwrap
+from tinygrad.helpers import BEAM, ALL2ALL, time_to_str, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer, graph_rewrite, pm_flatten_linear
 from tinygrad.device import Device, Buffer, ProfileGraphEntry, DEV, HCQ_RUNTIME_DEV, HOST_DEVS
 from tinygrad.dtype import AddrSpace
-from tinygrad.renderer import Estimates, Renderer, TinyELF
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context, to_program_config
-from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
+from tinygrad.renderer import TinyELF
+from tinygrad.codegen import to_program, to_program_config, lower_and_compile, get_call_arg_uops, get_call_outs_ins, get_call_name, estimate_uop
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link
 
 # **************** Helpers ****************
 
-def get_call_arg_uops(call:UOp) -> tuple[UOp, ...]: return tuple(s for s in call.src[1:] if s.addrspace is not AddrSpace.ALU)
 def get_call_kernel_args(call:UOp, prg:UOp, devs:tuple[str, ...]) -> list[UOp]:
   return [call.scalar_arg(p).ccast(p.dtype) if p.addrspace is AddrSpace.ALU else
           call.src[1+p.arg.slot].getaddr(devs) for p in prg.kernel_params]
-
-def get_call_outs_ins(call:UOp) -> tuple[tuple[int, ...], tuple[int, ...]]:
-  ast = call.body
-  if call.arg.hcq is not None: return (), ()
-  if ast.op is Ops.PROGRAM: return tuple(ast.arg.outs), tuple(ast.arg.ins)
-  if ast.op is Ops.STORE: return (0,), (1,)
-  if ast.op is Ops.NATIVE and ast.arg.code == "encdec": return (0,), tuple(range(1, len(get_call_arg_uops(call))))
-  return (), ()
 
 def get_call_kernels(call:UOp) -> list[tuple[str, UOp, tuple|None]]:
   if call.arg.hcq is not None: # the submitter itself, then every kernel it enqueues
@@ -35,25 +25,7 @@ def get_call_kernels(call:UOp) -> list[tuple[str, UOp, tuple|None]]:
   if ast.op is Ops.NATIVE and ast.arg.code == "validate": return []
   return [(d, call, None) for d in to_tuple(call.device if ast.op is Ops.STORE else get_call_arg_uops(call)[0].device)]
 
-def get_call_name(call:UOp, bufs:Sequence[Buffer|UOp], var_vals:dict[str, int]|None=None) -> str:
-  def _uop_sz_to_str(uop:UOp) -> str: return size_to_str(sym_infer(prod(uop.shape) * uop.dtype.itemsize, var_vals or {}))
-  def _dev_str(buf:Buffer|UOp) -> str: return ', '.join(d[:7] for d in to_tuple(buf.device))
-
-  ast, arg_uops = call.body, get_call_arg_uops(call)
-  if ast.op is Ops.PROGRAM: return ast.src[0].arg.name
-  if ast.op is Ops.STORE: return colored(f"copy {_uop_sz_to_str(arg_uops[0]):>10}, {_dev_str(bufs[0]):>7s} <- {_dev_str(bufs[1]):7s}", "yellow")
-  if ast.op is Ops.NATIVE and ast.arg.code == "encdec": return colored(f"enc/dec {_uop_sz_to_str(arg_uops[0])}", "yellow")
-  raise NotImplementedError("get_call_name is not implemented")
-
 # **************** Stat ****************
-
-def estimate_uop(call:UOp) -> Estimates:
-  call = call.without_after
-  if call.arg.hcq is not None: return call.arg.hcq.estimates
-  if (ast:=call.body).op is Ops.PROGRAM and (est:=ast.src[0].arg.estimates): return Estimates(*map(call.bind_symbols, (est.ops, est.lds, est.mem)))
-  if ast.op is Ops.STORE or (ast.op is Ops.NATIVE and ast.arg.code == "encdec"):
-    return Estimates(lds=(nbytes:=prod(call.src[1].shape) * call.src[1].dtype.itemsize), mem=nbytes)
-  return Estimates()
 
 first_run_cache:set[bytes] = set()
 def track_stats(ctx:ExecContext, call:UOp, st:decimal.Decimal, ets:list[float|None]):
@@ -194,49 +166,6 @@ pm_beam = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True),
    lambda ctx,call,sink: call.replace(src=(sink.replace(arg=replace(sink.arg, beam=ctx)), *call.src[1:])) if sink.arg.beam == 0 else None),
 ])
-
-# **************** parallel lowering + compilation ****************
-
-def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]:
-  with Context(**x[2]): return x[0], to_program(*x[1])
-
-def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
-  ast = c.body
-  # a PROGRAM with a ProgramInfo and a BINARY is already compiled
-  if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
-     (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
-    return ast, Device.renderer_for(Device.canonicalize(to_tuple(c.device)[0]), HCQ_RUNTIME_DEV if c.arg.hcq is not None else DEV)
-  return None
-
-def lower_and_compile(linear:UOp, verbose=True) -> UOp:
-  # collect the kernels to lower and compile, deduped by their compile cache key
-  if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
-
-  # lower and compile what's not cached, in parallel if there's a worker pool
-  keys = {c: to_program_key(*a) for c, a in ar.items()}
-  todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
-  if len(todo):
-    # kernels that beam search must compile in the parent, beam needs device access to time candidates
-
-    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
-    ctx = {v.key: v.value for v in to_program_context}
-    if CAPTURE_PROCESS_REPLAY: ctx["PROCESS_REPLAY_LOC"] = get_process_replay_loc()
-    tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
-    try:
-      with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1 or not verbose) as pbar:
-        for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
-          pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
-          to_program_cache[todo[i][0]] = prg
-          pbar.update(1)
-    except KeyboardInterrupt:
-      if pool is not None: terminate_worker_pool()
-      raise
-
-  # swap the compiled PROGRAMs into the calls
-  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
-                           name="precompile kernels")
-
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
 
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),

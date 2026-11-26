@@ -3,11 +3,10 @@ from tinygrad.dtype import DType, dtypes, AddrSpace
 from tinygrad.tensor import Tensor
 from tinygrad.device import Device, Buffer
 from tinygrad.engine.jit import TinyJit
-from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.nn.state import get_state_dict
 from tinygrad.helpers import Context, prod
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.codegen import to_program
+from tinygrad.codegen import to_program, get_call_arg_uops
 import json
 from collections import OrderedDict
 

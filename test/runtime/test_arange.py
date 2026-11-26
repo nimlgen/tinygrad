@@ -2,7 +2,8 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, GlobalCounters, dtypes, nn, Device, Variable
 from tinygrad.helpers import Context, getenv
-from tinygrad.engine.realize import estimate_uop, compile_linear
+from tinygrad.engine.realize import compile_linear
+from tinygrad.codegen import estimate_uop
 from test.helpers import needs_devices, check_schedule, assert_kernel_count, KernelCountException, run_schedule
 
 class TestArange(unittest.TestCase):

@@ -1,7 +1,8 @@
 import unittest
 from tinygrad import Tensor, Device, dtypes, GlobalCounters
 from tinygrad.helpers import DEV
-from tinygrad.engine.realize import compile_linear, estimate_uop
+from tinygrad.engine.realize import compile_linear
+from tinygrad.codegen import estimate_uop
 from test.helpers import KernelCountException
 
 class TestIndexing(unittest.TestCase):
