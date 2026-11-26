@@ -259,7 +259,7 @@ RING, ALL2ALL, ALLREDUCE_CAST = ContextVar("RING", 1), ContextVar("ALL2ALL", 0),
 NODE_NDEVS = ContextVar("NODE_NDEVS", 0) # gpus per node, the nodes cabled gpu k to gpu k
 CACHELEVEL, IGNORE_BEAM_CACHE = ContextVar("CACHELEVEL", 2), ContextVar("IGNORE_BEAM_CACHE", 0)
 VALIDATE_WITH_CPU = ContextVar("VALIDATE_WITH_CPU", 0)
-HCQ_RUNTIME_DEV = _DEV("HCQ_RUNTIME_DEV", "CPU:TCC" if sys.platform == "linux" and _has_lib("tcc") else "CPU:LLVM")
+HOST_RENDERER = "TCC" if sys.platform == "linux" and _has_lib("tcc") else "LLVM" # host submit programs always compile with this
 # TODO: this is broken for some indexing
 DISABLE_FAST_IDIV = ContextVar("DISABLE_FAST_IDIV", 1)
 FUSE_OPTIM = ContextVar("FUSE_OPTIM", 0)

@@ -3,7 +3,7 @@ import itertools, ctypes, struct, time
 from dataclasses import replace, dataclass, field
 from collections import defaultdict, Counter
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, DEBUG, VIZ, ALL2ALL, PROFILE
-from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_RUNTIME_DEV, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
+from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
 from tinygrad.device import is_iface_usb, peer_group, host_of
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc
 from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType
@@ -157,7 +157,7 @@ def ccall(fn:Any, *args:UOp|int) -> UOp:
 def cstruct(struct_t:type[Struct], **fields:UOp|int) -> UOp:
   flds = {n: (o, {d.itemsize: d for d in dtypes.uints}[ctypes.sizeof(t)]) for n, t, o, *_ in struct_t._real_fields_ if ctypes.sizeof(t)}
   rows = [(flds[n][0], UOp.const(v, flds[n][1])) for n, v in fields.items()]
-  buf = UOp.alloc((ctypes.sizeof(struct_t),), dtypes.u8, device=HCQ_RUNTIME_DEV.device, name=struct_t.__name__)
+  buf = UOp.alloc((ctypes.sizeof(struct_t),), dtypes.u8, device="CPU", name=struct_t.__name__)
   return patch(buf, rows, bytes(ctypes.sizeof(struct_t)))
 
 # **** prep: unwrap multi, staging copies
@@ -479,7 +479,7 @@ def _param_for(u:UOp, slot:int) -> UOp:
   if u.op is Ops.GETADDR or u.is_variable:
     return UOp.param(slot, u.commit_dtype(dtypes.i32), name=u.arg.name if u.is_variable else None, addrspace=AddrSpace.ALU).cast(u.dtype)
   name = f"{u.arg.name}_{slot}" if u.op in (Ops.ALLOC, Ops.EXTERN) and u.arg.name else None
-  return UOp.param(slot, u.dtype, u.max_numel(), HCQ_RUNTIME_DEV.device, name=name)
+  return UOp.param(slot, u.dtype, u.max_numel(), "CPU", name=name)
 
 def lift(call:UOp, root:bool=False) -> UOp: # callees are lifted already
   body, args = graph_rewrite(call.body, pm_lift_deps + pm_renumber_slots, init_ctx=CountCtx, walk=True, name="lift deps"), list(call.src[1:])
@@ -527,7 +527,7 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp:
   if b.arg.name is None: return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
   dev, spec = Device[b.device], b.arg.spec or BufferSpec(cpu_access=True)
   r = Buffer(dev.device, max(b.max_numel(), 1) * b.dtype.itemsize, options=spec, preallocate=True)
-  return UOp.from_buffer(r, b.dtype, HCQ_RUNTIME_DEV.device)
+  return UOp.from_buffer(r, b.dtype, "CPU")
 
 def resolve_extern(ctx:LinkCtx, b:UOp) -> UOp:
   if b.arg.name is None:
@@ -535,7 +535,7 @@ def resolve_extern(ctx:LinkCtx, b:UOp) -> UOp:
       raise RuntimeError(f"extern {i} must match its EXTERN, {b.dtype} {b.shape} on {b.device}, got {ctx.inputs[i:i+1] or 'nothing'}")
     return UOp.const(a.arg.val, b.dtype) if a.is_bound_var else a
   owned = Compiled.link_bufs[b.arg.name if b.arg.name in Compiled.link_bufs else to_name(b.device, b.arg.name)]
-  return UOp.from_buffer(owned if isinstance(owned, Buffer) else owned(b), b.dtype, HCQ_RUNTIME_DEV.device)
+  return UOp.from_buffer(owned if isinstance(owned, Buffer) else owned(b), b.dtype, "CPU")
 
 def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
   if unwrap_lane(buf:=(v:=unwrap_view(g.src[0]))[0])[0].op is not Ops.BUFFER: return None # input address, resolved per run

@@ -3,7 +3,6 @@ from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace
-from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops, UOp, uopfunc, KernelInfo
 from tinygrad.engine.realize import compile_linear, link_linear, lower_and_compile, run_linear, compile_cache
 from tinygrad.renderer.cstyle import CStyleLanguage
@@ -97,7 +96,6 @@ class TestHCQ2Schedule(unittest.TestCase):
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, (CStyleLanguage, LLVMRenderer)), "CALL is rendered in C style and LLVM only")
 class TestHCQ2Fence(unittest.TestCase):
   def setUp(self):
-    self.enterContext(Context(HCQ_RUNTIME_DEV="CPU"))
     self.tl = Device["CPU"].timeline.host.view(fmt='Q')
     self.addCleanup(lambda: self.tl.__setitem__(0, self.tl[1]))
 
@@ -131,41 +129,36 @@ class TestHCQ2FFI(unittest.TestCase):
     return [u for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
 
   def test_ffi_ccall(self):
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      out = cpu_buf(dtype=dtypes.int32, slot=1, name="ffi_result")
-      bufs = self._run(out.index(0).store(hcq2.ccall(libc.dll.ffs, 0x10)))
+    out = cpu_buf(dtype=dtypes.int32, slot=1, name="ffi_result")
+    bufs = self._run(out.index(0).store(hcq2.ccall(libc.dll.ffs, 0x10)))
     self.assertEqual(next(b for b in bufs if b.dtype is dtypes.int).buffer.host.view(fmt='i')[0], 5)
 
-  def test_nested_ffi_call(self, host="CPU"): # a function calls a C function: no pointer to pass, the symbol links
+  def test_nested_ffi_call(self): # a function calls a C function: no pointer to pass, the symbol links
     @uopfunc
     def copy(dst:UOp, src:UOp): return hcq2.ccall(libc.memcpy, dst.index(0), src.index(0), 4).sink()
     @uopfunc
     def copy_pair(dst:UOp, src:UOp): return copy(dst.after(copy(dst, src)).index(1), src).sink()
 
-    with Context(HCQ_RUNTIME_DEV=host):
-      src = hcq2.cstruct(init_c_struct_t(4, (("value", ctypes.c_uint32, 0),)), value=42)
-      out = cpu_buf(2, dtypes.uint32, name="ffi_result")
-      bufs = self._run(copy_pair(out, src.bitcast(dtypes.uint32)))
+    src = hcq2.cstruct(init_c_struct_t(4, (("value", ctypes.c_uint32, 0),)), value=42)
+    out = cpu_buf(2, dtypes.uint32, name="ffi_result")
+    bufs = self._run(copy_pair(out, src.bitcast(dtypes.uint32)))
     self.assertEqual(list(next(b for b in bufs if b.dtype is dtypes.uint32).buffer.host.view(fmt='I')), [42, 42])
-  def test_nested_ffi_call_python(self): self.test_nested_ffi_call("PYTHON")
 
   def test_ffi_cstruct(self):
     struct_t = init_c_struct_t(16, (("u8", ctypes.c_uint8, 0), ("u16", ctypes.c_uint16, 2),
                                   ("u32", ctypes.c_uint32, 4), ("u64", ctypes.c_uint64, 8)))
     cpu_buf() # reserve slot zero for device-owned placeholders
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      s = hcq2.cstruct(struct_t, u8=0x12, u16=UOp.const(0x3456, dtypes.uint16), u32=0x789ABCDE, u64=0xFEDCBA9876543210)
-      bufs = self._run(s.index(0).load())
+    s = hcq2.cstruct(struct_t, u8=0x12, u16=UOp.const(0x3456, dtypes.uint16), u32=0x789ABCDE, u64=0xFEDCBA9876543210)
+    bufs = self._run(s.index(0).load())
     got = struct_t.from_buffer_copy(bytes(next(b for b in bufs if b.nbytes() == ctypes.sizeof(struct_t)).buffer.host.view(fmt='B')))
     self.assertEqual((got.u8, got.u16, got.u32, got.u64), (0x12, 0x3456, 0x789ABCDE, 0xFEDCBA9876543210))
 
   def test_nested_cstruct_patches(self):
-    with Context(HCQ_RUNTIME_DEV="CPU"):
-      inner = hcq2.cstruct(init_c_struct_t(8, (("pad", ctypes.c_uint32, 0), ("value", ctypes.c_uint32, 4))), value=42)
-      outer = hcq2.cstruct(init_c_struct_t(8, (("ptr", ctypes.c_uint64, 0),)), ptr=inner[4:8].getaddr("CPU"))
-      out = cpu_buf(dtype=dtypes.uint32, name="result")
-      copied = hcq2.ccall(libc.memcpy, out.index(0), outer.bitcast(dtypes.uint64).index(0).load(), 4)
-      bufs = self._run(out.after(copied).index(0).load())
+    inner = hcq2.cstruct(init_c_struct_t(8, (("pad", ctypes.c_uint32, 0), ("value", ctypes.c_uint32, 4))), value=42)
+    outer = hcq2.cstruct(init_c_struct_t(8, (("ptr", ctypes.c_uint64, 0),)), ptr=inner[4:8].getaddr("CPU"))
+    out = cpu_buf(dtype=dtypes.uint32, name="result")
+    copied = hcq2.ccall(libc.memcpy, out.index(0), outer.bitcast(dtypes.uint64).index(0).load(), 4)
+    bufs = self._run(out.after(copied).index(0).load())
     self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32).buffer.host.view(fmt='I')[0], 42)
 
 @uopfunc
@@ -174,8 +167,6 @@ def addr_of(o:UOp, b:UOp): return o.index(0).store(b.getaddr("CPU")).sink() # o[
 # host functions in a batch
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, (CStyleLanguage, LLVMRenderer)), "CALL is rendered in C style and LLVM only")
 class TestHostCalls(unittest.TestCase):
-  def setUp(self): self.enterContext(Context(HCQ_RUNTIME_DEV="CPU"))
-
   @staticmethod
   def _buf(n:int, dtype=dtypes.uint64) -> UOp:
     return UOp.from_buffer(Buffer("CPU", n * dtype.itemsize, initial_value=bytes(n * dtype.itemsize)), dtype)

@@ -3,7 +3,7 @@ import os, ctypes, functools, mmap, struct, array, math, select, contextlib, tim
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator
 from tinygrad.renderer import TinyELF
-from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
+from tinygrad.runtime.support.hcq2 import HWQueue, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
 from tinygrad.runtime.support.memory import MMIOInterface, TLSFAllocator
 from tinygrad.runtime.support.system import FileIOInterface, System
 from tinygrad.runtime.autogen import kgsl, msm_drm, mesa, libc
@@ -339,7 +339,7 @@ class KGSLIface:
   @staticmethod
   def submit_req(ib:UOp, size:int, ctx:UOp) -> UOp:
     obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib, size=size, flags=kgsl.KGSL_CMDLIST_IB)
-    return cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.device), cmdsize=obj.nbytes(), numcmds=1, context_id=ctx)
+    return cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr("CPU"), cmdsize=obj.nbytes(), numcmds=1, context_id=ctx)
 
   def sleep(self, tm:int): # wait for the last queued command
     ts = kgsl.IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, type=kgsl.KGSL_TIMESTAMP_QUEUED).timestamp
@@ -385,7 +385,7 @@ class MSMIface:
   @staticmethod
   def submit_req(ib:UOp, size:int, ctx:UOp) -> UOp:
     cmd = cstruct(msm_drm.struct_drm_msm_gem_submit_cmd, type=msm_drm.MSM_SUBMIT_CMD_BUF, size=size, iova=ib)
-    return cstruct(msm_drm.struct_drm_msm_gem_submit, flags=msm_drm.MSM_PIPE_3D0, nr_cmds=1, cmds=cmd.getaddr(HCQ_RUNTIME_DEV.device), queueid=ctx)
+    return cstruct(msm_drm.struct_drm_msm_gem_submit, flags=msm_drm.MSM_PIPE_3D0, nr_cmds=1, cmds=cmd.getaddr("CPU"), queueid=ctx)
 
   def sleep(self, tm:int): # the timeout is absolute monotonic time
     fence = self.dev.timeline.host.view(fmt='Q')[1] # the queue numbers its submits from 1, so does the timeline: a batch is one submit

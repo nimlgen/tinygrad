@@ -2,14 +2,13 @@ import multiprocessing, unittest
 from concurrent.futures import ProcessPoolExecutor
 from tinygrad import Context, Tensor, Variable, Device
 from tinygrad.device import host_of
-from tinygrad.helpers import HCQ_RUNTIME_DEV
 from tinygrad.uop.uir import render_uir, parse_uir
 from tinygrad.codegen import create_linear
 from tinygrad.engine.realize import compile_linear
 
 @Context(ALLOW_DEVICE_USAGE=0)
-def compile_uir(src:str, dev:str, host:str) -> str:
-  with Context(DEV=dev, HCQ_RUNTIME_DEV=host): return render_uir(Tensor.compile(parse_uir(src)))
+def compile_uir(src:str, dev:str) -> str:
+  with Context(DEV=dev): return render_uir(Tensor.compile(parse_uir(src)))
 
 class TestExportRun(unittest.TestCase):
   def test_export_compile_run(self):
@@ -22,9 +21,8 @@ class TestExportRun(unittest.TestCase):
     _, second = b.export()
     # the compiler only gets the targets, it opens no device
     dev = ";".join(repr(Device.target_for(d)) for d in dict.fromkeys([Device.DEFAULT, host_of(Device.DEFAULT)]))
-    host = repr(Device.target_for(HCQ_RUNTIME_DEV.device, HCQ_RUNTIME_DEV))
     with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as compiler:
-      linear = parse_uir(compiler.submit(compile_uir, render_uir(fn), dev, host).result())
+      linear = parse_uir(compiler.submit(compile_uir, render_uir(fn), dev).result())
     Tensor.run(linear, first)
     Tensor.run(linear, second)
     self.assertEqual(a.shrink(((0, 3),)).tolist(), [6., 9., 12.])

@@ -6,7 +6,7 @@ import importlib, inspect, functools, itertools, pathlib, os, contextlib, atexit
 from tinygrad.helpers import mv_address, LRU, getenv, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, unwrap, round_up, is_numpy_ndarray
-from tinygrad.helpers import cpu_profile, perf_counter_us, HCQ_RUNTIME_DEV, is_disk_device, canonicalize_device_name, Target, to_tuple, NODE_NDEVS
+from tinygrad.helpers import cpu_profile, perf_counter_us, is_disk_device, canonicalize_device_name, Target, to_tuple, NODE_NDEVS
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.renderer import Renderer, Compiler, TinyELF
@@ -39,13 +39,14 @@ class _Device:
     self._opened_devices[ix] = ret = self.get_class(ix)(ix)
     if DEBUG >= 1: print(f"opened device {ix} from pid:{os.getpid()} as DEV={self.target_for(ix)}")
     return ret
-  def target_for(self, device:str, cv=DEV) -> Target:
-    if (t:=cv.target(device.split(':')[0])).arch: return t
+  def target_for(self, device:str) -> Target:
+    if (t:=DEV.target(device.split(':')[0])).arch: return t
     try: d = self._opened_devices.get(device:=self.canonicalize(device)) or self[device]
     except Exception as e: raise RuntimeError(f"no target for {device}: set its arch in DEV, or open it") from e
     iface = type(d.iface).__name__[:-5] if hasattr(d, "iface") else ""
     return replace(t, arch=d.arch or "", interface=t.interface or iface, props=",".join(f"{k}={v}" for k, v in (d.props | t.opts).items()))
-  def renderer_for(self, device:str, cv=DEV) -> Renderer: return select_renderer(cv.target((t:=self.target_for(device, cv)).device, arch=t.arch))
+  def renderer_for(self, device:str, renderer:str="") -> Renderer: # renderer overrides the one in DEV
+    return select_renderer(replace(t:=DEV.target((d:=self.target_for(device)).device, arch=d.arch), renderer=renderer or t.renderer))
   @property
   def default(self) -> Compiled: return self[self.DEFAULT]
   def get_available_devices(self) -> Iterator[str]:
@@ -74,7 +75,7 @@ def node_of(dev:str) -> str:
   return nodes[int(dev.split(":")[1]) // NODE_NDEVS.value if ":" in dev and NODE_NDEVS else 0]
 def host_of(dev:str) -> str:
   if dev.split(":")[0] == "NULL": return dev
-  return HCQ_RUNTIME_DEV.device if (node:=node_of(dev)) == "local" else f"CPU:{node}"
+  return "CPU" if (node:=node_of(dev)) == "local" else f"CPU:{node}"
 def peer_group(dev:str) -> str:
   if (node:=node_of(dev:=Device.canonicalize(dev))) != "local": return node
   return dev if (iface:=Device.target_for(dev).interface).endswith("USB") else "PCI" if iface.endswith("PCI") else dev.split(":")[0]

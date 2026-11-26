@@ -1,7 +1,7 @@
 import ctypes, struct, time, functools, itertools
 from typing import cast
 from tinygrad.runtime.autogen import libusb, libc
-from tinygrad.helpers import DEBUG, DEV, HCQ_RUNTIME_DEV, to_mv, round_up, ceildiv, flatten
+from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv, flatten
 from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, uopfunc
 from tinygrad.device import Buffer, BufferSpec, Compiled, is_iface_usb
@@ -208,7 +208,7 @@ class USBMMIOInterface(MMIOInterface):
 HALF, CHUNK, SLOT, STREAM = 0x40000, 0x40000 - 512, 0x4000, 1 << 20 # sram half, payload, slot, stream
 HOST_SIZE = 64 + 2 * HALF + STREAM # link, staging, zeros
 
-def usb_host(dev:str) -> UOp: return UOp.extern((HOST_SIZE,), dtypes.uint8, HCQ_RUNTIME_DEV.device, to_name(dev, "usb_host"))
+def usb_host(dev:str) -> UOp: return UOp.extern((HOST_SIZE,), dtypes.uint8, "CPU", to_name(dev, "usb_host"))
 def usb_link(dev:str) -> UOp: return usb_host(dev)[:48].bitcast(dtypes.uint64) # handle, context, prev chunks, two transfers, error state
 def usb_stage(dev:str) -> UOp: return usb_host(dev)[64:64 + 2 * HALF]
 def usb_zeros(dev:str) -> UOp: return usb_host(dev)[64 + 2 * HALF:]
@@ -279,7 +279,7 @@ def usb_store(b:UOp, idx:UOp, v:UOp) -> UOp: # kernargs: poke on change
   link, addr = usb_link(b.device).after(*usb_deps(b)), usb_addr(b, idx, v.dtype)
   v = v.bitcast({d.itemsize: d for d in dtypes.uints}[v.dtype.itemsize]) # bitcast to uint raw bits
   if str(unwrap_view(b)[0].arg.name).startswith("kernargs"):
-    cache = UOp.alloc((int(idx.vmax - idx.vmin) + 1,), v.dtype, device=HCQ_RUNTIME_DEV.device, name="usb_arg_cache")
+    cache = UOp.alloc((int(idx.vmax - idx.vmin) + 1,), v.dtype, device="CPU", name="usb_arg_cache")
     return usb_patch(link, addr, v, patch(cache, [], bytes(v.dtype.itemsize * cache.max_numel())).index(idx - idx.vmin))
   return usb_poke_word(link, addr, v)
 
@@ -364,7 +364,7 @@ def chunks(nbytes:int, chunk_sz:int) -> list[tuple[UOp|int, int]]: # (index, byt
 def usb_table(hosts:list[tuple[UOp, int]], n:int, win:int, dev:str) -> UOp: # [address, bytes] per chunk
   rows = [(16 * (k + r) + o, w) for host, k in hosts for r, nb in chunks(host.nbytes(), win)
           for o, w in ((0, usb_hostaddr(host, dev) + UOp.const(r, dtypes.uint64) * win), (8, UOp.const(nb, dtypes.uint64)))]
-  return patch(UOp.alloc((2 * n,), dtypes.uint64, device=HCQ_RUNTIME_DEV.device, name="usb_table"), rows)
+  return patch(UOp.alloc((2 * n,), dtypes.uint64, device="CPU", name="usb_table"), rows)
 
 def usb_chunks(call:UOp, first:int, run:int) -> list[UOp]: # gpu side. first: chunk id of the copy and of its run
   dst, src = call.src[1:]

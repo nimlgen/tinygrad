@@ -2,11 +2,11 @@ from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
 import decimal
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, Context, to_tuple, tqdm, unwrap
+from tinygrad.helpers import CAPTURE_PROCESS_REPLAY, colored, DEBUG, GlobalCounters, ansipad, prod, Context, to_tuple, tqdm, unwrap, HOST_RENDERER
 from tinygrad.helpers import BEAM, ALL2ALL, size_to_str, time_to_str, PROFILE, ProfilePointEvent, cpu_events, perf_counter_us, cpu_profile
 from tinygrad.uop.ops import get_process_replay_loc, Ops, PatternMatcher, UOp, UPat, sym_infer, graph_rewrite, ProgramInfo, KernelInfo
 from tinygrad.uop.ops import pm_flatten_linear
-from tinygrad.device import Device, Buffer, ProfileGraphEntry, DEV, HCQ_RUNTIME_DEV, HOST_DEVS
+from tinygrad.device import Device, Buffer, ProfileGraphEntry, DEV, HOST_DEVS
 from tinygrad.dtype import AddrSpace
 from tinygrad.renderer import Estimates, Renderer, TinyELF
 from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context, to_program_config
@@ -205,7 +205,7 @@ def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   # a PROGRAM with a ProgramInfo and a BINARY is already compiled
   if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
      (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
-    return ast, Device.renderer_for(Device.canonicalize(to_tuple(c.device)[0]), HCQ_RUNTIME_DEV if c.arg.hcq is not None else DEV)
+    return ast, Device.renderer_for(Device.canonicalize(to_tuple(c.device)[0]), HOST_RENDERER if c.arg.hcq is not None else "")
   return None
 
 def lower_and_compile(linear:UOp, verbose=True) -> UOp:
@@ -251,7 +251,7 @@ def devices_of(linear:UOp) -> list[str]:
 compile_cache:dict[tuple, UOp] = {}
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
   beam, profile = BEAM.value if beam is None else beam, bool(PROFILE or DEBUG >= 2) if profile is None else profile
-  key = (linear, beam, bool(validate), profile, ALL2ALL >= 1, tuple(DEV.value), tuple(HCQ_RUNTIME_DEV.value), *[x.value for x in to_program_config])
+  key = (linear, beam, bool(validate), profile, ALL2ALL >= 1, tuple(DEV.value), *[x.value for x in to_program_config])
   if cache and (hit:=compile_cache.get(key)) is not None: return hit
   scalars = [e for e in linear.toposort() if e.op is Ops.EXTERN and e.is_variable and e.arg.name is None] # they bind by slot at run
   ret = linear.substitute({e: UOp.variable(e.expr, e.vmin, e.vmax, dtype=e.dtype) for e in scalars}, walk=True)

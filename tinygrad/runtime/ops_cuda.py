@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, functools, mmap, struct, time
 from typing import Any, Callable
 from tinygrad.helpers import DEBUG, DEV, getenv, unwrap, to_name
-from tinygrad.device import Device, Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface, HCQ_RUNTIME_DEV, host_of
+from tinygrad.device import Device, Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface, host_of
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import get_call_kernel_args
@@ -23,8 +23,8 @@ def check(status:int):
 
 def cu_launch_kernel(ctx:str, call:UOp, prg:UOp) -> tuple:
   rows = layout_args(get_call_kernel_args(call, prg, (ctx,)), 48)
-  buf = UOp.alloc((max([o + w.dtype.itemsize for o, w in rows], default=48),), dtypes.uint8, device=HCQ_RUNTIME_DEV.device, name="kernargs")
-  addr = buf.getaddr(HCQ_RUNTIME_DEV.device) # [extra: buffer pointer, &args, buffer size, &size, end][size][args]
+  buf = UOp.alloc((max([o + w.dtype.itemsize for o, w in rows], default=48),), dtypes.uint8, device="CPU", name="kernargs")
+  addr = buf.getaddr("CPU") # [extra: buffer pointer, &args, buffer size, &size, end][size][args]
   hdr = layout_args([UOp.const(v, dtypes.uint64) if isinstance(v, int) else v
                      for v in (1, addr+48, 2, addr+40, Device.get_class(ctx).launch_end, buf.max_numel()-48)])
   func = (p:=make_program(prg, 8, ctx)).after(p.store(prg)).bitcast(dtypes.u64).index(0).load()
@@ -102,9 +102,9 @@ class CUDADevice(Compiled):
     super().__init__(device, CUDAAllocator(self), None, arch=self.get_arch(device_id))
 
     # [ctx, compute stream, copy stream], and the host function that writes a timestamp
-    handles = Buffer(HCQ_RUNTIME_DEV.device, 24, initial_value=b"".join(map(bytes, (self.context, *self.streams))))
+    handles = Buffer("CPU", 24, initial_value=b"".join(map(bytes, (self.context, *self.streams))))
     fn = cuda.CUhostFn(lambda slot: ctypes.memmove(slot, struct.pack("Q", time.perf_counter_ns()), 8))
-    stamp = Buffer(HCQ_RUNTIME_DEV.device, 8, opaque=BufferStorage(int.from_bytes(bytes(fn), "little"), fn))
+    stamp = Buffer("CPU", 8, opaque=BufferStorage(int.from_bytes(bytes(fn), "little"), fn))
     Compiled.link_bufs |= {to_name(self.device, "handles"): handles, to_name(self.device, "stamp"): stamp}
     Compiled.pm_link += PatternMatcher([(UPat(Ops.ALLOC, name="p").store(UPat(Ops.PROGRAM, name="prg")), lambda p, prg, d=self:
       p.store(UOp(Ops.BINARY, arg=d.function(prg.src[3].arg, prg.src[0].arg.function_name))) if p.device == d.device else None)])

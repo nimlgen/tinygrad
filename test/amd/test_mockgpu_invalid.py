@@ -14,14 +14,11 @@ from test.helpers import run_schedule, bound_schedule
 linear = lower_and_compile(bound_schedule(Tensor.empty(1) + 1))
 binary = linear.src[-1].src[0].src[3]
 lib = binary.arg.replace(bytes.fromhex("0000b0bf"), bytes.fromhex("00fe017e"), 1)
-try:
-  run_schedule(linear.substitute({binary: binary.replace(arg=lib)}, enter_calls=True))
-except ValueError as error:
-  print(error, file=sys.stderr, flush=True)
-  os._exit(1)
+sys.unraisablehook = lambda u: (print(u.exc_value, file=sys.stderr, flush=True), os._exit(1)) # the emulator raises in a ctypes callback
+run_schedule(linear.substitute({binary: binary.replace(arg=lib)}, enter_calls=True))
 '''
 
-    env = {**os.environ, "DEV": "MOCKKFD+AMD", "HCQ_RUNTIME_DEV": "PYTHON"}
+    env = {**os.environ, "DEV": "MOCKKFD+AMD"}
     result = subprocess.run([sys.executable, "-c", test_code], env=env, capture_output=True, text=True, timeout=9)
     self.assertEqual(result.returncode, 1)
     self.assertIn("unknown rdna3 format word=0x7e01fe00", result.stderr)

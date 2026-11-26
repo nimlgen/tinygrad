@@ -12,7 +12,7 @@ from tinygrad.uop.ops import KernelInfo, AxisType
 from tinygrad.mixin import Mixin
 from tinygrad.codegen import create_linear, contiguous_mops_to_view
 from tinygrad.engine.realize import run_linear, capturing, compile_linear, link_linear
-from tinygrad.device import Buffer, Device, HCQ_RUNTIME_DEV, host_of
+from tinygrad.device import Buffer, Device, host_of
 
 # **** export: storage becomes EXTERN(slot), bound Variables lose their value and ALLOCs get canonical slots. ctx.externs is what it's linked to
 
@@ -254,7 +254,7 @@ class Tensor(Mixin):
 
     # validate all targets are set
     devs = {d for u in fn.toposort(enter_calls=True) for d in to_tuple(u.device) if d is not None}
-    for d in sorted({*devs, *map(host_of, devs), HCQ_RUNTIME_DEV.device}): Device.target_for(d)
+    for d in sorted({*devs, *map(host_of, devs), "CPU"}): Device.target_for(d)
 
     with Context(ALLOW_DEVICE_USAGE=0): return compile_linear(create_linear(fn), validate=VALIDATE_WITH_CPU, cache=True)
 
