@@ -45,7 +45,176 @@ def get_call_name(call:UOp, bufs:Sequence[Buffer|UOp], var_vals:dict[str, int]|N
   if ast.op is Ops.NATIVE and ast.arg.code == "encdec": return colored(f"enc/dec {_uop_sz_to_str(arg_uops[0])}", "yellow")
   raise NotImplementedError("get_call_name is not implemented")
 
-# **************** Stat ****************
+# **************** compile ****************
+
+# ctx is beam value
+pm_beam = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True),
+   lambda ctx,call,sink: call.replace(src=(sink.replace(arg=replace(sink.arg, beam=ctx)), *call.src[1:])) if sink.arg.beam == 0 else None),
+])
+
+def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]:
+  with Context(**x[2]): return x[0], to_program(*x[1])
+
+def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
+  ast = c.body
+  # a PROGRAM with a ProgramInfo and a BINARY is already compiled
+  if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
+     (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
+    return ast, Device.renderer_for(Device.canonicalize(to_tuple(c.device)[0]), HCQ_RUNTIME_DEV if c.arg.hcq is not None else DEV)
+  return None
+
+def lower_and_compile(linear:UOp, verbose=True) -> UOp:
+  # collect the kernels to lower and compile, deduped by their compile cache key
+  if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
+
+  # lower and compile what's not cached, in parallel if there's a worker pool
+  keys = {c: to_program_key(*a) for c, a in ar.items()}
+  todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
+  if len(todo):
+    # kernels that beam search must compile in the parent, beam needs device access to time candidates
+
+    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
+    ctx = {v.key: v.value for v in to_program_context}
+    if CAPTURE_PROCESS_REPLAY: ctx["PROCESS_REPLAY_LOC"] = get_process_replay_loc()
+    tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
+    try:
+      with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1 or not verbose) as pbar:
+        for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
+          pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
+          to_program_cache[todo[i][0]] = prg
+          pbar.update(1)
+    except KeyboardInterrupt:
+      if pool is not None: terminate_worker_pool()
+      raise
+
+  # swap the compiled PROGRAMs into the calls
+  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
+                           name="precompile kernels")
+
+compile_cache:dict[tuple, UOp] = {}
+def compile_linear(fn:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
+  # fn is an exported function or its LINEAR. the compiled LINEAR is cached on it and on all that changes the compile
+  beam, profile = BEAM.value if beam is None else beam, bool(PROFILE or DEBUG >= 2) if profile is None else profile
+  key = (fn, beam, bool(validate), profile, ALL2ALL >= 1, tuple(DEV.value), tuple(HCQ_RUNTIME_DEV.value), *[x.value for x in to_program_config])
+  if cache and SCACHE and (hit:=compile_cache.get(key)) is not None: return hit
+  linear = fn if fn.op is Ops.LINEAR else create_linear(fn)
+  scalars = [e for e in linear.toposort() if e.op is Ops.EXTERN and e.is_variable and e.arg.name is None] # they bind by slot at run
+  ret = linear.substitute({e: UOp.variable(e.expr, e.vmin, e.vmax, dtype=e.dtype) for e in scalars}, walk=True)
+  if validate: ret = graph_rewrite(ret, pm_validate, name="validate", walk=True)
+  if beam >= 1: ret = graph_rewrite(ret, pm_beam, ctx=beam, walk=True)
+  ret = hcq_compile(lower_and_compile(ret), profile)
+  if cache and SCACHE and ret is not fn: compile_cache[key] = ret
+  return ret
+
+# **************** link ****************
+
+def devices_of(linear:UOp) -> list[str]:
+  return sorted({d for u in linear.toposort() if u.op in {Ops.BUFFER, Ops.PARAM, Ops.ALLOC, Ops.EXTERN} for d in to_tuple(u.device) if d is not None})
+
+def link_linear(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:
+  # link opens the devices the linear uses, opening a device registers its link buffers and rules
+  for d in devices_of(linear): Device[d]
+  return hcq_link(linear, input_uops=input_uops)
+
+# **************** run ****************
+
+runtime_cache: dict[tuple[bytes, str], Any] = {}
+def get_runtime(device:str, ast:UOp, cache=True):
+  if (runtime:=runtime_cache.get(key:=(ast.key, device))) is None:
+    links = {call.body.src[0].arg.function_name:get_runtime(device, call.body, cache)
+             for call in ast.src[1].src if call.op is Ops.CALL and call.body.op is Ops.PROGRAM}
+    runtime = Device[device].runtime(TinyELF.from_program(ast), links=links)
+    if cache: runtime_cache[key] = runtime
+  return runtime
+
+capturing: list = []  # put classes with an add_export method in here
+
+@dataclass
+class ExecContext:
+  var_vals: dict[str, int] = field(default_factory=dict)
+  input_uops: tuple[UOp, ...] = ()
+  update_stats: bool = True
+  jit: bool = False
+  wait: bool = False
+  timeout: int|None = None
+  cache: bool = True
+
+def _resolve(b:UOp, inputs:tuple[UOp, ...]) -> UOp:
+  if b.op in (Ops.MSELECT, Ops.SHRINK, Ops.BITCAST, Ops.GETADDR): return b.replace(src=(_resolve(b.src[0], inputs), *b.src[1:]))
+  if b.op is Ops.MSTACK: return b.replace(src=tuple(_resolve(x, inputs) for x in b.src))
+  return inputs[b.arg.slot] if b.op is Ops.PARAM else b
+def _buffer(b:UOp, inputs:tuple[UOp, ...]) -> Buffer: return cast(Buffer, _resolve(b, inputs).buffer)
+
+def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
+  dest, src = [_buffer(b, ctx.input_uops).ensure_allocated() for b in get_call_arg_uops(call)[:2]]
+  if dest.get_storage().host is not None and src.get_storage().host is not None:
+    for b in (dest, src): b.allocator.dev.synchronize()
+    with cpu_profile(f"{src.device} -> {dest.device}", f"{src.device}:COPY"): dest.host[:] = src.host[:]
+  elif dest._host_mv() is not None: src.allocator._copyout(dest.as_memoryview(allow_zero_copy=True), src._buf)
+  else: dest.allocator._copyin(dest._buf, src.as_memoryview(allow_zero_copy=True))
+  return []
+
+def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, device:str|None=None) -> list[float|None]:
+  if device is None:
+    device = to_tuple(get_call_arg_uops(call)[0].device)[0]
+    if device.split(":")[0] in HOST_DEVS: Device[device].synchronize(ctx.timeout)
+  prg_bufs = {i:_buffer(call.src[1+i], ctx.input_uops).ensure_allocated() for i in ast.arg.globals}
+  rt = get_runtime(device, ast, cache=ctx.cache)
+  def scalar(a:UOp): return ctx.var_vals[a.expr] if a.is_variable else _resolve(a, ctx.input_uops).val
+  try:
+    args = [scalar(call.scalar_arg(p)) if p.addrspace is AddrSpace.ALU else prg_bufs[p.arg.slot].get_buf(device) for p in ast.kernel_params]
+    global_sz, local_sz = (tuple(sym_infer(x, ctx.var_vals) for x in dims) for dims in ast.arg.launch_dims(call))
+  except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
+  return [rt(*args, global_size=global_sz, local_size=local_sz, wait=ctx.wait, timeout=ctx.timeout)]
+
+def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
+  info = call.arg.hcq
+  ctx = replace(ctx, wait=ctx.wait and not info.skip_wait,
+                var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in Device[d].var_vals.items()}})
+  slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
+  if PROFILE:
+    for d in {d for d, _, _, prof, *_ in info.kernels if prof and (slots[d], prof[0]) in Device[d].prof_ents}: Device[d].synchronize()
+  ets = exec_kernel(ctx, call, ast, device=Device[info.device[0]].host)
+  if not (ctx.wait or PROFILE): return ets
+
+  for d, name, _, prof, pkey, *_ in info.kernels:
+    if prof: Device[d].prof_ents[(slots[d], prof[0])] = ProfileGraphEntry(d, name, prof[0], prof[1], pkey)
+  if ctx.wait:
+    for device in info.device: Device[device].synchronize(timeout=ctx.timeout)
+  def _prof_tm(device:str, prof:tuple[int, ...]) -> float:
+    st, en = (slots[device].host.view(fmt='Q')[x] for x in prof)
+    return float(en-st) / Device[device].timestamp_divider / 1e6
+  return ets + [_prof_tm(d, prof) if ctx.wait else None for d, _, _, prof, *_ in info.kernels if prof]
+
+def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
+  import numpy as np
+  from tinygrad.dtype import _to_np_dtype
+  Device["CPU"].synchronize(ctx.timeout)
+  exec_kernel(ctx, call, prg:=to_program(ast.src[0], Device["CPU"].renderer)) # the shadows sit at the call's slots, so it runs like any call
+  pos = [k for k, s in enumerate(call.src[1:]) if s.addrspace is not AddrSpace.ALU]
+  args = [_buffer(b, ctx.input_uops) for b in get_call_arg_uops(call)]
+  bufs, dev_bufs = dict(zip(pos, args[:len(args)//2])), dict(zip(pos, args[len(args)//2:]))
+  for i in prg.arg.outs:
+    dt = _to_np_dtype(call.src[1+i].dtype)
+    assert dt is not None, f"no np dtype for {call.src[1+i].dtype}"
+    np.testing.assert_allclose(np.frombuffer(dev_bufs[i].ensure_allocated().as_memoryview(), dt),
+                               np.frombuffer(bufs[i].as_memoryview(), dt), rtol=1e-3, atol=1e-3)
+  return []
+
+def _validate(call:UOp, sink:UOp) -> UOp:
+  shadows = tuple(p if p.addrspace is AddrSpace.ALU else UOp.alloc((prod(p.max_shape),), p.dtype, int.from_bytes(call.key[:8], "little")+i,
+                  device=("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU") for i,p in enumerate(call.src[1:]))
+  copies = tuple(s.store_call(p) for s, p in zip(shadows, call.src[1:]) if p.addrspace is not AddrSpace.ALU)
+  return UOp(Ops.LINEAR, src=copies + (call, UOp.native("validate", sink).call(*shadows, *call.src[1:])))
+pm_validate = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True), _validate)]) + pm_flatten_linear
+
+pm_exec = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
+  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="ast"),), name="call", allow_any_len=True),
+   lambda ctx, call, ast: exec_hcq(ctx, call, ast) if call.arg.hcq is not None else exec_kernel(ctx, call, ast)),
+  (UPat(Ops.CALL, src=(UPat.native("validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
+])
 
 def estimate_uop(call:UOp) -> Estimates:
   call = call.without_after
@@ -95,179 +264,6 @@ def track_stats(ctx:ExecContext, call:UOp, st:decimal.Decimal, ets:list[float|No
       ("" if et is None else f" tm {ptm}/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({flops_str} {mem_str})"))
     first_run_cache.add(key)
 
-# **************** runtime cache ****************
-
-runtime_cache: dict[tuple[bytes, str], Any] = {}
-def get_runtime(device:str, ast:UOp, cache=True):
-  if (runtime:=runtime_cache.get(key:=(ast.key, device))) is None:
-    links = {call.body.src[0].arg.function_name:get_runtime(device, call.body, cache)
-             for call in ast.src[1].src if call.op is Ops.CALL and call.body.op is Ops.PROGRAM}
-    runtime = Device[device].runtime(TinyELF.from_program(ast), links=links)
-    if cache: runtime_cache[key] = runtime
-  return runtime
-
-# **************** run linear ****************
-
-capturing: list = []  # put classes with an add_export method in here
-
-@dataclass
-class ExecContext:
-  var_vals: dict[str, int] = field(default_factory=dict)
-  input_uops: tuple[UOp, ...] = ()
-  update_stats: bool = True
-  jit: bool = False
-  wait: bool = False
-  timeout: int|None = None
-  cache: bool = True
-
-def _resolve(b:UOp, inputs:tuple[UOp, ...]) -> UOp:
-  if b.op in (Ops.MSELECT, Ops.SHRINK, Ops.BITCAST, Ops.GETADDR): return b.replace(src=(_resolve(b.src[0], inputs), *b.src[1:]))
-  if b.op is Ops.MSTACK: return b.replace(src=tuple(_resolve(x, inputs) for x in b.src))
-  return inputs[b.arg.slot] if b.op is Ops.PARAM else b
-def _buffer(b:UOp, inputs:tuple[UOp, ...]) -> Buffer: return cast(Buffer, _resolve(b, inputs).buffer)
-
-def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
-  dest, src = [_buffer(b, ctx.input_uops).ensure_allocated() for b in get_call_arg_uops(call)[:2]]
-  if dest.get_storage().host is not None and src.get_storage().host is not None:
-    for b in (dest, src): b.allocator.dev.synchronize()
-    with cpu_profile(f"{src.device} -> {dest.device}", f"{src.device}:COPY"): dest.host[:] = src.host[:]
-  elif dest._host_mv() is not None: src.allocator._copyout(dest.as_memoryview(allow_zero_copy=True), src._buf)
-  else: dest.allocator._copyin(dest._buf, src.as_memoryview(allow_zero_copy=True))
-  return []
-
-def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, device:str|None=None) -> list[float|None]:
-  if device is None:
-    device = to_tuple(get_call_arg_uops(call)[0].device)[0]
-    if device.split(":")[0] in HOST_DEVS: Device[device].synchronize(ctx.timeout)
-  prg_bufs = {i:_buffer(call.src[1+i], ctx.input_uops).ensure_allocated() for i in ast.arg.globals}
-  rt = get_runtime(device, ast, cache=ctx.cache)
-  def scalar(a:UOp): return ctx.var_vals[a.expr] if a.is_variable else _resolve(a, ctx.input_uops).val
-  try:
-    args = [scalar(call.scalar_arg(p)) if p.addrspace is AddrSpace.ALU else prg_bufs[p.arg.slot].get_buf(device) for p in ast.kernel_params]
-    global_sz, local_sz = (tuple(sym_infer(x, ctx.var_vals) for x in dims) for dims in ast.arg.launch_dims(call))
-  except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
-  return [rt(*args, global_size=global_sz, local_size=local_sz, wait=ctx.wait, timeout=ctx.timeout)]
-
-def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
-  import numpy as np
-  from tinygrad.dtype import _to_np_dtype
-  Device["CPU"].synchronize(ctx.timeout)
-  exec_kernel(ctx, call, prg:=to_program(ast.src[0], Device["CPU"].renderer)) # the shadows sit at the call's slots, so it runs like any call
-  pos = [k for k, s in enumerate(call.src[1:]) if s.addrspace is not AddrSpace.ALU]
-  args = [_buffer(b, ctx.input_uops) for b in get_call_arg_uops(call)]
-  bufs, dev_bufs = dict(zip(pos, args[:len(args)//2])), dict(zip(pos, args[len(args)//2:]))
-  for i in prg.arg.outs:
-    dt = _to_np_dtype(call.src[1+i].dtype)
-    assert dt is not None, f"no np dtype for {call.src[1+i].dtype}"
-    np.testing.assert_allclose(np.frombuffer(dev_bufs[i].ensure_allocated().as_memoryview(), dt),
-                               np.frombuffer(bufs[i].as_memoryview(), dt), rtol=1e-3, atol=1e-3)
-  return []
-
-def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
-  info = call.arg.hcq
-  ctx = replace(ctx, wait=ctx.wait and not info.skip_wait,
-                var_vals={**ctx.var_vals, **{k: v for d in info.device for k, v in Device[d].var_vals.items()}})
-  slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
-  if PROFILE:
-    for d in {d for d, _, _, prof, *_ in info.kernels if prof and (slots[d], prof[0]) in Device[d].prof_ents}: Device[d].synchronize()
-  ets = exec_kernel(ctx, call, ast, device=Device[info.device[0]].host)
-  if not (ctx.wait or PROFILE): return ets
-
-  for d, name, _, prof, pkey, *_ in info.kernels:
-    if prof: Device[d].prof_ents[(slots[d], prof[0])] = ProfileGraphEntry(d, name, prof[0], prof[1], pkey)
-  if ctx.wait:
-    for device in info.device: Device[device].synchronize(timeout=ctx.timeout)
-  def _prof_tm(device:str, prof:tuple[int, ...]) -> float:
-    st, en = (slots[device].host.view(fmt='Q')[x] for x in prof)
-    return float(en-st) / Device[device].timestamp_divider / 1e6
-  return ets + [_prof_tm(d, prof) if ctx.wait else None for d, _, _, prof, *_ in info.kernels if prof]
-
-def _validate(call:UOp, sink:UOp) -> UOp:
-  shadows = tuple(p if p.addrspace is AddrSpace.ALU else UOp.alloc((prod(p.max_shape),), p.dtype, int.from_bytes(call.key[:8], "little")+i,
-                  device=("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU") for i,p in enumerate(call.src[1:]))
-  copies = tuple(s.store_call(p) for s, p in zip(shadows, call.src[1:]) if p.addrspace is not AddrSpace.ALU)
-  return UOp(Ops.LINEAR, src=copies + (call, UOp.native("validate", sink).call(*shadows, *call.src[1:])))
-pm_validate = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True), _validate)]) + pm_flatten_linear
-
-# ctx is beam value
-pm_beam = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True),
-   lambda ctx,call,sink: call.replace(src=(sink.replace(arg=replace(sink.arg, beam=ctx)), *call.src[1:])) if sink.arg.beam == 0 else None),
-])
-
-# **************** parallel lowering + compilation ****************
-
-def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]:
-  with Context(**x[2]): return x[0], to_program(*x[1])
-
-def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
-  ast = c.body
-  # a PROGRAM with a ProgramInfo and a BINARY is already compiled
-  if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
-     (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
-    return ast, Device.renderer_for(Device.canonicalize(to_tuple(c.device)[0]), HCQ_RUNTIME_DEV if c.arg.hcq is not None else DEV)
-  return None
-
-def lower_and_compile(linear:UOp, verbose=True) -> UOp:
-  # collect the kernels to lower and compile, deduped by their compile cache key
-  if not len(ar:={c: a for c in linear.toposort() if c.op is Ops.CALL and (a:=_get_call_to_compile(c)) is not None}): return linear
-
-  # lower and compile what's not cached, in parallel if there's a worker pool
-  keys = {c: to_program_key(*a) for c, a in ar.items()}
-  todo = list({keys[c]: a for c, a in ar.items() if keys[c] not in to_program_cache}.items())
-  if len(todo):
-    # kernels that beam search must compile in the parent, beam needs device access to time candidates
-
-    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
-    ctx = {v.key: v.value for v in to_program_context}
-    if CAPTURE_PROCESS_REPLAY: ctx["PROCESS_REPLAY_LOC"] = get_process_replay_loc()
-    tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
-    try:
-      with tqdm(total=len(todo), desc="compiling", disable=DEBUG<1 or not verbose) as pbar:
-        for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
-          pbar.set_description(f"compiling {ansipad(prg.src[0].arg.name, 40)}")
-          to_program_cache[todo[i][0]] = prg
-          pbar.update(1)
-    except KeyboardInterrupt:
-      if pool is not None: terminate_worker_pool()
-      raise
-
-  # swap the compiled PROGRAMs into the calls
-  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
-                           name="precompile kernels")
-
-from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
-
-pm_exec = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat(Ops.STORE, name="ast"),), name="call", allow_any_len=True), exec_copy),
-  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="ast"),), name="call", allow_any_len=True),
-   lambda ctx, call, ast: exec_hcq(ctx, call, ast) if call.arg.hcq is not None else exec_kernel(ctx, call, ast)),
-  (UPat(Ops.CALL, src=(UPat.native("validate", name="ast"),), name="call", allow_any_len=True), exec_validate),
-])
-
-def devices_of(linear:UOp) -> list[str]:
-  return sorted({d for u in linear.toposort() if u.op in {Ops.BUFFER, Ops.PARAM, Ops.ALLOC, Ops.EXTERN} for d in to_tuple(u.device) if d is not None})
-
-compile_cache:dict[tuple, UOp] = {}
-def compile_linear(fn:UOp, beam:int|None=None, validate=False, profile:bool|None=None, cache=False) -> UOp:
-  # fn is an exported function or its LINEAR. the compiled LINEAR is cached on it and on all that changes the compile
-  beam, profile = BEAM.value if beam is None else beam, bool(PROFILE or DEBUG >= 2) if profile is None else profile
-  key = (fn, beam, bool(validate), profile, ALL2ALL >= 1, tuple(DEV.value), tuple(HCQ_RUNTIME_DEV.value), *[x.value for x in to_program_config])
-  if cache and SCACHE and (hit:=compile_cache.get(key)) is not None: return hit
-  linear = fn if fn.op is Ops.LINEAR else create_linear(fn)
-  scalars = [e for e in linear.toposort() if e.op is Ops.EXTERN and e.is_variable and e.arg.name is None] # they bind by slot at run
-  ret = linear.substitute({e: UOp.variable(e.expr, e.vmin, e.vmax, dtype=e.dtype) for e in scalars}, walk=True)
-  if validate: ret = graph_rewrite(ret, pm_validate, name="validate", walk=True)
-  if beam >= 1: ret = graph_rewrite(ret, pm_beam, ctx=beam, walk=True)
-  ret = hcq_compile(lower_and_compile(ret), profile)
-  if cache and SCACHE and ret is not fn: compile_cache[key] = ret
-  return ret
-
-def link_linear(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:
-  # link opens the devices the linear uses, opening a device registers its link buffers and rules
-  for d in devices_of(linear): Device[d]
-  return hcq_link(linear, input_uops=input_uops)
-
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:Sequence[UOp]=(), update_stats=True, jit=False, wait=False):
   assert linear.op is Ops.LINEAR, f"run_linear calls on {linear.op}"
   if len(linear.src) == 0: return
@@ -284,3 +280,5 @@ def time_call(call:UOp, var_vals:dict[str, int]|None=None, timeout:int|None=None
         from tinygrad.tensor import Tensor
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024, 1024).contiguous().realize(do_update_stats=False)
     yield max(map(unwrap, pm_exec.rewrite(c:=linear.src[0].without_after, ctx)[c.arg.hcq is not None:]))
+
+from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link # noqa: E402 # down here, hcq2 imports realize
