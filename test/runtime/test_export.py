@@ -1,6 +1,6 @@
 import multiprocessing, unittest
 from concurrent.futures import ProcessPoolExecutor
-from tinygrad import Context, Tensor, Variable, Device
+from tinygrad import Context, Tensor, Variable, Device, TinyJit
 from tinygrad.device import host_of
 from tinygrad.helpers import HCQ_RUNTIME_DEV
 from tinygrad.uop.uir import render_uir, parse_uir
@@ -62,6 +62,16 @@ class TestExportRun(unittest.TestCase):
     self.assertEqual(ran.tolist(), [3, 4, 5])
     Tensor.run(Tensor.compile(fn), externs)
     self.assertEqual(out.tolist(), [2, 3, 4])
+
+  def test_jit_cant_capture_run(self):
+    # a capturing jit would run the LINEAR once and replay without it
+    @TinyJit
+    def f(x:Tensor):
+      fn, externs = Tensor.export((x + 1).contiguous())
+      Tensor.run(Tensor.compile(fn), externs)
+      return x * 2
+    f(Tensor([1, 2, 3]).realize())
+    with self.assertRaisesRegex(RuntimeError, "a JIT can't capture a compiled LINEAR"): f(Tensor([1, 2, 3]).realize())
 
   def test_run_checks_externs(self):
     a, b = Tensor([1., 2.]).realize(), Tensor([1., 2., 3.]).realize()

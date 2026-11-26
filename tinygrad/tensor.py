@@ -255,6 +255,7 @@ class Tensor(Mixin):
     # validate all targets are set
     devs = {d for u in fn.toposort(enter_calls=True) for d in to_tuple(u.device) if d is not None}
     for d in sorted({*devs, *map(host_of, devs), HCQ_RUNTIME_DEV.device}): Device.target_for(d)
+    Device.target_for(HCQ_RUNTIME_DEV.device, HCQ_RUNTIME_DEV)
 
     with Context(ALLOW_DEVICE_USAGE=0): return compile_linear(create_linear(fn), validate=VALIDATE_WITH_CPU, cache=True)
 
@@ -266,6 +267,7 @@ class Tensor(Mixin):
   @staticmethod
   def run(linear:UOp, externs:tuple[UOp, ...], do_update_stats=True) -> None:
     """Links a LINEAR from `Tensor.compile` to the externs from `Tensor.export` and runs it."""
+    if capturing and CAPTURING: raise RuntimeError("a JIT can't capture a compiled LINEAR, realize the Tensors instead")
     var_vals = {f"e{i}": x.arg.val for i,x in enumerate(externs) if x.is_bound_var}
     run_linear(Tensor.link(linear, externs), var_vals, externs, update_stats=do_update_stats)
 
