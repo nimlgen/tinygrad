@@ -11,7 +11,7 @@ if not int(os.getenv("ASSERT_PROCESS_REPLAY", "1")): ASSERT_DIFF = 0
 try:
   from tinygrad.renderer import Renderer
   from tinygrad.renderer.x86 import X86Renderer
-  from tinygrad.codegen import to_program
+  from tinygrad.compiler import to_program
   from tinygrad.uop.ops import UOp, Ops
   from tinygrad.helpers import VERSION, Context, ContextVar, colored, db_connection, getenv, tqdm
 except ImportError as e:

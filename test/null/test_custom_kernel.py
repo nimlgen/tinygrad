@@ -1,12 +1,12 @@
 import unittest
 from tinygrad import Tensor, UOp, GlobalCounters, Device
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt.postrange import Scheduler
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.renderer import Target
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from test.helpers import assert_kernel_count
 
 def custom_elementwise_add_kernel(C:UOp, A:UOp, B:UOp) -> UOp:

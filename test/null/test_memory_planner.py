@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import dtypes
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.codegen.memory import memory_plan_rewrite
+from tinygrad.compiler.memory import memory_plan_rewrite
 
 global_map = {}
 held_bufs: set[UOp] = set()

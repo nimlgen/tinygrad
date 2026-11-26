@@ -7,13 +7,13 @@ from tinygrad.dtype import dtypes, DType, AddrSpace, ConstFloat, Invalid  # noqa
 from tinygrad.device import Device
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, AxisType
 from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.codegen import to_program
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler import to_program
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.wgsl import WGSLRenderer
 from tinygrad.runtime.ops_python import PythonRenderer
 from tinygrad.uop.ops import ParamArg, PatternMatcher, UPat, dtype_from_uop, exec_alu, graph_rewrite  # noqa: F401  # ParamArg used by eval(str(uop)) roundtrip tests
-from tinygrad.codegen.late.coalesce import memory_coalescing
+from tinygrad.compiler.late.coalesce import memory_coalescing
 from tinygrad.renderer import Renderer
 from tinygrad.uop.weak import pm_lower_weak
 from tinygrad.uop.spec import spec_program, spec_shared, type_verify

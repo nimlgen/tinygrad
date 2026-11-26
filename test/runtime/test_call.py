@@ -4,8 +4,8 @@ from tinygrad import Tensor, function, Device, Variable
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, uopfunc
 from tinygrad.engine.realize import get_runtime
-from tinygrad.codegen import to_program
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler import to_program
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer

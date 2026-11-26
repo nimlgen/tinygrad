@@ -9,7 +9,7 @@ from tinygrad.uop.ops import pm_flatten_linear
 from tinygrad.device import Device, Buffer, ProfileGraphEntry, DEV, HCQ_RUNTIME_DEV, HOST_DEVS
 from tinygrad.dtype import AddrSpace
 from tinygrad.renderer import Estimates, Renderer, TinyELF
-from tinygrad.codegen import to_program, to_program_cache, to_program_key, to_program_context, to_program_config
+from tinygrad.compiler import to_program, to_program_cache, to_program_key, to_program_context, to_program_config
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 
 # **************** Helpers ****************

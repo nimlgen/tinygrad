@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, Device, Context
-from tinygrad.codegen import do_to_program
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler import do_to_program
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.uop.ops import AxisType
 from test.external.process_replay.process_replay import replay_to_program
 from test.helpers import replace_opts

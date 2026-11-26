@@ -4,7 +4,7 @@ from tinygrad.uop import Ops
 from tinygrad.uop.ops import ParamArg, AddrSpace
 from tinygrad.uop.uir import render_uir, parse_uir
 from tinygrad.function import function
-from tinygrad.codegen import create_linear
+from tinygrad.compiler import create_linear
 def buf(n=8) -> Tensor: return Tensor.empty(n, device="NULL").realize()
 
 class TestExport(unittest.TestCase):
@@ -70,7 +70,7 @@ class TestExport(unittest.TestCase):
 
   def test_create_linear_deterministic(self):
     # the linear only depends on the export, the storage it allocates gets canonical slots
-    from tinygrad.codegen import create_linear, schedule_cache
+    from tinygrad.compiler import create_linear, schedule_cache
     fn, _ = Tensor.export((((buf()+1).contiguous()*2).to("NULL:1")+3).contiguous())
     linear = create_linear(fn)
     self.assertTrue(any(u.op is Ops.ALLOC for u in linear.toposort()))
@@ -83,12 +83,12 @@ class TestExport(unittest.TestCase):
     # the linear of a function is cached for as long as its schedule is
     from unittest.mock import patch
     from tinygrad import Context
-    import tinygrad.codegen as codegen
+    import tinygrad.compiler as compiler
     @function(precompile=True)
     def add_one(x): return (x+1).contiguous()
     fn, _ = Tensor.export((add_one(buf())*2+3).contiguous())
-    codegen.schedule_cache.clear()
-    with patch("tinygrad.codegen.memory_plan_rewrite", wraps=codegen.memory_plan_rewrite) as plan:
+    compiler.schedule_cache.clear()
+    with patch("tinygrad.compiler.memory_plan_rewrite", wraps=compiler.memory_plan_rewrite) as plan:
       linear = create_linear(fn)
       self.assertIs(create_linear(fn), linear)
       self.assertEqual(plan.call_count, 1)
@@ -96,13 +96,13 @@ class TestExport(unittest.TestCase):
       with Context(NO_MEMORY_PLANNER=1): self.assertIsNot(create_linear(fn), linear)
       with Context(SCACHE=0): self.assertIs(create_linear(fn), linear)
       self.assertEqual(plan.call_count, 3)
-      codegen.schedule_cache.clear()
+      compiler.schedule_cache.clear()
       self.assertIs(create_linear(fn), linear)
       self.assertEqual(plan.call_count, 4)
 
   def test_linear_cache_isolation(self):
     from tinygrad import Context
-    from tinygrad.codegen import schedule_cache
+    from tinygrad.compiler import schedule_cache
     fn, _ = Tensor.export(buf(65536).sum())
     schedule_cache.clear()
     with Context(SCACHE=1, SPLIT_REDUCEOP=0, NO_MEMORY_PLANNER=0):

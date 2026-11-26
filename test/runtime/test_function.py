@@ -4,7 +4,7 @@ from tinygrad.function import function
 from tinygrad import Tensor, TinyJit, GlobalCounters, Device
 from tinygrad.dtype import AddrSpace, Invalid, dtypes
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from test.helpers import assert_kernel_count, KernelCountException
 
 class TestFunction(unittest.TestCase):

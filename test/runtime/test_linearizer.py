@@ -1,11 +1,11 @@
 import numpy as np
 import unittest
 
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.uop.ops import UOp, Ops, GroupOp, AxisType, KernelInfo
 from tinygrad.device import Device, Buffer
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.helpers import Context, dedup, TC_SELECT, TC_OPT, DEV
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.renderer.ptx import PTXRenderer

@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt.postrange import Scheduler
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
 from tinygrad.helpers import Target
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops

@@ -1,6 +1,6 @@
 import math
 from tinygrad.uop.ops import UOp, Ops, sint, PatternMatcher, UPat, ssimplify, AxisType
-from tinygrad.codegen.late.linearizer import pm_split_ends
+from tinygrad.compiler.late.linearizer import pm_split_ends
 from tinygrad.dtype import AddrSpace
 from tinygrad.renderer import Renderer
 

@@ -2,7 +2,7 @@ import unittest, math, itertools
 from tinygrad import Tensor, Device, Context, dtypes
 from tinygrad.dtype import DTYPES_DICT, DType, ConstType
 from tinygrad.uop.ops import Ops, UOp, GroupOp
-from tinygrad.codegen.decomp.op import threefry2x32
+from tinygrad.compiler.decomp.op import threefry2x32
 from test.helpers import full_rewrite
 
 def _check_ast_count(desired_count:int, t:Tensor):

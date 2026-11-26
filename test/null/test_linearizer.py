@@ -1,9 +1,9 @@
 import unittest
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.uop.ops import UOp, Ops, GroupOp, AxisType
 from tinygrad.device import Device
 from tinygrad.tensor import Tensor
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.dtype import DType, dtypes, AddrSpace
 from tinygrad.renderer.x86 import ISARenderer
 from tinygrad.renderer.cstyle import ClangRenderer

@@ -1,6 +1,6 @@
 import unittest
 from tinygrad import Device, Tensor, dtypes
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
 from tinygrad.uop.ops import AxisType
 from tinygrad.helpers import DEV
 

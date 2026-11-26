@@ -2,7 +2,7 @@ import unittest, math
 import numpy as np
 from tinygrad import dtypes
 from tinygrad.uop.ops import UOp
-from tinygrad.codegen.decomp.transcendental import payne_hanek_reduction, cody_waite_reduction, frexp, rintk, pow2if
+from tinygrad.compiler.decomp.transcendental import payne_hanek_reduction, cody_waite_reduction, frexp, rintk, pow2if
 from test.helpers import eval_uop
 
 class TestTranscendentalFunctions(unittest.TestCase):

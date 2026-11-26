@@ -5,7 +5,7 @@ from test.helpers import is_hcq2_device, run_schedule, bound_schedule
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.device import Compiled, ProfileProgramEvent
 from tinygrad.runtime.ops_amd import ProfileSQTTEvent
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.viz.serve import load_amd_counters, VizData
 from tinygrad.renderer.amd.sqtt import decode, print_packets, map_insts, IMMEDIATE_MASK
 from tinygrad.renderer.amd.dsl import s, v

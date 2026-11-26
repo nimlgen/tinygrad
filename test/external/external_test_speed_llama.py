@@ -5,7 +5,7 @@ from tinygrad.tensor import Tensor
 from tinygrad import Device
 from tinygrad.nn.state import get_state_dict
 from tinygrad.device import BufferStorage, Allocator, Compiled
-from tinygrad.codegen import to_program_cache
+from tinygrad.compiler import to_program_cache
 from tinygrad.helpers import Profiling
 
 class FakeProgram:

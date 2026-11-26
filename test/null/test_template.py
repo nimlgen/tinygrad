@@ -1,6 +1,6 @@
 import unittest
 from tinygrad import Context, Device, Tensor, UOp, dtypes
-from tinygrad.codegen import full_rewrite_to_sink
+from tinygrad.compiler import full_rewrite_to_sink
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import KernelInfo, graph_rewrite, pm_resolve_params

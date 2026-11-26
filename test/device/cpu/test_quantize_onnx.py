@@ -3,7 +3,7 @@ import numpy as np
 from tinygrad import Tensor, Context, Device, dtypes
 from tinygrad.uop.ops import Ops
 from tinygrad.dtype import AddrSpace
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from test.device.dsp.test_quantize_onnx import get_quantized_model
 
 @unittest.skip("this is broken")

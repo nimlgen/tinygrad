@@ -3,7 +3,7 @@ from tinygrad import Tensor, UOp, Device, Variable
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import Context
 
 class TestEffectRetention(unittest.TestCase):

@@ -17,8 +17,8 @@ def _const_int(expr: str) -> int:
   return ev(ast.parse(expr.strip(), mode='eval'))
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.codegen.decomp.dtype import f2f
-from tinygrad.codegen.decomp.transcendental import exponent_bias
+from tinygrad.compiler.decomp.dtype import f2f
+from tinygrad.compiler.decomp.transcendental import exponent_bias
 
 # Type alias for vars dict: stores UOps and tuples for lambda definitions
 VarVal = UOp | tuple[str, list[str], str]

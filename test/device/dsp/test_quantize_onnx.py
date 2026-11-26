@@ -3,8 +3,8 @@ import numpy as np
 import tempfile, unittest
 from tinygrad import Tensor, Device, dtypes, UOp
 from tinygrad.uop.ops import Ops, AxisType
-from tinygrad.codegen.opt import Opt, OptOps
-from tinygrad.codegen import to_program
+from tinygrad.compiler.opt import Opt, OptOps
+from tinygrad.compiler import to_program
 from test.helpers import replace_opts, run_schedule, bound_schedule
 
 N = 512

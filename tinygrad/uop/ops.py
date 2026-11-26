@@ -884,7 +884,7 @@ class UOp(Mixin, metaclass=UOpMetaClass):
     return s
 
   def contiguous_view(self) -> tuple[UOp, int]|None:
-    from tinygrad.codegen.prepare import pm_mops
+    from tinygrad.compiler.prepare import pm_mops
     from tinygrad.uop.symbolic import symbolic
 
     # WEBGPU and CL do not support views.

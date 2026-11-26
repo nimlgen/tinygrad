@@ -4,9 +4,9 @@ from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, GroupOp, graph_rewr
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import prod, getenv, all_int, DEBUG, SPLIT_REDUCEOP, OPENPILOT_HACKS, FLOAT16, argsort, dedup
-from tinygrad.codegen.indexing import apply_movement_op
-from tinygrad.codegen.allreduce import create_allreduce_function
-from tinygrad.codegen.multi import multi_pm
+from tinygrad.compiler.indexing import apply_movement_op
+from tinygrad.compiler.allreduce import create_allreduce_function
+from tinygrad.compiler.multi import multi_pm
 
 def forward_call_outputs(sink:UOp) -> UOp:
   placed:dict[UOp, UOp] = {}

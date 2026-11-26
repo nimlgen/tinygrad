@@ -4,11 +4,11 @@ from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.device import Device
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str, IGNORE_BEAM_CACHE
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
-from tinygrad.codegen import to_program
-from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.compiler import to_program
+from tinygrad.compiler.opt.postrange import Scheduler
 
 actions = [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.UPCAST)) for amt in [0,2,3,4,5,7] for axis in range(10)]
 actions += [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.LOCAL)) for amt in [0,2,3,4,8,13,16,29] for axis in range(8)]

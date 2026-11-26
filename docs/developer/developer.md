@@ -17,7 +17,7 @@ The `UOp` graph specifies the compute in terms of low level tinygrad ops. Not al
 
 ## Scheduling
 
-The [scheduler](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/codegen/__init__.py) converts the graph of UOps into a `LINEAR` UOp whose `src` is a list of `CALL` UOps. One `CALL` is one kernel on the GPU, and the scheduler is responsible for breaking the large compute graph into subgraphs that can fit in a kernel. The `CALL`'s `src[0]` (a `SINK` ast) specifies what compute to run, and the remaining `src` are the buffers to run it on.
+The [scheduler](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/compiler/__init__.py) converts the graph of UOps into a `LINEAR` UOp whose `src` is a list of `CALL` UOps. One `CALL` is one kernel on the GPU, and the scheduler is responsible for breaking the large compute graph into subgraphs that can fit in a kernel. The `CALL`'s `src[0]` (a `SINK` ast) specifies what compute to run, and the remaining `src` are the buffers to run it on.
 
 ## Lowering
 
@@ -25,7 +25,7 @@ The code in [realize](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/
 
 ::: tinygrad.engine.realize.run_linear
 
-There's a ton of complexity hidden behind this, see the `codegen/` directory.
+There's a ton of complexity hidden behind this, see the `compiler/` directory.
 
 First we lower the AST to UOps, which is a linear list of the compute to be run. This is where the BEAM search happens.
 

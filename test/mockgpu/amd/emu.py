@@ -54,7 +54,7 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo, uopfunc, rewrite_group, graph
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.device import Buffer, BufferSpec, Device
 from tinygrad.engine.realize import compile_linear, link_linear, run_linear
-from tinygrad.codegen import to_program, to_program_config
+from tinygrad.compiler import to_program, to_program_config
 from tinygrad.renderer import Renderer
 from tinygrad.helpers import Context, DEV, to_mv, ContextVar, VIZ
 from tinygrad.runtime.autogen import hsa

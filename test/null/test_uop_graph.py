@@ -3,7 +3,7 @@ from tinygrad import dtypes, Variable
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, graph_rewrite, AxisType, broadcast_axes, KernelInfo
 from tinygrad.uop.symbolic import sym
-from tinygrad.codegen.simplify import pm_reduce_collapse
+from tinygrad.compiler.simplify import pm_reduce_collapse
 from test.helpers import full_rewrite, to_uops_list
 
 simple_pm = PatternMatcher([
@@ -216,7 +216,7 @@ class TestUOpGraph(unittest.TestCase):
     self.assertIs(full_rewrite(out.sink()).src[0], full_rewrite(UOp.const(0, dtypes.int).sink()).src[0])
 
   def test_devectorize_derives_lane_dtype(self):
-    from tinygrad.codegen import do_devectorize
+    from tinygrad.compiler import do_devectorize
     # an Invalid lane derives bool while the value lane derives float: the lane rebuild must derive, not inherit
     lhs = UOp.stack(UOp.invalid(), UOp.const(1.0).cast(dtypes.float))
     out = do_devectorize(lhs * lhs)
@@ -224,7 +224,7 @@ class TestUOpGraph(unittest.TestCase):
     self.assertIs(invalid_lane_mul.dtype, dtypes.bool)
 
   def test_devectorize_zero_sized_scalar_expand(self):
-    from tinygrad.codegen import devectorizer2
+    from tinygrad.compiler import devectorizer2
     expanded = UOp.const(1.0).reshape(1, 1).expand(0, 3)
     self.assertEqual(graph_rewrite(expanded, devectorizer2).shape, (0, 3))
 
@@ -463,7 +463,7 @@ class TestReduceCollapse(unittest.TestCase):
 
 class TestMovementOps(unittest.TestCase):
   def test_pm_mops_partial_reshape_index_removes_reshape(self):
-    from tinygrad.codegen.prepare import pm_mops
+    from tinygrad.compiler.prepare import pm_mops
     src = UOp.param(0, dtypes.float, shape=(32, 4))
     r0, r1 = UOp.range(4, 0), UOp.range(8, 1)
     result = graph_rewrite(src.reshape((4, 8, 4)).index(r0, r1), pm_mops, name="test")
@@ -474,7 +474,7 @@ class TestMovementOps(unittest.TestCase):
     self.assertEqual([u for u in result.toposort() if u.op is Ops.RESHAPE], [src])
 
   def test_pm_mops_partial_reshape_index_suffix_mismatch_does_nothing(self):
-    from tinygrad.codegen.prepare import pm_mops
+    from tinygrad.compiler.prepare import pm_mops
     src = UOp.param(0, dtypes.float, shape=(2, 6))
     result = graph_rewrite(src.reshape((2, 3, 2)).index(UOp.range(2, 0)), pm_mops, name="test")
     self.assertEqual(result.op, Ops.INDEX)
@@ -488,7 +488,7 @@ class TestConstBufferize(unittest.TestCase):
     The pattern at rangeify.py uses allow_any_len=True because
     CONST doesn't depend on ranges (constant is same value everywhere).
     """
-    from tinygrad.codegen.rangeify import pm_const_buffer_folding, BufferizeOpts
+    from tinygrad.compiler.rangeify import pm_const_buffer_folding, BufferizeOpts
     c = UOp.const(42.0)
     r1 = UOp.range(3, 0)
     bufferize_with_range = c.bufferize(r1, arg=BufferizeOpts(device=None))
@@ -502,7 +502,7 @@ class TestConstBufferize(unittest.TestCase):
 
   def test_const_bufferize_with_multiple_ranges(self):
     """Test CONST.BUFFERIZE with multiple ranges is also folded."""
-    from tinygrad.codegen.rangeify import pm_const_buffer_folding, BufferizeOpts
+    from tinygrad.compiler.rangeify import pm_const_buffer_folding, BufferizeOpts
     c = UOp.const(3.14)
     r1 = UOp.range(3, 0)
     r2 = UOp.range(4, 1)

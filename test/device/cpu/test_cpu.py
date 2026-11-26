@@ -5,7 +5,7 @@ from tinygrad.helpers import Target
 from tinygrad.renderer.nir import LVPRenderer
 from tinygrad.renderer.x86 import X86Renderer
 from tinygrad.renderer.cstyle import TCCRenderer
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 
 @unittest.skipIf(Device.DEFAULT != "CPU", "only run on CPU")
 class TestCPU(unittest.TestCase):

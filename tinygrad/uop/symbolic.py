@@ -9,7 +9,7 @@ from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.weak import pm_uncast_const
 
 # TODO: symbolic shouldn't be importing from codegen
-from tinygrad.codegen.decomp.transcendental import xpow, xpow_int
+from tinygrad.compiler.decomp.transcendental import xpow, xpow_int
 
 # ******** phase 1 of symbolic used to live in ops, it's the most generic folding rules ********
 

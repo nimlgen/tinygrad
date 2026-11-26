@@ -1,7 +1,7 @@
 import unittest
 from tinygrad.device import Device
 from tinygrad.dtype import dtypes
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.helpers import Target
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.wgsl import WGSLRenderer

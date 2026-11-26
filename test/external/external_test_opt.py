@@ -8,7 +8,7 @@ from tinygrad.helpers import getenv, Context
 from tinygrad.nn.state import get_parameters
 from tinygrad.engine.realize import capturing
 from tinygrad.tensor import _to_np_dtype
-from tinygrad.codegen import create_linear
+from tinygrad.compiler import create_linear
 
 class CLCache:
   def __init__(self, allowed=None, strict=False, preclear=True, var_vals=None):

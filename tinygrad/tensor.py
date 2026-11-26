@@ -10,7 +10,7 @@ from tinygrad.helpers import Context, cpu_profile, suppress_finalizing, disable_
 from tinygrad.uop.ops import UOp, Ops, Variable, ConstLike, PatternMatcher, UPat, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
 from tinygrad.uop.ops import KernelInfo, AxisType
 from tinygrad.mixin import Mixin
-from tinygrad.codegen import create_linear, contiguous_mops_to_view
+from tinygrad.compiler import create_linear, contiguous_mops_to_view
 from tinygrad.engine.realize import run_linear, capturing, compile_linear, link_linear
 from tinygrad.device import Buffer, Device, HCQ_RUNTIME_DEV, host_of
 

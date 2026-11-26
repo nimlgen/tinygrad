@@ -5,8 +5,8 @@
 import unittest
 from tinygrad import Device, dtypes
 from tinygrad.uop.ops import UOp, Ops, AxisType, KernelInfo
-from tinygrad.codegen.opt.search import Opt, OptOps
-from tinygrad.codegen import to_program
+from tinygrad.compiler.opt.search import Opt, OptOps
+from tinygrad.compiler import to_program
 
 class TestLinearizerFailure(unittest.TestCase):
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local and Device[Device.DEFAULT].renderer.has_shared, "requires local/shared memory")

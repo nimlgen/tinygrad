@@ -1,7 +1,7 @@
 import unittest, itertools
 from dataclasses import replace
 
-from tinygrad.codegen.late.coalesce import indexing_simplify, pm_simplify_add_image
+from tinygrad.compiler.late.coalesce import indexing_simplify, pm_simplify_add_image
 from tinygrad import Tensor
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite
@@ -540,7 +540,7 @@ class TestImageStore(unittest.TestCase):
 class TestDropTrueGate(unittest.TestCase):
   def test_drop_true_gate_on_index(self):
     # test that INDEX with a constant True valid gets simplified to drop the valid
-    from tinygrad.codegen.late.coalesce import indexing_simplify
+    from tinygrad.compiler.late.coalesce import indexing_simplify
     from tinygrad.uop.ops import graph_rewrite
     from tinygrad.uop.symbolic import sym
     buf = UOp.param(0, dtypes.int, 1)

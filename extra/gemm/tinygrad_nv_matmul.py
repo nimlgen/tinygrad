@@ -1,6 +1,6 @@
 from tinygrad import Tensor, dtypes, Context
 from tinygrad.helpers import getenv
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.uop.ops import AxisType
 from tinygrad.engine.realize import compile_linear, link_linear, run_linear
 from dataclasses import replace

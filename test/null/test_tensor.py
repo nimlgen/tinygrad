@@ -7,8 +7,8 @@ from tinygrad.dtype import DTYPES_DICT, DType
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.nir import NIRRenderer
-from tinygrad.codegen import full_rewrite_to_sink
-from tinygrad.codegen.late.linearizer import linearize
+from tinygrad.compiler import full_rewrite_to_sink
+from tinygrad.compiler.late.linearizer import linearize
 
 x_init = np.random.randn(1,3).astype(np.float32)
 W_init = np.random.randn(3,3).astype(np.float32)

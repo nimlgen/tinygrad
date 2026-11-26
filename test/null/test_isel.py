@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor
 from tinygrad.helpers import Target, Context
-from tinygrad.codegen import to_program, pack_args
+from tinygrad.compiler import to_program, pack_args
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import UOp, dtypes, graph_rewrite, ProgramInfo
 from tinygrad.renderer.x86 import X86Renderer, X86Ops, IselContext

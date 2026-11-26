@@ -4,7 +4,7 @@ from tinygrad import Context, Tensor, Variable, Device
 from tinygrad.device import host_of
 from tinygrad.helpers import HCQ_RUNTIME_DEV
 from tinygrad.uop.uir import render_uir, parse_uir
-from tinygrad.codegen import create_linear
+from tinygrad.compiler import create_linear
 from tinygrad.engine.realize import compile_linear
 
 @Context(ALLOW_DEVICE_USAGE=0)

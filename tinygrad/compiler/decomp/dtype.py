@@ -5,7 +5,7 @@ from tinygrad.uop import GroupOp
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, graph_rewrite, shape_to_shape_arg
 from tinygrad.uop.weak import commit_weak_consts
 from tinygrad.renderer import Renderer
-from tinygrad.codegen.decomp.transcendental import exponent_bias, shl, shr
+from tinygrad.compiler.decomp.transcendental import exponent_bias, shl, shr
 
 # ***** long as 2 ints *****
 

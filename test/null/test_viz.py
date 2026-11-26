@@ -12,7 +12,7 @@ from tinygrad.device import Buffer
 
 from tinygrad.uop.ops import tracked_keys, tracked_ctxs, uop_fields, active_rewrites, active_group, _name_cnt, RewriteTrace
 from tinygrad.viz.serve import load_rewrites, get_full_rewrite, uop_to_json, VizData, get_render, addrspace_colors
-from tinygrad.codegen import do_to_program
+from tinygrad.compiler import do_to_program
 
 @rewrite_group(name=True)
 def exec_rewrite(sink:UOp, pm_lst:list[PatternMatcher], names:None|list[str]=None) -> UOp:
@@ -1281,7 +1281,7 @@ class TestCLI(unittest.TestCase):
 
   @needs_tracked_pm
   def test_nested_calls_schedule_ls(self):
-    from tinygrad.codegen import schedule_cache
+    from tinygrad.compiler import schedule_cache
     @function(precompile=True)
     def inner(x:Tensor): return (x+x).contiguous()
     @function(precompile=True)

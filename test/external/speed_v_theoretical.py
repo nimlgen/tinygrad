@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 from itertools import islice
 from tinygrad import Tensor, Device
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.engine.realize import time_call
 from tinygrad.helpers import Context, DEBUG
 from tinygrad.nn import Conv2d

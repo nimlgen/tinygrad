@@ -14,23 +14,23 @@ from tinygrad.renderer.x86 import ISARenderer, IselContext
 from tinygrad.dtype import dtypes, AddrSpace
 
 # import all pattern matchers here
-from tinygrad.codegen.gpudims import pm_group_gpudims, pm_range_to_special
+from tinygrad.compiler.gpudims import pm_group_gpudims, pm_range_to_special
 from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid
 from tinygrad.uop.movement import mop_cleanup
-from tinygrad.codegen.decomp.dtype import DTypeDecompCtx, pm_dtype_decomps
-from tinygrad.codegen.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
-from tinygrad.codegen.decomp.transcendental import get_transcendental_patterns
-from tinygrad.codegen.opt.postrange import apply_opts
-from tinygrad.codegen.late.gater import pm_move_gates_from_index
-from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse, pm_reduce_unparented
-from tinygrad.codegen.multi import multi_pm
-from tinygrad.codegen.prepare import pm_mops, expand_bitcast, prepare_rangeify
-from tinygrad.codegen.indexing import _stack_select
-from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
-from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
-from tinygrad.codegen.late.coalesce import indexing_simplify, memory_coalescing, pm_simplify_add_image
-from tinygrad.codegen.rangeify import BufferizeOpts, get_kernel_graph
-from tinygrad.codegen.memory import memory_plan_rewrite
+from tinygrad.compiler.decomp.dtype import DTypeDecompCtx, pm_dtype_decomps
+from tinygrad.compiler.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
+from tinygrad.compiler.decomp.transcendental import get_transcendental_patterns
+from tinygrad.compiler.opt.postrange import apply_opts
+from tinygrad.compiler.late.gater import pm_move_gates_from_index
+from tinygrad.compiler.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse, pm_reduce_unparented
+from tinygrad.compiler.multi import multi_pm
+from tinygrad.compiler.prepare import pm_mops, expand_bitcast, prepare_rangeify
+from tinygrad.compiler.indexing import _stack_select
+from tinygrad.compiler.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
+from tinygrad.compiler.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
+from tinygrad.compiler.late.coalesce import indexing_simplify, memory_coalescing, pm_simplify_add_image
+from tinygrad.compiler.rangeify import BufferizeOpts, get_kernel_graph
+from tinygrad.compiler.memory import memory_plan_rewrite
 
 def do_number_param(ctx:tuple[int, dict[str, int]], x:UOp): # after the params, one slot per name
   if x.is_variable and x.arg.slot == -1: return x.replace(arg=replace(x.arg, slot=ctx[0] + ctx[1].setdefault(x.arg.name, len(ctx[1]))))

@@ -6,8 +6,8 @@ from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.dtype import DType, AddrSpace
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, Ops, rewrite_group, graph_rewrite
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear
-from tinygrad.codegen import create_linear
-from tinygrad.codegen.memory import memory_plan_rewrite, _collect_bufs
+from tinygrad.compiler import create_linear
+from tinygrad.compiler.memory import memory_plan_rewrite, _collect_bufs
 from tinygrad.nn.state import get_parameters
 from tinygrad.uop.movement import mop_cleanup
 from dataclasses import dataclass, field

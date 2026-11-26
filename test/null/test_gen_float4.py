@@ -1,8 +1,8 @@
 import unittest
 from tinygrad import Device, Tensor, Variable, dtypes
 from tinygrad.uop.ops import UOp, Ops, AxisType
-from tinygrad.codegen import to_program
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler import to_program
+from tinygrad.compiler.opt import Opt, OptOps
 
 from test.helpers import replace_opts
 

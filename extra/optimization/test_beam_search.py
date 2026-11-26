@@ -5,9 +5,9 @@ from tinygrad.helpers import BEAM, Timing, prod
 from tinygrad import Variable, Device, Tensor
 from tinygrad.nn import Conv2d
 from tinygrad.uop.ops import AxisType
-from tinygrad.codegen.opt import Opt, OptOps
-from tinygrad.codegen.opt.postrange import Scheduler
-from tinygrad.codegen.opt.search import get_kernel_actions
+from tinygrad.compiler.opt import Opt, OptOps
+from tinygrad.compiler.opt.postrange import Scheduler
+from tinygrad.compiler.opt.search import get_kernel_actions
 
 def rand(*shape):
   return Tensor(np.random.rand(*shape).astype(np.float32))

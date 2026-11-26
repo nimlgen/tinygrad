@@ -2,7 +2,7 @@ import unittest, math
 from unittest.mock import patch
 import z3
 from tinygrad import Tensor, Device
-from tinygrad.codegen.gpudims import get_grouped_dims, group_gpudims, pm_range_to_special
+from tinygrad.compiler.gpudims import get_grouped_dims, group_gpudims, pm_range_to_special
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, graph_rewrite
 from tinygrad.uop.validate import uops_to_z3
 from tinygrad.dtype import dtypes

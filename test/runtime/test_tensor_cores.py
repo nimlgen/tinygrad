@@ -8,9 +8,9 @@ from tinygrad.dtype import DType
 from tinygrad.device import Buffer
 from tinygrad.helpers import Context, TC_SELECT, TC_OPT
 from test.helpers import slow, replace_opts, buffer_uops, run_schedule
-from tinygrad.codegen import to_program
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
-from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.compiler import to_program
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt.postrange import Scheduler
 from tinygrad.renderer.tc import amd_cdna_1616128
 from tinygrad.renderer.llvmir import LLVMRenderer, AMDLLVMRenderer
 

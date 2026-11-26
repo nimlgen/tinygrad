@@ -1,11 +1,11 @@
 import unittest
 from tinygrad import Tensor, UOp, function, Device
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.helpers import Target
 from tinygrad.renderer.cstyle import ClangRenderer
 from tinygrad.uop.ops import KernelInfo, Ops
-from tinygrad.codegen import resolve_linear_call
+from tinygrad.compiler import resolve_linear_call
 
 def sched_key(t:Tensor): return t.export()[0].key
 

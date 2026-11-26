@@ -6,11 +6,11 @@ Directories are listed in order of how they are processed.
 
 ---
 
-## tinygrad/codegen: scheduling
+## tinygrad/compiler: scheduling
 
 Group UOps into kernels.
 
-::: tinygrad.codegen.rangeify.get_kernel_graph
+::: tinygrad.compiler.rangeify.get_kernel_graph
     options:
         members: false
         show_labels: false
@@ -18,17 +18,17 @@ Group UOps into kernels.
 
 ---
 
-## tinygrad/codegen/opt
+## tinygrad/compiler/opt
 
 Transforms the ast into an optimized ast. This is where BEAM search and heuristics live.
 
 ---
 
-## tinygrad/codegen: lowering
+## tinygrad/compiler: lowering
 
 Transform the optimized ast into a linearized and rendered program.
 
-::: tinygrad.codegen.to_program
+::: tinygrad.compiler.to_program
     options:
         members: false
         show_labels: false

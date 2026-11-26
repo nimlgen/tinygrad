@@ -6,13 +6,13 @@ from tinygrad import Tensor, dtypes, Device
 from tinygrad.device import Buffer
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.tensor import _to_np_dtype
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.dtype import DType, truncate, AddrSpace
 from tinygrad.nn.state import get_parameters
 from tinygrad.helpers import T, Target, DEV, DEBUG, Context, GlobalCounters, VALIDATE_WITH_CPU
 from tinygrad.renderer import Renderer, TinyELF
-from tinygrad.codegen import full_rewrite_to_sink, linearize_cleanups
-from tinygrad.codegen.late.linearizer import linearize
+from tinygrad.compiler import full_rewrite_to_sink, linearize_cleanups
+from tinygrad.compiler.late.linearizer import linearize
 from tinygrad.engine.realize import compile_linear, link_linear, run_linear
 from tinygrad.engine.jit import bind_export
 

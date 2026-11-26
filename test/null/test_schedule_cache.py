@@ -1,7 +1,7 @@
 import unittest
 from tinygrad import Tensor, Variable, Context
 from tinygrad.helpers import cpu_events
-from tinygrad.codegen import schedule_cache
+from tinygrad.compiler import schedule_cache
 
 def schedule_one():
   Tensor([1]).schedule_linear()

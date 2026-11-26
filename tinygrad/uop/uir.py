@@ -46,7 +46,7 @@ _skip_fields = {"buffer", "grad_fxn"}   # runtime objects
 
 @functools.cache
 def _struct_args() -> dict[Ops, type]:
-  from tinygrad.codegen.indexing import BufferizeOpts  # codegen imports this
+  from tinygrad.compiler.indexing import BufferizeOpts  # codegen imports this
   return {Ops.PARAM: ParamArg, Ops.REFPARAM: ParamArg, Ops.BUFFER: ParamArg, Ops.ALLOC: ParamArg, Ops.EXTERN: ParamArg, Ops.SINK: KernelInfo,
           Ops.CALL: CallInfo, Ops.NATIVE: NativeInfo, Ops.STAGE: BufferizeOpts, Ops.PROGRAM: ProgramInfo}
 

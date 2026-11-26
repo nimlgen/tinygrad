@@ -3,7 +3,7 @@
 import functools, re, sys
 from dataclasses import replace
 from test.mockgpu.amd.emu import lift
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.device import Device
 from tinygrad.helpers import VERSION, Target
 from tinygrad.renderer import Renderer

@@ -3,7 +3,7 @@ from tinygrad import Device, Tensor, dtypes, TinyJit
 from tinygrad.helpers import Context, ProfileRangeEvent, cpu_profile, cpu_events, flatten, ansistrip, perf_counter_us
 from tinygrad.device import Buffer, BufferSpec, Compiled, ProfileDeviceEvent, ProfileGraphEvent, HCQ_DEVS
 from tinygrad.uop.ops import UOp, Ops
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from test.helpers import needs_devices, run_schedule
 
 def _dev_base(d):

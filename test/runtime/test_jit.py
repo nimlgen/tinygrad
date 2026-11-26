@@ -121,7 +121,7 @@ class TestJit(unittest.TestCase):
     @TinyJit
     def add(a, b): return (a+b).realize()
     a, b = Tensor.ones(10, 10).contiguous().realize(), Tensor.ones(10, 10).contiguous().realize()
-    with patch("tinygrad.codegen.opt.search.beam_search", wraps=lambda k,*a,**kw: k) as mock_beam:
+    with patch("tinygrad.compiler.opt.search.beam_search", wraps=lambda k,*a,**kw: k) as mock_beam:
       add(a, b)
       assert mock_beam.call_count == 0
       with patch("tinygrad.engine.jit.getenv", side_effect=lambda k, d=0: 1 if k == "JITBEAM" else _getenv(k, d)): add(a, b)

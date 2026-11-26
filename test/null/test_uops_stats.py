@@ -2,11 +2,11 @@ import unittest
 from tinygrad import Tensor
 from tinygrad.helpers import GlobalCounters, Target
 from tinygrad.engine.realize import compile_linear, estimate_uop
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 from tinygrad.renderer import Estimates
 from tinygrad.uop.ops import Ops, UOp, AxisType, KernelInfo
 from tinygrad.dtype import dtypes
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.compiler.opt import Opt, OptOps, KernelOptError
 from tinygrad.device import Device
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.x86 import X86Renderer

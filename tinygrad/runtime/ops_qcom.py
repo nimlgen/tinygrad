@@ -19,7 +19,7 @@ BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
 
 @functools.cache
 def dcache_flush():
-  from tinygrad.codegen import to_program
+  from tinygrad.compiler import to_program
   buf, n = UOp.param(0, dtypes.uint8, 1), UOp.param(1, dtypes.int, shape=(), name="n", addrspace=AddrSpace.ALU)
   i = UOp.range(n, 0, dtype=dtypes.int)
   flush = UOp.native('__asm__ volatile("dc cvac, %0" :: "r"({0}) : "memory");', fmt=True).call(buf.index(i * 64))

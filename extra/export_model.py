@@ -7,7 +7,7 @@ from tinygrad.engine.realize import get_call_arg_uops
 from tinygrad.nn.state import get_state_dict
 from tinygrad.helpers import Context, prod
 from tinygrad.uop.ops import Ops, UOp
-from tinygrad.codegen import to_program
+from tinygrad.compiler import to_program
 import json
 from collections import OrderedDict
 

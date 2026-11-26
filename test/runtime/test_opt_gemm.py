@@ -2,7 +2,7 @@ import numpy as np
 import unittest
 from tinygrad import Tensor
 from tinygrad.helpers import get_single_element
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.compiler.opt import Opt, OptOps
 from tinygrad.uop.ops import Ops, UOp, AxisType
 from test.helpers import replace_opts, run_schedule, bound_schedule
 

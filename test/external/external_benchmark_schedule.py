@@ -2,8 +2,8 @@ from extra.models.resnet import ResNet50
 from tinygrad import Tensor, nn, Device
 from tinygrad.helpers import Profiling, Timing, getenv
 from tinygrad.uop.ops import Ops
-from tinygrad.codegen import full_rewrite_to_sink
-from tinygrad.codegen.late.linearizer import linearize
+from tinygrad.compiler import full_rewrite_to_sink
+from tinygrad.compiler.late.linearizer import linearize
 from tinygrad.uop.spec import type_verify, spec_program
 
 if __name__ == "__main__":

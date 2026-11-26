@@ -3,7 +3,7 @@ from tinygrad import dtypes, Tensor
 from tinygrad.helpers import getenv, get_single_element
 from tinygrad.dtype import _to_np_dtype
 from tinygrad.engine.realize import lower_and_compile
-from tinygrad.codegen.opt import OptOps
+from tinygrad.compiler.opt import OptOps
 
 dtype_in = (dtypes.half if getenv("HALF") else dtypes.bfloat16 if getenv("BFLOAT16") else
             dtypes.fp8e4m3 if getenv("FP8E4M3") else dtypes.fp8e5m2 if getenv("FP8E5M2") else dtypes.float)
